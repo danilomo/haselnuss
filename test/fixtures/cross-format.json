@@ -1,0 +1,10 @@
+[
+  {"id": "knuth1984",
+   "author": [{"family": "Knuth", "given": "Donald"}],
+   "issued": {"date-parts": [[1984]]},
+   "title": "The TeXbook"},
+  {"id": "lamport1986",
+   "author": [{"family": "Lamport", "given": "Leslie"}],
+   "issued": {"date-parts": [[1986]]},
+   "title": "A Document Preparation System"}
+]

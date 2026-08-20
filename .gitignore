@@ -1,0 +1,31 @@
+/target
+/.lein-*
+/.nrepl-port
+*.jar
+/.clj-kondo/.cache
+/.lsp/.cache
+
+# examples/ is governed by examples/.gitignore, which whitelists the sources
+# and ignores everything else -- see there for why that direction, and the
+# README's "Example" section for the build-into-out/ recipe that keeps
+# products out of the source directory in the first place (TASK-50.5).
+
+# A hand-run pdflatex/bibtex from the repo root leaves its byproducts here.
+# Listed by extension rather than whitelisted, because the repository root
+# cannot be ignored wholesale the way a source directory can. Prefer
+# `-output-directory`, which is what makes this list a backstop rather than
+# the thing being relied on.
+/*.aux
+/*.log
+/*.out
+/*.bbl
+/*.blg
+/*.pdf
+/*.dvi
+/*.bib
+/*.toc
+/*.lof
+/*.lot
+/*.fls
+/*.fdb_latexmk
+/*.synctex.gz

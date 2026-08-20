@@ -1,0 +1,10 @@
+[
+  {"id": "crowe2018",
+   "author": [{"family": "Crowe", "given": "Miriam"}],
+   "issued": {"date-parts": [[2018]]},
+   "title": "Hedgerow Nut Crops in Temperate Gardens"},
+  {"id": "schmidt2021",
+   "author": [{"family": "Schmidt", "given": "Ana"}, {"family": "Novak", "given": "Petr"}],
+   "issued": {"date-parts": [[2021]]},
+   "title": "Spacing Trials in Corylus avellana"}
+]

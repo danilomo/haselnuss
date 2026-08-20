@@ -1,0 +1,51 @@
+---
+title: Cross-format Numbering
+authors:
+  - Ada Lovelace
+lang: en
+bibliography: cross-format.json
+---
+
+:::{toc}
+:::
+
+:::{list-of-figures}
+:::
+
+:::{list-of-tables}
+:::
+
+# Background {#sec:background}
+
+The mass-energy equivalence is stated in @eq:mass, and the tree in
+@fig:tree illustrates the structure it applies to. Both are discussed
+by [@knuth1984]. @sec:results carries this further.
+
+![A hazel tree.](tree.png){#fig:tree}
+
+$$
+E = mc^2
+$$ {#eq:mass}
+
+# Results {#sec:results}
+
+A second figure keeps the per-section counters honest: see @fig:leaf.
+The second equation, @eq:energy, follows from @eq:mass, which
+@sec:background introduced.
+
+![A hazel leaf.](leaf.png){#fig:leaf}
+
+$$
+E_k = \frac{1}{2}mv^2
+$$ {#eq:energy}
+
+The measurements are in @tbl:yields.
+
+| Parameter | Yield |
+|:----------|------:|
+| Water     |   1.4 |
+| Nitrogen  |   0.8 |
+: Measured yield per parameter {#tbl:yields}
+
+The result agrees with [@lamport1986] and, taken together, with
+[@knuth1984; @lamport1986].

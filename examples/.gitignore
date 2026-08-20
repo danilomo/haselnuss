@@ -1,0 +1,29 @@
+# This directory holds sources only: the .hdoc documents, the CSL-JSON
+# bibliography they name, and the figure they include. Anything else here is
+# something a build produced.
+#
+# So: a whitelist, not a list of artifact extensions (TASK-50.5). The
+# extension-list version had to be patched reactively twice -- once for the
+# pdflatex byproducts, once for the .bib that native mode began generating in
+# TASK-42 -- and both times the new artifact was noticed only by reading
+# `git status --short` after it had already been committed. A whitelist cannot
+# lag behind an artifact type nobody has seen yet.
+#
+# Two consequences worth knowing before adding anything here:
+#
+#   - subdirectories are ignored wholesale, which is what makes the recommended
+#     `examples/out/` build directory (see the README's "Example" section)
+#     invisible to git. A source subdirectory would need its own `!` rule.
+#   - a source of a NEW type -- say a .csv a future example reads -- is ignored
+#     until it is named below. `git add examples/data.csv` says so out loud;
+#     `git add -A` just skips it.
+#
+# The figure is whitelisted by name, not as `*.png`: the one image type this
+# directory actually generates is a rendered page (pdftoppm in TASK-29's
+# review, --screenshot in TASK-43's), and `!*.png` would let those straight
+# back in.
+*
+!.gitignore
+!*.hdoc
+!*.json
+!catkins.png

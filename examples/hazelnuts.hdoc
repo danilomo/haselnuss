@@ -1,0 +1,75 @@
+---
+title: Growing Hazelnuts in a Small Garden
+authors:
+  - Danilo Oliveira
+lang: en
+bibliography: hazelnuts.json
+cslStyle: numeric
+---
+
+# Why hazel {#sec:why}
+
+Hazel (*Corylus avellana*) is the most forgiving nut tree a small garden
+can hold. It coppices willingly, tolerates a hedge's worth of shade, and
+starts bearing in four or five years rather than the decade a walnut
+expects. The catch is pollination: hazel is wind-pollinated and
+self-incompatible, so a single tree in an otherwise hazel-free
+neighbourhood will flower every February and set nothing at all.
+
+:::{admonition #adm:pollination}
+Plant at least two cultivars whose flowering periods overlap. Two trees
+of the *same* cultivar are genetically identical and will not pollinate
+each other.
+:::
+
+@fig:catkins shows the two flower types that make this necessary. The
+male catkins are impossible to miss; the female flowers are a few
+millimetres across and easy to walk past for years.
+
+![Male catkins and female flowers on the same branch in
+February.](catkins.png){#fig:catkins}
+
+# Spacing and yield {#sec:spacing}
+
+Spacing is the decision that is hardest to undo. At the four-metre
+spacing usually recommended for orchard rows, a garden fits very few
+trees; at two metres the canopy closes by year six and yield per tree
+collapses even though yield per square metre holds up for a while
+[@crowe2018].
+
+Kernel yield per tree follows roughly
+
+$$
+Y = k \cdot A \cdot e^{-\alpha d}
+$$ {#eq:yield}
+
+where $A$ is the ground area available to the tree, $d$ is the shading
+from its neighbours, and $k$ and $\alpha$ are cultivar constants.
+@eq:yield is descriptive rather than predictive — the constants vary
+enough between cultivars that it is best used to compare spacings for
+one cultivar, not to forecast a harvest.
+
+| Spacing | Trees in 100 m² | Yield per tree | Yield per 100 m² |
+|:--------|----------------:|---------------:|-----------------:|
+| 4 m     |               6 |         2.9 kg |          17.4 kg |
+| 3 m     |              11 |         1.8 kg |          19.8 kg |
+| 2 m     |              25 |         0.6 kg |          15.0 kg |
+: Modelled kernel yield by spacing, after ten years. {#tbl:spacing}
+
+@tbl:spacing is why three metres is the usual compromise: it gives up
+little against the theoretical optimum and leaves room to walk between
+the rows. The underlying figures follow [@crowe2018; @schmidt2021].
+
+:::{collapsable summary="A note on squirrels"}
+Netting does not work. A squirrel takes hazelnuts at the milk stage,
+before the shell hardens and well before you would think of harvesting,
+and it will strip a tree in an afternoon. The only reliable answers are
+a dog or a very large number of trees.
+:::
+
+# Conclusion {#sec:conclusion}
+
+Two cultivars, three metres apart, and patience. See @sec:why for the
+pollination constraint, @adm:pollination for what that means when you
+choose them, and @sec:spacing for the arithmetic. The pollination one is
+what costs a year if you get it wrong.

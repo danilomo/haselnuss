@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# The documented way to start this project's agent-facing nREPL (TASK-45).
+#
+# `lein repl :headless` on its own is *almost* enough: project.clj pins
+# :repl-options {:host "127.0.0.1" :port 7888}, and its :repl profile refuses
+# the LEIN_REPL_* overrides that would outrank those keys. What that guard
+# cannot reach is configuration resolved inside Leiningen's own JVM before any
+# project code exists -- notably :repl-options in a user-level
+# ~/.lein/profiles.clj, which is merged over project.clj.
+#
+# This script closes that by passing :host and :port as task arguments, the
+# highest-precedence source in leiningen.repl/configured-repl-connection. The
+# values below must match project.clj's :repl-options; haselnuss.repl-config-test
+# fails if they drift.
+#
+# Usage:
+#   bin/repl              # headless server, safe to background
+#   bin/repl :connect     # client against the running server
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+HOST=127.0.0.1
+PORT=7888
+
+# Refused, not silently overridden: a shell carrying these means someone
+# expects a different connection than the one they are about to get. This
+# mirrors project.clj's :repl profile guard so both entry points agree.
+for var in LEIN_REPL_HOST LEIN_REPL_PORT LEIN_REPL_SOCKET; do
+  if [ -n "${!var:-}" ]; then
+    echo "bin/repl: $var is set (${!var}), but this project pins its nREPL to $HOST:$PORT." >&2
+    echo "bin/repl: unset it, or run lein repl directly if you really mean to override." >&2
+    exit 1
+  fi
+done
+
+if [ "${1:-}" = ":connect" ]; then
+  exec lein repl :connect "$HOST:$PORT"
+fi
+
+exec lein repl "${1:-:headless}" :host "$HOST" :port "$PORT"

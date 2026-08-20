@@ -1,0 +1,25 @@
+;; Strict, idiom-focused clj-kondo config. See README ("Linting") and
+;; doc-1 (Agentic Clojure Tooling Stack) for why clj-kondo was chosen.
+;;
+;; Every :level :warning entry below is OFF in clj-kondo's own defaults and
+;; was individually confirmed (against this project's clj-kondo version) to
+;; actually fire before being added here -- see TASK-34 notes for the
+;; per-rule verification. Rules intentionally left disabled, with why:
+;;
+;; - :consistent-alias -- requires pre-declaring the canonical alias for
+;;   every namespace up front (:aliases {ns alias, ...}). Premature for a
+;;   fresh skeleton with no established aliasing conventions yet; revisit
+;;   once real code settles on recurring requires.
+;; - :redundant-fn-wrapper, :not-nil? -- could not get either to fire on
+;;   their documented trigger patterns with this clj-kondo version, so they
+;;   were left out rather than shipping unverified/dead config.
+{:linters {:missing-docstring {:level :warning}
+           :shadowed-var {:level :warning}
+           :used-underscored-binding {:level :warning}
+           :single-key-in {:level :warning}
+           :unsorted-required-namespaces {:level :warning}
+           :unused-alias {:level :warning}
+           :equals-nil {:level :warning}
+           :equals-true {:level :warning}
+           :equals-false {:level :warning}
+           :main-without-gen-class {:level :warning}}}

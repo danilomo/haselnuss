@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Required before finishing any task -- see CLAUDE.md and TASK-34.
+# Runs the strict clj-kondo config (.clj-kondo/config.edn), the cljfmt check
+# (lein-cljfmt) and a shell check over bin/, and fails if any finds a
+# violation.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+status=0
+
+# project.clj is Clojure and is gated like the rest of it (TASK-50.2). It was
+# not, and that was not academic: TASK-45 put about forty lines of :injections
+# guard code there and the mandatory gate passed over it vacuously.
+#
+# One limit, measured rather than assumed (TASK-50.2 review): clj-kondo turns
+# :unresolved-symbol and :unresolved-namespace OFF for a file named
+# project.clj, and no --config can turn them back on, so a typo'd var name
+# inside :injections is still invisible here. Everything else fires --
+# docstrings, arity, binding shapes, duplicate keys, this project's own strict
+# rules. haselnuss.repl-config-test is what actually executes that guard code.
+lint_paths=(src project.clj)
+[ -d test ] && lint_paths+=(test)
+
+echo "== clj-kondo =="
+clj-kondo --lint "${lint_paths[@]}"
+kondo_status=$?
+[ "$kondo_status" -eq 0 ] || status=1
+
+echo
+echo "== cljfmt =="
+# The same paths, passed explicitly. With no arguments lein-cljfmt reads
+# :source-paths/:test-paths, which cannot include project.clj -- so the two
+# checks would silently cover different files. One invocation rather than two,
+# since each costs a cold JVM.
+lein cljfmt check "${lint_paths[@]}"
+fmt_status=$?
+[ "$fmt_status" -eq 0 ] || status=1
+
+echo
+echo "== shell =="
+# bin/lint, bin/repl and the edit hook are real logic -- bin/repl refuses
+# environment overrides and passes task arguments -- and nothing checked them
+# (TASK-50.2 AC #3). Decided: `bash -n` is the floor, because it needs no
+# install and so cannot become a gate that quietly does nothing; shellcheck
+# runs on top of it when present. A missing shellcheck is reported rather than
+# passed over in silence, so the difference between "checked" and "not
+# installed" is visible in the output. See the README ("Linting").
+#
+# Discovered by shebang, not by directory listing: `bin/*` assumed every entry
+# is a bash script, so a future bin/NOTES.md or bin/tool.py would have failed
+# the mandatory gate on a clean tree (TASK-50.2 review).
+shell_scripts=()
+while IFS= read -r script; do
+  shell_scripts+=("$script")
+done < <(
+  for candidate in bin/* .claude/hooks/*; do
+    [ -f "$candidate" ] || continue
+    head -n 1 "$candidate" | grep -qE '^#!.*[ /](ba)?sh( |$)' && echo "$candidate"
+  done
+)
+
+if [ "${#shell_scripts[@]}" -eq 0 ]; then
+  echo "no shell scripts found"
+else
+  shell_failures=0
+  for script in "${shell_scripts[@]}"; do
+    bash -n "$script" || shell_failures=$((shell_failures + 1))
+  done
+  [ "$shell_failures" -eq 0 ] || status=1
+  echo "bash -n: ${#shell_scripts[@]} script(s) checked, $shell_failures with syntax errors"
+
+  if command -v shellcheck >/dev/null 2>&1; then
+    # Pinned severity, so the gate means the same thing on every machine: with
+    # shellcheck's default (style) a passing tree here could fail on a
+    # developer's laptop for an idiom preference (TASK-50.2 review).
+    shellcheck --severity=warning "${shell_scripts[@]}"
+    shellcheck_status=$?
+    [ "$shellcheck_status" -eq 0 ] || status=1
+  else
+    echo "shellcheck: not installed, skipped (bash -n still ran)"
+  fi
+fi
+
+exit "$status"

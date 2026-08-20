@@ -1,0 +1,127 @@
+---
+title: Sensitivity of Hazel Yield Models
+authors:
+  - Ada Lovelace
+lang: en
+topLevelDivision: chapter
+bibliography: thesis.json
+---
+
+:::{abstract keywords="Hazel; Yield; Sensitivity"}
+Yield models for hazel orchards are fitted on a handful of measured
+parameters, and their predictions are only as stable as those
+parameters are. This work measures that stability.
+
+The result is a ranking of parameters by influence, and a
+recommendation for which of them a grower should measure twice.
+:::
+
+:::{abstract lang=pt-BR keywords="Aveleira; Produtividade; Sensibilidade"}
+Modelos de produtividade para pomares de aveleira são ajustados sobre
+poucos parâmetros medidos, e suas previsões são tão estáveis quanto
+esses parâmetros.
+
+O resultado é uma ordenação dos parâmetros por influência.
+:::
+
+:::{dedication}
+To my parents.
+:::
+
+:::{epigraph}
+Science is what we understand well enough to explain to a computer.
+
+--- Donald Knuth
+:::
+
+:::{acknowledgements}
+Thanks to everyone who read a draft, and to the orchard that let us
+count its nuts.
+:::
+
+:::{toc}
+:::
+
+:::{list-of-figures}
+:::
+
+:::{list-of-tables}
+:::
+
+# Introduction {#ch:intro}
+
+This chapter states the problem; @ch:methods gives the model and the
+experiment. The sensitivity of the fitted model is summarised in
+@fig:sens, and panel @fig:sens-b is the one a grower should read first.
+The fitting procedure is @alg:bisect, its driver is @lst:dine, the
+measurements are in @tbl:yield, and the model itself is @eq:mass.
+@sec:model derives it.
+
+## Scope {#sec:scope}
+
+The study covers one cultivar and one region.
+
+![A hazel tree, at half its natural size.](tree.png){#fig:tree scale=0.5}
+
+@fig:tree shows the tree the measurements were taken from.
+
+# Methods {#ch:methods}
+
+## The model {#sec:model}
+
+The model is stated in @eq:mass and fitted by @alg:bisect.
+
+$$
+E = mc^2
+$$ {#eq:mass}
+
+::::{figure #fig:sens caption="Sensitivity of the fitted model" columns=2}
+
+:::{subfigure #fig:sens-a caption="Temperature"}
+![](panel.png)
+:::
+
+:::{subfigure #fig:sens-b}
+![](panel.png)
+:::
+
+:::{subfigure #fig:sens-c caption="Rainfall"}
+![](panel.png)
+:::
+
+::::
+
+Panel @fig:sens-b carries no caption of its own, and the prose refers to
+it by its letter, exactly as the source thesis does.
+
+| Parameter | Yield |
+|:----------|------:|
+| Water     |   1.4 |
+| Nitrogen  |   0.8 |
+: Measured yield per parameter {#tbl:yield}
+
+@tbl:yield lists what was measured.
+
+:::{listing #lst:dine caption="The fitting driver"}
+```clojure
+(defn fit [model data]
+  (bisect (partial residual model) data))
+```
+:::
+
+:::{algorithm #alg:bisect caption="Bisection"}
+```
+KwData: an interval [a, b], a tolerance t
+While (b - a) > t {
+  m <- (a + b) / 2
+  If f(a) * f(m) < 0 { b <- m } Else { a <- m }
+}
+```
+:::
+
+## Apparatus {#sec:apparatus}
+
+![A hazel leaf, three centimetres tall.](leaf.png){#fig:leaf height=3cm}
+
+The leaf in @fig:leaf sets the scale. The procedure follows
+[@knuth1984], and the typesetting conventions follow [@lamport1986].
