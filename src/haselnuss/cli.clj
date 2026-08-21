@@ -70,12 +70,14 @@
   written, the message goes to stderr, and the exit code is non-zero."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
+            [clojure.walk :as walk]
             [haselnuss.emit.html :as html]
             [haselnuss.emit.latex :as latex]
             [haselnuss.extensions.collapsable :as collapsable]
             [haselnuss.extensions.derived-lists :as derived-lists]
             [haselnuss.extensions.front-matter :as front-matter]
             [haselnuss.extensions.small-collapsable :as small-collapsable]
+            [haselnuss.json :as json]
             [haselnuss.lower :as lower]
             [haselnuss.parser :as parser]
             [haselnuss.registry :as registry]
@@ -84,9 +86,19 @@
 
 (def targets
   "The emission targets this CLI supports, each mapping to the file
-  extension `output-path` gives its output when none was requested."
+  extension `output-path` gives its output when none was requested.
+
+  `json` (TASK-80) is not a rendering target like the other two: it
+  writes the parsed Document's own JSON interchange representation
+  (`haselnuss.json/->json`, SPEC.md sec11), with no resolve or lower
+  pass run over it at all -- see `run`'s own `emit-target` branch. Its
+  prose is written more compactly than `haselnuss.json`'s own faithful
+  encoding would: consecutive word/space Inlines (CommonMark's own
+  per-word tokenization) are folded into single `:str` runs before
+  encoding -- see `coalesce-prose`."
   {"html" {:target :html :extension ".html"}
-   "latex" {:target :latex :extension ".tex"}})
+   "latex" {:target :latex :extension ".tex"}
+   "json" {:target :json :extension ".json"}})
 
 (defn- environment-title
   "The head word a mapped environment prints of its own accord (its
@@ -418,10 +430,11 @@
    "\n"
    ["Usage: haselnuss [options] INPUT.hdoc"
     ""
-    "Converts a Haselnuss document to HTML or LaTeX."
+    "Converts a Haselnuss document to HTML, LaTeX, or its own JSON interchange"
+    "representation."
     ""
     "Options:"
-    "  -t, --target TARGET     html (default) or latex"
+    "  -t, --target TARGET     html (default), latex, or json"
     "  -o, --output PATH       output file (default: INPUT with the target's extension)"
     "      --computed-numbers  latex only: bake in the resolver's computed numbers and"
     "                          citation text instead of emitting \\Cref/\\cite for LaTeX"
@@ -441,11 +454,17 @@
     "  -h, --help              show this help"
     "      --version           show the version of this build and exit"
     ""
+    "The json target writes the parsed document's own JSON representation --"
+    "no resolve or lower pass runs over it, so it carries no computed numbers,"
+    "cross-reference text or bibliography, and --computed-numbers, --fragment"
+    "and --no-stylesheet have no effect on it. Prose is written compactly:"
+    "consecutive word/space tokens are folded into plain :str text runs."
+    ""
     "Resolver diagnostics (dangling references and citations, duplicate ids,"
     "unknown directives, id-prefix/role mismatches, directives whose id prefix"
     "names a different kind than the directive does, sections whose id prefix"
     "names a different division than their own level is emitted as) are printed"
-    "to stderr as warnings; the build still succeeds."
+    "to stderr as warnings on the html/latex targets; the build still succeeds."
     ""
     "Exit codes:"
     "  0  the document was converted and written"
@@ -558,8 +577,20 @@
   empty-after-stripping trap `haselnuss.emit.latex/bib-resource-name`
   already guards (its own TASK-23 review finding). The chosen path --
   derived or explicit -- is then checked against the input, so a build
-  can never overwrite the document it is reading."
-  [{:keys [input output target]}]
+  can never overwrite the document it is reading.
+
+  `bib-path` (TASK-81), when given, is checked the same way: the json
+  target's own default extension is `.json`, the same extension a
+  CSL-JSON bibliography almost always carries, and this repo's own
+  `examples/hazelnuts.hdoc` names its bibliography `hazelnuts.json` --
+  the exact base name `--target json` with no `--output` would derive on
+  its own. Running that combination against the real file, once, is what
+  found this: the bibliography was silently replaced by the AST dump.
+  html/latex practically never collide here (nobody names a CSL-JSON
+  file `.html`/`.tex`), but the check is unconditional rather than
+  target-gated, since it costs nothing and a target-specific carve-out
+  would be one more thing to keep in sync with `targets`."
+  [{:keys [input output target]} bib-path]
   (let [file (io/file input)
         path (or output
                  (let [parent (.getParent file)
@@ -579,6 +610,10 @@
     ;; that flag (found by review).
     (when (= (.getAbsolutePath (io/file path)) (.getAbsolutePath file))
       (throw (ex-info (str "refusing to overwrite the input file: " input)
+                      {:type ::usage-error})))
+    (when (and bib-path (= (.getAbsolutePath (io/file path)) (.getAbsolutePath (io/file bib-path))))
+      (throw (ex-info (str "refusing to overwrite the bibliography file: " bib-path
+                           " -- pass --output to write the converted document elsewhere")
                       {:type ::usage-error})))
     path))
 
@@ -616,6 +651,69 @@
       (throw (ex-info (str "bibliography file not found: " path) {:type ::missing-bibliography})))
     (resolver/load-bibliography path)))
 
+(def ^:private glueable-inline-tags
+  "Inline tags the json target (TASK-80 follow-up) folds into plain text
+  rather than keeping as their own JSON entries. CommonMark's own word/
+  whitespace tokenization is what puts one word per `:str` node with a
+  `:space` or `:soft-break` between them -- needed so an inline construct
+  like `*emph*` or a bare `@key` has a clean token boundary, and for
+  TASK-47's vocabulary check -- but it makes for noisy JSON that no other
+  target exposes at all: html/latex both simply concatenate this exact
+  shape when rendering, so nothing downstream of the parser actually
+  depends on the words staying split.
+
+  `:line-break` is deliberately excluded: it is an AUTHORED line break (a
+  trailing backslash or two spaces), not filler between words, so it
+  ends a glued run rather than folding into it."
+  #{:str :space :soft-break})
+
+(defn- glue-text
+  "The literal text one glued run of `glueable-inline-tags` nodes becomes:
+  each `:str`'s own `:text`, each `:space`/`:soft-break` a single literal
+  space -- concatenated in order, so a space at either edge of the run
+  (adjacent to markup outside it, e.g. the two spaces around `*emph*` in
+  \"wrong *emph* text\") survives instead of being silently dropped."
+  [run]
+  (apply str (map (fn [{:keys [t text]}] (if (= :str t) text " ")) run)))
+
+(defn- coalesce-inline-run
+  "One `haselnuss.ast` Inline vector (`:inlines`, or any of the other
+  fields typed as a vector of Inlines -- `:heading`, `:caption`, `:title`,
+  `:prefix`, `:suffix`), with every consecutive run of
+  `glueable-inline-tags` nodes folded into a single `:str`.
+
+  Safe to call on ANY vector, Inline or not: a `:blocks`/`:rows`/
+  `:classes` vector's own elements never carry a `:t` in
+  `glueable-inline-tags` (a Block's own tags are disjoint from an
+  Inline's, and a bare string has no `:t` at all), so `partition-by`
+  finds nothing to fold there and the vector comes back unchanged."
+  [v]
+  (into []
+        (mapcat (fn [group]
+                  (if (and (map? (first group))
+                           (contains? glueable-inline-tags (:t (first group))))
+                    [{:t :str :text (glue-text group)}]
+                    group)))
+        (partition-by #(and (map? %) (contains? glueable-inline-tags (:t %))) v)))
+
+(defn- coalesce-prose
+  "`document`, with every Inline vector anywhere in it run through
+  `coalesce-inline-run` -- a compact json-target dump, at the cost of
+  `haselnuss.json`'s own general round-trip contract, which this
+  deliberately does NOT touch: `haselnuss.json` itself stays exactly as
+  faithful as TASK-3 built it, and this is a display-only transform
+  private to the CLI's own json target, applied to the parsed Document
+  right before `json/->json` sees it.
+
+  A plain `postwalk`, not a schema-aware walk, because `coalesce-inline-
+  run` is already safe to call on every vector in the tree regardless of
+  what it holds (see its own docstring) -- so there is no field name
+  (`:inlines`/`:heading`/`:caption`/...) this would need to know about,
+  and a schema change adding a new Inline-vector field needs no matching
+  change here."
+  [document]
+  (walk/postwalk (fn [x] (cond-> x (vector? x) coalesce-inline-run)) document))
+
 (defn run
   "The pure core (AC #1/#2/#3): parses `source`, resolves it, lowers it
   for `opts`' own target, and emits it. Returns `{:output :diagnostics
@@ -637,7 +735,20 @@
 
   Throws whatever `parse`/`lower`/`emit-document` throw. That is the
   unrecoverable half of the split this namespace's docstring describes
-  (AC #5); `build`/`-main` turn it into a message and an exit code."
+  (AC #5); `build`/`-main` turn it into a message and an exit code.
+
+  The `:json` target (TASK-80) is a deliberate exception to all of the
+  above: it returns right after `parser/parse`, with `:output` the
+  parsed Document's own JSON interchange representation
+  (`haselnuss.json/->json`, through `coalesce-prose` -- see its own
+  docstring) and empty `:diagnostics` -- no `resolve-document`, no
+  `build-registry`, no `lower`, no emitter runs at all. It still needs
+  `vocabulary` (so a bare `@key` parses as the same construct it would on
+  any other target), and therefore the same bibliography load `bib-path`/
+  `bibliography` do, but nothing past `parser/parse` -- resolution is
+  what would turn a `CrossRef`'s bare `:label` into resolved `:text`, and
+  the JSON target's whole point is the document exactly as parsed, not
+  that computed view of it."
   [source {:keys [target computed-numbers] :as opts}]
   (when-not (targets target)
     ;; `run` and `build` are public, so a caller can reach them without
@@ -695,11 +806,26 @@
                      ;; dangles.
                      {:kinds (into #{} (map name) (keys lexicon))
                       :cite-keys (set (keys bibliography))})
-        document (parser/parse source vocabulary)
-        {:keys [document diagnostics labels ordered-keys bibliography-id]}
-        (resolver/resolve-document document
-                                   (cond-> {:lexicon lexicon
-                                            :directive-registry base-registry
+        document (parser/parse source vocabulary)]
+    (if (= emit-target :json)
+      ;; TASK-80: the JSON target is the raw parsed AST, not a
+      ;; resolved/lowered view -- SPEC.md sec11 treats the JSON
+      ;; representation as the canonical interchange form derived
+      ;; straight from parsing, so no resolver diagnostic, directive
+      ;; registry, or lowering pass applies here at all. `coalesce-prose`
+      ;; is the one exception to "exactly as parsed": it folds CommonMark's
+      ;; own per-word :str/:space tokenization into plain-text :str runs,
+      ;; purely for a more compact dump -- see its own docstring.
+      {:diagnostics []
+       :bibliography bibliography
+       :ordered-keys nil
+       :preamble nil
+       :front-matter nil
+       :output (json/->json (coalesce-prose document))}
+      (let [{:keys [document diagnostics labels ordered-keys bibliography-id]}
+            (resolver/resolve-document document
+                                       (cond-> {:lexicon lexicon
+                                                :directive-registry base-registry
                                             ;; TASK-48. The same table
                                             ;; `build-registry` registers, read
                                             ;; for the kind each directive
@@ -708,8 +834,8 @@
                                             ;; warning rather than two
                                             ;; different numbers in the two
                                             ;; targets.
-                                            :directive-kinds
-                                            (latex/directive-lexicon-kinds)
+                                                :directive-kinds
+                                                (latex/directive-lexicon-kinds)
                                             ;; TASK-54. Which directives
                                             ;; are front matter is the
                                             ;; extension's to say; what
@@ -718,7 +844,7 @@
                                             ;; inside them, list none of
                                             ;; their sections -- is
                                             ;; `body-view`'s.
-                                            :front-matter-names front-matter-names
+                                                :front-matter-names front-matter-names
                                             ;; TASK-56. Which directive
                                             ;; is a PANEL of the float
                                             ;; above it is the emitter
@@ -733,8 +859,8 @@
                                             ;; panels out from, so the
                                             ;; two cannot disagree
                                             ;; about what a panel is.
-                                            :sublabel-names
-                                            (latex/sublabel-directive-names)
+                                                :sublabel-names
+                                                (latex/sublabel-directive-names)
                                             ;; TASK-38. The resolver owns the
                                             ;; splicing, the cycle guard and
                                             ;; the diagnostics; reading and
@@ -747,17 +873,17 @@
                                             ;; one, so an `@`-token means the
                                             ;; same thing in a chapter as in
                                             ;; the document that includes it.
-                                            :includes
-                                            {:base-dir (:base-dir opts)
+                                                :includes
+                                                {:base-dir (:base-dir opts)
                                              ;; Puts the document itself
                                              ;; on the cycle stack, so a
                                              ;; loop back to the root is
                                              ;; caught like any other.
-                                             :source-path (:input opts)
-                                             :load (fn [file]
-                                                     (parser/parse (slurp file) vocabulary))}}
-                                     bibliography (assoc :bibliography bibliography)))
-        build-reg (build-registry labels)
+                                                 :source-path (:input opts)
+                                                 :load (fn [file]
+                                                         (parser/parse (slurp file) vocabulary))}}
+                                         bibliography (assoc :bibliography bibliography)))
+            build-reg (build-registry labels)
         ;; TASK-59. Derived here, once, from the SAME resolved document
         ;; and the same label table every cross-reference's text was
         ;; baked from -- the discipline `:labels` already follows, and
@@ -769,14 +895,14 @@
         ;; `front-matter-names`, so a heading inside an abstract is no
         ;; more a table-of-contents entry than it is a numbered
         ;; section.
-        float-names (latex/float-directive-names)
-        derived-lists {:toc (resolver/derive-toc document labels front-matter-names)
-                       :list-of-figures (resolver/derive-list-of-figures document labels float-names)
-                       :list-of-tables (resolver/derive-list-of-tables document labels float-names)}
-        emit-opts {:registry build-reg
-                   :labels labels
-                   :derived-lists derived-lists
-                   :bibliography-id bibliography-id
+            float-names (latex/float-directive-names)
+            derived-lists {:toc (resolver/derive-toc document labels front-matter-names)
+                           :list-of-figures (resolver/derive-list-of-figures document labels float-names)
+                           :list-of-tables (resolver/derive-list-of-tables document labels float-names)}
+            emit-opts {:registry build-reg
+                       :labels labels
+                       :derived-lists derived-lists
+                       :bibliography-id bibliography-id
                    ;; TASK-42: in native mode `build` generates a .bib
                    ;; from the CSL-JSON already loaded and names it here,
                    ;; so the reference list needs no hand-maintained
@@ -795,38 +921,38 @@
                    ;; leaks into the .tex -- turning a portable
                    ;; \\bibliography{refs} into a machine-specific one
                    ;; (found by review).
-                   :bib-resource (or (:bib-resource opts)
-                                     (some-> (:bibliography opts) latex/bib-resource-name))}
+                       :bib-resource (or (:bib-resource opts)
+                                         (some-> (:bibliography opts) latex/bib-resource-name))}
         ;; Lowering happens here rather than inline below because it
         ;; produces a diagnostic of its own (TASK-51): only the LOWERED
         ;; tree shows which references now point at a degraded directive,
         ;; and only this layer knows the target and the mode.
-        lowered (try
-                  (lower/lower document emit-target build-reg)
-                  (catch clojure.lang.ExceptionInfo e
-                    (throw (ex-info (ex-message e)
-                                    (assoc (ex-data e) ::diagnostics diagnostics)
-                                    e))))
-        diagnostics (cond-> diagnostics
-                      (= :latex emit-target)
-                      (into (latex/unanchored-reference-diagnostics
-                             lowered {:computed-numbers (boolean computed-numbers)})))
+            lowered (try
+                      (lower/lower document emit-target build-reg)
+                      (catch clojure.lang.ExceptionInfo e
+                        (throw (ex-info (ex-message e)
+                                        (assoc (ex-data e) ::diagnostics diagnostics)
+                                        e))))
+            diagnostics (cond-> diagnostics
+                          (= :latex emit-target)
+                          (into (latex/unanchored-reference-diagnostics
+                                 lowered {:computed-numbers (boolean computed-numbers)})))
         ;; TASK-78: an Image :src is a filename this emitter cannot
         ;; safely rewrite (see latex/unescapable-image-path-diagnostics'
         ;; own docstring) the way a Link :target or a bibliography
         ;; url/doi field now is, so a backslash or unbalanced brace in
         ;; one is warned about here instead of fixed.
-        diagnostics (cond-> diagnostics
-                      (= :latex emit-target)
-                      (into (latex/unescapable-image-path-diagnostics lowered)))
+            diagnostics (cond-> diagnostics
+                          (= :latex emit-target)
+                          (into (latex/unescapable-image-path-diagnostics lowered)))
         ;; One options map for both LaTeX entry points (TASK-52). The
         ;; companion preamble is only worth anything if it names what
         ;; THIS body needs, so it must be derived from the same document
         ;; and the same options -- not from a second, hand-kept list.
-        latex-opts (assoc emit-opts
-                          :computed-numbers (boolean computed-numbers)
-                          :fragment (boolean (:fragment opts)))
-        fragment-latex? (and (= :latex emit-target) (:fragment opts))
+            latex-opts (assoc emit-opts
+                              :computed-numbers (boolean computed-numbers)
+                              :fragment (boolean (:fragment opts)))
+            fragment-latex? (and (= :latex emit-target) (:fragment opts))
         ;; Every emission -- the document, the companion preamble and the
         ;; front-matter side files -- inside ONE try, so whichever of them
         ;; throws carries the diagnostics collected so far (found by
@@ -834,23 +960,23 @@
         ;; with none of them, while the same document's standalone build
         ;; reported them, because two of these used to be evaluated
         ;; outside the guard).
-        {:keys [output preamble front-matter]}
-        (try
-          {:output (case emit-target
-                     :html (html/emit-document lowered
-                                               (assoc emit-opts
-                                                      :ordered-keys ordered-keys
-                                                      :stylesheet (if (:no-stylesheet opts)
-                                                                    :none
-                                                                    :default)))
-                     :latex (latex/emit-document lowered latex-opts))
-           :preamble (when fragment-latex? (latex/emit-preamble lowered latex-opts))
-           :front-matter (when fragment-latex? (latex/emit-front-matter lowered latex-opts))}
-          (catch clojure.lang.ExceptionInfo e
-            (throw (ex-info (ex-message e)
-                            (assoc (ex-data e) ::diagnostics diagnostics)
-                            e))))]
-    {:diagnostics
+            {:keys [output preamble front-matter]}
+            (try
+              {:output (case emit-target
+                         :html (html/emit-document lowered
+                                                   (assoc emit-opts
+                                                          :ordered-keys ordered-keys
+                                                          :stylesheet (if (:no-stylesheet opts)
+                                                                        :none
+                                                                        :default)))
+                         :latex (latex/emit-document lowered latex-opts))
+               :preamble (when fragment-latex? (latex/emit-preamble lowered latex-opts))
+               :front-matter (when fragment-latex? (latex/emit-front-matter lowered latex-opts))}
+              (catch clojure.lang.ExceptionInfo e
+                (throw (ex-info (ex-message e)
+                                (assoc (ex-data e) ::diagnostics diagnostics)
+                                e))))]
+        {:diagnostics
      ;; TASK-76: the last thing checked is what is actually about to be
      ;; written, so authored and generated text are scanned by one pass.
      ;; The front-matter side files are the document too -- a fragment
@@ -858,31 +984,31 @@
      ;; companion preamble is the one written file NOT scanned, and
      ;; deliberately: every character in it comes from this emitter's
      ;; own package list rather than from the author.
-     (cond-> diagnostics
-       (= :latex emit-target)
-       (into (mapcat #(latex/untypesettable-character-diagnostics % :document)
-                     (cons output (map :content front-matter)))))
+         (cond-> diagnostics
+           (= :latex emit-target)
+           (into (mapcat #(latex/untypesettable-character-diagnostics % :document)
+                         (cons output (map :content front-matter)))))
      ;; Returned so `build` can write the generated BibTeX database
      ;; (TASK-42) from the same loaded data the resolver formatted
      ;; against, rather than reading `meta.bibliography` a second time
      ;; and risking the two disagreeing.
-     :bibliography bibliography
+         :bibliography bibliography
      ;; Alongside it, the keys the document actually cites, so the
      ;; generated database carries those entries and not every entry in
      ;; a possibly-shared CSL-JSON file.
-     :ordered-keys ordered-keys
+         :ordered-keys ordered-keys
      ;; The companion preamble a `--fragment` build owes its host
      ;; (TASK-52), or nil when this build is not one -- `build` writes it
      ;; beside the fragment as `<output>-preamble.tex`. Returned rather
      ;; than written here for the same reason `:bibliography` is: this
      ;; function writes nothing at all.
-     :preamble preamble
+         :preamble preamble
      ;; TASK-54: the front-matter blocks a fragment does NOT put in its
      ;; body, each to become its own `\input`-able side file. Empty for
      ;; a document with none, and nil for any other build -- a
      ;; standalone document places them itself.
-     :front-matter front-matter
-     :output output}))
+         :front-matter front-matter
+         :output output}))))
 
 (def ^:private generated-bibtex-marker
   "The first line of a `.bib` this namespace generated (TASK-42). Its
@@ -1140,14 +1266,21 @@
   (when-not (.isFile (io/file input))
     (throw (ex-info (str "input file not found: " input) {:type ::usage-error})))
   (let [opts (assoc opts :base-dir (.getParent (.getAbsoluteFile (io/file input))))
+        source (slurp input)
+        ;; The same declared-or-overridden bibliography `run` itself
+        ;; loads (TASK-81), read here too so `output-path` can refuse a
+        ;; collision -- see its own docstring. Reading front matter only
+        ;; (not the whole document) is what keeps this cheap enough to
+        ;; do before the "chosen before converting anything" check below.
+        bib-path (bibliography-path opts (:bibliography (parser/front-matter source)))
         ;; Chosen before converting anything, so a bad destination is
         ;; reported without first doing the whole build's work.
-        path (output-path opts)
+        path (output-path opts bib-path)
         native-latex? (and (= :latex (:target (targets (:target opts))))
                            (not (:computed-numbers opts)))
         resource (when native-latex? (bibtex-resource path))
         {:keys [output diagnostics bibliography ordered-keys preamble front-matter]}
-        (run (slurp input) (cond-> opts resource (assoc :bib-resource resource)))
+        (run source (cond-> opts resource (assoc :bib-resource resource)))
         ;; The condition is that the emitted .tex actually asks for this
         ;; database, read off the output itself rather than re-derived
         ;; from the same inputs. A document that declares a bibliography

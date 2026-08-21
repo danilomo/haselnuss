@@ -14,7 +14,8 @@
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [haselnuss.cli :as cli])
+            [haselnuss.cli :as cli]
+            [haselnuss.json :as json])
   (:import (java.awt.image BufferedImage)
            (java.io StringReader)
            (java.nio.file Files)
@@ -155,6 +156,87 @@
                                       ["citation" "Knuth" "Knuth"]]]
         (is (str/includes? html in-html) label)
         (is (str/includes? tex in-tex) label)))))
+
+(defn- ast-nodes
+  "Every map in decoded AST `ast` (recursively, including `ast` itself)
+  that carries a `:t` tag, for querying `json-target-test`'s output by
+  node shape rather than by brittle JSON substring matching."
+  [ast]
+  (->> (tree-seq (fn [x] (or (map? x) (sequential? x)))
+                 (fn [x] (if (map? x) (vals x) (seq x)))
+                 ast)
+       (filter #(and (map? %) (contains? % :t)))))
+
+(deftest json-target-test
+  (testing "AC #1 (TASK-80): the CLI dumps the parsed document's own JSON
+            interchange representation (haselnuss.json/->json), not a
+            resolved/lowered view -- decoding the output back
+            (haselnuss.json/json->ast) must round-trip, and what it
+            contains must be the RAW parse: an unresolved cross-reference
+            with no baked :text, and a directive surviving as a Directive
+            rather than degraded to a BlockQuote"
+    (let [dir (fixture-dir!)
+          {:keys [output-path output diagnostics]} (build! dir {:target "json"})
+          nodes (ast-nodes (json/json->ast output))]
+      (is (= (str (io/file dir "doc.json")) output-path))
+      (is (empty? diagnostics)
+          "the resolver never runs for this target, so it can report nothing")
+      (is (some #(and (= :section (:t %)) (= "sec:intro" (get-in % [:attr :id]))) nodes))
+      (is (some #(and (= :figure (:t %)) (= "fig:tree" (get-in % [:attr :id]))) nodes))
+      (is (some #(and (= :cite (:t %)) (= "knuth1984" (:key (first (:items %))))) nodes))
+      (is (some #(and (= :directive (:t %)) (= "theorem" (:name %))) nodes)
+          "a directive survives as a Directive, not degraded to a BlockQuote")
+      (let [cross-ref (some (fn [n] (when (and (= :cross-ref (:t n))
+                                               (= "fig:tree" (:label n)))
+                                      n))
+                            nodes)]
+        (is cross-ref)
+        (is (not (contains? cross-ref :text))
+            "no computed cross-reference text -- resolution never ran"))))
+  (testing "AC #2: a genuine parse error aborts the build too, matching
+            the html/latex error contract -- nothing written, exception
+            thrown"
+    (let [dir (fixture-dir! ":::{note}\nunterminated\n")]
+      (is (thrown? clojure.lang.ExceptionInfo (build! dir {:target "json"})))
+      (is (not (.exists (io/file dir "doc.json"))))))
+  (testing "AC #4: latex/html-only flags have no effect on the json
+            target, the same way a latex-only flag is already a no-op on
+            --target html"
+    (let [dir (fixture-dir!)
+          plain (:output (build! dir {:target "json"}))
+          flagged (:output (build! dir {:target "json" :computed-numbers true
+                                        :fragment true :no-stylesheet true}))]
+      (is (= plain flagged)))))
+
+(deftest json-target-coalesces-prose-test
+  (testing "AC #1/#5 (TASK-81): a plain-prose paragraph decodes
+            (haselnuss.json/json->ast) to ONE :str Inline per run of
+            words, not one per word with :space entries between, and the
+            words are joined exactly as authored"
+    (let [{:keys [output]} (cli/run "Some prose with several words.\n" {:target "json"})
+          para (first (:blocks (json/json->ast output)))]
+      (is (= [{:t :str :text "Some prose with several words."}] (:inlines para)))))
+  (testing "AC #2: a CommonMark soft line-break (a wrapped source line
+            inside one paragraph, not an authored hard break) glues the
+            same way :space does"
+    (let [{:keys [output]} (cli/run "Line one\nline two.\n" {:target "json"})
+          para (first (:blocks (json/json->ast output)))]
+      (is (= [{:t :str :text "Line one line two."}] (:inlines para)))))
+  (testing "AC #3: an authored hard line-break still appears as its own
+            entry rather than being glued into the surrounding text"
+    (let [{:keys [output]} (cli/run "End.\\\nnext line.\n" {:target "json"})
+          para (first (:blocks (json/json->ast output)))]
+      (is (= [{:t :str :text "End."} {:t :line-break} {:t :str :text "next line."}]
+             (:inlines para)))))
+  (testing "AC #4: spacing on both sides of inline markup survives
+            exactly -- neither word is glued to the markup, and no space
+            is lost or duplicated at either boundary"
+    (let [{:keys [output]} (cli/run "wrong *emphasis* text.\n" {:target "json"})
+          para (first (:blocks (json/json->ast output)))]
+      (is (= [{:t :str :text "wrong "}
+              {:t :emph :inlines [{:t :str :text "emphasis"}]}
+              {:t :str :text " text."}]
+             (:inlines para))))))
 
 (deftest computed-numbers-flag-test
   (let [dir (fixture-dir!)
@@ -518,6 +600,34 @@
               steps later"
       (let [e (is (thrown? clojure.lang.ExceptionInfo (cli/run "text\n" {:target "pdf"})))]
         (is (= :haselnuss.cli/usage-error (:type (ex-data e))))))))
+
+(deftest bibliography-output-collision-test
+  (testing "TASK-81: --target json's default output path (same base name
+            as the input, .json extension) collides with a CSL-JSON
+            bibliography of that same base name -- exactly the shape of
+            examples/hazelnuts.hdoc/examples/hazelnuts.json, and running
+            this combination against the real files once silently
+            replaced the bibliography with the AST dump"
+    (let [dir (fixture-dir! (str "---\nbibliography: doc.json\n---\n\n" "# Hi {#sec:hi}\n\ntext\n"))
+          input (str (io/file dir "doc.hdoc"))
+          bib (io/file dir "doc.json")
+          before (do (spit bib "[]") (slurp bib))
+          {:keys [status err]} (main-run "--target" "json" input)]
+      (is (= 2 status))
+      (is (str/includes? err "refusing to overwrite the bibliography file"))
+      (is (= before (slurp bib)) "the bibliography must be left untouched")
+      (is (not (.exists (io/file dir "doc.json.json")))
+          "the build must not have silently picked a different path either")))
+  (testing "an explicit --output pointing at the bibliography is refused
+            too, not just the derived default path"
+    (let [dir (fixture-dir!)
+          input (str (io/file dir "doc.hdoc"))
+          bib (str (io/file dir "refs.json"))
+          before (slurp bib)
+          {:keys [status err]} (main-run "--target" "json" "-o" bib input)]
+      (is (= 2 status))
+      (is (str/includes? err "refusing to overwrite the bibliography file"))
+      (is (= before (slurp bib)) "the bibliography must be left untouched"))))
 
 (deftest prose-at-tokens-test
   (testing "TASK-47 AC #1/#2 end to end, which is the only place the

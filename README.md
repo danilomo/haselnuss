@@ -31,6 +31,7 @@ Build the standalone jar and convert a document:
 lein uberjar
 java -jar target/uberjar/haselnuss.jar paper.hdoc                      # -> paper.html
 java -jar target/uberjar/haselnuss.jar paper.hdoc --target latex       # -> paper.tex
+java -jar target/uberjar/haselnuss.jar paper.hdoc --target json        # -> paper.json
 java -jar target/uberjar/haselnuss.jar --help
 java -jar target/uberjar/haselnuss.jar --version                        # -> haselnuss <version>
 ```
@@ -38,6 +39,31 @@ java -jar target/uberjar/haselnuss.jar --version                        # -> has
 The jar's name deliberately carries no version, so `--version` is how you tell which build
 one on disk is. It reads the version Leiningen packed in from `project.clj`, so the two
 cannot drift.
+
+`--target json` is not a rendering target like the other two: it writes the parsed
+document's own `haselnuss.json` interchange representation (SPEC.md sec11) -- no
+resolve or lower pass runs, so it carries no computed section/figure numbers, no
+resolved cross-reference text, and no bibliography. `--computed-numbers`, `--fragment`
+and `--no-stylesheet` have no effect on it, the same way a LaTeX-only flag is already
+a no-op on `--target html`.
+
+Its prose is written more compactly than `haselnuss.json`'s own faithful encoding
+would be: CommonMark tokenizes a paragraph one word per `:str` node, with a `:space`/
+`:soft-break` node between each pair -- needed so an inline construct or a bare `@key`
+has a clean token boundary, but noisy for a human or another tool reading the JSON
+directly. The json target folds each consecutive run of those back into a single
+`:str`, so `"wrong."`/`{"t":"space"}`/`"answer"` becomes one `{"t":"str","text":"wrong.
+answer"}` -- but only up to the next node that is not a word or a space (an authored
+`:line-break`, or markup like `:emph`/`:cross-ref`/`:cite`), which still ends the run
+and keeps the space on either side of it. This is display-only: it is not part of
+`haselnuss.json`'s own round-trip contract, which stays exactly as faithful as before.
+
+With no `--output`, the json target's default output path is the input's own base name
+with a `.json` extension -- the same extension a CSL-JSON bibliography almost always
+carries. A document whose bibliography happens to share that base name (as this repo's
+own `examples/hazelnuts.hdoc`/`examples/hazelnuts.json` do) would have that bibliography
+silently overwritten by `haselnuss hazelnuts.hdoc --target json`; the build refuses this,
+the same way it already refuses to overwrite its own `.hdoc` input.
 
 ### Title, authors, date
 
