@@ -86,6 +86,23 @@
         :node-types #{:section}
         :words {"en" {:singular "Chapter"}
                 "pt-BR" {:singular "Capítulo"}}}
+   ;; TASK-82. A part sits one division above a chapter
+   ;; (`topLevelDivision: part`) and is structural exactly the way `:ch`
+   ;; is -- `:section-scoped` plus `:node-types #{:section}` so it nests
+   ;; by AST structure, and its own counter steps for every level-1
+   ;; Section whether labeled or not (`number-block`'s `part-counter-key`).
+   ;; What sets it apart from every other kind is `:number-format
+   ;; :roman`: confirmed against a real pdflatex, a `\part` prints as a
+   ;; roman numeral ("Part I") via its own counter, which never resets or
+   ;; composes with the chapter/figure/table/equation numbering -- a
+   ;; chapter after Part II still numbers 4, not reset to 1, and a figure
+   ;; under it still composes only with its own chapter (see
+   ;; `number-block`'s own docstring for the full confirmation).
+   :part {:counter :section-scoped
+          :node-types #{:section}
+          :number-format :roman
+          :words {"en" {:singular "Part"}
+                  "pt-BR" {:singular "Parte"}}}
    :sec {:counter :section-scoped
          :node-types #{:section}
          :words {"en" {:singular "Section"}
@@ -538,6 +555,25 @@
       (str/replace template "{n}" number)
       (str/trim (str singular " " number)))))
 
+(def ^:private roman-numerals
+  "`[value numeral]` pairs, largest first, for the standard subtractive
+  roman-numeral algorithm `roman-numeral` greedily consumes."
+  [[1000 "M"] [900 "CM"] [500 "D"] [400 "CD"]
+   [100 "C"] [90 "XC"] [50 "L"] [40 "XL"]
+   [10 "X"] [9 "IX"] [5 "V"] [4 "IV"] [1 "I"]])
+
+(defn- roman-numeral
+  "`n` (a positive int) as an uppercase roman numeral, e.g. `4` -> `\"IV\"`
+  (TASK-82): a real `\\part` prints this way via cleveref against a
+  standard class's own `\\Roman{part}`, confirmed with a real pdflatex."
+  [n]
+  (loop [n n acc "" pairs roman-numerals]
+    (if-let [[[value numeral] & more] (seq pairs)]
+      (if (>= n value)
+        (recur (- n value) (str acc numeral) pairs)
+        (recur n acc more))
+      acc)))
+
 (def ^:private chapter-counter-key
   "The `:counters` key the STRUCTURAL chapter counter lives under
   (TASK-53). Structural, not per-kind: it counts every level-1 `:section`
@@ -553,6 +589,18 @@
   \"1\" while the compiled PDF numbered them from `\\thechapter` = 3
   (found by review)."
   [:chapter])
+
+(def ^:private part-counter-key
+  "The `:counters` key the STRUCTURAL part counter lives under (TASK-82),
+  the exact `chapter-counter-key` idea one division up: it counts every
+  level-1 `:section` Block in a PARTED document, labeled or not, because
+  a real `\\part`-bearing class counts every `\\part` it is given the
+  same unconditional way it counts `\\chapter`. Unlike the chapter
+  counter, nothing downstream composes onto this one -- a part never
+  resets or scopes the chapter/figure/table/equation counters (confirmed
+  with a real pdflatex, see `number-block`) -- so its only job is giving
+  an unlabeled part the same number a labeled one would have gotten."
+  [:part])
 
 (defn- number-block
   "Recursively numbers `block` and its descendants, threading `state`
@@ -598,8 +646,26 @@
 
   None of this is reachable for a document that did not opt in:
   `:chapters` is false, `:chapter-path` is never consulted, and every
-  number is composed exactly as before (AC #4)."
-  [{:keys [lexicon lang chapters sublabel-names] :as ctx} state block]
+  number is composed exactly as before (AC #4).
+
+  A PARTED document (`ctx`'s own `:parts`, TASK-82) sits one division
+  above the chapter and, once its own structural number is assigned, is
+  otherwise a no-op for everything above: `:chapter-path`/`:section-path`
+  are neither reset nor seeded by entering or leaving a Part, confirmed
+  against a real pdflatex on the equivalent `report` document -- chapters
+  keep counting continuously across parts (a chapter after Part II still
+  numbers 4, never restarting at 1), and a float sitting directly under a
+  `\\part` before its first `\\chapter` still carries whatever
+  `\\c@chapter` the PREVIOUS part left set, exactly what inheriting
+  `:chapter-path` unchanged already produces here. `:parts` shifts which
+  level IS the chapter -- level 2, not level 1 -- via `chapter-level`;
+  level 1 becomes `part?`, stepped by its own STRUCTURAL `part-counter-key`
+  (`chapter-counter-key`'s own reasoning, one division up: an unlabeled
+  `\\part` still numbers in the PDF). A part's `:number-format :roman`
+  lexicon entry (`default-lexicon`'s `:part`) is what turns its digit
+  path into \"I\"/\"II\"/... instead of the arithmetic every other kind
+  prints."
+  [{:keys [lexicon lang chapters parts sublabel-names] :as ctx} state block]
   (let [id (some-> block :attr :id)
         kind (id->kind id)
         entry (get lexicon kind)
@@ -607,17 +673,23 @@
         chapter-path (:chapter-path state)
         section? (= :section (:t block))
         section-scoped? (= :section-scoped (:counter entry))
-        chapter? (and chapters section? (= 1 (:level block)))
+        chapter-level (if parts 2 1)
+        chapter? (and chapters section? (= chapter-level (:level block)))
+        part? (and parts section? (= 1 (:level block)))
         chapter-n (when chapter? (inc (get (:counters state) chapter-counter-key 0)))
+        part-n (when part? (inc (get (:counters state) part-counter-key 0)))
         counters (cond-> (:counters state)
-                   chapter? (assoc chapter-counter-key chapter-n))
+                   chapter? (assoc chapter-counter-key chapter-n)
+                   part? (assoc part-counter-key part-n))
         ;; What a `:section-scoped` number here composes onto: a chapter
-        ;; starts a path rather than continuing one, another Section
-        ;; continues the section path, and anything else continues the
-        ;; chapter path in a chaptered document and the section path
-        ;; otherwise.
+        ;; or a part each start a path rather than continuing one (their
+        ;; own number is never composed against anything), another
+        ;; Section continues the section path, and anything else
+        ;; continues the chapter path in a document with chapters and the
+        ;; section path otherwise.
         own-scope (cond
                     chapter? []
+                    part? []
                     section? section-path
                     chapters chapter-path
                     :else section-path)
@@ -656,18 +728,25 @@
         [own-path counters' sublabel]
         (cond
           (and chapter? id entry section-scoped?) [[chapter-n] counters nil]
+          (and part? id entry section-scoped?) [[part-n] counters nil]
           sub? (assign-sublabel counters parent kind)
           (and id entry) (let [[path counters'] (assign-number counters entry kind own-scope)]
                            [path counters' nil])
           :else [nil counters nil])
         number (when own-path
-                 (if sublabel
+                 (cond
+                   sublabel
                    ;; The parent's own number with the letter appended
                    ;; and no separator -- "Figure 1.1a", exactly what
                    ;; `subcaption` prints and what a `\Cref` to a panel
                    ;; resolves to (confirmed with a real pdflatex).
                    (str (str/join "." (butlast own-path)) sublabel)
-                   (str/join "." own-path)))
+                   ;; A part's own path is always its single structural
+                   ;; count (`[part-n]`); a `:number-format :roman` kind
+                   ;; is always a top-level structural one like `:part`,
+                   ;; never a composed multi-component path.
+                   (= :roman (:number-format entry)) (roman-numeral (first own-path))
+                   :else (str/join "." own-path)))
         entries' (if own-path
                    (let [word-info (words-for entry lang)]
                      (assoc (:entries state) id
@@ -684,6 +763,18 @@
                              ;; `\chapter` still numbers in the PDF, so
                              ;; its sections must still hang off it.
                              chapter? [chapter-n]
+                             ;; A part's own `[part-n]` path is NEVER what
+                             ;; its children compose onto -- unlike a
+                             ;; chapter, a part does not seed
+                             ;; `:section-path` at all (confirmed with a
+                             ;; real pdflatex: entering a `\part` leaves
+                             ;; `\thesection` alone). Checked ahead of the
+                             ;; generic branch below, which would
+                             ;; otherwise fire for a labeled part too
+                             ;; (`:part` is `:section-scoped`) and wrongly
+                             ;; seed it with the part's own roman-numbered
+                             ;; path.
+                             part? section-path
                              (and own-path section? section-scoped?) own-path
                              :else section-path)
         state' (assoc state :counters counters' :entries entries'
@@ -715,7 +806,22 @@
                                       {:id id :kind kind
                                        :path own-path :number number}))
         state'' (reduce (partial number-block ctx) state' (block-children block))]
-    (assoc state'' :section-path section-path :chapter-path chapter-path :parent-label parent)))
+    ;; `:section-path` (and `:parent-label`) revert to what THIS node saw
+    ;; on entry -- tree-scoped, exactly like `report`'s own `\thesection`,
+    ;; which really does reset once its enclosing scope ends. `:chapter-
+    ;; path` does NOT: unlike `\thesection`, `\c@chapter` is a genuinely
+    ;; global, monotonically-advancing LaTeX counter that nothing ever
+    ;; rewinds, so `state''`'s own chapter-path (whatever the most
+    ;; recently seen chapter left it at) has to flow onward exactly like
+    ;; `:counters` already does below this node, not revert to what stood
+    ;; before it (TASK-82, found by a real pdflatex: reverting here was
+    ;; unreachable and therefore harmless before a chapter could be
+    ;; nested two levels deep under a Part with content following it at
+    ;; the PART's own level -- `\part{Applications}` then a figure before
+    ;; its first `\chapter` still carried the PREVIOUS part's last
+    ;; `\c@chapter`, e.g. \"Figure 1.2\", not a bare \"Figure 2\" as
+    ;; reverting here produced)."
+    (assoc state'' :section-path section-path :parent-label parent)))
 
 (defn number-document
   "The numbering pass (SPEC.md sec9 step 1): assigns every labeled node in
@@ -738,16 +844,21 @@
   steps (TASK-12's CrossRef resolution, TASK-14's TOC) are expected to
   consult this table directly rather than fields stamped onto the AST.
 
-  `meta.topLevelDivision` (TASK-53) changes one thing here, and only for
-  a document that opts in: with `:chapter`, every level-1 Section is a
-  chapter -- counted structurally, labeled or not -- and a
-  `:section-scoped` kind on a node that is not itself a Section composes
-  with, and counts per, that enclosing chapter rather than the whole
-  section path. This matches what a `\\chapter`-bearing LaTeX class does
-  with the same document, which is what lets a native-mode `\\Cref` and
-  an HTML reference print the same number; see `number-block` for the
-  three consequences and the two shapes that made a simpler design
-  wrong. Every other document is numbered exactly as before.
+  `meta.topLevelDivision` (TASK-53, extended by TASK-82) changes one
+  thing here, and only for a document that opts in: with `:chapter`,
+  every level-1 Section is a chapter -- counted structurally, labeled or
+  not -- and a `:section-scoped` kind on a node that is not itself a
+  Section composes with, and counts per, that enclosing chapter rather
+  than the whole section path. This matches what a `\\chapter`-bearing
+  LaTeX class does with the same document, which is what lets a
+  native-mode `\\Cref` and an HTML reference print the same number; see
+  `number-block` for the three consequences and the two shapes that made
+  a simpler design wrong. With `:part`, every level-1 Section is instead
+  a roman-numbered part and every level-2 Section a chapter, shifted down
+  the same way -- but a part composes with, resets, or is composed onto
+  by NOTHING else (see `number-block`'s own docstring): chapters keep
+  counting continuously across parts, exactly what a real `\\part`-bearing
+  class does. Every other document is numbered exactly as before.
 
   `sublabel-names` (TASK-56, default `#{}`) names the directives whose
   nodes take a LETTER within the numbered node directly above them
@@ -771,10 +882,12 @@
   ([document lexicon front-matter-names sublabel-names]
    (let [document (body-view document front-matter-names)
          lang (get-in document [:meta :lang] "en")
+         division (get-in document [:meta :top-level-division])
          ctx {:lexicon lexicon
               :lang lang
               :sublabel-names sublabel-names
-              :chapters (= :chapter (get-in document [:meta :top-level-division]))}
+              :chapters (contains? #{:chapter :part} division)
+              :parts (= :part division)}
          ;; A chaptered document starts inside chapter ZERO, not outside
          ;; any chapter, and the asymmetry is `report`'s own: a section
          ;; before the first `\chapter` sets as \"0.1\" (its
@@ -1505,14 +1618,23 @@
   (into #{} (remove nil?) (ids-in-blocks (:blocks document))))
 
 (defn- chaptered?
-  "True when `document` opted into chapters (`meta.topLevelDivision`).
+  "True when `document` has a CHAPTER level (`meta.topLevelDivision` is
+  `:chapter`, or `:part` -- TASK-82 shifts chapters to level 2 rather
+  than removing them).
 
   One function rather than the third literal copy of the same
   `get-in` (found by review): the generated bibliography's id prefix and
   `division-kind-diagnostics` must agree about this, or the warning the
   prefix exists to avoid comes straight back."
   [document]
-  (= :chapter (get-in document [:meta :top-level-division])))
+  (contains? #{:chapter :part} (get-in document [:meta :top-level-division])))
+
+(defn- parted?
+  "True when `document` opted into parts (`meta.topLevelDivision`
+  `:part`, TASK-82) -- unlike `chaptered?`, `:chapter` alone does not
+  count: this is specifically the division ABOVE chapter."
+  [document]
+  (= :part (get-in document [:meta :top-level-division])))
 
 (defn- unique-bibliography-id
   "The id `bibliography-section` should use, given `existing-ids` (an
@@ -1524,16 +1646,22 @@
   so the author whose own node already used `\"sec:bibliography\"` is
   told their id was *not* silently reused (TASK-13 review fix, AC #3).
 
-  `chapters?` (`meta.topLevelDivision`) changes the PREFIX to `ch:`,
-  and that is not cosmetic (TASK-63). The generated section is a
-  level-1 heading, which a chaptered document emits as `\\chapter`, so a
-  `sec:` prefix there is exactly the id-prefix/division disagreement
+  `chapters?` (`meta.topLevelDivision` `:chapter` OR `:part`, TASK-82)
+  changes the PREFIX to `ch:`, and that is not cosmetic (TASK-63). The
+  generated section is a heading at the chapter level (level 1 for
+  `:chapter`, level 2 for `:part` -- see `bibliography-section`'s own
+  `level`), which such a document emits as `\\chapter`, so a `sec:`
+  prefix there is exactly the id-prefix/division disagreement
   `division-kind-diagnostics` warns about -- a reference to it printing
   \"Section 5\" in HTML and \"Chapter 5\" in a native PDF. Every
   chaptered document with a bibliography therefore warned about a
   section nobody wrote, and no edit to the document could silence it,
   since the id is generated here. The prefix follows the division the
-  section is actually emitted into instead."
+  section is actually emitted into instead. It stays `ch:` rather than
+  gaining a third `part:` option in a parted document: the bibliography
+  is chapter-level furniture there too, never its own `\\part` (matching
+  `haselnuss.emit.latex/front-matter-standalone`'s own `:heading` shape,
+  which reasons the same way about an acknowledgements page)."
   [existing-ids chapters?]
   (let [base (if chapters? "ch:bibliography" "sec:bibliography")]
     (if-not (contains? existing-ids base)
@@ -1556,13 +1684,16 @@
   per distinct resolvable key in `ordered-keys` (already sorted/ordered
   per `style`), each formatted via `style`'s own `:bib-entry`. `lang`
   picks the heading word from `bibliography-heading-words`, defaulting to
-  English."
-  [style bibliography ordered-keys lang id]
+  English. `level` is the heading level to emit it at -- `1` normally, or
+  `2` in a PARTED document (TASK-82), so the bibliography lands at the
+  chapter level (`\\chapter`) rather than becoming a `\\part` of its own
+  (see `unique-bibliography-id`'s own docstring for why)."
+  [style bibliography ordered-keys lang id level]
   (let [items (mapv (fn [k] [{:t :para :inlines ((:bib-entry style) (get bibliography k))}])
                     ordered-keys)
         heading-word (or (get bibliography-heading-words lang) (get bibliography-heading-words "en"))]
     {:t :section
-     :level 1
+     :level level
      :heading [(str-inline heading-word)]
      :blocks [{:t :list :ordered (boolean (:ordered? style)) :tight true :items items
                :attr {:classes [] :props {}}}]
@@ -1667,6 +1798,7 @@
                         (sort-by #(sort-key % (get bibliography %)) resolvable-keys)
                         resolvable-keys)
          lang (get-in document [:meta :lang] "en")
+         bib-level (if (parted? document) 2 1)
          [bib-id bib-id-warnings] (if (seq ordered-keys)
                                     (unique-bibliography-id (existing-block-ids document)
                                                             (chaptered? document))
@@ -1676,7 +1808,8 @@
                      true (assoc :blocks (vec blocks'))
                      (seq ordered-keys)
                      (update :blocks conj
-                             (bibliography-section style bibliography ordered-keys lang bib-id)))]
+                             (bibliography-section style bibliography ordered-keys lang bib-id
+                                                   bib-level)))]
      {:document document'
       :warnings (-> style-warnings (into tw) (into bw) (into bib-id-warnings))
       :ordered-keys (vec ordered-keys)
@@ -2435,13 +2568,14 @@
         (:blocks document)))
 
 (def ^:private division-kinds
-  "The two built-in kinds that name a sectioning DIVISION (TASK-53),
-  mapped to the word for the LaTeX sectioning command a Section of that
-  division is emitted as. Only these two are checked by
-  `division-kind-diagnostics`: a custom section-scoped kind on a heading
-  is its author's own arrangement, and warning about it would be this
-  namespace guessing at a convention it does not define."
-  {:ch "chapter"
+  "The built-in kinds that name a sectioning DIVISION (TASK-53, extended
+  by TASK-82's `:part`), mapped to the word for the LaTeX sectioning
+  command a Section of that division is emitted as. Only these three are
+  checked by `division-kind-diagnostics`: a custom section-scoped kind on
+  a heading is its author's own arrangement, and warning about it would
+  be this namespace guessing at a convention it does not define."
+  {:part "part"
+   :ch "chapter"
    :sec "section"})
 
 (defn- division-kind-diagnostics
@@ -2470,14 +2604,25 @@
   A Section with no id, or one whose prefix is neither of
   `division-kinds`, is not reported here -- an unlabeled Section is
   intentionally transparent (see `unnumbered-section-diagnostics`), and
-  a non-division kind on a Section is `kind-role-diagnostics`' own case."
+  a non-division kind on a Section is `kind-role-diagnostics`' own case.
+
+  Three-way since TASK-82: in a PARTED document level 1 expects `:part`
+  and level 2 expects `:ch` (both shifted down the one extra division),
+  in a chapter-only document level 1 still expects `:ch`, and every other
+  level in either shape expects `:sec`."
   [document]
-  (let [chapters? (chaptered? document)]
+  (let [chapters? (chaptered? document)
+        parts? (parted? document)]
     (into []
           (comp (mapcat pre-order-blocks)
                 (keep (fn [block]
                         (let [kind (id->kind (get-in block [:attr :id]))
-                              expected (if (and chapters? (= 1 (:level block))) :ch :sec)]
+                              level (:level block)
+                              expected (cond
+                                         (and parts? (= 1 level)) :part
+                                         (and parts? (= 2 level)) :ch
+                                         (and chapters? (= 1 level)) :ch
+                                         :else :sec)]
                           (when (and (= :section (:t block))
                                      (contains? division-kinds kind)
                                      (not= kind expected))

@@ -1242,11 +1242,11 @@
             all is reported -- it is numbered as nothing and its children
             skip a level -- for both an unprefixed id and an unknown one"
     (let [doc {:meta {} :blocks [(section "intro" [])
-                                 (section "part:one" [])]}
+                                 (section "widget:one" [])]}
           diagnostics (resolver/structural-diagnostics doc)]
       (is (= [:unnumbered-section-id :unnumbered-section-id] (map :type diagnostics)))
-      (is (= ["intro" "part:one"] (map :id diagnostics)))
-      (is (= [nil :part] (map :kind diagnostics))
+      (is (= ["intro" "widget:one"] (map :id diagnostics)))
+      (is (= [nil :widget] (map :kind diagnostics))
           "the diagnostic reports the prefix it did resolve, nil for an unprefixed id")))
   (testing "review finding #5: the two checks really do discriminate. A
             section wearing a fig: id has the WRONG ROLE but keeps its
@@ -1261,8 +1261,8 @@
             takes, since register's own :kind fragment need not declare
             :node-types -- silently drops its level too, and used to go
             entirely undiagnosed"
-    (let [lexicon (merge resolver/default-lexicon {:part {:counter :global}})
-          doc {:meta {} :blocks [(section "part:one" [(figure "fig:inner")])]}]
+    (let [lexicon (merge resolver/default-lexicon {:widget {:counter :global}})
+          doc {:meta {} :blocks [(section "widget:one" [(figure "fig:inner")])]}]
       (is (= [:unnumbered-section-id]
              (map :type (resolver/structural-diagnostics doc #{} lexicon))))
       (is (= "1" (get-in (resolver/number-document doc lexicon) ["fig:inner" :number]))
@@ -1275,7 +1275,7 @@
   (testing "the same unrecognized prefix on a non-Section is not reported
             -- it only makes that node a non-target, with no effect on
             anything else's numbering"
-    (let [doc {:meta {} :blocks [(figure "intro") (table "part:one")]}]
+    (let [doc {:meta {} :blocks [(figure "intro") (table "widget:one")]}]
       (is (empty? (resolver/structural-diagnostics doc))))))
 
 (deftest kind-role-diagnostics-surface-through-resolve-document-test
@@ -1793,7 +1793,17 @@
                     :blocks [{:t :section :level 1 :heading [] :attr attr :blocks []}
                              {:t :section :level 1 :heading [] :attr (id-attr "ch:fine")
                               :blocks [{:t :section :level 2 :heading []
-                                        :attr (id-attr "thm:oops") :blocks []}]}]}))))))
+                                        :attr (id-attr "thm:oops") :blocks []}]}]}))))
+    (testing "TASK-82: three-way in a PARTED document -- level 1 expects
+              :part and level 2 expects :ch, both shifted down the one
+              extra division, and every deeper level still expects :sec"
+      (is (= [["sec:one" :part] ["part:two" :ch] ["part:three" :sec]]
+             (mismatches
+              {:meta {:top-level-division :part}
+               :blocks [{:t :section :level 1 :heading [] :attr (id-attr "sec:one")
+                         :blocks [{:t :section :level 2 :heading [] :attr (id-attr "part:two")
+                                   :blocks [{:t :section :level 3 :heading []
+                                             :attr (id-attr "part:three") :blocks []}]}]}]}))))))
 
 (deftest chapter-structural-scope-test
   (let [fig (fn [id] {:t :figure :attr (id-attr id) :caption [] :content {:t :para :inlines []}})
@@ -1854,6 +1864,74 @@
       (is (= {"sec:a" "1" "fig:a" "1.1"}
              (numbers {:meta {}
                        :blocks [(unlabeled 1 (sec 2 "sec:a" (fig "fig:a")))]}))))))
+
+(deftest part-pre-part-float-test
+  (testing "TASK-82: a figure BEFORE the first part has no chapter to
+            compose with either -- entering/leaving a part never resets
+            or seeds the chapter path, and none has opened yet -- and
+            numbers as a bare 1, exactly TASK-53's own pre-chapter-float
+            shape one division up, confirmed against a real pdflatex"
+    (let [fig (fn [id] {:t :figure :attr (id-attr id) :caption []
+                        :content {:t :para :inlines []}})]
+      (is (= {"fig:pre" "1" "part:one" "I" "ch:one" "1" "fig:a" "1.1"}
+             (into {} (map (fn [[id entry]] [id (:number entry)]))
+                   (resolver/number-document
+                    {:meta {:top-level-division :part}
+                     :blocks [(fig "fig:pre")
+                              {:t :section :level 1 :heading [] :attr (id-attr "part:one")
+                               :blocks [{:t :section :level 2 :heading []
+                                         :attr (id-attr "ch:one")
+                                         :blocks [(fig "fig:a")]}]}]})))))))
+
+(deftest part-structural-scope-test
+  (let [fig (fn [id] {:t :figure :attr (id-attr id) :caption [] :content {:t :para :inlines []}})
+        sec (fn [level id & blocks]
+              {:t :section :level level :heading [] :attr (id-attr id) :blocks (vec blocks)})
+        unlabeled (fn [level & blocks]
+                    {:t :section :level level :heading [] :attr attr :blocks (vec blocks)})
+        numbers (fn [doc] (into (sorted-map)
+                                (map (fn [[id entry]] [id (:number entry)]))
+                                (resolver/number-document doc)))]
+    (testing "TASK-82: chapters count CONTINUOUSLY across parts -- a part
+              never resets or composes with the chapter/figure numbering,
+              confirmed against a real pdflatex on the equivalent report
+              document -- and a part's own number is a roman numeral from
+              its own independent structural counter"
+      (is (= {"part:one" "I" "ch:intro" "1" "fig:a" "1.1"
+              "part:two" "II" "ch:third" "2" "fig:c" "2.1"}
+             (numbers
+              {:meta {:top-level-division :part}
+               :blocks [(sec 1 "part:one" (sec 2 "ch:intro" (fig "fig:a")))
+                        (sec 1 "part:two" (sec 2 "ch:third" (fig "fig:c")))]}))))
+    (testing "found while implementing, review this again if chapter-path
+              handling ever changes: a float sitting directly under a
+              Part, before its OWN first chapter, still carries the
+              PREVIOUS part's last chapter -- \\c@chapter is a genuinely
+              global LaTeX counter that entering/leaving a \\part never
+              touches. A float here numbered as a bare 2 (its own
+              structural-only count) before number-block stopped
+              reverting :chapter-path on return; a real pdflatex prints
+              1.2, the second figure of chapter 1"
+      (is (= {"ch:intro" "1" "fig:a" "1.1" "part:two" "II"
+              "fig:mid" "1.2" "ch:third" "2" "fig:c" "2.1"}
+             (numbers
+              {:meta {:top-level-division :part}
+               :blocks [(unlabeled 1 (sec 2 "ch:intro" (fig "fig:a")))
+                        (sec 1 "part:two" (fig "fig:mid")
+                             (sec 2 "ch:third" (fig "fig:c")))]}))))
+    (testing "an unlabeled part still steps the structural part counter,
+              exactly like an unlabeled chapter (TASK-53's own
+              chapter-structural-scope-test)"
+      (is (= {"part:third" "III"}
+             (numbers
+              {:meta {:top-level-division :part}
+               :blocks [(unlabeled 1) (unlabeled 1)
+                        (sec 1 "part:third")]}))))
+    (testing "none of it reaches a document that opted into chapters but
+              not parts: it numbers exactly as TASK-53 left it"
+      (is (= {"ch:one" "1" "fig:a" "1.1"}
+             (numbers {:meta {:top-level-division :chapter}
+                       :blocks [(sec 1 "ch:one" (fig "fig:a"))]}))))))
 
 ;; Sublabels: a numbered node inside a numbered node of its own kind
 ;; (TASK-56)

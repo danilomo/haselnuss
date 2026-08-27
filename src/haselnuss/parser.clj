@@ -2877,15 +2877,17 @@
   (if (sequential? v) (mapv str v) [(str v)]))
 
 (def ^:private top-level-divisions
-  "The `topLevelDivision` front-matter values (TASK-53), each mapped to
-  its own `haselnuss.ast` Meta keyword. Named after pandoc's own
-  `--top-level-division`, so an author who knows that tool already knows
-  this key; written in front matter rather than passed on the command
-  line because it changes what every number in the document *means*, and
-  a document whose figure numbering depends on how it was invoked is one
-  whose cross-references cannot be checked by reading it."
+  "The `topLevelDivision` front-matter values (TASK-53, extended by
+  TASK-82's `\"part\"`), each mapped to its own `haselnuss.ast` Meta
+  keyword. Named after pandoc's own `--top-level-division`, so an author
+  who knows that tool already knows this key; written in front matter
+  rather than passed on the command line because it changes what every
+  number in the document *means*, and a document whose figure numbering
+  depends on how it was invoked is one whose cross-references cannot be
+  checked by reading it."
   {"section" :section
-   "chapter" :chapter})
+   "chapter" :chapter
+   "part" :part})
 
 (defn- coerce-top-level-division
   "A front-matter `topLevelDivision` scalar as its Meta keyword

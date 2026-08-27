@@ -1344,6 +1344,82 @@
         (let [[ok? log] (compiles? dir (:output tex))]
           (is ok? (str "expected the chaptered .tex to compile:\n" log)))))))
 
+;; ---------------------------------------------------------------------
+;; TASK-82: parts, end to end through the CLI.
+;; ---------------------------------------------------------------------
+
+(deftest parted-document-wiring-test
+  (testing "TASK-82: topLevelDivision: part written in front matter
+            reaches BOTH emitters through the whole pipeline -- the same
+            gap chaptered-document-wiring-test closes for TASK-53, one
+            division up. Every other test for this feature builds its
+            AST by hand or calls one emitter directly, so none of them
+            can catch the key being parsed and then dropped on the way
+            to the thing that reads it"
+    (let [source (str "---\n"
+                      "title: A Thesis\n"
+                      "topLevelDivision: part\n"
+                      "---\n\n"
+                      "# Foundations {#part:one}\n\n"
+                      "## Background {#ch:bg}\n\n"
+                      "### Models {#sec:models}\n\n"
+                      "![A hazel tree.](pic.png){#fig:tree}\n\n"
+                      "# Applications {#part:two}\n\n"
+                      "## More {#ch:more}\n\n"
+                      "![Another.](pic.png){#fig:leaf}\n\n"
+                      "See @part:one, @ch:bg, @sec:models and @fig:leaf.\n")
+          dir (fixture-dir! source)
+          html (:output (build! dir {}))
+          tex (:output (build! dir {:target "latex" :output (str (io/file dir "doc.tex"))}))]
+      (testing "LaTeX gets \\part and \\chapter, and a class that provides both"
+        (is (str/starts-with? tex "\\documentclass{report}"))
+        (is (str/includes? tex "\\part{Foundations}"))
+        (is (str/includes? tex "\\chapter{Background}"))
+        (is (str/includes? tex "\\section{Models}")))
+      (testing "and both targets agree: the part is a roman numeral, and a
+                chapter after Part II keeps counting from Part I's last
+                chapter rather than restarting"
+        (is (str/includes? html "<a href=\"#part:one\">Part I</a>"))
+        (is (str/includes? html "<a href=\"#ch:bg\">Chapter 1</a>"))
+        (is (str/includes? html "Figure 1.1: A hazel tree.")
+            "a figure nested three levels deep still composes onto the chapter alone, never the deeper section"))
+      (testing "and the whole thing compiles"
+        (let [[ok? log] (compiles? dir tex)]
+          (is ok? (str "expected the parted .tex to compile:\n" log)))))))
+
+(deftest parted-bibliography-warns-about-nothing-test
+  (testing "TASK-82: the bibliography section this codebase GENERATES
+            stays chapter-level furniture in a PARTED document too --
+            never its own \\part (haselnuss.resolver/bibliography-section
+            takes a :level, 2 rather than 1, exactly so this does not
+            regress chaptered-bibliography-warns-about-nothing-test's own
+            TASK-63 fix one division up)"
+    (let [source (str "---\ntitle: A Thesis\ntopLevelDivision: part\n"
+                      "bibliography: refs.json\n---\n\n"
+                      "# Foundations {#part:one}\n\n"
+                      "## Background {#ch:bg}\n\nAs shown in [@knuth1984].\n")
+          dir (fixture-dir! source)
+          _ (spit (io/file dir "refs.json")
+                  (str "[{\"id\": \"knuth1984\","
+                       " \"author\": [{\"family\": \"Knuth\", \"given\": \"Donald\"}],"
+                       " \"issued\": {\"date-parts\": [[1984]]},"
+                       " \"title\": \"The TeXbook\"}]"))
+          html (build! dir {})
+          tex (build! dir {:target "latex" :output (str (io/file dir "doc.tex"))})]
+      (is (empty? (:diagnostics html)) (pr-str (:diagnostics html)))
+      (is (empty? (:diagnostics tex)) (pr-str (:diagnostics tex)))
+      (is (str/includes? (:output html) "<section id=\"ch:bibliography\"")
+          "and the id names the division it is really emitted into")
+      (testing "and the document still compiles, reference list and all --
+                native mode delegates the heading itself to BibTeX/report's
+                own \\bibliography machinery rather than this Block's
+                heading text, so what proves the :level fix here is the
+                empty diagnostics above (a level-1 :ch id in a parted
+                document is exactly what division-kind-diagnostics flags)
+                and a real compile"
+        (let [[ok? log] (compiles? dir (:output tex))]
+          (is ok? (str "expected the parted .tex to compile:\n" log)))))))
+
 (deftest untypesettable-character-test
   (testing "TASK-76 AC #1/#2: a character the emitted LaTeX cannot
             typeset is reported as a warning naming it, and the

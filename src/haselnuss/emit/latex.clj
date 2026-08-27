@@ -771,19 +771,50 @@
   level 6 of the five-entry list)."
   (into ["chapter"] section-commands))
 
+(def ^:private part-section-commands
+  "`chapter-section-commands` for a document whose top-level division is
+  the part (TASK-82): the same list with `\\part` in front, so level 1 is
+  a part, level 2 a chapter, and every deeper level shifts down once
+  more, out to `\\subparagraph` at level 7.
+
+  Confirmed against a real two-pass pdflatex on a `report` document:
+  `\\part` needs no `book`/no extra package (TASK-53's `article`/`report`/
+  `book` decision is not reopened by this list -- `document-class` still
+  picks `report` for any document with chapters, parted or not), chapters
+  keep numbering continuously across parts rather than resetting per
+  part, and a float never composes with the part, only with whichever
+  chapter it falls under (`haselnuss.resolver/number-block` carries the
+  same confirmation for the numbering side).
+
+  Seven entries is one past what a Markdown ATX heading can ever reach:
+  CommonMark caps an ATX heading at 6 `#`s (flexmark's own `Heading` node
+  never emits a `:level` past 6), so `\\subparagraph` -- this list's 7th
+  entry -- is reachable only from a hand-built or JSON-sourced
+  `haselnuss.ast/Document` carrying `:level 7`, never from authored
+  Markdown. Accepted rather than worked around: there is no CommonMark
+  heading syntax that reaches a 7th depth, and a parted document's
+  deepest AUTHORED heading therefore bottoms out at `\\paragraph`
+  (`section-command`'s own clamp still degrades gracefully rather than
+  erroring, exactly as it does for `chapter-section-commands`)."
+  (into ["part"] chapter-section-commands))
+
 (defn- section-command
   "The sectioning command name (no leading backslash) for Section `level`
   in `ctx`'s own division, clamped into the active list's range (sec4.3
-  places no bound on `:level`, but neither class has a command beyond
+  places no bound on `:level`, but no class has a command beyond
   `\\subparagraph`) -- mirrors `haselnuss.emit.html/heading-tag`'s own
   `h1`-`h6` clamp.
 
-  `ctx`'s `:chapters` selects the list: `chapter-section-commands` for a
-  document that opted into chapters (`meta.topLevelDivision`),
-  `section-commands` otherwise, which is every document written before
-  that key existed."
+  `ctx`'s `:parts`/`:chapters` select the list: `part-section-commands`
+  for a document that opted into parts (`meta.topLevelDivision: part`,
+  TASK-82), `chapter-section-commands` for one that opted into chapters
+  only (`:chapter`), `section-commands` otherwise, which is every
+  document written before either key existed."
   [ctx level]
-  (let [commands (if (:chapters ctx) chapter-section-commands section-commands)]
+  (let [commands (cond
+                   (:parts ctx) part-section-commands
+                   (:chapters ctx) chapter-section-commands
+                   :else section-commands)]
     (nth commands (min (dec (count commands)) (max 0 (dec level))))))
 
 (declare render-inlines)
@@ -3157,11 +3188,15 @@
     agreeing with the exclusion `haselnuss.resolver/body-view` enforces
     upstream; an UNstarred one would print a body number over content
     the resolver never numbered. WHICH command follows the document's
-    own top-level division (TASK-53): `\\chapter*` in a chaptered
-    document, `\\section*` otherwise. An acknowledgements page in a
-    thesis is chapter-level furniture, and `\\section*` set it beneath
-    every chapter title in the one document shape this milestone exists
-    for (found by review).
+    own top-level division (TASK-53): `\\chapter*` when the document has
+    chapters at all (`:chapter` OR `:part`, TASK-82), `\\section*`
+    otherwise -- NEVER `\\part*`, even in a parted document. An
+    acknowledgements page in a thesis is chapter-level furniture, and
+    `\\section*` set it beneath every chapter title in the one document
+    shape this milestone exists for (found by review); the same
+    reasoning is why a parted document's generated bibliography
+    (`haselnuss.resolver/bibliography-section`) is a chapter too, never
+    its own part.
   - `:epigraph` -- `flushright` in italic. Its attribution is the
     author's own last paragraph, not a field this emitter punctuates.
   - `:dedication` -- `center` in italic.
@@ -3275,8 +3310,11 @@
 
 (defn- document-class
   "The `\\documentclass` a standalone document is emitted into: `report`
-  when `chapters?` (`meta.topLevelDivision: chapter`, TASK-53), else
-  `article`, which is what this emitter has always written.
+  when `chapters?` (`meta.topLevelDivision` is `:chapter` -- TASK-53 --
+  or `:part` -- TASK-82, which does not reopen this decision: a real
+  `\\part` compiles under `report` with no extra package, confirmed with
+  a real pdflatex), else `article`, which is what this emitter has
+  always written.
 
   DECISION (TASK-53 AC #5). `article` has no `\\chapter` at all, so a
   chaptered document emitted into it does not merely look wrong -- it
@@ -3650,7 +3688,13 @@
   (let [doc-meta (:meta document)
         {natbib-options :options natbib-bst :bst} (natbib-config doc-meta)
         computed? (boolean (:computed-numbers opts))
-        chapters? (= :chapter (:top-level-division doc-meta))
+        ;; TASK-82: "has chapters" now includes :part too, since a parted
+        ;; document still has chapters, just at level 2 rather than
+        ;; level 1 -- so document-class/front-matter-standalone's own
+        ;; \chapter*/report choices (both keyed on this flag) are made
+        ;; exactly the same way for :chapter and :part.
+        chapters? (contains? #{:chapter :part} (:top-level-division doc-meta))
+        parts? (= :part (:top-level-division doc-meta))
         bibliography-id (:bibliography-id opts)
         bib-resource (or (:bib-resource opts) (bib-resource-name (:bibliography doc-meta)))
         environments (:directive-environments opts default-directive-environments)]
@@ -3660,12 +3704,13 @@
      :ctx {:registry (:registry opts)
            :directive-environments environments
            :computed-numbers computed?
-           ;; TASK-53: read from the document itself, never from an opt,
-           ;; so the class, the sectioning commands and the resolver's
-           ;; own float numbering are all decided by the same
+           ;; TASK-53/TASK-82: read from the document itself, never from
+           ;; an opt, so the class, the sectioning commands and the
+           ;; resolver's own float numbering are all decided by the same
            ;; `meta.topLevelDivision` and cannot be set to three
            ;; different things by three callers.
            :chapters chapters?
+           :parts parts?
            :labels (:labels opts {})
            ;; TASK-59: the document's own language for a list's printed
            ;; heading, and the three derived lists themselves, keyed by

@@ -61,17 +61,22 @@
      [:bibliography {:optional true} :string]
      [:csl-style {:optional true} :string]
      [:lang {:optional true} :string]
-     ;; TASK-53. Which sectioning division a level-1 Section is: the
-     ;; default `:section` is every document written before this key
-     ;; existed, and `:chapter` is the book-length shape -- level 1
-     ;; becomes a chapter, every deeper level shifts down with it, and a
-     ;; section-scoped figure/table/equation number composes with the
-     ;; chapter rather than with the whole section path (see
+     ;; TASK-53 (:section/:chapter), extended by TASK-82 (:part). Which
+     ;; sectioning division a level-1 Section is: the default `:section`
+     ;; is every document written before this key existed, `:chapter` is
+     ;; the book-length shape -- level 1 becomes a chapter, every deeper
+     ;; level shifts down with it, and a section-scoped figure/table/
+     ;; equation number composes with the chapter rather than with the
+     ;; whole section path -- and `:part` shifts everything down once
+     ;; more (level 1 a part, level 2 a chapter, ...): a part gets its
+     ;; own roman-numeral counter but never resets or composes with the
+     ;; chapter/figure/table/equation numbering, exactly as a real
+     ;; `\part`-bearing `report`/`book` class behaves (see
      ;; `haselnuss.resolver/number-document`). An enum rather than an
      ;; open string: the two emitters and the numbering pass each branch
-     ;; on it, and a third value none of them recognizes would be a
+     ;; on it, and a fourth value none of them recognizes would be a
      ;; silent no-op.
-     [:top-level-division {:optional true} [:enum :section :chapter]]]
+     [:top-level-division {:optional true} [:enum :section :chapter :part]]]
 
     ::document
     [:map

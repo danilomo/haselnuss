@@ -2668,6 +2668,124 @@
           (is (not (str/includes? text "??"))))))))
 
 ;; ---------------------------------------------------------------------
+;; TASK-82: parts as the division above chapters.
+;; ---------------------------------------------------------------------
+
+(defn- part-figure
+  [id]
+  {:t :figure :attr {:id id :classes [] :props {}}
+   :content (para {:t :image :src "pic.png" :alt "p" :attr empty-attr})
+   :caption [(str-inline "A panel")]})
+
+(def ^:private part-document
+  "Two parts, the second holding a chapter with a figure in each of two
+  sections -- the same shape `chapter-document` uses, shifted one
+  division: parts do not compose with the chapter/figure numbering at
+  all, so this must number IDENTICALLY to `chapter-document` for every
+  id it shares, plus a roman part number of its own."
+  {:meta {:top-level-division :part}
+   :blocks
+   [{:t :section :level 1 :heading [(str-inline "Foundations")]
+     :attr {:id "part:one" :classes [] :props {}}
+     :blocks [{:t :section :level 2 :heading [(str-inline "Background")]
+               :attr {:id "ch:bg" :classes [] :props {}}
+               :blocks [{:t :section :level 3 :heading [(str-inline "Models")]
+                         :attr {:id "sec:models" :classes [] :props {}}
+                         :blocks [(part-figure "fig:one")]}]}]}
+    {:t :section :level 1 :heading [(str-inline "Applications")]
+     :attr {:id "part:two" :classes [] :props {}}
+     :blocks [{:t :section :level 2 :heading [(str-inline "Results")]
+               :attr {:id "ch:res" :classes [] :props {}}
+               :blocks [{:t :section :level 3 :heading [(str-inline "Found")]
+                         :attr {:id "sec:found" :classes [] :props {}}
+                         :blocks [(part-figure "fig:two")]}
+                        {:t :section :level 3 :heading [(str-inline "Also")]
+                         :attr {:id "sec:also" :classes [] :props {}}
+                         :blocks [(part-figure "fig:three")
+                                  (para (str-inline "See ")
+                                        {:t :cross-ref :label "fig:three" :target "fig:three"
+                                         :text "Figure 2.2"}
+                                        (str-inline " and ")
+                                        {:t :cross-ref :label "part:one" :target "part:one"
+                                         :text "Part I"}
+                                        (str-inline "."))]}]}]}]})
+
+(deftest part-sectioning-commands-test
+  (testing "TASK-82: a parted document emits \\part for level 1 and
+            shifts every deeper level down with it, out to
+            \\subparagraph at level 7"
+    (let [levels (fn [meta*]
+                   (latex/emit-document
+                    {:meta meta*
+                     :blocks (mapv (fn [n] {:t :section :level n
+                                            :heading [(str-inline (str "H" n))]
+                                            :attr empty-attr :blocks []})
+                                   (range 1 8))}))
+          parted (levels {:top-level-division :part})]
+      (doseq [[level command] {1 "part" 2 "chapter" 3 "section" 4 "subsection"
+                               5 "subsubsection" 6 "paragraph" 7 "subparagraph"}]
+        (is (str/includes? parted (str "\\" command "{H" level "}")) (str "level " level)))))
+  (testing "and the parted list clamps at its own end too, one level
+            deeper than the chaptered one -- reachable only from a
+            hand-built AST, since a Markdown ATX heading never reaches
+            level 7 on its own (CommonMark caps an ATX heading at 6 #s,
+            and flexmark's own Heading node never emits past that)"
+    (let [out (latex/emit-document
+               {:meta {:top-level-division :part}
+                :blocks [{:t :section :level 8 :heading [(str-inline "Deep")]
+                          :attr empty-attr :blocks []}]})]
+      (is (str/includes? out "\\subparagraph{Deep}"))))
+  (testing "a chapter-only document is unaffected: it still stops at
+            \\chapter on level 1 and never reaches for \\part"
+    (let [out (latex/emit-document
+               {:meta {:top-level-division :chapter}
+                :blocks [{:t :section :level 1 :heading [(str-inline "H1")]
+                          :attr empty-attr :blocks []}]})]
+      (is (str/includes? out "\\chapter{H1}"))
+      (is (not (str/includes? out "\\part"))))))
+
+(deftest part-computed-numbers-test
+  (testing "TASK-82: a parted document in computed-numbers mode uses the
+            starred part/chapter/section commands with the resolver's
+            own roman/arabic numbers baked in, and a float still carries
+            the chapter-composed number the body's own references use --
+            never the part's"
+    (let [labels (resolver/number-document part-document)
+          out (latex/emit-document part-document
+                                   {:computed-numbers true :labels labels})]
+      (is (str/includes? out "\\part*{I\\quad Foundations}\\phantomsection\\label{part:one}"))
+      (is (str/includes? out "\\chapter*{1\\quad Background}\\phantomsection\\label{ch:bg}"))
+      (is (str/includes? out "\\section*{1.1\\quad Models}"))
+      (is (str/includes? out "\\caption*{Figure 2.2: A panel}"))
+      (assert-compiles! out))))
+
+(deftest part-float-numbering-parity-test
+  (testing "TASK-82: a section-scoped figure number composes with the
+            CHAPTER, never the part, and native-mode LaTeX -- which
+            computes its own numbers from report's counters, knowing
+            nothing about the resolver -- prints exactly the numbers
+            HTML does, identical to what chapter-document alone
+            produces for the same ids"
+    (let [labels (resolver/number-document part-document)
+          html (html/emit-document part-document {:labels labels})
+          pdf (compile-pdf-resolved! (latex/emit-document part-document))]
+      (is (= {"fig:one" "1.1" "fig:two" "2.1" "fig:three" "2.2" "part:one" "I"}
+             (into {} (map (fn [[id entry]] [id (:number entry)]))
+                   (select-keys labels ["fig:one" "fig:two" "fig:three" "part:one"])))
+          "the second figure of chapter 2 is 2.2 whether or not that chapter sits in a part")
+      (is (some? pdf) "the parted document must compile under a real pdflatex")
+      (let [text (str/replace (pdf-text pdf) #"\s+" " ")]
+        (doseq [number ["Part I" "Figure 1.1" "Figure 2.1" "Figure 2.2"]]
+          (is (str/includes? text number)
+              (str "native-mode LaTeX did not print " number ":\n" text))
+          (is (str/includes? html number)
+              (str "HTML did not print " number)))
+        (testing "and a reference to one resolves to that same number
+                  rather than to LaTeX's ?? placeholder"
+          (is (str/includes? text "See Figure 2.2 and Part I."))
+          (is (not (str/includes? text "??"))))))))
+
+;; ---------------------------------------------------------------------
 ;; TASK-60: scale and height on images.
 ;; ---------------------------------------------------------------------
 
