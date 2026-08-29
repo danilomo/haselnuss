@@ -8,7 +8,14 @@
   ends: the renderer emits the `small-collapsable-body` block wrapper that
   a stylesheet can key on, and `haselnuss.emit.html/default-stylesheet`
   carries the `display:inline` / block-body rules that turn that markup
-  into the two states. Neither half is the feature on its own."
+  into the two states. Neither half is the feature on its own.
+
+  TASK-89 changed how `render-html`'s own output is reached from a test:
+  it is now `(fn [directive ctx] -> data)`, not `(fn [directive target]
+  -> string)`, so every test that needs its rendered HTML goes through
+  `haselnuss.emit.html/emit-document` now (`render` below), the same
+  reasoning `haselnuss.extensions.collapsable-test`'s own docstring gives
+  in full."
   (:require [clojure.test :refer [deftest is testing]]
             [haselnuss.ast :as ast]
             [haselnuss.emit.html :as html]
@@ -21,6 +28,15 @@
   (-> {}
       (registry/register collapsable/extension)
       (registry/register small-collapsable/extension)))
+
+(defn- render
+  "`directive` rendered through the real HTML emitter core, registering
+  both `collapsable` and `small-collapsable`, returning just the
+  `<body>`'s own inner HTML."
+  [directive]
+  (let [out (html/emit-document {:meta {} :blocks [directive]} {:registry registry-with-both})
+        [_ body] (re-find #"(?s)<body>(.*)</body>" out)]
+    body))
 
 (defn- para
   [& inlines]
@@ -61,7 +77,7 @@
     (let [d (small-collapsable/make "João 3:16"
                                     [(para (str-inline "Porque Deus amou o mundo"))]
                                     {:id "collapse:jo316" :classes [] :props {}})
-          out (small-collapsable/render-html d :html)]
+          out (render d)]
       (is (= (str "<details id=\"collapse:jo316\" class=\"small-collapsable\">"
                   "<summary>João 3:16</summary>"
                   "<div class=\"small-collapsable-body\">"
@@ -72,16 +88,15 @@
   (testing "authored attr.classes are appended after the base class, and
             attr.id is omitted entirely when unset"
     (let [d (small-collapsable/make "Label" [] {:classes ["proof-text"] :props {}})
-          out (small-collapsable/render-html d :html)]
+          out (render d)]
       (is (re-find #"<details class=\"small-collapsable proof-text\">" out))
       (is (not (re-find #"id=" out)))))
   (testing "the summary is HTML-escaped, not spliced raw"
     (let [d (small-collapsable/make "1 João <3> & 4" [])]
-      (is (re-find #"<summary>1 João &lt;3&gt; &amp; 4</summary>"
-                   (small-collapsable/render-html d :html)))))
+      (is (re-find #"<summary>1 João &lt;3&gt; &amp; 4</summary>" (render d)))))
   (testing "an empty body still emits the wrapper, so the collapsed and
             expanded states stay structurally identical"
-    (let [out (small-collapsable/render-html (small-collapsable/make "Label" []) :html)]
+    (let [out (render (small-collapsable/make "Label" []))]
       (is (re-find #"<div class=\"small-collapsable-body\"></div>" out)))))
 
 (deftest label-test
@@ -91,20 +106,19 @@
             and is not itself clickable"
     (let [d (small-collapsable/make "1 Coríntios 3:23" []
                                     {:classes [] :props {"label" "(1)"}})
-          out (small-collapsable/render-html d :html)]
+          out (render d)]
       (is (= "(1)" (small-collapsable/label d)))
       (is (re-find #"^<span class=\"small-collapsable-label\">\(1\)</span><details" out))
       (is (not (re-find #"<summary>[^<]*\(1\)" out)))))
   (testing "no label means no span at all -- an unmarked disclosure emits
             exactly what it did before the prop existed"
-    (let [out (small-collapsable/render-html (small-collapsable/make "Ref" []) :html)]
+    (let [out (render (small-collapsable/make "Ref" []))]
       (is (nil? (small-collapsable/label (small-collapsable/make "Ref" []))))
       (is (not (re-find #"small-collapsable-label" out)))
       (is (re-find #"^<details" out))))
   (testing "the marker is HTML-escaped like any other authored text"
     (let [d (small-collapsable/make "Ref" [] {:classes [] :props {"label" "<1>"}})]
-      (is (re-find #"<span class=\"small-collapsable-label\">&lt;1&gt;</span>"
-                   (small-collapsable/render-html d :html)))))
+      (is (re-find #"<span class=\"small-collapsable-label\">&lt;1&gt;</span>" (render d)))))
   (testing "a static target keeps the marker rather than dropping it: it
             is space-joined onto the summary in the flattened head, since
             nothing else in that form could carry it"
@@ -124,27 +138,45 @@
   (testing "a small-collapsable nests inside its own hidden content"
     (let [inner (small-collapsable/make "Inner" [(para (str-inline "deep"))])
           outer (small-collapsable/make "Outer" [inner])
-          out (small-collapsable/render-html outer :html)]
+          out (render outer)]
       (is (= 2 (count (re-seq #"<details" out))))
       (is (< (.indexOf out "<summary>Outer</summary>")
              (.indexOf out "<summary>Inner</summary>")))))
   (testing "a plain collapsable nests inside a small-collapsable, rendered
-            by its own native renderer rather than mangled"
+            by its own native renderer rather than mangled -- through the
+            ordinary registry now (TASK-89), not a dispatch map this
+            namespace hard-codes \"collapsable\" into"
     (let [inner (collapsable/make "Inner" [(para (str-inline "deep"))])
           outer (small-collapsable/make "Outer" [inner])
-          out (small-collapsable/render-html outer :html)]
+          out (render outer)]
       (is (re-find #"<details class=\"collapsable\">" out))
       (is (re-find #"<details class=\"small-collapsable\">" out))))
-  (testing "content outside the shared renderer's documented scope raises
-            collapsable's own error type -- the shared helper reporting,
-            not a mis-attribution (see the namespace docstring)"
+  (testing "TASK-89: the reverse case -- a small-collapsable nested inside
+            a plain collapsable -- now works too, which is a real
+            capability change from before this task: closing that gap
+            used to mean collapsable requiring this namespace, a require
+            cycle, since each namespace's own dispatch map had to know the
+            other's directive name by hand. ctx's own :render-blocks
+            closes it for free, since dispatch is the ordinary registry
+            lookup and neither namespace needs to require the other at
+            all (confirmed here: this file requires
+            haselnuss.extensions.collapsable, but collapsable.clj itself
+            requires neither small-collapsable nor this namespace)"
+    (let [inner (small-collapsable/make "Inner" [(para (str-inline "deep"))])
+          outer (collapsable/make "Outer" [inner])
+          out (render outer)]
+      (is (re-find #"<details class=\"collapsable\">" out))
+      (is (re-find #"<details class=\"small-collapsable\">" out))
+      (is (< (.indexOf out "<summary>Outer</summary>")
+             (.indexOf out "<summary>Inner</summary>")))))
+  (testing "TASK-89: content outside this extension's former documented
+            scope limit now renders instead of raising an error, since the
+            hidden content is rendered through the core emitter's own
+            :render-blocks -- the same capability change
+            collapsable-test's own render-html-ac1-test documents in full
+            for the sibling extension"
     (let [d (small-collapsable/make "Label" [{:t :thematic-break}])]
-      (try
-        (small-collapsable/render-html d :html)
-        (is false "expected render-html to throw")
-        (catch clojure.lang.ExceptionInfo e
-          (is (= :haselnuss.extensions.collapsable/unsupported-block
-                 (:type (ex-data e)))))))))
+      (is (re-find #"<hr/>" (render d))))))
 
 (deftest lower-test
   (testing "lowering for :html keeps the directive intact, so the emitter
@@ -218,3 +250,10 @@
             output as XML, where an unescaped `>` in <style> is invalid
             (default-stylesheet's own documented constraint)"
     (is (not (re-find #">" html/default-stylesheet)))))
+
+(deftest extension-v2-and-trust-test
+  (testing "TASK-89: the registered :html renderer speaks the v2 contract"
+    (is (registry/v2? (get-in small-collapsable/extension [:emit :html]))))
+  (testing "TASK-89 AC #8: this extension is registered untrusted -- it
+            needs no [:raw ...] escape hatch either"
+    (is (false? (:trusted (registry/lookup registry-with-both "small-collapsable"))))))

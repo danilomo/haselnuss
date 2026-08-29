@@ -744,6 +744,163 @@ Exit codes, so a `make`-style tool can act on them:
 | 1 | the build failed (no representation for the target, a parse error, an unreadable file); nothing was written |
 | 2 | the command line was wrong; usage is printed |
 
+### Overlays
+
+A repeatable `--overlay PATH` flag layers one or more separate `.hdoc` files onto the
+base document at build time, without the base document ever referencing them:
+
+```
+haselnuss paper.hdoc --overlay alt-text.hdoc --overlay editorial-notes.hdoc
+```
+
+Each overlay file is an ordinary `.hdoc` document whose top-level blocks are expected to
+be entirely `prepend`/`append` directives, each carrying `target=<id>` — the `attr.id` of
+the Section (part, chapter, or section, any level) in the *base* document to patch:
+
+```
+:::{prepend target=ch:intro}
+Extra intro material, injected before the chapter's own first block.
+:::
+
+:::{append target=sec:results}
+A browser-only interactive chart, injected after the chapter's own last block.
+:::
+```
+
+`prepend` injects its own blocks at the start of the target Section's own content;
+`append` injects them at the end. Injection happens before numbering, so spliced content
+numbers and cross-references exactly as if it had been typed into the base document —
+including a target Section that only exists after the base document's own `!include`s
+have been expanded (e.g. a chapter pulled in from another file). Multiple `prepend`/
+`append` directives naming the same target, across one or more `--overlay` files,
+accumulate in `--overlay` order, then in each file's own top-to-bottom order.
+
+An `!include` written inside an overlay file resolves against *that file's own*
+directory, with the same cycle detection the base document gets — an overlay that
+includes itself is reported as a cycle, not a hang.
+
+Every other case is a distinct, non-fatal build warning, and the offending content is
+dropped rather than guessed at or silently merged into the base document: a `target=`
+that is missing or blank, a `target=` that does not resolve to anything in the base
+document, and any top-level block in an overlay file that is not a recognized `prepend`/
+`append`/`describe` directive (a stray paragraph, or a directive name this build does not
+recognize). A `prepend`/`append`/`describe` directive's own id, if it is given one, is
+discarded once its content is spliced into the target — also warned about, since it can
+otherwise look referenceable and silently never be. A `--overlay` path that does not name
+a file is a hard build failure naming the path, unlike a build-time diagnostic — it is a
+path typed on the command line, not a reference embedded in document prose.
+
+Omitting `--overlay` entirely builds the base document byte-for-byte identically to a
+build with no overlay mechanism at all, whether or not an unused overlay file happens to
+exist on disk. `--overlay` has no effect on `--target json`, matching `--bibliography`'s
+own existing behavior there.
+
+Writing a `prepend`/`append`/`describe` directive directly in the *base* document, rather
+than in a file named by `--overlay`, is not a way to use this feature — it is an ordinary,
+unregistered directive there, so it warns as `unknown directive` and then fails the build
+like any other undefined one.
+
+### `describe`
+
+`describe` attaches flat metadata to *any* referenceable node, not only a Section —
+a Figure, Table, MathBlock, or a referenceable Directive too — addressed the same way,
+by `attr.id`:
+
+```
+:::{describe target=fig:tree alt="A hazelnut tree in early spring bloom, seen from the orchard path."}
+:::
+```
+
+Every prop other than `target` merges into the target node's own `attr.props`. This needs
+no schema change (`props` already exists on every node's `Attr`) and is invisible to both
+emitters by default: HTML renders it as an ordinary tag attribute on the target element
+(present in the markup, never as visible page text), and LaTeX has no generic `props`
+target at all, so a `describe`d prop never appears in the `.tex` output. That is exactly
+the "present but not shown unless something opts in" shape a use case like a per-figure
+textual description — for an eventual audiobook or accessibility pass — wants.
+
+A prop key colliding with one already set on the target node is its own non-fatal build
+warning, and the target's own value is kept rather than silently overwritten. `describe`
+shares every other diagnostic `prepend`/`append` already has: a missing or blank
+`target=`, a `target=` that resolves to nothing, its own id (if given one) being
+discarded, and being dropped as unrecognized top-level content when misspelled.
+
+Not in scope: a multi-paragraph or richly-marked-up description. `attr.props` is a flat
+`string -> string` map, so `describe` only fits a caption-length string per key — a richer
+description (its own cross-references, math, multiple paragraphs) would need an actual
+AST addition, and is left for a future extension.
+
+### Author-defined extensions
+
+A repeatable `--extensions PATH` flag loads a plain Clojure file defining a custom
+directive — its own name, and how it renders on the `html` and `latex` targets — with no
+recompile:
+
+```
+haselnuss paper.hdoc --extensions callout.clj
+```
+
+`callout.clj`:
+
+```clojure
+{:name "callout"
+ :emit {:html (fn [directive ctx]
+                [:div {:class "callout"} ((:render-blocks ctx) (:blocks directive))])
+        :latex (fn [directive ctx]
+                 ["Note: " ((:render-blocks ctx) (:blocks directive))])}}
+```
+
+The file's last form must evaluate to a map like this one — the same `{:name :kind?
+:emit? :lower?}` shape every built-in extension already uses internally — or a vector of
+several, for a file defining more than one directive at once. `:emit`'s `:html`/`:latex`
+functions take the directive being rendered and a rendering context whose `:render-blocks`
+callback renders the directive's own nested content through the *real* emitter, so a
+custom directive supports every construct the core one does, composed rather than
+hand-rolled — the way `["Note: " ...]` above is a plain, escaped string followed by
+already-rendered content, not a hand-built string. `:html`'s return value is hiccup-shaped
+data (`[tag attrs? & children]`); a plain string or keyword, on either target, is escaped
+exactly like authored prose. A directive with no representation on some other target
+(`json`, or a target this file's own `:emit` map omits) needs a `:lower` rule — see
+`haselnuss.registry`'s own docstring for the full shape, `:kind`'s numbering-lexicon
+fragment included.
+
+Loaded extensions are scoped to the one build that loaded them: nothing a `--extensions`
+file defines is visible to a later, separate conversion, even in the same process, and an
+unused `--extensions` file changes nothing about a build that never names it.
+
+The file is evaluated in a sandbox with **no host interop, no file reads, no process
+execution, and no `require` reaching anything on this machine's classpath** — an attempt
+at any of these is refused, and a build that never terminates is stopped rather than left
+to hang. Output a directive's renderer produces is capped in size, and anything the file
+itself prints during evaluation is captured rather than mixed into the build's own output.
+An extension entry that does not match the expected shape is refused with an error naming
+the file.
+
+A separate flag, `--trusted-extensions`, allows every `--extensions` file loaded in that
+run to emit genuinely verbatim, unescaped output (`haselnuss.ext/raw`) — needed for
+something that must be script or markup exactly as written, a browser-only interactive
+widget being the motivating case. It defaults to off, and a sidecar file can never grant
+itself this on its own.
+
+`examples/reveal.clj` and `examples/reveal-demo.hdoc` are a worked example of exactly
+this: a `reveal` directive — a small quiz prompt with a button that reveals its answer —
+whose `html` rendering needs `--trusted-extensions` (an inline `<script>`, spliced in via
+`haselnuss.ext/raw`, that an ordinary escaped hiccup child could not carry intact) and
+whose `latex` rendering is a distinct, print-appropriate fallback: the question followed
+directly by its answer, with no click for a PDF to defer to and no `:raw`/trust involved
+at all on that half. Building it without `--trusted-extensions` fails loudly with the
+same error a host-defined untrusted renderer gets; `examples/reveal.clj`'s own header
+comment has the exact commands to try both ways.
+
+**What this does and does not protect against.** This sandbox is for an author running
+their own file: it is built to catch a mistake — a typo that tries to read a file, a
+copy-pasted loop that never terminates, a stray debug `println` — not to withstand a
+determined attacker. It does not run in a separate, killable process, so a single runaway
+computation inside the sandbox is stopped from hanging the *build*, but is not guaranteed
+to be reclaimed instantly. Treat `--extensions` the way you would treat running someone
+else's script directly: fine for your own files, or a collaborator's; not a boundary for
+converting a document from someone you do not trust.
+
 ## Example
 
 `examples/hazelnuts.hdoc` is a short real document — sections, a figure,

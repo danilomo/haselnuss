@@ -74,8 +74,8 @@
             [haselnuss.emit.html :as html]
             [haselnuss.emit.latex :as latex]
             [haselnuss.extensions.collapsable :as collapsable]
-            [haselnuss.extensions.derived-lists :as derived-lists]
             [haselnuss.extensions.front-matter :as front-matter]
+            [haselnuss.extensions.sidecar :as sidecar]
             [haselnuss.extensions.small-collapsable :as small-collapsable]
             [haselnuss.json :as json]
             [haselnuss.lower :as lower]
@@ -332,6 +332,18 @@
   `environment-lower-rule` for each of those so they degrade rather than
   fail on every other target.
 
+  TASK-89 moved the three derived-list placeholder names
+  (`\"toc\"`/`\"list-of-figures\"`/`\"list-of-tables\"`) from a registered
+  marker (`haselnuss.extensions.derived-lists`'s own former
+  `list-renderer`/`extensions`, never actually called) to a real renderer
+  each emitter now installs itself, `register-derived-lists` -- the same
+  shape `register-environments` already has below it, and called right
+  alongside it for the same reason: a name with a real per-target
+  renderer is what makes `haselnuss.lower/lower` keep the directive for
+  that target at all, and calling it is now genuinely each emitter's own
+  job rather than a special case `render-directive` used to check ahead
+  of the registry.
+
   Registering the LaTeX mappings is what makes a `{theorem}`/`{proof}`/
   `{admonition}` directive survive `lower` for LaTeX at all -- see
   `haselnuss.emit.latex/register-environments` -- and the `:lower` rules
@@ -359,14 +371,17 @@
                ;; front-matter blocks before rendering -- so it is a
                ;; marker; see front-matter/front-matter-renderer.
                (registry/register-all front-matter/extensions)
-               ;; TASK-59: and the same for the three list
-               ;; placeholders. Both emitters draw a list themselves --
-               ;; from the resolver's own derivations, or by handing
-               ;; the job to LaTeX's counters in native mode -- so what
-               ;; is registered here is a marker too; registering it is
-               ;; what keeps `lower` from aborting on a placeholder,
-               ;; which carries no fallback of its own either.
-               (registry/register-all derived-lists/extensions)
+               ;; TASK-89: and a real renderer for the three list
+               ;; placeholders, one per emitter -- each draws a list
+               ;; itself, from the resolver's own derivations, or (LaTeX
+               ;; native mode) by handing the job to LaTeX's own
+               ;; counters -- installed the same way
+               ;; `register-environments` installs its own mapping,
+               ;; right below. Registering either is what keeps `lower`
+               ;; from aborting on a placeholder, which carries no
+               ;; fallback of its own.
+               (html/register-derived-lists)
+               (latex/register-derived-lists)
                (latex/register-environments))
            latex/default-directive-environments)))
 
@@ -448,6 +463,16 @@
     "                          the host's preamble (see that file's own header)."
     "      --bibliography PATH CSL-JSON bibliography (overrides the document's own"
     "                          meta.bibliography)"
+    "      --overlay PATH      a .hdoc overlay file patching the base document via"
+    "                          prepend/append/describe directives (repeatable; see"
+    "                          README \"Overlays\"). No effect on --target json."
+    "      --extensions PATH   a sidecar .clj file defining author directives, evaluated"
+    "                          in a sandbox with no host interop, file, process or"
+    "                          classpath access (repeatable; see README \"Author-defined"
+    "                          extensions\"). No effect on --target json."
+    "      --trusted-extensions  allow every --extensions file loaded this run to emit"
+    "                          verbatim, unescaped output; off by default, and never"
+    "                          settable by the sidecar file itself"
     "      --no-stylesheet     html only: omit the default stylesheet the emitter"
     "                          otherwise inlines, for embedding the output in a page"
     "                          that brings its own CSS"
@@ -474,7 +499,8 @@
 
 (defn- parse-args
   "Parses `args` into `{:input :target :output :computed-numbers
-  :bibliography :help :version :no-stylesheet :fragment}`, or throws
+  :bibliography :overlay :extensions :trusted-extensions :help :version
+  :no-stylesheet :fragment}`, or throws
   `ex-info` (`:type ::usage-error`) for
   an unknown flag, a flag missing its value, a target that is not in
   `targets`, or anything other than exactly one positional input.
@@ -499,7 +525,7 @@
                                [arg nil])
           _ (when (and inline-value
                        (contains? #{"--help" "--version" "--computed-numbers"
-                                    "--no-stylesheet" "--fragment"}
+                                    "--no-stylesheet" "--fragment" "--trusted-extensions"}
                                   arg))
               ;; A value on a flag that takes none must be an error, not
               ;; silently discarded: `--computed-numbers=false` turned
@@ -546,6 +572,24 @@
         (and (not literal?) (= "--bibliography" arg))
         (let [[value rest-args] (take-value arg)]
           (recur rest-args (assoc opts :bibliography value) literal?))
+
+        ;; The one repeatable flag (TASK-83.1): every other branch here
+        ;; uses `assoc`, since every other option is single-valued, so
+        ;; `--overlay a.hdoc --overlay b.hdoc` collects into a vector
+        ;; instead of the second occurrence silently replacing the first.
+        (and (not literal?) (= "--overlay" arg))
+        (let [[value rest-args] (take-value arg)]
+          (recur rest-args (update opts :overlay (fnil conj []) value) literal?))
+
+        ;; TASK-90: the second repeatable flag, exactly `--overlay`'s own
+        ;; shape and for the same reason -- an author may load more than
+        ;; one sidecar file in a single build.
+        (and (not literal?) (= "--extensions" arg))
+        (let [[value rest-args] (take-value arg)]
+          (recur rest-args (update opts :extensions (fnil conj []) value) literal?))
+
+        (and (not literal?) (= "--trusted-extensions" arg))
+        (recur more (assoc opts :trusted-extensions true) literal?)
 
         (and (not literal?) (= "--computed-numbers" arg))
         (recur more (assoc opts :computed-numbers true) literal?)
@@ -651,6 +695,55 @@
       (throw (ex-info (str "bibliography file not found: " path) {:type ::missing-bibliography})))
     (resolver/load-bibliography path)))
 
+(defn- load-overlays!
+  "Reads and parses every `--overlay` path in `paths` (TASK-83.1, doc-5),
+  mirroring `load-bibliography!`: a missing file is a hard failure
+  (`ex-info ::missing-overlay`), like `::missing-bibliography` above --
+  it is a path the user typed on the command line, not a reference
+  embedded in document prose that can be diagnosed and skipped.
+
+  Each file is parsed with `vocabulary` -- the same one the base
+  document uses, so `@cross-ref`/`[@cite]` tokens inside an overlay file
+  parse the same construct they would in the document it patches -- and
+  then run through `resolver/expand-includes` on its OWN, with
+  `:source-path`/`:base-dir` seeded to THAT FILE's own path/directory.
+  That is the exact TASK-38 finding-1 root-seeding fix
+  (`resolve-document`'s own `:source-path` above), one level down: an
+  overlay file that `!include`s itself is caught as a cycle instead of
+  looping, and its own relative `!include`s resolve against its own
+  directory, not the base document's.
+
+  Returns `{:sources [[Block] ...] :warnings [...]}`: `:sources`, in
+  `paths`' own order, each already include-expanded and ready to hand to
+  `resolver/resolve-document`'s `:overlay-sources`; `:warnings`, every
+  `expand-includes` warning from every source, concatenated in the same
+  order. This I/O runs here, in `haselnuss.cli`, entirely BEFORE
+  `resolve-document` is even called -- unlike the base document's own
+  `:includes`, whose I/O is deferred into a `:load` callback
+  `resolve-document` invokes itself -- so `:warnings` is prepended by
+  `run` onto whatever `resolve-document` separately returns in its own
+  `:diagnostics`, rather than folded in by the resolver the way
+  `apply-overlays`'s own diagnostics are. Asymmetric with `:includes` by
+  necessity, not oversight: an overlay file is read by this namespace,
+  never by the resolver, which stays free of file I/O throughout."
+  [paths vocabulary]
+  (reduce
+   (fn [acc path]
+     (let [file (io/file path)]
+       (when-not (.isFile file)
+         (throw (ex-info (str "overlay file not found: " path) {:type ::missing-overlay})))
+       (let [document (parser/parse (slurp file) vocabulary)
+             {:keys [document warnings]}
+             (resolver/expand-includes document
+                                       {:base-dir (.getParentFile (.getAbsoluteFile file))
+                                        :source-path path
+                                        :load (fn [f] (parser/parse (slurp f) vocabulary))})]
+         (-> acc
+             (update :sources conj (:blocks document))
+             (update :warnings into warnings)))))
+   {:sources [] :warnings []}
+   paths))
+
 (def ^:private glueable-inline-tags
   "Inline tags the json target (TASK-80 follow-up) folds into plain text
   rather than keeping as their own JSON entries. CommonMark's own word/
@@ -723,8 +816,17 @@
   BibTeX database native mode asks for (TASK-42), and (only for a
   `--fragment` LaTeX build, TASK-52) the companion preamble text the
   emitted body's host has to load. Reads nothing but the
-  bibliography the document itself names (see `bibliography-path`), and
-  writes nothing: a caller decides what to do with the result.
+  bibliography the document itself names (see `bibliography-path`),
+  every `opts`' own `:overlay` path (TASK-83.1, `load-overlays!`, non-
+  json target only -- see its own docstring), and every `opts`' own
+  `:extensions` path (TASK-90, `haselnuss.extensions.sidecar/
+  load-extensions`, non-json target only, for the identical reason) --
+  and writes nothing: a caller decides what to do with the result.
+  `:trusted-extensions` (also non-json-only) is forwarded to that call as
+  `:trusted?`, gating whether every sidecar loaded THIS call may emit
+  unescaped output (`haselnuss.registry/register`'s own `:trusted?`); it
+  defaults to false and is never something a sidecar file can set for
+  itself.
 
   `opts` additions beyond the CLI's own flags: `:bib-resource`, the
   `\\bibliography{}` argument native mode should name. `build` passes
@@ -822,10 +924,55 @@
        :preamble nil
        :front-matter nil
        :output (json/->json (coalesce-prose document))}
-      (let [{:keys [document diagnostics labels ordered-keys bibliography-id]}
+      (let [;; TASK-83.1. Read here, before `resolve-document` runs, and
+            ;; only on this (non-json) branch -- an `--overlay` combined
+            ;; with `--target json` has no effect, matching
+            ;; `--bibliography`'s own existing behavior there (the json
+            ;; target never calls `resolve-document` at all). A missing
+            ;; path is a hard failure (`load-overlays!`'s own `ex-info`);
+            ;; every overlay file's own `!include` warnings are threaded
+            ;; through below, alongside `resolve-document`'s.
+            {overlay-sources :sources overlay-load-warnings :warnings}
+            (load-overlays! (:overlay opts) vocabulary)
+        ;; TASK-90. Loaded here too, alongside overlays, for the same
+        ;; --target json exclusion (this whole branch is never reached on
+        ;; that target -- see `usage`'s own "No effect on --target json"
+        ;; for `--extensions`) and because a sidecar-defined directive has
+        ;; to be part of the registry BEFORE `resolve-document` runs, or
+        ;; it is reported as an unknown directive rather than dispatched.
+        ;; A missing `--extensions` path, a malformed extension entry, or
+        ;; a sidecar file that fails to evaluate (host interop, a file
+        ;; read, a non-terminating top-level form, ...) are all hard
+        ;; failures naming the offending file
+        ;; (`haselnuss.extensions.sidecar`'s own `ex-info`), the same
+        ;; "typed on the command line, not embedded in document prose"
+        ;; treatment `load-overlays!`/`load-bibliography!` already give
+        ;; their own paths.
+        ;;
+        ;; A sidecar extension's own `:kind` fragment, if it gives one, is
+        ;; deliberately NOT folded into `lexicon` above -- that is
+        ;; computed once, before this branch, from the built-in registry
+        ;; only, since `lexicon` also drives `vocabulary` for PARSING,
+        ;; which runs on both targets and is exactly what "no effect on
+        ;; --target json" means to keep true. This is the same
+        ;; "without the lexicon a registered kind never numbers" caveat
+        ;; this namespace's own docstring already names for `:kind` in
+        ;; general (`build-registry`'s own docstring), now also true of
+        ;; one sourced from a sidecar file specifically: its directive is
+        ;; fully dispatched and rendered, but a NEW numbering kind it
+        ;; tries to introduce is not numbered -- an author reaches
+        ;; existing numbering (a referenceable, numbered result) the same
+        ;; way `chart`'s own SPEC.md sec8.4 example already does, by
+        ;; reusing an EXISTING kind's id-prefix convention (`#fig:...`),
+        ;; not by inventing a new kind keyword.
+            sidecar-extensions (sidecar/load-extensions
+                                (:extensions opts)
+                                {:trusted? (boolean (:trusted-extensions opts))})
+            directive-registry (registry/register-all base-registry sidecar-extensions)
+            {:keys [document diagnostics labels ordered-keys bibliography-id]}
             (resolver/resolve-document document
                                        (cond-> {:lexicon lexicon
-                                                :directive-registry base-registry
+                                                :directive-registry directive-registry
                                             ;; TASK-48. The same table
                                             ;; `build-registry` registers, read
                                             ;; for the kind each directive
@@ -881,9 +1028,28 @@
                                              ;; caught like any other.
                                                  :source-path (:input opts)
                                                  :load (fn [file]
-                                                         (parser/parse (slurp file) vocabulary))}}
+                                                         (parser/parse (slurp file) vocabulary))}
+                                            ;; TASK-83.1. Already read
+                                            ;; and include-expanded above
+                                            ;; (`load-overlays!`); empty
+                                            ;; with no `--overlay` at
+                                            ;; all, which `apply-overlays`
+                                            ;; treats as a no-op.
+                                                :overlay-sources overlay-sources}
                                          bibliography (assoc :bibliography bibliography)))
-            build-reg (build-registry labels)
+            ;; `load-overlays!`'s OWN warnings (reading/expanding the
+            ;; overlay FILES themselves) lead `resolve-document`'s --
+            ;; that I/O happened here, before `resolve-document` was even
+            ;; called, unlike `:includes`, whose warnings `resolve-
+            ;; document` already folds in itself (see its own docstring).
+            diagnostics (into (vec overlay-load-warnings) diagnostics)
+        ;; TASK-90. The same sidecar extensions merged into
+        ;; `directive-registry` above, merged again onto the labels-aware
+        ;; registry `lower`/the emitters actually dispatch through --
+        ;; `build-registry` is called twice for the reason its own
+        ;; docstring gives (a pre- and a post-numbering registry), so
+        ;; this merge is repeated here rather than threaded through once.
+            build-reg (registry/register-all (build-registry labels) sidecar-extensions)
         ;; TASK-59. Derived here, once, from the SAME resolved document
         ;; and the same label table every cross-reference's text was
         ;; baked from -- the discipline `:labels` already follows, and
@@ -937,14 +1103,21 @@
                           (= :latex emit-target)
                           (into (latex/unanchored-reference-diagnostics
                                  lowered {:computed-numbers (boolean computed-numbers)})))
-        ;; TASK-78: an Image :src is a filename this emitter cannot
-        ;; safely rewrite (see latex/unescapable-image-path-diagnostics'
-        ;; own docstring) the way a Link :target or a bibliography
-        ;; url/doi field now is, so a backslash or unbalanced brace in
-        ;; one is warned about here instead of fixed.
-            diagnostics (cond-> diagnostics
-                          (= :latex emit-target)
-                          (into (latex/unescapable-image-path-diagnostics lowered)))
+        ;; TASK-89 review comments #16/#17 (finalizer's own call, after a
+        ;; blocking false-negative -- Finding A -- and a blocking
+        ;; regression -- Finding B -- were both found in the AST+text
+        ;; reconciliation machinery a #11/#12/#13/#14 patch sequence had
+        ;; built here): the AST-based image-path-hazard check
+        ;; (`latex/unescapable-image-path-diagnostics`, TASK-78) is
+        ;; DELIBERATELY NOT called from here any more. It is still
+        ;; defined, still public, still independently tested in
+        ;; `haselnuss.emit.latex-test` -- just not wired into this
+        ;; pipeline. See `unescapable-image-path-text-diagnostics`'s own
+        ;; docstring, immediately below where its output is used, for
+        ;; what running only the text-based scan means it does not catch,
+        ;; and why that is now an accepted, documented limitation rather
+        ;; than something this namespace tries to close by reconciling
+        ;; two overlapping scans.
         ;; One options map for both LaTeX entry points (TASK-52). The
         ;; companion preamble is only worth anything if it names what
         ;; THIS body needs, so it must be derived from the same document
@@ -975,19 +1148,61 @@
               (catch clojure.lang.ExceptionInfo e
                 (throw (ex-info (ex-message e)
                                 (assoc (ex-data e) ::diagnostics diagnostics)
-                                e))))]
+                                e))))
+        ;; TASK-76/78: the last thing checked is what is actually about to
+        ;; be written, so authored and generated text are scanned by one
+        ;; pass, once `output`/`front-matter` both exist. The front-matter
+        ;; side files are the document too -- a fragment build puts
+        ;; authored prose in them rather than in `output`. The companion
+        ;; preamble is the one written file NOT scanned, and deliberately:
+        ;; every character in it comes from this emitter's own package
+        ;; list rather than from the author.
+        ;;
+        ;; The image-path-hazard check (TASK-78) is the text-based
+        ;; `unescapable-image-path-text-diagnostics` ONLY (TASK-89 review
+        ;; comments #16/#17 -- see the comment above `latex-opts`, and
+        ;; that function's own docstring, for why the AST-based
+        ;; `unescapable-image-path-diagnostics` used to also run here and
+        ;; no longer does): it sees every hazard a core Image's own
+        ;; `\includegraphics{...}` can carry AND, since it scans the
+        ;; actually-emitted text rather than the AST, a v2 renderer's own
+        ;; trusted `:raw` output too, which never becomes an `:image` AST
+        ;; node at any stage. Its own documented residual limitation (a
+        ;; stray-CLOSING-brace hazard with nothing open before it) is an
+        ;; accepted, tested gap now, for core-authored and extension-
+        ;; produced content alike, rather than something this namespace
+        ;; tries to close by also running a second, AST-based scan and
+        ;; reconciling the two.
+            text-based-diagnostics
+            (if (= :latex emit-target)
+              (into [] (mapcat (fn [text]
+                                 (concat (latex/untypesettable-character-diagnostics text :document)
+                                         (latex/unescapable-image-path-text-diagnostics text))))
+                    (cons output (map :content front-matter)))
+              [])]
         {:diagnostics
-     ;; TASK-76: the last thing checked is what is actually about to be
-     ;; written, so authored and generated text are scanned by one pass.
-     ;; The front-matter side files are the document too -- a fragment
-     ;; build puts authored prose in them rather than in `output`. The
-     ;; companion preamble is the one written file NOT scanned, and
-     ;; deliberately: every character in it comes from this emitter's
-     ;; own package list rather than from the author.
-         (cond-> diagnostics
-           (= :latex emit-target)
-           (into (mapcat #(latex/untypesettable-character-diagnostics % :document)
-                         (cons output (map :content front-matter)))))
+     ;; Plain concatenation, no de-duplication (TASK-89 review comment
+     ;; #21): `diagnostics` (resolver warnings, overlay warnings, the
+     ;; unanchored-reference check) and `text-based-diagnostics`
+     ;; (character/image-path hazards scanned from the final emitted
+     ;; text) are fully disjoint in both type and source now that the
+     ;; AST-based image-path check is gone -- there is no overlapping
+     ;; scan left to reconcile between them, the only thing any
+     ;; de-duplication here was ever structurally needed for. A `distinct`
+     ;; briefly lived here (comments #19-20) on the belief that it
+     ;; restored pre-TASK-89 behavior for a `:dangling-cross-ref`
+     ;; diagnostic repeated for the same missing id referenced twice --
+     ;; comment #21 checked that directly against the actual pre-TASK-89
+     ;; commit (`d751e26`) rather than against this task's own prose about
+     ;; it, and found the claim false: pre-TASK-89 `run` never
+     ;; de-duplicated anything, and `haselnuss.resolver` produces one
+     ;; `:dangling-cross-ref` warning per occurrence, undeduplicated, by
+     ;; its own established design (its own docstring says so). Plain
+     ;; `into`, matching that exactly, rather than a `distinct` that was
+     ;; new, general, whole-list behavior no AC ever asked for and that
+     ;; this codebase had mis-described as a restoration since the round
+     ;; that introduced it.
+         (into diagnostics text-based-diagnostics)
      ;; Returned so `build` can write the generated BibTeX database
      ;; (TASK-42) from the same loaded data the resolver formatted
      ;; against, rather than reading `meta.bibliography` a second time

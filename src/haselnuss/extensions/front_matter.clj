@@ -63,8 +63,16 @@
     environment at all: `\\begin{resumo}` is abntex2's, and template
     furniture is out of scope for this milestone.
 
-  `extract` is the one function both emitters call to make that split."
-  (:require [clojure.string :as str]))
+  `extract` is the one function both emitters call to make that split.
+
+  Requires `haselnuss.ast` and `haselnuss.walk` (TASK-88) for `extract`'s
+  own nesting check, which walks the schema-derived table rather than a
+  hand-written per-node-type traversal -- see `nested-scope`/
+  `check-not-nested!`."
+  (:require [clojure.string :as str]
+            [haselnuss.ast :as ast]
+            [haselnuss.registry :as registry]
+            [haselnuss.walk :as walk]))
 
 (def keyword-separator
   "The separator between terms in a front-matter block's own `keywords`
@@ -231,8 +239,22 @@
   renderer. Registering *something* is what makes `haselnuss.lower/lower`
   keep the directive rather than demand a fallback it has no way to
   declare; the emitters recognize these directives by name in `extract`
-  and render them through their own `render-blocks`, so this is never
-  called.
+  -- BEFORE a document's body ever reaches either emitter's own
+  `render-directive` dispatch -- and render them through their own
+  `render-blocks`, so this is never called by either.
+
+  `[directive ctx]`, TASK-89's v2 contract (`extensions` below wraps this
+  in `registry/renderer-v2`) rather than the pre-TASK-89 `[directive
+  target]` shape: unlike `haselnuss.extensions.derived-lists`'s own
+  former marker of the same kind, migrating this one changes no
+  behavior at all, since a front-matter block never reaches EITHER
+  emitter's registry dispatch in the first place (`extract` runs over
+  the whole document, ahead of `render-blocks`/`render-directive`, not
+  inside them the way the derived-lists special case once was) -- kept
+  as a v2 renderer anyway, for the same reason every other built-in
+  extension is now one: a reader scanning the registry should not have
+  to remember which one of four is still speaking the deprecated shape
+  for no reason.
 
   A function that throws rather than an inert value, for the reason
   `haselnuss.emit.latex/environment-renderer` records in full: the
@@ -240,26 +262,74 @@
   whatever non-nil `:emit` value it finds would otherwise splice
   something meaningless into its output. This makes that a named error
   instead."
-  [directive target]
+  [directive ctx]
   (throw (ex-info
           (str "the front-matter marker was called as a renderer for directive "
-               (pr-str (:name directive)) " on target " (pr-str target)
+               (pr-str (:name directive)) " on target " (pr-str (:target ctx))
                ": a front-matter block is extracted by the emitter before the body is"
                " rendered (haselnuss.extensions.front-matter/extract), never dispatched"
                " through the registry")
-          {:type ::front-matter-marker-called :block directive :target target})))
+          {:type ::front-matter-marker-called :block directive :target (:target ctx)})))
 
 (def extensions
   "One `haselnuss.registry/register`-shaped entry per front-matter block
-  name, each carrying the `front-matter-renderer` marker for both
-  targets. No `:kind` (a front-matter block takes part in no numbering
-  scheme, which is what keeps it out of cross-referencing) and no
-  `:lower` (it has a representation on every target this project emits,
-  so it never needs to degrade)."
+  name, each carrying the `front-matter-renderer` marker, `renderer-v2`-
+  marked (TASK-89), for both targets. No `:kind` (a front-matter block
+  takes part in no numbering scheme, which is what keeps it out of
+  cross-referencing) and no `:lower` (it has a representation on every
+  target this project emits, so it never needs to degrade)."
   (mapv (fn [block-name]
           {:name block-name
-           :emit {:html front-matter-renderer :latex front-matter-renderer}})
+           :emit {:html (registry/renderer-v2 front-matter-renderer)
+                  :latex (registry/renderer-v2 front-matter-renderer)}})
         (sort (keys blocks))))
+
+(def ^:private nested-scope
+  "Every reference kind `extract`'s own nesting check needs
+  `haselnuss.walk/fold` (TASK-88) to descend through: `::block`/`::inline`
+  for the tree itself, `::cell`/`::row` so a Table's own `:head`/`:rows`
+  reach down to each cell's `:blocks`, and `::cite-item` so a Cite's own
+  `:items` reach their `:prefix`/`:suffix` (which can themselves hide a
+  footnote) -- mirroring `haselnuss.lower`'s own `scope` for the identical
+  reason (TASK-85).
+
+  `::meta`/`::fallback` are deliberately absent: this check only ever
+  walks `document`'s own top-level Blocks (never `meta.title`), and a
+  Directive's own `:fallback` is data a lower-time rule reads, not a
+  position a front-matter block could ever be authored into."
+  #{::ast/block ::ast/inline ::ast/cell ::ast/row ::ast/cite-item})
+
+(defn- check-not-nested!
+  "`extract`'s own `haselnuss.walk/fold` `:visit` (TASK-88): throws the
+  same `::nested-front-matter` `ex-info` this namespace has always
+  raised, naming `node`, exactly when `node` is a front-matter directive
+  AND `path` is non-empty. `path` is `[]` only for the top-level Block
+  `fold` was called on (see `extract`), so a genuine top-level
+  front-matter block -- the only place one is legal -- is never rejected
+  here, only one reached through some deeper field.
+
+  Replaces a hand-rolled `case (:t ...)` pair (once `nested`/
+  `note-blocks`) whose own default branch silently returned `[]` for any
+  node type it did not explicitly enumerate -- exactly the doc-6-measured
+  hole `haselnuss.walk`'s schema-derived traversal exists to close (see
+  `haselnuss.lower`'s own TASK-85 port for the identical fix): a Block or
+  Inline type this namespace has never heard of is now reached because
+  the schema says it carries children, not because someone remembered to
+  add a case for it here. A Para's own Inlines reaching a footnote's
+  Blocks was the case the old hand-written version once missed (a
+  regression fixed before this port, and the reason its own docstring
+  called out reaching a footnote nested inside emphasis by name) --
+  `fold`'s generic recursion reaches that position, and every other
+  child-bearing one the schema declares, uniformly."
+  [acc path _ref-kind node]
+  (when (and (seq path) (front-matter? node))
+    (throw (ex-info
+            (str "front-matter block " (pr-str (:name node))
+                 " is nested inside the document body; it must be a top-level"
+                 " block, since it is not part of the numbered body at all")
+            {:type ::nested-front-matter :name (:name node)
+             :id (get-in node [:attr :id])})))
+  acc)
 
 (defn extract
   "Splits a Document's own top-level `blocks` into
@@ -274,45 +344,14 @@
   inside the body by construction. Emitting it there anyway would put an
   abstract under a section heading, in the table of contents' shadow, and
   -- in a fragment build -- silently in a different place from the side
-  file the host was told to `\\input`. Failing names the mistake instead."
+  file the host was told to `\\input`. Failing names the mistake instead.
+
+  The nesting check itself (`check-not-nested!`) is a `haselnuss.walk/
+  fold` over each top-level Block (TASK-88), not a hand-written traversal
+  -- see that function's own docstring."
   [document]
-  (let [top (:blocks document)]
-    (letfn [(check! [block]
-              (when (front-matter? block)
-                (throw (ex-info
-                        (str "front-matter block " (pr-str (:name block))
-                             " is nested inside the document body; it must be a top-level"
-                             " block, since it is not part of the numbered body at all")
-                        {:type ::nested-front-matter :name (:name block)
-                         :id (get-in block [:attr :id])})))
-              (run! check! (nested block)))
-            ;; Every position a Block can be nested in, kept in step with
-            ;; `haselnuss.resolver/block-children` -- including a Para's
-            ;; own Inlines, which reach Blocks through a footnote. That
-            ;; last one is not hypothetical tidiness: without it an
-            ;; abstract written inside a footnote passed this check and
-            ;; failed later, in an emitter, as a marker-called error that
-            ;; named neither the mistake nor where it was.
-            (nested [block]
-              (case (:t block)
-                (:section :block-quote :directive) (:blocks block)
-                :list (mapcat identity (:items block))
-                :figure [(:content block)]
-                :table (mapcat :blocks (mapcat :cells (cons (:head block) (:rows block))))
-                :para (note-blocks (:inlines block))
-                []))
-            (note-blocks [inlines]
-              (mapcat (fn [inline]
-                        (case (:t inline)
-                          :note (:blocks inline)
-                          (:emph :strong :strike :small-caps :sub :sup :span :link)
-                          (note-blocks (:inlines inline))
-                          :cite (mapcat (fn [item]
-                                          (concat (note-blocks (:prefix item))
-                                                  (note-blocks (:suffix item))))
-                                        (:items inline))
-                          []))
-                      inlines))]
-      (run! (fn [block] (run! check! (nested block))) top))
+  (let [top (:blocks document)
+        walker {:table walk/table :scope nested-scope :visit check-not-nested!}]
+    (run! (fn [block] (walk/fold walker nil ::ast/block block)) top)
     [(filterv front-matter? top)
      (filterv (complement front-matter?) top)]))

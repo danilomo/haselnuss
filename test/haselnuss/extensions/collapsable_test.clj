@@ -1,14 +1,27 @@
 (ns haselnuss.extensions.collapsable-test
   "Fixtures for the `collapsable` extension (`haselnuss.extensions.
   collapsable`, TASK-18), the reference built-in built on top of the
-  extension registry (TASK-16) and the `lower` pass (TASK-17): a
-  collapsable directive renders as an interactive `<details>`/`<summary>`
-  element on the `:html` target (AC #1); the same directive renders as
-  flattened static content on the `:latex` target via its own `:blocks`
-  Fallback (AC #2); and it round-trips through `resolve`/`lower` for both
-  targets without a build error (AC #3)."
-  (:require [clojure.test :refer [deftest is testing]]
+  extension registry (TASK-16), the `lower` pass (TASK-17) and, since
+  TASK-89, the emitter core's own v2 renderer contract: a collapsable
+  directive renders as an interactive `<details>`/`<summary>` element on
+  the `:html` target (AC #1); the same directive renders as flattened
+  static content on the `:latex` target via its own `:blocks` Fallback
+  (AC #2); and it round-trips through `resolve`/`lower` for both targets
+  without a build error (AC #3).
+
+  TASK-89 changed how `render-html`'s own output is reached from a test:
+  it is now `(fn [directive ctx] -> data)`, not `(fn [directive target]
+  -> string)`, and `ctx` is a real emitter context a renderer uses to
+  render its own nested content through -- not something a test can hand
+  it by hand without reproducing the emitter itself. Every test that
+  needs `render-html`'s own rendered HTML therefore goes through
+  `haselnuss.emit.html/emit-document` now (`render` below), the same way
+  this codebase's own emitter test suites already do, rather than calling
+  the renderer directly the way this file did before TASK-89."
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [haselnuss.ast :as ast]
+            [haselnuss.emit.html :as html]
             [haselnuss.extensions.collapsable :as collapsable]
             [haselnuss.lower :as lower]
             [haselnuss.registry :as registry]
@@ -16,6 +29,18 @@
 
 (def ^:private registry-with-collapsable
   (registry/register {} collapsable/extension))
+
+(defn- render
+  "`directive` rendered through the real HTML emitter core, registering
+  only `collapsable`, and returning just the `<body>`'s own inner HTML --
+  the fragment every pre-TASK-89 assertion in this file already expected
+  `render-html` to return directly, before that function took `ctx`
+  rather than a bare target keyword and so needed a real emitter around
+  it to call at all."
+  [directive]
+  (let [out (html/emit-document {:meta {} :blocks [directive]} {:registry registry-with-collapsable})
+        [_ body] (re-find #"(?s)<body>(.*)</body>" out)]
+    body))
 
 (defn- para
   [& inlines]
@@ -58,16 +83,19 @@
     (let [d (collapsable/make "Click to expand"
                               [(para (str-inline "Hidden content"))]
                               {:id "collapse:1" :classes [] :props {}})
-          html (collapsable/render-html d :html)]
+          html (render d)]
       (is (re-find #"<details id=\"collapse:1\" class=\"collapsable\">" html))
       (is (re-find #"<summary>Click to expand</summary>" html))
       (is (re-find #"<p>Hidden content</p>" html))
       (is (< (.indexOf html "<summary>") (.indexOf html "Hidden content")))))
   (testing "escapes HTML-significant characters in both the summary and the
-            hidden content rather than splicing them raw"
+            hidden content rather than splicing them raw -- TASK-89: via
+            the core emitter's own escaping, applied to this renderer's
+            returned hiccup data, not a copy of it this namespace used to
+            carry itself"
     (let [d (collapsable/make "<script>&\""
                               [(para (str-inline "<b>&\""))])
-          html (collapsable/render-html d :html)]
+          html (render d)]
       (is (not (re-find #"<script>" html)))
       (is (re-find #"&lt;script&gt;&amp;&quot;" html))
       (is (re-find #"&lt;b&gt;&amp;&quot;" html))))
@@ -76,30 +104,45 @@
                               [(para {:t :emph :inlines [(str-inline "em")]}
                                      {:t :strong :inlines [(str-inline "strong")]}
                                      {:t :line-break})])
-          html (collapsable/render-html d :html)]
+          html (render d)]
       (is (re-find #"<em>em</em>" html))
       (is (re-find #"<strong>strong</strong>" html))
       (is (re-find #"<br/>" html))))
-  (testing "an unsupported block or inline type in the hidden content
-            raises a descriptive ex-info rather than silently mangling or
-            dropping it -- this renderer's own documented scope limit"
+  (testing "TASK-89: the hidden content is rendered through the core
+            emitter's own :render-blocks callback now, not a hand-rolled
+            sub-renderer supporting a hand-picked subset of Block/Inline
+            variants -- so a variant that namespace never supported before
+            (a thematic break, a resolved cross-reference) renders
+            correctly here too, rather than raising this extension's own
+            ::unsupported-block/::unsupported-inline the way it used to
+            (a real capability the OLD renderer contract could not have
+            given it: no way to reach the core emitter's own render-blocks
+            at all). Genuinely unknown node types still raise a
+            descriptive error -- now the core emitter's own
+            ::unsupported-block/::unsupported-inline, since this
+            extension no longer maintains error types of its own for a
+            limitation it no longer has"
     (let [d (collapsable/make "x" [{:t :thematic-break}])]
+      (is (re-find #"<hr/>" (render d))))
+    (let [d (collapsable/make "x" [(para {:t :cross-ref :label "sec:x" :target nil :text "??"})])]
+      (is (re-find #"\?\?" (render d))))
+    (let [d (collapsable/make "x" [{:t :not-a-real-block-type}])]
       (try
-        (collapsable/render-html d :html)
-        (is false "expected render-html to throw")
+        (render d)
+        (is false "expected render to throw")
         (catch clojure.lang.ExceptionInfo e
-          (is (= ::collapsable/unsupported-block (:type (ex-data e)))))))
-    (let [d (collapsable/make "x" [(para {:t :cross-ref :label "sec:x"})])]
+          (is (= :haselnuss.emit.html/unsupported-block (:type (ex-data e)))))))
+    (let [d (collapsable/make "x" [(para {:t :not-a-real-inline-type})])]
       (try
-        (collapsable/render-html d :html)
-        (is false "expected render-html to throw")
+        (render d)
+        (is false "expected render to throw")
         (catch clojure.lang.ExceptionInfo e
-          (is (= ::collapsable/unsupported-inline (:type (ex-data e)))))))))
+          (is (= :haselnuss.emit.html/unsupported-inline (:type (ex-data e)))))))))
 
 (deftest lower-ac1-native-renderer-kept-test
   (testing "AC #1/#3: lowering for :html keeps the collapsable directive
             as-is (its native renderer exists for that target), ready for
-            render-html to be called on it -- no build error"
+            the emitter to render it -- no build error"
     (let [d (collapsable/make "Click to expand"
                               [(para (str-inline "Hidden content"))]
                               {:id "collapse:1" :classes [] :props {}})
@@ -107,7 +150,7 @@
           lowered (lower/lower document :html registry-with-collapsable)
           kept (first (:blocks lowered))]
       (is (= d kept))
-      (is (re-find #"<details" (collapsable/render-html kept :html))))))
+      (is (re-find #"<details" (render kept))))))
 
 (deftest lower-ac2-blocks-fallback-test
   (testing "AC #2: the same collapsable directive renders as flattened
@@ -158,7 +201,7 @@
               directive (get-in lowered [:blocks 0 :blocks 0])]
           (is (= :directive (:t directive)))
           (is (ast/valid? ast/Document lowered))
-          (is (re-find #"<details" (collapsable/render-html directive :html)))))
+          (is (re-find #"<details" (render directive)))))
       (testing "latex target: the directive is fully flattened by lower"
         (let [lowered (lower/lower document :latex registry-with-collapsable)]
           (is (every? #(not= :directive (:t %)) (get-in lowered [:blocks 0 :blocks])))
@@ -179,28 +222,26 @@
             attribute -- previously silently dropped regardless of what
             attr.id was set to"
     (let [d (collapsable/make "Click to expand" [] {:id "collapse:1" :classes [] :props {}})]
-      (is (re-find #"<details id=\"collapse:1\" class=\"collapsable\">"
-                   (collapsable/render-html d :html)))))
+      (is (re-find #"<details id=\"collapse:1\" class=\"collapsable\">" (render d)))))
   (testing "no :id set -> no id=\"...\" attribute at all, rather than an
             empty or nil-string artifact"
     (let [d (collapsable/make "Click to expand" [])]
-      (is (re-find #"^<details class=\"collapsable\">" (collapsable/render-html d :html)))))
+      (is (re-find #"^<details class=\"collapsable\">" (render d)))))
   (testing "an :id with HTML-significant characters is still escaped, same
             as the summary/hidden-content text"
     (let [d (collapsable/make "x" [] {:id "collapse:\"><script>" :classes [] :props {}})]
-      (is (re-find #"id=\"collapse:&quot;&gt;&lt;script&gt;\"" (collapsable/render-html d :html)))))
+      (is (re-find #"id=\"collapse:&quot;&gt;&lt;script&gt;\"" (render d)))))
   (testing "review bug fix: caller-supplied attr.classes are appended to
             the rendered class=\"...\" attribute alongside the
             always-present collapsable class -- previously silently
             dropped entirely, only the hardcoded collapsable literal ever
             reached the output"
     (let [d (collapsable/make "x" [] {:classes ["note" "warning"] :props {}})]
-      (is (re-find #"<details class=\"collapsable note warning\">"
-                   (collapsable/render-html d :html)))))
+      (is (re-find #"<details class=\"collapsable note warning\">" (render d)))))
   (testing "a class with HTML-significant characters is escaped the same
             way id/summary/content are"
     (let [d (collapsable/make "x" [] {:classes ["a\"b"] :props {}})]
-      (is (re-find #"class=\"collapsable a&quot;b\"" (collapsable/render-html d :html)))))
+      (is (re-find #"class=\"collapsable a&quot;b\"" (render d)))))
   (testing "an id with NO recognized-kind prefix (e.g. a bare
             \"collapse:1\", used purely for the HTML anchor) is invisible to
             numbering -- haselnuss.resolver/number-document's numbering is
@@ -240,12 +281,16 @@
         (is (= "Figure 1" (:text cross-ref)))))))
 
 (deftest render-html-nested-collapsable-test
-  (testing "review bug fix: a collapsable nested inside another collapsable's
-            own hidden content renders correctly on the html target instead
-            of being misreported as an unsupported block -- lower's own AC #1
-            branch deliberately keeps a directive with a native :html
-            renderer as a :directive node (rather than flattening it), so
-            block->html must be able to recognize and render one"
+  (testing "review bug fix (kept true under TASK-89's full delegation to
+            the core emitter): a collapsable nested inside another
+            collapsable's own hidden content renders correctly on the html
+            target instead of being misreported as an unsupported block --
+            lower's own AC #1 branch deliberately keeps a directive with a
+            native :html renderer as a :directive node (rather than
+            flattening it), so the core emitter's own render-directive
+            must be able to recognize and render one, which it now does
+            through the ordinary registry rather than a name this
+            namespace has to hard-code"
     (let [inner (collapsable/make "Inner summary"
                                   [(para (str-inline "Inner hidden content"))]
                                   {:id "collapse:inner" :classes [] :props {}})
@@ -260,7 +305,7 @@
                 flattened, since both have a native :html renderer"
         (is (= :directive (:t outer')))
         (is (= :directive (:t inner'))))
-      (let [html (collapsable/render-html outer' :html)]
+      (let [html (render outer')]
         (is (re-find #"<details id=\"collapse:outer\" class=\"collapsable\">" html))
         (is (re-find #"<summary>Outer summary</summary>" html))
         (is (re-find #"<details id=\"collapse:inner\" class=\"collapsable\">" html))
@@ -269,18 +314,23 @@
         (is (< (.indexOf html "<summary>Outer summary</summary>")
                (.indexOf html "<summary>Inner summary</summary>")))
         (is (= 2 (count (re-seq #"<details" html))))))
-    (testing "a nested directive under any name other than \"collapsable\"
-              remains an explicit, documented unsupported case (no registry
-              access to dispatch it correctly) rather than being silently
-              mangled"
+    (testing "TASK-89: a nested directive under any OTHER name not in the
+              registry is still an error -- now the core emitter's own
+              ::unsupported-block (\"no native renderer for directive\"),
+              since dispatch is the ordinary registry lookup rather than
+              a hard-coded map of names this extension used to maintain
+              (a real capability change from before: this extension no
+              longer needs to know a nested directive's name in advance
+              at all, only the registry does)"
       (let [fake-directive {:t :directive :name "not-collapsable"
                             :attr {:classes [] :props {}} :blocks []}
             outer (collapsable/make "Outer" [fake-directive])]
         (try
-          (collapsable/render-html outer :html)
-          (is false "expected render-html to throw")
+          (render outer)
+          (is false "expected render to throw")
           (catch clojure.lang.ExceptionInfo e
-            (is (= ::collapsable/unsupported-block (:type (ex-data e))))))))))
+            (is (= :haselnuss.emit.html/unsupported-block (:type (ex-data e))))
+            (is (str/includes? (ex-message e) "not-collapsable"))))))))
 
 (deftest lower-rule-test
   (let [reg (registry/register {} collapsable/extension)
@@ -305,3 +355,11 @@
     (testing "the :html target still keeps the directive for its own
               native renderer -- the :lower rule must not shadow that"
       (is (= [:directive] (mapv :t (:blocks (lower/lower {:meta {} :blocks [authored]} :html reg))))))))
+
+(deftest extension-v2-and-trust-test
+  (testing "TASK-89: the registered :html renderer speaks the v2 contract"
+    (is (registry/v2? (get-in collapsable/extension [:emit :html]))))
+  (testing "TASK-89 AC #8: this extension is registered untrusted -- it
+            needs no [:raw ...] escape hatch, proving an untrusted
+            extension can still produce rich structured output"
+    (is (false? (:trusted (registry/lookup registry-with-collapsable "collapsable"))))))

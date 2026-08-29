@@ -381,6 +381,112 @@
         (catch clojure.lang.ExceptionInfo e
           (is (= ::html/unsupported-block (:type (ex-data e)))))))))
 
+(deftest v2-renderer-contract-test
+  (testing "TASK-89 AC #1/#2: a v2 renderer (registry/renderer-v2) returns
+            DATA -- hiccup here -- which this namespace serializes and
+            escapes itself, and can render its own nested content by
+            calling back into the emitter through ctx's own
+            :render-blocks -- a <p>, the ordinary core visitor's own
+            output, not something the renderer built by hand"
+    (let [reg (registry/register {} {:name "widget"
+                                     :emit {:html (registry/renderer-v2
+                                                   (fn [directive ctx]
+                                                     [:div {:class "widget"}
+                                                      [:strong (get-in directive [:attr :props "label"])]
+                                                      ((:render-blocks ctx) (:blocks directive))]))}})
+          d {:t :directive :name "widget"
+             :attr {:classes [] :props {"label" "<hi> & bye"}}
+             :blocks [(para (str-inline "nested <text>"))]}
+          out (body-of (html/emit-document {:meta {} :blocks [d]} {:registry reg}))]
+      (is (= (str "<div class=\"widget\"><strong>&lt;hi&gt; &amp; bye</strong>"
+                  "<p>nested &lt;text&gt;</p></div>")
+             out))))
+  (testing "AC #2, continued: a :note reached only through :render-blocks
+            still gets a real number in the surrounding document's own
+            footnote list -- the renderer itself never touches footnote
+            bookkeeping at all, `ctx`'s own callback does it invisibly"
+    (let [reg (registry/register {} {:name "widget"
+                                     :emit {:html (registry/renderer-v2
+                                                   (fn [directive ctx]
+                                                     ((:render-blocks ctx) (:blocks directive))))}})
+          d {:t :directive :name "widget" :attr empty-attr
+             :blocks [(para (str-inline "see") {:t :note :blocks [(para (str-inline "a note"))]})]}
+          out (html/emit-document {:meta {} :blocks [d]} {:registry reg})]
+      (is (re-find #"<sup id=\"fnref1\"><a href=\"#fn1\">1</a></sup>" out))
+      (is (re-find #"<li id=\"fn1\"><p>a note</p>" out))))
+  (testing "AC #8: an untrusted registration's [:raw ...] is a loud error
+            naming the directive, never a silent downgrade to escaped
+            text or a silent verbatim splice"
+    (let [reg (registry/register {} {:name "widget"
+                                     :emit {:html (registry/renderer-v2
+                                                   (fn [_d _ctx] [:raw "<script>evil</script>"]))}})
+          d {:t :directive :name "widget" :attr empty-attr :blocks []}]
+      (try
+        (html/emit-document {:meta {} :blocks [d]} {:registry reg})
+        (is false "expected emit-document to throw")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= ::html/untrusted-raw-output (:type (ex-data e))))
+          (is (str/includes? (ex-message e) "widget"))))))
+  (testing "AC #8, continued: the SAME registration with :trusted? true
+            lets [:raw ...] through verbatim -- the opt-in a renderer's
+            own code cannot grant itself, decided only by whoever
+            registered it"
+    (let [reg (registry/register {} {:name "widget" :trusted? true
+                                     :emit {:html (registry/renderer-v2
+                                                   (fn [_d _ctx] [:raw "<script>ok</script>"]))}})
+          d {:t :directive :name "widget" :attr empty-attr :blocks []}
+          out (body-of (html/emit-document {:meta {} :blocks [d]} {:registry reg}))]
+      (is (= "<script>ok</script>" out))))
+  (testing "AC #7: a legacy (fn [directive target] -> string) renderer,
+            registered with no renderer-v2 marker, is called and spliced
+            exactly as it was before TASK-89 -- registered alongside a v2
+            one in the SAME registry, so this is dispatch actually
+            distinguishing the two per-entry, not merely 'the emitter
+            still supports the old shape in isolation'"
+    (let [reg (-> {}
+                  (registry/register {:name "legacy"
+                                      :emit {:html (fn [directive _target]
+                                                     (str "<b>" (:name directive) "</b>"))}})
+                  (registry/register {:name "modern"
+                                      :emit {:html (registry/renderer-v2
+                                                    (fn [_d _ctx] [:i "modern"]))}}))
+          document {:meta {}
+                    :blocks [{:t :directive :name "legacy" :attr empty-attr :blocks []}
+                             {:t :directive :name "modern" :attr empty-attr :blocks []}]}
+          out (body-of (html/emit-document document {:registry reg}))]
+      (is (= "<b>legacy</b><i>modern</i>" out))))
+  (testing "review finding #1 (TASK-89): a hiccup element's own TAG
+            position is validated, independent of :raw/:trusted -- an
+            UNTRUSTED v2 renderer cannot inject markup by building a
+            keyword from directive-supplied data and using it as a tag,
+            since `element-attrs` escapes attribute names/values and
+            every child goes back through render-data, but nothing had
+            ever validated the tag itself before this fix. Reproduced
+            live before the fix: `[(keyword \"div onmouseover=..\") x]`
+            spliced that whole string into BOTH the opening and the
+            closing tag with no :raw node anywhere"
+    (let [evil-tag (keyword "div onmouseover=\"alert(1)\"")
+          reg (registry/register {} {:name "evil"
+                                     :emit {:html (registry/renderer-v2
+                                                   (fn [_d _ctx] [evil-tag "gotcha"]))}})
+          d {:t :directive :name "evil" :attr empty-attr :blocks []}]
+      (try
+        (html/emit-document {:meta {} :blocks [d]} {:registry reg})
+        (is false "expected emit-document to throw rather than splice the malformed tag")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= ::html/invalid-element-tag (:type (ex-data e))))
+          (is (str/includes? (ex-message e) "onmouseover"))))))
+  (testing "the same validation accepts every real element name this
+            codebase's own vocabulary needs, including a hyphenated
+            custom element -- the fix rejects a malformed tag, not
+            hiccup elements in general"
+    (let [reg (registry/register {} {:name "widget"
+                                     :emit {:html (registry/renderer-v2
+                                                   (fn [_d _ctx] [:my-widget {:class "x"} "hi"]))}})
+          d {:t :directive :name "widget" :attr empty-attr :blocks []}
+          out (body-of (html/emit-document {:meta {} :blocks [d]} {:registry reg}))]
+      (is (= "<my-widget class=\"x\">hi</my-widget>" out)))))
+
 (deftest unsupported-node-test
   (testing "with :thematic-break and :include both claimed by TASK-37
             (see thematic-break-test/include-test), every Block variant
@@ -877,3 +983,46 @@
               scale here and HTML did not (found by review)"
       (is (= "<img src=\"pic.png\" alt=\"p\" style=\"height: 2cm; zoom: 0.5\"/>"
              (img {"height" "2cm" "scale" "0.5"}))))))
+
+(deftest open-dispatch-test
+  (testing "TASK-88 AC #4: a caller can render a Block/Inline :t neither
+            this namespace nor haselnuss.emit.latex has ever heard of, by
+            supplying a handler via emit-document's own :block-handlers/
+            :inline-handlers opts -- no edit to either emitter file"
+    (let [document {:meta {}
+                    :blocks [(para (str-inline "before ")
+                                   {:t :redacted :text "secret"}
+                                   (str-inline " after"))
+                             {:t :callout :label "note"}]}
+          out (html/emit-document
+               document
+               {:inline-handlers
+                {:redacted (fn [_ctx inline footnotes]
+                             [(str "[REDACTED:" (count (:text inline)) "]") footnotes])}
+                :block-handlers
+                {:callout (fn [_ctx block footnotes]
+                            [(str "<div class=\"callout\">" (:label block) "</div>") footnotes])}})]
+      (is (str/includes? out "<p>before [REDACTED:6] after</p>"))
+      (is (str/includes? out "<div class=\"callout\">note</div>"))))
+  (testing "TASK-88 AC #5: a node type added for one document is not
+            visible to a later, unrelated emit-document call in the same
+            process -- the handler table is merged fresh per call from
+            built-in-block-handlers/built-in-inline-handlers, never a
+            mutated shared/global table (the concurrency/leakage property
+            a handler-table-in-context design has over defmethod)"
+    (let [callout-handler (fn [_ctx block footnotes]
+                            [(str "<div class=\"callout\">" (:label block) "</div>") footnotes])
+          with-handler (html/emit-document
+                        {:meta {} :blocks [{:t :callout :label "note"}]}
+                        {:block-handlers {:callout callout-handler}})
+          thrown (try
+                   (html/emit-document {:meta {} :blocks [{:t :callout :label "note"}]})
+                   nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+      (is (str/includes? with-handler "<div class=\"callout\">note</div>"))
+      (is (not (contains? html/built-in-block-handlers :callout))
+          "the built-in table itself must never be mutated by an opt")
+      (is (some? thrown)
+          "a later call with no :block-handlers opt must not see the earlier call's addition")
+      (is (= ::html/unsupported-block (:type (ex-data thrown))))
+      (is (str/includes? (ex-message thrown) ":callout")))))

@@ -23,6 +23,7 @@
             [haselnuss.cli :as cli]
             [haselnuss.extensions.front-matter :as front-matter]
             [haselnuss.parser :as parser]
+            [haselnuss.registry :as registry]
             [haselnuss.resolver :as resolver])
   (:import (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)))
@@ -226,7 +227,11 @@
             reached through a Para's Inlines and which an earlier version
             missed, so an abstract written inside one failed later in an
             emitter as a marker-called error naming neither the mistake
-            nor where it was"
+            nor where it was; also a footnote reached through a Figure's
+            or Table's own Caption Inlines rather than a Para's, since
+            TASK-88's port to haselnuss.walk/fold reaches every schema
+            position uniformly rather than the hand-picked set the
+            traversal once enumerated"
     (let [abstract {:t :directive :name "abstract" :attr {:classes [] :props {}} :blocks []}
           attr {:classes [] :props {}}
           wrap {:section {:t :section :level 1 :heading [] :attr attr :blocks [abstract]}
@@ -238,7 +243,12 @@
                 :directive {:t :directive :name "theorem" :attr attr :blocks [abstract]}
                 :note {:t :para :inlines [{:t :note :blocks [abstract]}]}
                 :note-in-emph {:t :para :inlines [{:t :emph :inlines
-                                                   [{:t :note :blocks [abstract]}]}]}}]
+                                                   [{:t :note :blocks [abstract]}]}]}
+                :figure-caption-note {:t :figure :attr attr :content {:t :para :inlines []}
+                                      :caption [{:t :note :blocks [abstract]}]}
+                :table-caption-note {:t :table :colspec [] :attr attr
+                                     :head {:cells []} :rows []
+                                     :caption [{:t :note :blocks [abstract]}]}}]
       (doseq [[position block] wrap]
         (let [thrown (try (front-matter/extract {:meta {} :blocks [block]})
                           nil
@@ -372,15 +382,21 @@
             registry is one table shared across targets and a consumer
             calling whatever it finds would otherwise splice something
             meaningless into its output. Same shape and reason as
-            latex/environment-renderer"
+            latex/environment-renderer. TASK-89: [directive ctx], the v2
+            contract, rather than [directive target] -- ctx a plain map
+            carrying :target, the way both emitters' own ctx now do"
     (let [thrown (try (front-matter/front-matter-renderer
-                       {:t :directive :name "abstract"} :html)
+                       {:t :directive :name "abstract"} {:target :html})
                       nil
                       (catch clojure.lang.ExceptionInfo e e))]
       (is (some? thrown))
       (is (= :haselnuss.extensions.front-matter/front-matter-marker-called
              (:type (ex-data thrown))))
-      (is (str/includes? (ex-message thrown) "abstract")))))
+      (is (str/includes? (ex-message thrown) "abstract"))
+      (is (str/includes? (ex-message thrown) ":html"))))
+  (testing "TASK-89: registered wrapped in renderer-v2, for both targets"
+    (is (registry/v2? (get-in front-matter/extensions [0 :emit :html])))
+    (is (registry/v2? (get-in front-matter/extensions [0 :emit :latex])))))
 
 (deftest front-matter-in-a-chaptered-report-test
   (testing "the \\abstractname rename works in BOTH classes this emitter

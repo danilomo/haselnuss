@@ -6,12 +6,8 @@
   `attr.props[\"summary\"]` label, same `:blocks` hidden content, same
   `:fallback {:kind :blocks}` degradation -- and it deliberately shares
   that namespace's rendering helpers (`collapsable/render-details`,
-  `collapsable/blocks->html`, `collapsable/fallback-for`) rather than
-  copying them, so the supported-content scope limit and the
-  `::collapsable/unsupported-block`/`::collapsable/unsupported-inline`
-  error types stay one definition. Content unsupported inside a
-  `small-collapsable` therefore raises those `collapsable`-namespaced
-  types; that is the shared renderer reporting, not a mis-attribution.
+  `collapsable/fallback-for`) rather than copying them, so the two stay
+  one definition.
 
   What differs is layout, and it is a two-state contract:
 
@@ -38,17 +34,22 @@
   revealed content would inherit the inline formatting context and run on
   in the same line.
 
-  Nesting: this namespace's own dispatch map recognizes both
-  `small-collapsable` (itself, recursively) and `collapsable` (delegated
-  to `collapsable/render-html`), so either can appear inside a
-  `small-collapsable`'s hidden content. The reverse case -- a
-  `small-collapsable` nested inside a plain `collapsable` -- is NOT
-  supported and raises `::collapsable/unsupported-block`: closing it would
-  mean `collapsable` requiring this namespace, i.e. a require cycle, and
-  the general fix is the registry-driven renderer dispatch
-  `haselnuss.extensions.collapsable`'s own docstring defers to TASK-19/21.
-  Named here rather than left to be discovered, per this codebase's
-  convention on scope limits.
+  Nesting (TASK-89): a directive nested inside this extension's own
+  hidden content -- `small-collapsable` recursively, a plain `collapsable`,
+  or any OTHER natively-rendered directive -- is rendered through `ctx`'s
+  own `:render-blocks` callback, the ordinary core emitter dispatch, so it
+  resolves through the registry exactly the way a top-level one does; this
+  namespace (like `collapsable`) no longer hand-maintains a dispatch map
+  of directive names it happens to know about. Before TASK-89, the OLD
+  `(fn [directive target] -> string)` registry contract gave a renderer
+  no way to reach the real emitter's own `render-blocks` at all, so this
+  namespace's own dispatch map recognized `small-collapsable`/
+  `collapsable` by name and nothing else -- in particular, the reverse
+  case, a `small-collapsable` nested inside a plain `collapsable`, was
+  NOT supported (closing it would have meant `collapsable` requiring this
+  namespace, a require cycle). `ctx`'s own `:render-blocks` closes that
+  gap for free: neither namespace requires the other, and either can now
+  nest inside the other, or inside any third native renderer, uniformly.
 
   Like `collapsable`, this extension registers no `:kind` (it takes part
   in no numbering scheme) and does register a `:lower` rule, without which
@@ -56,19 +57,8 @@
   *authored* directive -- one parsed from a `.hdoc` file never carries the
   `:fallback` that only `make` attaches."
   (:require [clojure.string :as str]
-            [haselnuss.extensions.collapsable :as collapsable]))
-
-(declare render-html)
-
-(def nested-renderers
-  "This extension's nested-directive dispatch (the map
-  `collapsable/blocks->html` documents): `small-collapsable` recursing
-  into itself, plus `collapsable` delegated to its own native renderer, so
-  either disclosure may appear inside a `small-collapsable`'s hidden
-  content. See the namespace docstring for why the mirror-image case is
-  not supported."
-  {"small-collapsable" (fn [directive target] (render-html directive target))
-   "collapsable" collapsable/render-html})
+            [haselnuss.extensions.collapsable :as collapsable]
+            [haselnuss.registry :as registry]))
 
 (defn label
   "`directive`'s own optional `attr.props[\"label\"]` -- a plain-text
@@ -85,33 +75,33 @@
   (get-in directive [:attr :props "label"]))
 
 (defn render-html
-  "This extension's native `:html` renderer (registered on `extension`):
-  renders `directive` as an HTML5 `<details>`/`<summary>` disclosure whose
-  revealed `:blocks` are wrapped in a `<div class=\"small-collapsable-body\">`.
-  That wrapper, plus the `small-collapsable` class on the `<details>`
-  element itself, are the two hooks the default stylesheet's inline-when-
-  collapsed / block-when-expanded rules attach to (see the namespace
-  docstring). `directive`'s own `attr.id` and `attr.classes` are carried
-  through exactly as `collapsable/render-details` carries them.
+  "This extension's native `:html` renderer (registered on `extension`,
+  TASK-89's v2 contract: `(fn [directive ctx] -> data)`, `renderer-v2`-
+  marked): renders `directive` as an HTML5 `<details>`/`<summary>`
+  disclosure whose revealed `:blocks` are wrapped in a `[:div {:class
+  \"small-collapsable-body\"}]`. That wrapper, plus the `small-collapsable`
+  class on the `<details>` element itself, are the two hooks the default
+  stylesheet's inline-when-collapsed / block-when-expanded rules attach to
+  (see the namespace docstring). `directive`'s own `attr.id` and
+  `attr.classes` are carried through exactly as
+  `collapsable/render-details` carries them.
 
-  An optional `label` (which see) is emitted as a `<span
-  class=\"small-collapsable-label\">` immediately BEFORE the `<details>`
+  An optional `label` (which see) is emitted as a `[:span {:class
+  \"small-collapsable-label\"}]` immediately BEFORE the `<details>`
   element rather than inside it: content before `<summary>` would not be
   valid inside `<details>`, and a span is inline-level, so the marker
-  joins the same flow the disclosures themselves lay out in.
-
-  `target` is accepted per the `(fn [directive target] ...)` call
-  signature `haselnuss.extensions.collapsable` established, but unused: an
-  `:html`-registered renderer is only ever invoked for the `:html` target."
-  [directive _target]
-  (str (when-let [marker (label directive)]
-         (str "<span class=\"small-collapsable-label\">"
-              (collapsable/escape-html marker)
-              "</span>"))
-       (collapsable/render-details {:base-class "small-collapsable"
-                                    :body-class "small-collapsable-body"
-                                    :nested nested-renderers}
-                                   directive)))
+  joins the same flow the disclosures themselves lay out in. The two are
+  returned as a fragment (a vector whose first child is not itself a tag
+  keyword -- see `haselnuss.emit.html/render-data`'s own docstring on
+  that vocabulary) rather than one wrapping element, since there is no
+  single element both belong inside."
+  [directive ctx]
+  (let [details (collapsable/render-details {:base-class "small-collapsable"
+                                             :body-class "small-collapsable-body"}
+                                            directive ctx)]
+    (if-let [marker (label directive)]
+      [[:span {:class "small-collapsable-label"} marker] details]
+      details)))
 
 (defn- flattened-head
   "The head a static target prints ahead of the no-longer-hidden content:
@@ -157,7 +147,7 @@
   An id-bearing one keeps a BlockQuote carrier around that content, for
   the reason `collapsable/lower-rule` records in full (TASK-51): the flat
   splice has nowhere to put the directive's own `attr.id`, and a
-  reference to it would then point at nothing in the emitted output."
+  reference to it would then point at nothing in the emitted LaTeX."
   [directive _target]
   (let [blocks (:blocks (collapsable/fallback-for (flattened-head directive)
                                                   (:blocks directive)))]
@@ -168,7 +158,11 @@
 (def extension
   "The registry entry for `small-collapsable`
   (`haselnuss.registry/register`'s own `{:name :kind? :emit? :lower?}`
-  shape): an `:html` renderer (the inline-flowing `<details>` widget) and
-  a `:lower` rule (the flattened degradation every other target gets).
-  Registered alongside `collapsable/extension` in `haselnuss.cli`."
-  {:name "small-collapsable" :emit {:html render-html} :lower lower-rule})
+  shape): an `:html` renderer (the inline-flowing `<details>` widget,
+  `renderer-v2`-marked -- TASK-89's v2 contract) and a `:lower` rule (the
+  flattened degradation every other target gets). Registered alongside
+  `collapsable/extension` in `haselnuss.cli`. No `:trusted?`, for the same
+  reason `collapsable/extension` has none: every Block/Inline this
+  renderer emits goes through ordinary hiccup elements and `ctx`'s own
+  `:render-blocks`, never a `[:raw ...]` node."
+  {:name "small-collapsable" :emit {:html (registry/renderer-v2 render-html)} :lower lower-rule})

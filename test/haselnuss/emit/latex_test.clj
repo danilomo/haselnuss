@@ -484,6 +484,84 @@
         (catch clojure.lang.ExceptionInfo e
           (is (= ::latex/unsupported-block (:type (ex-data e)))))))))
 
+(deftest v2-renderer-contract-test
+  (testing "TASK-89 AC #1/#2: a v2 renderer (registry/renderer-v2) returns
+            DATA, which this namespace serializes and escapes itself, and
+            can render its own nested content by calling back into the
+            emitter through ctx's own :render-blocks; a trusted
+            registration may ALSO splice genuinely raw TeX ([:raw ...])
+            around it -- proven compiling under a real pdflatex, not just
+            string-matched"
+    (let [reg (registry/register {} {:name "widget" :trusted? true
+                                     :emit {:latex (registry/renderer-v2
+                                                    (fn [directive ctx]
+                                                      [[:raw "\\begin{quote}\n"]
+                                                       ((:render-blocks ctx) (:blocks directive))
+                                                       [:raw "\n\\end{quote}"]]))}})
+          d {:t :directive :name "widget" :attr empty-attr
+             :blocks [{:t :para :inlines [{:t :str :text "50% & fancy"}]}]}
+          out (latex/emit-document {:meta {} :blocks [d]} {:registry reg})]
+      (is (re-find #"\\begin\{quote\}\n50\\% \\& fancy\n\\end\{quote\}" out)
+          "the raw wrapper is verbatim, the nested content is escaped by the core -- both in one
+          renderer's own output")
+      (assert-compiles! out)))
+  (testing "AC #1, continued: a v2 renderer's plain string return is
+            escaped exactly the way authored prose is -- not the
+            OLD contract's verbatim splice"
+    (let [reg (registry/register {} {:name "widget"
+                                     :emit {:latex (registry/renderer-v2
+                                                    (fn [_d _ctx] "100% & fine"))}})
+          d {:t :directive :name "widget" :attr empty-attr :blocks []}
+          out (latex/emit-document {:meta {} :blocks [d]} {:registry reg})]
+      (is (re-find #"100\\% \\& fine" out))
+      (assert-compiles! out)))
+  (testing "AC #8: an untrusted registration's [:raw ...] is a loud error
+            naming the directive, never a silent downgrade or splice"
+    (let [reg (registry/register {} {:name "widget"
+                                     :emit {:latex (registry/renderer-v2
+                                                    (fn [_d _ctx] [:raw "\\input{evil}"]))}})
+          d {:t :directive :name "widget" :attr empty-attr :blocks []}]
+      (try
+        (latex/emit-document {:meta {} :blocks [d]} {:registry reg})
+        (is false "expected emit-document to throw")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= ::latex/untrusted-raw-output (:type (ex-data e))))
+          (is (str/includes? (ex-message e) "widget"))))))
+  (testing "AC #7: a legacy (fn [directive target] -> string) renderer and
+            a v2 one coexist in the same registry, each dispatched by its
+            own marker rather than a global mode -- the legacy renderer's
+            own string still spliced verbatim exactly as before TASK-89"
+    (let [reg (-> {}
+                  (registry/register {:name "legacy"
+                                      :emit {:latex (fn [_d _t] "\\textbf{legacy}")}})
+                  (registry/register {:name "modern"
+                                      :emit {:latex (registry/renderer-v2
+                                                     (fn [_d _ctx] "100%"))}}))
+          document {:meta {}
+                    :blocks [{:t :directive :name "legacy" :blocks [] :attr empty-attr}
+                             {:t :directive :name "modern" :blocks [] :attr empty-attr}]}
+          out (latex/emit-document document {:registry reg})]
+      (is (re-find #"\\textbf\{legacy\}" out) "legacy: spliced verbatim, unescaped")
+      (is (re-find #"100\\%" out) "v2: escaped by the core")
+      (assert-compiles! out)))
+  (testing "AC #5: a character the emitted LaTeX cannot typeset is
+            reported for a v2 renderer's own returned text on the same
+            terms as for authored prose -- untypesettable-character-
+            diagnostics scans the whole emitted document regardless of
+            which renderer produced which part of it, so this needs no
+            plumbing of its own beyond routing a v2 renderer's plain
+            strings through escape-tex the way this test file's other
+            assertion already confirms"
+    (let [reg (registry/register {} {:name "widget"
+                                     :emit {:latex (registry/renderer-v2
+                                                    (fn [_d _ctx] "Greek: \u03b1"))}})
+          d {:t :directive :name "widget" :attr empty-attr :blocks []}
+          out (latex/emit-document {:meta {} :blocks [d]} {:registry reg})
+          warnings (latex/untypesettable-character-diagnostics out :document)]
+      (is (= 1 (count warnings)))
+      (is (= 0x03B1 (:code-point (first warnings))))
+      (is (str/includes? (:message (first warnings)) "the document")))))
+
 (deftest unsupported-node-test
   (testing "the fallback for a node outside the schema entirely. Every
             Block variant haselnuss.ast actually defines is handled now
@@ -2156,6 +2234,183 @@
       (is (str/includes? (:message diagnostic) "backslash"))
       (is (str/includes? (:message diagnostic) "unbalanced brace")))))
 
+(deftest unescapable-image-path-text-diagnostics-test
+  (testing "TASK-89 review finding #2: the same hazards, found by scanning
+            already-emitted LaTeX TEXT for \\includegraphics{...} rather
+            than walking the AST -- same shape, same message, since both
+            call the one shared helper (image-path-hazard-diagnostic)"
+    (let [document {:meta {} :blocks [(para {:t :image :src "pic\\x.png" :alt ""
+                                             :attr empty-attr})]}
+          out (latex/emit-document document)
+          from-text (latex/unescapable-image-path-text-diagnostics out)
+          from-ast (latex/unescapable-image-path-diagnostics document)]
+      (is (= from-ast from-text)
+          "both routes agree exactly on a backslash-only hazard -- it needs no fallback on
+           either side, unlike the brace-hazard shapes below")))
+  (testing "TASK-89 review finding #2's OWN regression, reproduced and
+            fixed: an unbalanced brace -- the other of the two hazards
+            image-path-hazards checks for, on an ORDINARY core Image, no
+            extension or :raw involved at all -- used to be silently
+            invisible to this text-based scan (a [^{}]*-shaped regex
+            structurally cannot locate an argument that itself contains a
+            brace), which was a real regression from pre-TASK-89 behavior
+            since haselnuss.cli had already stopped calling the AST-based
+            check by the time this shipped. Fixed via depth-aware
+            scanning (includegraphics-arg-end, mirroring
+            balanced-braces?), which correctly detects the hazard even
+            though its own :src falls back to a value carrying one extra
+            trailing } rather than the AST-based check's own exact value
+            -- haselnuss.cli (TASK-89 review comment #18) calls only this
+            function today, so that one-extra-} value is simply what a
+            caller sees for this shape, not something reconciled against
+            a second, AST-based scan any more"
+    (let [document {:meta {} :blocks [(para {:t :image :src "pic{x.png" :alt ""
+                                             :attr empty-attr})]}
+          out (latex/emit-document document)
+          [diagnostic :as diagnostics] (latex/unescapable-image-path-text-diagnostics out)]
+      (is (= [:unescapable-image-path] (map :type diagnostics))
+          "must not be silently empty -- this is the exact regression shape")
+      (is (= "pic{x.png}" (:src diagnostic))
+          "the documented fallback shape: the true src plus one trailing } this scan could
+           not resolve, not the AST value byte-for-byte")
+      (is (str/includes? (:message diagnostic) "unbalanced brace"))))
+  (testing "and the combined-hazard shape the AST-based test suite already
+            covers (a path carrying both a backslash and an unbalanced
+            brace at once) is caught here too, naming both"
+    (let [document {:meta {} :blocks [(para {:t :image :src "a\\b{c.png" :alt ""
+                                             :attr empty-attr})]}
+          out (latex/emit-document document)
+          [diagnostic] (latex/unescapable-image-path-text-diagnostics out)]
+      (is (str/includes? (:message diagnostic) "backslash"))
+      (is (str/includes? (:message diagnostic) "unbalanced brace"))))
+  (testing "TASK-89 review comment #11's own follow-up finding: a src
+            whose OWN hazard is a stray CLOSING brace with no matching
+            open before it is a DOCUMENTED, honest residual limitation of
+            THIS function specifically (includegraphics-arg-end's own
+            docstring has the full reasoning) -- depth-tracking resolves
+            at that FIRST stray }, which is the src's own, not render-
+            image's, so this function alone reports nothing for it.
+
+            A round of this task's own review (comment #11) once closed
+            this one level up, by having haselnuss.cli also run the
+            AST-based check directly on every core Image -- but
+            reconciling two scans over genuinely overlapping content
+            proved to need a comparison key with no notion of which
+            occurrence a diagnostic was about, and repeated fixes to that
+            key kept closing one live-reproduced bug and opening another
+            (TASK-89 review comments #12-14, #16, #17). haselnuss.cli now
+            calls only this function (comment #18), so this gap is an
+            ACCEPTED, universal limitation rather than something closed
+            one level up -- haselnuss.cli-test's own
+            unescapable-image-path-diagnostic-stray-closing-brace-test
+            pins exactly that (empty diagnostics through the real CLI
+            pipeline for this shape, on a core Image). The AST-based
+            check below still catches this shape when called directly --
+            it did not change, it is simply not wired into that pipeline
+            any more (haselnuss.emit.latex/unescapable-image-path-
+            diagnostics's own docstring has the full accounting)"
+    (let [document {:meta {} :blocks [(para {:t :image :src "a}b.png" :alt ""
+                                             :attr empty-attr})]}
+          out (latex/emit-document document)]
+      (is (empty? (latex/unescapable-image-path-text-diagnostics out))
+          "pinned, documented behavior -- not an oversight")
+      (is (seq (latex/unescapable-image-path-diagnostics document))
+          "the AST-based check, called directly, still catches what this one alone cannot --
+           it is simply not wired into haselnuss.cli's own pipeline any more")))
+  (testing "and an ordinary path carrying a LEGITIMATE, balanced internal
+            brace pair still warns about nothing -- the fix for the
+            regression above must not turn every brace into a false
+            positive"
+    (let [document {:meta {} :blocks [(para {:t :image :src "figures/plot_1{a}.png"
+                                             :alt "" :attr empty-attr})]}
+          out (latex/emit-document document)]
+      (is (empty? (latex/unescapable-image-path-text-diagnostics out)))))
+  (testing "an ordinary path SCALED via render-image's own \\adjustbox{
+            scale=...}{\\includegraphics[...]{...}} wrapping still warns
+            about nothing -- review comment #11's own follow-up finding,
+            reproduced against the real thesis fixture: an earlier
+            'find the LAST } before a bound' version of this scan read
+            the wrapper's own closing brace as part of the argument,
+            reporting a false positive (:src \"tree.png}\") on ordinary,
+            shipped content; depth-tracking to the FIRST point depth
+            returns to zero never reaches that wrapper's own brace at
+            all, since the argument's own true close always comes first"
+    (let [document {:meta {} :blocks [(para {:t :image :src "tree.png" :alt ""
+                                             :attr {:classes [] :props {"scale" "0.5"}}})]}
+          out (latex/emit-document document)]
+      (is (str/includes? out "\\adjustbox{scale=0.5}")
+          "confirms the fixture actually exercises the wrapped shape, not just a plain Image")
+      (is (empty? (latex/unescapable-image-path-text-diagnostics out)))))
+  (testing "two hazardous images sharing one paragraph (two
+            \\includegraphics calls on the same line), the FIRST one
+            unbalanced -- includegraphics-arg-end's own per-occurrence
+            bound is what keeps the first image's own fallback scan from
+            running straight into the second image's own text: without
+            it, an earlier version of this fix reported one diagnostic
+            whose :src spanned both images' own \\includegraphics calls"
+    (let [document {:meta {}
+                    :blocks [(para {:t :image :src "x{y.png" :alt "" :attr empty-attr}
+                                   (str-inline " ")
+                                   {:t :image :src "z\\w.png" :alt "" :attr empty-attr})]}
+          out (latex/emit-document document)
+          diagnostics (latex/unescapable-image-path-text-diagnostics out)]
+      (is (= ["x{y.png} " "z\\w.png"] (map :src diagnostics))
+          "the first image's own fallback stops at the second \\includegraphics's own start,
+           not somewhere inside it")))
+  (testing "an argument that never closes at all, even within reach --
+            unreachable through any core Image (render-image always
+            appends its own closing }), so only exercised directly here:
+            a hand-written string with no closing brace whatsoever is
+            still reported, forced unbalanced regardless of what the
+            leftover fragment itself contains"
+    (let [[diagnostic :as diagnostics]
+          (latex/unescapable-image-path-text-diagnostics "\\includegraphics{never-closes-at-all")]
+      (is (= [:unescapable-image-path] (map :type diagnostics)))
+      (is (= "never-closes-at-all" (:src diagnostic)))
+      (is (str/includes? (:message diagnostic) "unbalanced brace"))))
+  (testing "AC #5, the gap this closes: a TRUSTED v2 renderer's own [:raw
+            ...] \\includegraphics is invisible to the AST-based check --
+            it never becomes an :image node at any stage -- but the
+            text-based scan sees it, on the same emitted output the
+            character-safety check (untypesettable-character-diagnostics)
+            already reads. Reproduces the review's own finding directly"
+    (let [reg (registry/register {} {:name "widget" :trusted? true
+                                     :emit {:latex (registry/renderer-v2
+                                                    (fn [_d _ctx]
+                                                      [:raw "\\includegraphics{a\\b.png}"]))}})
+          d {:t :directive :name "widget" :attr empty-attr :blocks []}
+          out (latex/emit-document {:meta {} :blocks [d]} {:registry reg})
+          [diagnostic :as diagnostics] (latex/unescapable-image-path-text-diagnostics out)]
+      (is (empty? (latex/unescapable-image-path-diagnostics {:meta {} :blocks [d]}))
+          "confirms the AST-based check really cannot see this -- the gap is real, not assumed")
+      (is (= [:unescapable-image-path] (map :type diagnostics)))
+      (is (= "a\\b.png" (:src diagnostic)))
+      (is (str/includes? (:message diagnostic) "backslash"))))
+  (testing "the same hazard reached through an UNTRUSTED renderer's own
+            attempt never reaches the output at all -- render-directive's
+            own trust gate throws first, so there is nothing here for
+            this scan to find or not find"
+    (let [reg (registry/register {} {:name "widget"
+                                     :emit {:latex (registry/renderer-v2
+                                                    (fn [_d _ctx]
+                                                      [:raw "\\includegraphics{a\\b.png}"]))}})
+          d {:t :directive :name "widget" :attr empty-attr :blocks []}]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"widget"
+                            (latex/emit-document {:meta {} :blocks [d]} {:registry reg})))))
+  (testing "an ordinary path (including one embedded in a \\includegraphics
+            with an option list, the shape render-image actually emits)
+            warns about nothing"
+    (is (empty? (latex/unescapable-image-path-text-diagnostics
+                 "\\includegraphics[width=1cm]{figures/plot_1.png}"))))
+  (testing "documented residual limitation (TASK-89 review finding #2,
+            haselnuss.registry's own :trusted? docstring names it too):
+            this scan is fixed to \\includegraphics specifically, so a
+            :raw node writing some OTHER path-bearing command with the
+            same class of hazard warns about nothing -- pinned here as a
+            known, tested limitation rather than an undiscovered gap"
+    (is (empty? (latex/unescapable-image-path-text-diagnostics "\\input{a\\b.tex}"))
+        "a raw \\input carrying the identical backslash hazard is not recognized by this scan")))
+
 (deftest directive-lexicon-kinds-test
   (testing "TASK-48: the built-in table reads out as a plain
             name -> kind-keyword map, which is what the resolver's
@@ -3009,3 +3264,43 @@
           out (latex/emit-document document {:registry environment-registry :fragment true})]
       (is (not (str/includes? out "\\pagenumbering")))
       (is (not (str/includes? out "\\hypersetup"))))))
+
+(deftest open-dispatch-test
+  (testing "TASK-88 AC #4: a caller can render a Block/Inline :t neither
+            this namespace nor haselnuss.emit.html has ever heard of, by
+            supplying a handler via emit-document's own :block-handlers/
+            :inline-handlers opts -- no edit to either emitter file"
+    (let [document {:meta {}
+                    :blocks [(para (str-inline "before ")
+                                   {:t :redacted :text "secret"}
+                                   (str-inline " after"))
+                             {:t :callout :label "note"}]}
+          out (latex/emit-document
+               document
+               {:inline-handlers
+                {:redacted (fn [_ctx inline] (str "[REDACTED:" (count (:text inline)) "]"))}
+                :block-handlers
+                {:callout (fn [_ctx block] (str "\\begin{quote}" (:label block) "\\end{quote}"))}})]
+      (is (str/includes? out "before [REDACTED:6] after"))
+      (is (str/includes? out "\\begin{quote}note\\end{quote}"))))
+  (testing "TASK-88 AC #5: a node type added for one document is not
+            visible to a later, unrelated emit-document call in the same
+            process -- the handler table is merged fresh per call from
+            built-in-block-handlers/built-in-inline-handlers, never a
+            mutated shared/global table (the concurrency/leakage property
+            a handler-table-in-context design has over defmethod)"
+    (let [callout-handler (fn [_ctx block] (str "\\begin{quote}" (:label block) "\\end{quote}"))
+          with-handler (latex/emit-document
+                        {:meta {} :blocks [{:t :callout :label "note"}]}
+                        {:block-handlers {:callout callout-handler}})
+          thrown (try
+                   (latex/emit-document {:meta {} :blocks [{:t :callout :label "note"}]})
+                   nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+      (is (str/includes? with-handler "\\begin{quote}note\\end{quote}"))
+      (is (not (contains? latex/built-in-block-handlers :callout))
+          "the built-in table itself must never be mutated by an opt")
+      (is (some? thrown)
+          "a later call with no :block-handlers opt must not see the earlier call's addition")
+      (is (= ::latex/unsupported-block (:type (ex-data thrown))))
+      (is (str/includes? (ex-message thrown) ":callout")))))

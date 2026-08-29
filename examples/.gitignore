@@ -1,5 +1,6 @@
 # This directory holds sources only: the .hdoc documents, the CSL-JSON
-# bibliography they name, and the figure they include. Anything else here is
+# bibliography they name, the figure they include, and (TASK-92) a sidecar
+# .clj file an .hdoc document loads via --extensions. Anything else here is
 # something a build produced.
 #
 # So: a whitelist, not a list of artifact extensions (TASK-50.5). The
@@ -26,4 +27,5 @@
 !.gitignore
 !*.hdoc
 !*.json
+!*.clj
 !catkins.png

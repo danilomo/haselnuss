@@ -373,46 +373,79 @@
        text-html)
      footnotes']))
 
+(def built-in-inline-handlers
+  "The built-in `:t -> (fn [ctx inline footnotes] -> [rendered
+  footnotes'])` table `render-inline` dispatches through (TASK-88): every
+  Inline variant this namespace's own docstring documents, contributed as
+  data rather than as `case` branches, so `emit-document`'s own
+  `:inline-handlers` opt can merge in a node type neither this file nor
+  `haselnuss.emit.latex` has ever heard of, for one document, with no
+  edit here (AC #2/#4).
+
+  Most entries reference an existing render function directly, since its
+  own signature already matches this table's `(ctx inline footnotes)`
+  contract (`render-note`, `render-cite`); the rest are small adapter
+  `fn`s wrapping a narrower-signatured helper that needs no `ctx`/
+  `footnotes` of its own (`render-math-inline`, `render-cross-ref`), or
+  inlining what used to be a one-line `case` body directly."
+  {:str (fn [_ctx inline footnotes] [(escape-html (:text inline)) footnotes])
+   :space (fn [_ctx _inline footnotes] [" " footnotes])
+   :soft-break (fn [_ctx _inline footnotes] ["\n" footnotes])
+   :line-break (fn [_ctx _inline footnotes] ["<br/>" footnotes])
+   :emph (fn [ctx inline footnotes] (render-wrapped ctx inline footnotes "<em>" "</em>"))
+   :strong (fn [ctx inline footnotes] (render-wrapped ctx inline footnotes "<strong>" "</strong>"))
+   ;; A stylistic strikethrough, not a "this was deleted" edit annotation
+   ;; -- `<s>` carries presentation semantics, unlike `<del>`.
+   :strike (fn [ctx inline footnotes] (render-wrapped ctx inline footnotes "<s>" "</s>"))
+   ;; No native HTML small-caps element; an inline `font-variant` style
+   ;; renders correctly with no dependency on an external stylesheet.
+   :small-caps (fn [ctx inline footnotes]
+                 (render-wrapped ctx inline footnotes
+                                 "<span style=\"font-variant: small-caps;\">" "</span>"))
+   :sub (fn [ctx inline footnotes] (render-wrapped ctx inline footnotes "<sub>" "</sub>"))
+   :sup (fn [ctx inline footnotes] (render-wrapped ctx inline footnotes "<sup>" "</sup>"))
+   :code (fn [_ctx inline footnotes]
+           [(str "<code>" (escape-html (:text inline)) "</code>") footnotes])
+   :link (fn [ctx inline footnotes]
+           (render-wrapped ctx inline footnotes
+                           (str "<a href=\"" (escape-html (:target inline)) "\""
+                                (attr-attrs (:attr inline)) ">")
+                           "</a>"))
+   :image (fn [_ctx inline footnotes]
+            [(str "<img src=\"" (escape-html (:src inline)) "\" alt=\""
+                  (escape-html (:alt inline)) "\""
+                  (attr-attrs (image-attr (:attr inline))) "/>")
+             footnotes])
+   :span (fn [ctx inline footnotes]
+           (render-wrapped ctx inline footnotes
+                           (str "<span" (attr-attrs (:attr inline)) ">") "</span>"))
+   :note render-note
+   :math-inline (fn [_ctx inline footnotes] [(render-math-inline inline) footnotes])
+   :cross-ref (fn [_ctx inline footnotes] [(render-cross-ref inline) footnotes])
+   :cite render-cite})
+
+(defn- unsupported-inline!
+  "The declared default `render-inline` dispatches an unrecognized Inline
+  `:t` to (TASK-88 AC #3): raises the same `ex-info` (`:type
+  ::unsupported-inline`) this namespace has always raised for a variant
+  outside its documented scope, naming it -- unchanged from the `case`
+  fallthrough this default replaces, so the failure mode a caller already
+  handles for keeps working."
+  [_ctx inline _footnotes]
+  (throw (ex-info
+          (str "html emitter does not support inline type " (pr-str (:t inline)))
+          {:type ::unsupported-inline :inline inline})))
+
 (defn- render-inline
   "Renders one Inline (`haselnuss.ast/Inline`) to `[html footnotes']`
-  (`footnotes` threaded per this namespace's own docstring). Covers this
-  task's documented Inline scope; every other variant raises `ex-info`
-  (`:type ::unsupported-inline`)."
+  (`footnotes` threaded per this namespace's own docstring): looks
+  `inline`'s own `:t` up in `ctx`'s `:inline-handlers` table (TASK-88 AC
+  #1 -- `built-in-inline-handlers` merged with any document-specific
+  additions `emit-document`'s own `:inline-handlers` opt supplied) and
+  calls the handler found there, or `unsupported-inline!` when there is
+  none."
   [ctx inline footnotes]
-  (case (:t inline)
-    :str [(escape-html (:text inline)) footnotes]
-    :space [" " footnotes]
-    :soft-break ["\n" footnotes]
-    :line-break ["<br/>" footnotes]
-    :emph (render-wrapped ctx inline footnotes "<em>" "</em>")
-    :strong (render-wrapped ctx inline footnotes "<strong>" "</strong>")
-    ;; A stylistic strikethrough, not a "this was deleted" edit annotation
-    ;; -- `<s>` carries presentation semantics, unlike `<del>`.
-    :strike (render-wrapped ctx inline footnotes "<s>" "</s>")
-    ;; No native HTML small-caps element; an inline `font-variant` style
-    ;; renders correctly with no dependency on an external stylesheet.
-    :small-caps (render-wrapped ctx inline footnotes
-                                "<span style=\"font-variant: small-caps;\">" "</span>")
-    :sub (render-wrapped ctx inline footnotes "<sub>" "</sub>")
-    :sup (render-wrapped ctx inline footnotes "<sup>" "</sup>")
-    :code [(str "<code>" (escape-html (:text inline)) "</code>") footnotes]
-    :link
-    (render-wrapped ctx inline footnotes
-                    (str "<a href=\"" (escape-html (:target inline)) "\""
-                         (attr-attrs (:attr inline)) ">")
-                    "</a>")
-    :image
-    [(str "<img src=\"" (escape-html (:src inline)) "\" alt=\"" (escape-html (:alt inline)) "\""
-          (attr-attrs (image-attr (:attr inline))) "/>")
-     footnotes]
-    :span (render-wrapped ctx inline footnotes (str "<span" (attr-attrs (:attr inline)) ">") "</span>")
-    :note (render-note ctx inline footnotes)
-    :math-inline [(render-math-inline inline) footnotes]
-    :cross-ref [(render-cross-ref inline) footnotes]
-    :cite (render-cite ctx inline footnotes)
-    (throw (ex-info
-            (str "html emitter does not support inline type " (pr-str (:t inline)))
-            {:type ::unsupported-inline :inline inline}))))
+  ((get (:inline-handlers ctx) (:t inline) unsupported-inline!) ctx inline footnotes))
 
 (defn- render-inlines
   "`render-inline` folded over every Inline in `inlines`, in order,
@@ -830,6 +863,194 @@
           entries-html "</nav>")
      footnotes']))
 
+(defrecord Rendered
+  ;; TASK-89: the wrapper `ctx`'s `:render-blocks`/`:render-inlines`
+  ;; callbacks return -- "this HTML string was already produced by this
+  ;; namespace's own render pipeline (which already escaped whatever
+  ;; needed it), splice it verbatim" -- see `RenderData`'s own docstring
+  ;; for why this is a distinct type from the trust-gated `[:raw ...]`
+  ;; rather than the same mechanism: a v2 renderer cannot itself produce
+  ;; one just by returning the right-looking data (a plain vector/keyword
+  ;; pair is trivial to construct; `->Rendered` is an ordinary function in
+  ;; THIS namespace, not one a v2 renderer is handed), and once TASK-90's
+  ;; sandbox excludes this namespace from its own allowed-namespace list
+  ;; it becomes unreachable outright rather than merely inconvenient --
+  ;; adequate for today's threat model (doc-6: "prevent accident and
+  ;; casual mischief, not a determined attacker").
+           [html])
+
+(defprotocol ^:private RenderData
+  (render-data [node ctx]
+    "Serializes a v2 renderer's return value `node` (TASK-89) to an HTML
+    string, applying exactly the escaping/error behavior this namespace's
+    own core rendering already gets, over this small vocabulary:
+
+    - `nil` -- `\"\"`.
+    - a `String` or `Keyword` -- HTML-escaped text (`escape-html`; a
+      Keyword renders as its own bare `name`, escaped the same way).
+    - a `Number` -- `str`-ed then escaped, for a renderer that hands back
+      a bare count/id/etc. rather than pre-stringifying it.
+    - a vector `[:raw s]` -- `s` spliced verbatim, no escaping at all --
+      the one way to emit output that has to be genuinely raw (a
+      browser-only interactive widget, doc-5's own motivating case) --
+      but ONLY when `ctx`'s own `:trusted?` is true (set by
+      `render-directive` from the DISPATCHED entry's own `:trusted`,
+      which a renderer's own code never controls); otherwise a loud
+      `ex-info` naming the directive, never a silent downgrade to escaped
+      text and never a silent splice.
+    - a vector `[tag attrs? & children]`, `tag` a keyword other than
+      `:raw`, `attrs?` an optional leading map -- a hiccup-shaped HTML
+      element: `<tag attrs>children</tag>`, `attrs`' own keys/values
+      escaped as an ordinary attribute (`element-attrs`), each child
+      itself `render-data`-ed and concatenated.
+    - any other vector, or any `ISeq` (a `map`/`for`/`list` result) --
+      a FRAGMENT: every child `render-data`-ed and concatenated, no
+      wrapping tag at all. (A vector fragment whose own first child could
+      itself be mistaken for a tag keyword should use `list`/`seq`
+      instead, which is never read as an element in any hiccup
+      convention -- see this method's own `IPersistentVector` clause.)
+    - a `Rendered` (this namespace's own -- see its own docstring) --
+      spliced verbatim, unconditionally: it is this namespace's own
+      already-rendered, already-escaped output, returned by `ctx`'s
+      `:render-blocks`/`:render-inlines` callbacks, never something a v2
+      renderer's own code constructs.
+    - anything else -- a loud `ex-info` naming the value and its class,
+      rather than silently stringifying or dropping something a renderer
+      almost certainly did not mean to return this way."))
+
+(defn- element-attr-name
+  "The literal attribute name a hiccup attrs-map key `k` becomes: a
+  Keyword's own bare `name` (`:data-x` -> `\"data-x\"`), else `str`."
+  [k]
+  (if (keyword? k) (name k) (str k)))
+
+(defn- element-attrs
+  "Every escaped ` name=\"value\"` HTML attribute fragment for hiccup
+  attrs map `attrs`, concatenated in a fixed, deterministic order: `:id`
+  first, then `:class`, then every other key sorted by its own attribute
+  name -- the same `id`, then `class`, then the rest order `attr-attrs`
+  already uses for a core Block's own Attr (TASK-89's hiccup vocabulary
+  deliberately mirrors it rather than depending on hash-map iteration
+  order, which Clojure makes no guarantee about). A key mapped to `nil`
+  contributes nothing at all -- omitted, not an empty attribute -- the
+  same `(when id ...)` convention `attr-attrs` already uses for a Block
+  with no id of its own."
+  [attrs]
+  (let [known [:id :class]
+        ordered (concat (filter #(contains? attrs %) known)
+                        (sort-by element-attr-name (remove (set known) (keys attrs))))]
+    (apply str
+           (keep (fn [k]
+                   (when-let [v (get attrs k)]
+                     (str " " (escape-html (element-attr-name k)) "=\""
+                          (escape-html (str v)) "\"")))
+                 ordered))))
+
+(def ^:private element-tag-name-re
+  "The only shape a hiccup element's own tag name (`render-element`) may
+  take: an ASCII letter, then any run of ASCII letters/digits/hyphens --
+  every real HTML element name, including a hyphenated custom element
+  (`<my-widget>`), and nothing able to break out of the tag position in
+  the surrounding markup: no whitespace, `\"`/`'`, `<`/`>`, `/`, `=`, or
+  anything else an attribute or a second tag could be smuggled in with.
+
+  This exists because the tag position is structure, not escapable text
+  -- `element-attrs` already escapes every attribute name/value, and
+  every child goes back through `render-data`, but nothing validated
+  `tag` itself before this (TASK-89 review finding #1, reproduced live:
+  an UNTRUSTED registration returning `[(keyword \"div onmouseover=..\")
+  \"x\"]` spliced that whole string into both the opening and the
+  closing tag, no `:raw`/`:trusted?` involved at all -- exactly the
+  injection AC #1/#8 and doc-6 decision #3 exist to make structurally
+  impossible, not merely filtered). Validating the tag closes it the
+  same way `element-attrs` already closes the attribute position: by
+  construction, before a single character of it reaches the output,
+  rather than by trying to escape a value that is supposed to be HTML
+  syntax (a tag name), not text."
+  #"[a-zA-Z][a-zA-Z0-9-]*")
+
+(defn- element-tag-name!
+  "`tag`'s own `name`, validated against `element-tag-name-re` -- anything
+  else raises a loud `ex-info` (`:type ::invalid-element-tag`) naming the
+  offending value, rather than splicing it into the output. See
+  `element-tag-name-re`'s own docstring for why this check exists at
+  all: an untrusted v2 renderer has no way to reach the output through a
+  malformed tag, trusted or not, since this throws before `render-element`
+  ever builds a string with it."
+  [tag]
+  (let [n (name tag)]
+    (if (re-matches element-tag-name-re n)
+      n
+      (throw (ex-info
+              (str "html emitter cannot use " (pr-str tag) " as a hiccup element tag: a tag "
+                   "name must match " (pr-str (str element-tag-name-re)) ", so it cannot inject "
+                   "markup outside the tag position it appears in")
+              {:type ::invalid-element-tag :tag tag})))))
+
+(defn- render-element
+  "One hiccup element `<tag attrs>children</tag>` -- `tag` a keyword,
+  validated by `element-tag-name!` before either tag is built, `rest-args`
+  everything after it in the vector `render-data`'s own
+  `IPersistentVector` clause matched, an optional leading attrs map then
+  every child, each `render-data`-ed against `ctx` and concatenated."
+  [tag rest-args ctx]
+  (let [[attrs children] (if (map? (first rest-args))
+                           [(first rest-args) (rest rest-args)]
+                           [nil rest-args])
+        tag-name (element-tag-name! tag)]
+    (str "<" tag-name (element-attrs attrs) ">"
+         (apply str (map #(render-data % ctx) children))
+         "</" tag-name ">")))
+
+(defn- untrusted-raw-output!
+  "Raises the `ex-info` (`:type ::untrusted-raw-output`) a `[:raw ...]`
+  node in `ctx`'s current v2 renderer's return value gets when that
+  renderer's own registry entry is not `:trusted` (`register`'s own
+  `:trusted?`, TASK-89 AC #8) -- naming the directive so the build says
+  which extension tried to emit unescaped output without the opt-in,
+  rather than silently downgrading it to escaped text (which would leave
+  a widget's own script mangled and unrunnable) or silently splicing it
+  (which is exactly the injection this contract exists to close off)."
+  [ctx]
+  (throw (ex-info
+          (str "directive " (pr-str (:directive-name ctx)) "'s renderer returned a [:raw ...] "
+               "node, but its own registry entry is not :trusted -- only a registration with "
+               ":trusted? true (haselnuss.registry/register) may emit unescaped output")
+          {:type ::untrusted-raw-output :directive-name (:directive-name ctx)})))
+
+(extend-protocol RenderData
+  nil
+  (render-data [_ _ctx] "")
+
+  String
+  (render-data [s _ctx] (escape-html s))
+
+  clojure.lang.Keyword
+  (render-data [k _ctx] (escape-html (name k)))
+
+  Number
+  (render-data [n _ctx] (escape-html (str n)))
+
+  Rendered
+  (render-data [r _ctx] (:html r))
+
+  clojure.lang.IPersistentVector
+  (render-data [v ctx]
+    (cond
+      (= :raw (first v)) (if (:trusted? ctx) (second v) (untrusted-raw-output! ctx))
+      (keyword? (first v)) (render-element (first v) (rest v) ctx)
+      :else (apply str (map #(render-data % ctx) v))))
+
+  clojure.lang.ISeq
+  (render-data [s ctx] (apply str (map #(render-data % ctx) s)))
+
+  Object
+  (render-data [x _ctx]
+    (throw (ex-info
+            (str "html emitter cannot serialize a v2 renderer's return value of type "
+                 (pr-str (class x)) ": " (pr-str x))
+            {:type ::unrenderable-data :value x}))))
+
 (defn- render-directive
   "Dispatches Directive `directive` to its own native `:html` renderer,
   looked up in `registry` (an optional `haselnuss.registry` map, from
@@ -837,24 +1058,109 @@
   docstring for why calling it is this task's job. No registry at all, or
   no renderer registered for `directive`'s name, raises `ex-info` (`:type
   ::unsupported-block`) naming the directive, exactly like any other
-  unsupported block type; the renderer's own return value is spliced in
-  verbatim, `footnotes` unchanged (see docstring: an extension's own
-  nested content is opaque to this namespace's footnote accumulator)."
+  unsupported block type.
+
+  Two renderer contracts share this one dispatch point (TASK-89 --
+  `haselnuss.registry/register`'s own `:emit` docstring and
+  `renderer-v2`'s docstring have the full split):
+
+  - a v2 renderer (`registry/v2?`) is called `(renderer directive ctx')`,
+    `ctx'` this call's own `ctx` plus `:directive-name` (for a clear
+    diagnostic), `:trusted?` (this directive's own registry entry, so an
+    untrusted extension's `[:raw ...]` attempt is a loud error rather
+    than a silent bypass or downgrade -- AC #8) and
+    `:render-blocks`/`:render-inlines` -- callbacks a renderer uses to
+    render its own nested content through this very emitter (AC #2),
+    each closing over a footnotes accumulator of its own so a `:note`
+    reached through one still gets a real number in the surrounding
+    document's own footnote list, entirely invisibly to the renderer
+    itself (it only ever sees the returned `Rendered` HTML, never
+    `footnotes` at all). The renderer's return value is DATA this
+    namespace serializes and escapes via `render-data`/`RenderData`
+    (AC #1) rather than a string spliced verbatim, which is what makes
+    injection through it structurally impossible rather than merely
+    filtered.
+  - a legacy renderer (anything else callable) is called `(renderer
+    directive :html)`, its returned string spliced in verbatim,
+    `footnotes` unchanged -- exactly this namespace's own pre-TASK-89
+    behavior, preserved so a renderer registered before TASK-89 is not
+    broken by it (AC #7)."
   [{:keys [registry] :as ctx} {directive-name :name :as directive} footnotes]
-  (if-let [spec (derived-lists/spec directive)]
-    ;; A list placeholder is drawn here, from the resolver's own
-    ;; derivations, rather than by the marker the registry holds for it
-    ;; (TASK-59) -- a list entry carries Inline content, which the
-    ;; registry's `(fn [directive target])` signature gives no way to
-    ;; render. Checked before the registry so the marker is never
-    ;; called, the same order `haselnuss.emit.latex/render-directive`
-    ;; uses for its own environment table.
-    (render-derived-list ctx spec directive footnotes)
-    (if-let [renderer (some-> registry (registry/lookup directive-name) (registry/renderer :html))]
+  (let [entry (some-> registry (registry/lookup directive-name))
+        renderer (registry/renderer entry :html)]
+    (cond
+      (and (ifn? renderer) (registry/v2? renderer))
+      (let [footnotes-atom (atom footnotes)
+            ctx' (assoc ctx
+                        :directive-name directive-name
+                        :trusted? (boolean (:trusted entry))
+                        :render-blocks (fn [blocks]
+                                         (let [[html fs'] (render-blocks ctx blocks @footnotes-atom)]
+                                           (reset! footnotes-atom fs')
+                                           (->Rendered html)))
+                        :render-inlines (fn [inlines]
+                                          (let [[html fs'] (render-inlines ctx inlines
+                                                                           @footnotes-atom)]
+                                            (reset! footnotes-atom fs')
+                                            (->Rendered html))))]
+        [(render-data (renderer directive ctx') ctx') @footnotes-atom])
+
+      (ifn? renderer)
       [(renderer directive :html) footnotes]
+
+      :else
       (throw (ex-info
               (str "html emitter has no native renderer for directive " (pr-str directive-name))
               {:type ::unsupported-block :block directive})))))
+
+(defn- derived-list-renderer
+  "`render-derived-list`, adapted to TASK-89's v2 contract (`registry/
+  renderer-v2` wraps this before `register-derived-lists` installs it):
+  `[directive ctx] -> Rendered`, rather than `[ctx spec directive
+  footnotes] -> [html footnotes']`.
+
+  Deliberately the thinnest possible adapter, not a rewrite into hiccup:
+  `render-derived-list` and everything it calls
+  (`render-toc-entries`/`render-float-list-entries`/`attr-attrs`/
+  `escape-html`) already are this namespace's own core code, already
+  escaping through the exact same functions core Block rendering does --
+  wrapping its unmodified output in `Rendered` is honest about that
+  (\"this namespace already rendered and escaped this\"), rather than
+  re-expressing already-correct, already-tested string-building as
+  hiccup for no safety benefit. `footnotes` is always `[]` in and ignored
+  out: a list entry's own Inlines are always `derived-lists/entry-inlines`
+  first, which strips every `:note` out by construction (see its own
+  docstring), so a list can never itself introduce a footnote."
+  [directive ctx]
+  (let [spec (derived-lists/spec directive)]
+    (->Rendered (first (render-derived-list ctx spec directive [])))))
+
+(defn register-derived-lists
+  "Registers a real `:html` renderer (`derived-list-renderer`, TASK-89)
+  for every list-placeholder name `haselnuss.extensions.derived-lists`
+  defines (`\"toc\"`/`\"list-of-figures\"`/`\"list-of-tables\"`), merging
+  into an existing entry of the same name exactly the way
+  `haselnuss.emit.latex/register-environments` already does for its own
+  per-target mapping -- so registering this does not silently discard a
+  same-named entry's own `:kind`/`:lower`/other-target `:emit`. A name
+  with no existing entry is registered fresh, with no `:kind` (a list is
+  not a numbering target, `haselnuss.extensions.derived-lists`'s own
+  docstring) and no `:lower` (it has a representation on every target
+  this project emits).
+
+  This is what makes `render-directive` need no special case for a list
+  placeholder ahead of the registry any more (TASK-89 AC #3): dispatch
+  finds a real, `renderer-v2`-marked renderer through the ordinary
+  registry lookup, the same way it finds any other extension's own."
+  [registry]
+  (reduce (fn [reg list-name]
+            (if-let [entry (registry/lookup reg list-name)]
+              (assoc reg list-name (assoc-in entry [:emit :html]
+                                             (registry/renderer-v2 derived-list-renderer)))
+              (registry/register reg {:name list-name
+                                      :emit {:html (registry/renderer-v2 derived-list-renderer)}})))
+          registry
+          (sort (keys derived-lists/lists))))
 
 (defn- unresolved-include-message
   "The `::unresolved-include` message for Include Block `block` (TASK-37
@@ -880,69 +1186,102 @@
        " :load option -- haselnuss.cli always supplies one, so this AST did not"
        " come through it)"))
 
-(defn- render-block
-  "Renders one Block (`haselnuss.ast/Block`) to `[html footnotes']`.
-  Covers every Block variant `haselnuss.ast` defines except `:include`
-  (Section/Para/List/CodeBlock/BlockQuote/Directive/Figure/Table/
-  MathBlock, plus TASK-37's `:thematic-break`); `:include` raises
-  `::unresolved-include` and anything outside the schema entirely raises
-  `::unsupported-block` -- see this namespace's own docstring for why."
+(defn- render-section
+  "Renders Section `block` (sec4.3: `:level`/`:heading`/`:blocks`/`:attr`)
+  as `<section attr><hN>number heading</hN>body</section>` (`tag` per
+  `heading-tag`, the number per `section-number-html`, TASK-41)."
   [ctx block footnotes]
-  (case (:t block)
-    :section
-    (let [[heading-html footnotes'] (render-inlines ctx (:heading block) footnotes)
-          tag (heading-tag (:level block))
-          ;; TASK-20: the generated bibliography Section's own direct List
-          ;; gets each <li> tagged for render-cite's own anchors to target
-          ;; -- see render-list's own docstring.
-          section-ctx (if (and (:bibliography-id ctx)
-                               (= (:bibliography-id ctx) (get-in block [:attr :id])))
-                        (assoc ctx :li-id-prefix (:bibliography-id ctx))
-                        ctx)
-          [body-html footnotes''] (render-blocks section-ctx (:blocks block) footnotes')]
-      [(str "<section" (attr-attrs (:attr block)) ">"
-            "<" tag ">" (section-number-html ctx (:attr block)) heading-html "</" tag ">"
-            body-html "</section>")
-       footnotes''])
+  (let [[heading-html footnotes'] (render-inlines ctx (:heading block) footnotes)
+        tag (heading-tag (:level block))
+        ;; TASK-20: the generated bibliography Section's own direct List
+        ;; gets each <li> tagged for render-cite's own anchors to target
+        ;; -- see render-list's own docstring.
+        section-ctx (if (and (:bibliography-id ctx)
+                             (= (:bibliography-id ctx) (get-in block [:attr :id])))
+                      (assoc ctx :li-id-prefix (:bibliography-id ctx))
+                      ctx)
+        [body-html footnotes''] (render-blocks section-ctx (:blocks block) footnotes')]
+    [(str "<section" (attr-attrs (:attr block)) ">"
+          "<" tag ">" (section-number-html ctx (:attr block)) heading-html "</" tag ">"
+          body-html "</section>")
+     footnotes'']))
 
-    :para
-    (let [[html footnotes'] (render-inlines ctx (:inlines block) footnotes)]
-      [(str "<p>" html "</p>") footnotes'])
+(defn- render-para
+  "Renders Para `block` (sec4.3: `:inlines`) as `<p>...</p>`."
+  [ctx block footnotes]
+  (let [[html footnotes'] (render-inlines ctx (:inlines block) footnotes)]
+    [(str "<p>" html "</p>") footnotes']))
 
-    :list (render-list ctx block footnotes)
+(defn- render-block-quote
+  "Renders BlockQuote `block` (sec4.3: `:blocks`, `:attr` optional) as
+  `<blockquote attr>...</blockquote>`. `attr-attrs` here, not a bare
+  `<blockquote>`: BlockQuote carries an `Attr` like every other
+  attr-bearing Block, and dropping it silently cost any BlockQuote its id
+  -- so a resolved cross-reference to one emitted a link to an anchor
+  that existed nowhere in the document. Reachable in practice: a
+  directive degraded to a BlockQuote by a registry `:lower` rule keeps
+  the directive's own id (see `haselnuss.cli`)."
+  [ctx block footnotes]
+  (let [[html footnotes'] (render-blocks ctx (:blocks block) footnotes)]
+    [(str "<blockquote" (attr-attrs (:attr block)) ">" html "</blockquote>") footnotes']))
 
-    :code-block [(render-code-block block) footnotes]
+(def built-in-block-handlers
+  "The built-in `:t -> (fn [ctx block footnotes] -> [rendered
+  footnotes'])` table `render-block` dispatches through (TASK-88): every
+  Block variant `haselnuss.ast` defines except `:include` (Section/Para/
+  List/CodeBlock/BlockQuote/Directive/Figure/Table/MathBlock, plus
+  TASK-37's `:thematic-break`), plus `:include` itself -- see this
+  namespace's own docstring for why it raises `::unresolved-include`
+  rather than rendering. Contributed as data rather than as `case`
+  branches (AC #2), so `emit-document`'s own `:block-handlers` opt can
+  merge in a node type this file has never heard of, for one document,
+  with no edit here (AC #4).
 
-    :math-block [(render-math-block ctx block) footnotes]
+  Most entries reference an existing render function directly, since its
+  own signature already matches this table's `(ctx block footnotes)`
+  contract (`render-section`, `render-para`, `render-list`,
+  `render-figure`, `render-table`, `render-block-quote`,
+  `render-directive`); the rest are small adapter `fn`s wrapping a
+  narrower-signatured helper (`render-code-block`/`render-math-block`
+  need no `footnotes` of their own) or a fixed string/throw."
+  {:section render-section
+   :para render-para
+   :list render-list
+   :code-block (fn [_ctx block footnotes] [(render-code-block block) footnotes])
+   :math-block (fn [ctx block footnotes] [(render-math-block ctx block) footnotes])
+   :figure render-figure
+   :table render-table
+   :block-quote render-block-quote
+   :directive render-directive
+   ;; TASK-37 AC #1. HTML's own semantic element for a thematic break
+   ;; between sections of content -- self-closed, since this
+   ;; namespace's own test suite parses its output as XML.
+   :thematic-break (fn [_ctx _block footnotes] ["<hr/>" footnotes])
+   :include (fn [_ctx block _footnotes]
+              (throw (ex-info (unresolved-include-message block)
+                              {:type ::unresolved-include :block block})))})
 
-    :figure (render-figure ctx block footnotes)
+(defn- unsupported-block!
+  "The declared default `render-block` dispatches an unrecognized Block
+  `:t` to (TASK-88 AC #3): raises the same `ex-info` (`:type
+  ::unsupported-block`) this namespace has always raised for a variant
+  outside its documented scope, naming it -- unchanged from the `case`
+  fallthrough this default replaces, so the failure mode a caller already
+  handles for keeps working."
+  [_ctx block _footnotes]
+  (throw (ex-info
+          (str "html emitter does not support block type " (pr-str (:t block)))
+          {:type ::unsupported-block :block block})))
 
-    :table (render-table ctx block footnotes)
-
-    ;; `attr-attrs` here, not a bare `<blockquote>`: BlockQuote carries
-    ;; an `Attr` like every other attr-bearing Block (sec4.3), and
-    ;; dropping it silently cost any BlockQuote its id -- so a resolved
-    ;; cross-reference to one emitted a link to an anchor that existed
-    ;; nowhere in the document. Reachable in practice: a directive
-    ;; degraded to a BlockQuote by a registry `:lower` rule keeps the
-    ;; directive's own id (see `haselnuss.cli`).
-    :block-quote
-    (let [[html footnotes'] (render-blocks ctx (:blocks block) footnotes)]
-      [(str "<blockquote" (attr-attrs (:attr block)) ">" html "</blockquote>") footnotes'])
-
-    :directive (render-directive ctx block footnotes)
-
-    ;; TASK-37 AC #1. HTML's own semantic element for a thematic break
-    ;; between sections of content -- self-closed, since this
-    ;; namespace's own test suite parses its output as XML.
-    :thematic-break ["<hr/>" footnotes]
-
-    :include (throw (ex-info (unresolved-include-message block)
-                             {:type ::unresolved-include :block block}))
-
-    (throw (ex-info
-            (str "html emitter does not support block type " (pr-str (:t block)))
-            {:type ::unsupported-block :block block}))))
+(defn- render-block
+  "Renders one Block (`haselnuss.ast/Block`) to `[html footnotes']`:
+  looks `block`'s own `:t` up in `ctx`'s `:block-handlers` table (TASK-88
+  AC #1 -- `built-in-block-handlers` merged with any document-specific
+  additions `emit-document`'s own `:block-handlers` opt supplied) and
+  calls the handler found there, or `unsupported-block!` when there is
+  none."
+  [ctx block footnotes]
+  ((get (:block-handlers ctx) (:t block) unsupported-block!) ctx block footnotes))
 
 (defn- render-blocks
   "`render-block` folded over every Block in `blocks`, in order,
@@ -1463,7 +1802,16 @@
   contents / list of figures / list of tables, keyed by derivation --
   `:toc`/`:list-of-figures`/`:list-of-tables` -- which a matching
   placeholder directive in `document` renders; default `{}`, with which
-  such a placeholder prints its heading over an empty list).
+  such a placeholder prints its heading over an empty list), and
+  (TASK-88) `:block-handlers`/`:inline-handlers` -- extra `:t -> (fn [ctx
+  node footnotes] -> [rendered footnotes'])` entries merged ON TOP of
+  `built-in-block-handlers`/`built-in-inline-handlers` for this call
+  alone, so a caller can render a Block/Inline `:t` this namespace has
+  never heard of without editing it (or override a built-in entry): see
+  `render-block`/`render-inline`. Freshly merged every call, into a plain
+  local map handed only to this one document's `ctx` -- nothing here is
+  a process-global table, so one document's addition never reaches a
+  later, unrelated `emit-document` call in the same process.
 
   Front-matter blocks (TASK-54) are lifted out of `document`'s own
   top-level Blocks by `haselnuss.extensions.front-matter/extract` and
@@ -1476,9 +1824,22 @@
   ([document opts]
    (let [lang (get-in document [:meta :lang])
          ctx {:registry (:registry opts)
+              ;; TASK-89: which target a v2 renderer is being asked to
+              ;; render for -- available on `ctx` for a renderer that
+              ;; wants it (e.g. a diagnostic, or a renderer shared
+              ;; between both `:emit` targets branching on it), though
+              ;; none of this project's own built-in extensions need to,
+              ;; since `:emit {:html f :latex g}` already separates by
+              ;; target before either is ever called.
+              :target :html
               :labels (:labels opts {})
               :bibliography-id (:bibliography-id opts)
               :citation-positions (citation-positions (:ordered-keys opts))
+              ;; TASK-88: merged fresh for this one call, never mutating
+              ;; built-in-block-handlers/built-in-inline-handlers
+              ;; themselves -- see emit-document's own docstring.
+              :block-handlers (merge built-in-block-handlers (:block-handlers opts))
+              :inline-handlers (merge built-in-inline-handlers (:inline-handlers opts))
               ;; TASK-54: the document's own language, so a front-matter
               ;; block with no `lang` of its own still prints its heading
               ;; word in the language the document is written in.

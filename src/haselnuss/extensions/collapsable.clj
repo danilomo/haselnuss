@@ -6,8 +6,9 @@
   hidden `<span>`, driven by two plain strings `text`/`hiddenText` -- as a
   `Directive{name:\"collapsable\"}` (sec8.1) -- SPEC.md's own words: \"the
   simplest instance of the whole mechanism.\" Exercises the extension
-  registry (`haselnuss.registry`, TASK-16) and the `lower` pass
-  (`haselnuss.lower`, TASK-17) end-to-end on this one real element, proving
+  registry (`haselnuss.registry`, TASK-16), the `lower` pass
+  (`haselnuss.lower`, TASK-17) and, since TASK-89, the emitter core's own
+  v2 renderer contract end-to-end on this one real element, proving
   sec8.4's own worked-example row verbatim: `emit.html` an interactive
   widget, static targets via `fallback: {kind:\"blocks\"}` flattening both
   parts inline.
@@ -31,56 +32,34 @@
     `:blocks`, unmodified: \"flatten both parts inline.\"
 
   `render-html` (this extension's native `:html` renderer, registered on
-  `extension`) uses a `(fn [directive target] -> string)` call signature.
-  `haselnuss.registry`'s own docstring explicitly leaves a renderer's call
-  signature an open, not-yet-decided emitter-core concern (TASK-19/21 are
-  still To Do); this is the first concrete instance, chosen to match the
-  2-arg shape `haselnuss.lower-test`'s own AC #1 fixtures already exercise
-  (`(fn [_node _target] ...)`) rather than `haselnuss.registry-test`'s own
-  single-arg example -- neither fixture is authoritative (both are
-  placeholder stand-ins, never actually called by `haselnuss.registry`/
-  `haselnuss.lower` themselves), so this namespace's own choice is offered
-  as a reference for TASK-19/21 to adopt, adjust, or formalize once the
-  real emitter core exists, not a settled contract. It produces a real,
-  JS-free interactive disclosure widget using HTML5's native `<details>`/
-  `<summary>` elements -- strictly more accessible than the original
-  component's `useState`+`onClick` button, and requires no client-side
-  scripting story this codebase has not built.
+  `extension`) speaks TASK-89's v2 contract: `(fn [directive ctx] ->
+  data)`, `renderer-v2`-marked. It produces hiccup-shaped data -- a real
+  `<details>`/`<summary>` element, HTML5's native disclosure widget,
+  strictly more accessible than the original component's `useState`+
+  `onClick` button, and requiring no client-side scripting story this
+  codebase has not built -- which `haselnuss.emit.html`'s own core
+  serializes and escapes; this namespace itself no longer escapes
+  anything.
 
-  Scope limit (flagged explicitly, mirroring this codebase's established
-  precedent of naming such limits rather than leaving them to be discovered
-  by accident): `render-html`'s own Block/Inline-to-HTML conversion
-  (turning the hidden `:blocks`' content into markup) is intentionally
-  minimal -- covers only Para blocks and the handful of purely-textual
-  Inline variants (`:str`/`:space`/`:soft-break`/`:line-break`/`:emph`/
-  `:strong`) a collapsable's own hidden content is realistically expected
-  to carry, NOT a general emitter; it raises a descriptive `ex-info`
-  (`::unsupported-block`/`::unsupported-inline`) for anything outside that
-  set rather than silently mangling or dropping it. TASK-19/20 own building
-  the real, comprehensive HTML emitter core; this helper is not meant to be
-  reused as one.
-
-  Nested directives, corrected (this namespace previously claimed the
-  opposite -- a real bug caught by review): by the time `render-html` runs,
-  `haselnuss.lower/lower` has already recursively lowered this directive's
-  own `:blocks` -- but `lower-directive`'s own AC #1 branch (`haselnuss.
-  lower`) deliberately *keeps* a directive with a native renderer for the
-  target as a `:t :directive` node (only recursing into its own nested
-  `:blocks`), precisely so a later emitter can dispatch it to that native
-  renderer. Since `collapsable` is (so far) this codebase's only built-in
-  extension, the one concrete instance of this is a `collapsable` nested
-  inside another `collapsable`'s own hidden content -- SPEC.md sec8 names
-  no rule forbidding it. `block->html` therefore special-cases a nested
-  `:directive` block whose own `:name` is `\"collapsable\"`, dispatching it
-  straight back into `render-html` (ordinary same-signature recursion, no
-  registry needed for this one case); a nested `:directive` under any
-  *other* name is still outside this helper's documented scope and raises
-  `::unsupported-block`, same as any other unsupported block type here.
-  Generalizing this into a real registry-driven dispatch (so an arbitrary
-  native-renderable nested directive resolves correctly, not just
-  `collapsable` recognizing itself) is left open pending TASK-19/21's own
-  renderer call-signature decision (see above) -- there is only one
-  extension in this codebase to test that against today.
+  Before TASK-89, this namespace hand-rolled its own minimal Block/
+  Inline-to-HTML sub-renderer for the hidden content (`:para` plus a
+  handful of purely-textual Inline variants only, with a hard-coded
+  one-entry map recognizing a nested `collapsable` by name so it could
+  dispatch back into its own `render-html`), because the OLD `(fn
+  [directive target] -> string)` registry contract gave a renderer no way
+  to reach the real emitter's own `render-blocks`/`render-inlines` at
+  all -- documented at length here as a scope limit, and named as the
+  reason a real registry-driven nested-directive dispatch was \"left open
+  pending TASK-19/21's own renderer call-signature decision\". TASK-89 is
+  that decision: `render-details` now renders `:blocks` through `ctx`'s
+  own `:render-blocks` callback, the exact same visitor the rest of the
+  document uses, so this extension supports every Block/Inline variant
+  the core emitter does (not a hand-picked subset), and a nested
+  `:directive` -- `collapsable` inside itself, or any OTHER
+  natively-rendered directive -- resolves correctly through the ordinary
+  registry, with no name this namespace has to know in advance. Both
+  limitations this docstring used to name at length are gone with the
+  code that caused them, rather than merely worked around.
 
   This extension needs no registry `:kind` (collapsable participates in no
   numbering scheme, exactly as the original component never did). It DOES
@@ -90,94 +69,8 @@
   at all, so an authored collapsable has none, and without the rule
   `lower` aborts the build for every target but `:html` -- confirmed by
   running the real CLI over an authored one for `:latex`."
-  (:require [clojure.string :as str]))
-
-(defn escape-html
-  "Escapes `&`, `<`, `>`, and `\"` in `s` so plain text is always safe to
-  splice directly into HTML markup. Public so a sibling disclosure
-  extension built on `render-details` (`haselnuss.extensions.
-  small-collapsable`) escapes exactly the same set rather than growing a
-  second, subtly different copy."
-  [s]
-  (-> s
-      (str/replace "&" "&amp;")
-      (str/replace "<" "&lt;")
-      (str/replace ">" "&gt;")
-      (str/replace "\"" "&quot;")))
-
-(declare inlines->html)
-
-(defn- inline->html
-  "Renders one Inline (`haselnuss.ast/Inline`) to an HTML fragment. Scope
-  limit (see namespace docstring): only the purely-textual variants a
-  collapsable's own hidden content is expected to carry are supported;
-  anything else raises `ex-info` (`:type ::unsupported-inline`) instead of
-  silently dropping or mangling it."
-  [inline]
-  (case (:t inline)
-    :str (escape-html (:text inline))
-    :space " "
-    :soft-break "\n"
-    :line-break "<br/>"
-    :emph (str "<em>" (inlines->html (:inlines inline)) "</em>")
-    :strong (str "<strong>" (inlines->html (:inlines inline)) "</strong>")
-    (throw (ex-info
-            (str "collapsable's html renderer does not support inline type "
-                 (pr-str (:t inline)) " in hidden content")
-            {:type ::unsupported-inline :inline inline}))))
-
-(defn- inlines->html
-  "`inline->html` mapped and concatenated over every Inline in `inlines`."
-  [inlines]
-  (apply str (map inline->html inlines)))
-
-(declare render-html)
-
-(def default-nested-renderers
-  "The nested-directive dispatch `blocks->html` uses when a caller names
-  none: this extension recognizing itself, exactly the one case the
-  namespace docstring's \"Nested directives, corrected\" section describes.
-  A map of directive `:name` -> a `(fn [directive target] -> string)`
-  renderer, which is all the dispatch a registry-less helper can do; a
-  sibling extension passes its own map (see `render-details`) so the two
-  disclosure directives can nest inside each other without either
-  namespace requiring the other."
-  {"collapsable" (fn [directive target] (render-html directive target))})
-
-(defn- block->html
-  "Renders one Block (`haselnuss.ast/Block`) to an HTML fragment. Scope
-  limit (see namespace docstring): `:para` is always supported; a nested
-  `:directive` is supported only when `nested` (a `:name` -> renderer map,
-  `default-nested-renderers` by default) has an entry for its own `:name`
-  -- since that is the only native dispatch this namespace has without a
-  registry, see the namespace docstring's \"Nested directives, corrected\"
-  section; anything else raises `ex-info` (`:type ::unsupported-block`)."
-  [nested block]
-  (case (:t block)
-    :para (str "<p>" (inlines->html (:inlines block)) "</p>")
-    :directive
-    (if-let [render (get nested (:name block))]
-      (render block :html)
-      (throw (ex-info
-              (str "collapsable's html renderer does not support nested directive \""
-                   (:name block) "\" in hidden content")
-              {:type ::unsupported-block :block block})))
-    (throw (ex-info
-            (str "collapsable's html renderer does not support block type "
-                 (pr-str (:t block)) " in hidden content")
-            {:type ::unsupported-block :block block}))))
-
-(defn blocks->html
-  "`block->html` mapped and concatenated over every Block in `blocks`.
-  `nested` is the nested-directive dispatch map documented on
-  `block->html`, defaulting to `default-nested-renderers`. Public for the
-  same reason `escape-html` is: a sibling disclosure extension renders its
-  own hidden content through this one helper, so the supported-content
-  scope limit stays a single definition (and a single pair of
-  `::unsupported-block`/`::unsupported-inline` error types) rather than
-  drifting between copies."
-  ([blocks] (blocks->html blocks default-nested-renderers))
-  ([blocks nested] (apply str (map #(block->html nested %) blocks))))
+  (:require [clojure.string :as str]
+            [haselnuss.registry :as registry]))
 
 (defn summary
   "The always-visible label of collapsable `directive` (its own
@@ -185,77 +78,85 @@
   [directive]
   (get-in directive [:attr :props "summary"]))
 
-(defn- id-attr
-  "A ` id=\"...\"` HTML attribute fragment (escaped) for `directive`'s own
-  `attr.id`, or `\"\"` if unset -- this is what makes a rendered `<details>`
-  element anchorable via a URL fragment (a real bug fix: this attribute
-  used to be silently dropped regardless of `attr.id`, per `make`'s own
-  docstring, which see for what this id does -- and does not -- make a
-  collapsable referenceable for)."
+(defn- details-id
+  "Directive `directive`'s own `attr.id`, or nil -- the raw value
+  `render-details`'s own hiccup `:id` attrs-map entry needs; the core
+  emitter this data reaches escapes it, so this returns the value
+  itself, not an HTML fragment (contrast the pre-TASK-89 `id-attr`, which
+  built one by hand and escaped it here). This is what makes a rendered
+  `<details>` element anchorable via a URL fragment (a real bug fix, kept
+  from that earlier version: this attribute used to be silently dropped
+  regardless of `attr.id`, per `make`'s own docstring, which see for what
+  this id does -- and does not -- make a collapsable referenceable for)."
   [directive]
-  (if-let [id (get-in directive [:attr :id])]
-    (str " id=\"" (escape-html id) "\"")
-    ""))
+  (get-in directive [:attr :id]))
 
-(defn- class-attr
-  "The rendered `<details>` element's `class=\"...\"` HTML attribute
-  (escaped): always includes `base-class` (the owning extension's own
-  styling hook -- `collapsable` here), plus any caller-supplied
-  `attr.classes` from `directive` appended in order -- a real bug fix:
-  `attr.classes` used to be silently dropped entirely, only the hardcoded
-  `collapsable` literal ever reached the output, same class of bug as
-  `attr.id` before it."
+(defn- details-classes
+  "The space-joined class list `render-details`'s own hiccup `:class`
+  attrs-map entry needs: `base-class` (the owning extension's own styling
+  hook -- `collapsable`/`small-collapsable`) first, then any
+  caller-supplied `attr.classes` from `directive`, appended in order --
+  raw and unescaped, since the core emitter escapes an attribute value
+  generically now (a real bug fix, kept from the pre-TASK-89 version:
+  `attr.classes` used to be silently dropped entirely, only the
+  hardcoded base class ever reaching the output)."
   [base-class directive]
-  (->> (cons base-class (get-in directive [:attr :classes]))
-       (map escape-html)
-       (str/join " ")))
+  (str/join " " (cons base-class (get-in directive [:attr :classes] []))))
 
 (defn render-details
   "Renders `directive` as an HTML5 `<details>`/`<summary>` disclosure --
-  the shared body of every disclosure extension built on this namespace.
-  `opts` keys:
+  the shared body of every disclosure extension built on this namespace
+  -- as TASK-89's v2 hiccup DATA (a vector `haselnuss.emit.html` itself
+  serializes and escapes), not a string. `opts` keys:
 
   - `:base-class` -- the class always present on the `<details>` element,
-    alongside any authored `attr.classes` (`class-attr`).
+    alongside any authored `attr.classes` (`details-classes`).
   - `:body-class` -- when set, the revealed `:blocks` are wrapped in a
-    `<div class=\"...\">` carrying it; when nil they are emitted directly
+    `[:div {:class ...}]` carrying it; when nil they are emitted directly
     as the `<details>` element's own children, which is what `collapsable`
     has always done and what keeps its output byte-identical. The wrapper
     exists because a *block* box is what gives an inline-rendered
     disclosure a line break before and after its revealed content, and CSS
     cannot introduce a box that the markup does not have (see
     `haselnuss.extensions.small-collapsable`).
-  - `:nested` -- the nested-directive dispatch map `blocks->html`
-    documents, defaulting to `default-nested-renderers`.
 
-  `directive`'s own `attr.id`, when set, becomes the element's `id=\"...\"`
-  (`id-attr`), which is what makes a rendered disclosure anchorable by URL
-  fragment."
-  [{:keys [base-class body-class nested] :or {nested default-nested-renderers}} directive]
-  (let [body (blocks->html (:blocks directive) nested)]
-    (str "<details" (id-attr directive) " class=\"" (class-attr base-class directive) "\">"
-         "<summary>" (escape-html (or (summary directive) "")) "</summary>"
-         (if body-class
-           (str "<div class=\"" (escape-html body-class) "\">" body "</div>")
-           body)
-         "</details>")))
+  `directive`'s own `:blocks` (the revealed content) are rendered through
+  `ctx`'s own `:render-blocks` callback (TASK-89 AC #2) -- this
+  namespace's former hand-rolled `blocks->html`/`block->html`/
+  `inline->html` sub-renderer, and the nested-directive dispatch map it
+  needed to recognize a nested `collapsable` by name, are both gone: the
+  core emitter that callback reaches already supports every Block/Inline
+  variant it defines, and already dispatches ANY nested `:directive` with
+  a native renderer through the ordinary registry -- see this namespace's
+  own docstring.
+
+  `directive`'s own `attr.id`, when set, becomes the element's own `:id`
+  attrs-map entry, which is what makes a rendered disclosure anchorable
+  by URL fragment."
+  [{:keys [base-class body-class]} directive ctx]
+  (let [id (details-id directive)
+        body ((:render-blocks ctx) (:blocks directive))]
+    [:details (cond-> {:class (details-classes base-class directive)} id (assoc :id id))
+     [:summary (or (summary directive) "")]
+     (if body-class [:div {:class body-class} body] body)]))
 
 (defn render-html
-  "This extension's native `:html` renderer (registered on `extension`):
-  renders collapsable `directive` as an interactive HTML5 `<details>`/
-  `<summary>` disclosure -- `summary` is always visible; `directive`'s own
-  `:blocks` (the collapsed content) are revealed natively by the browser on
-  toggle, no JavaScript required. `directive`'s own `attr.id`, when set, is
-  emitted as the `<details>` element's own `id=\"...\"` HTML attribute
-  (`id-attr`) -- see `make`'s docstring for exactly what this id does, and
-  does not, make a collapsable referenceable for. `directive`'s own
-  `attr.classes`, when set, are appended to the element's `class=\"...\"`
-  attribute alongside the always-present `collapsable` class (`class-attr`).
-  `target` is accepted, per this namespace's own documented
-  `(fn [directive target] ...)` call-signature choice, but unused: a
-  `:html`-registered renderer is only ever invoked for the `:html` target."
-  [directive _target]
-  (render-details {:base-class "collapsable"} directive))
+  "This extension's native `:html` renderer (registered on `extension`,
+  TASK-89's v2 contract: `(fn [directive ctx] -> data)`, `renderer-v2`-
+  marked): renders collapsable `directive` as an interactive HTML5
+  `<details>`/`<summary>` disclosure -- `summary` is always visible;
+  `directive`'s own `:blocks` (the collapsed content) are revealed
+  natively by the browser on toggle, no JavaScript required, and rendered
+  through `ctx`'s own `:render-blocks` callback (`render-details`), so
+  any Block/Inline this codebase's own core emitter supports is supported
+  here too. `directive`'s own `attr.id`, when set, is emitted as the
+  `<details>` element's own `:id` (`details-id`) -- see `make`'s
+  docstring for exactly what this id does, and does not, make a
+  collapsable referenceable for. `directive`'s own `attr.classes`, when
+  set, are appended to the element's own `:class` alongside the
+  always-present `collapsable` class (`details-classes`)."
+  [directive ctx]
+  (render-details {:base-class "collapsable"} directive ctx))
 
 (defn fallback-for
   "The `:fallback {:kind :blocks}` (sec8.4) for a collapsable directive
@@ -370,6 +271,11 @@
   shape): a caller registers it via `(registry/register some-registry
   haselnuss.extensions.collapsable/extension)` (or via `register-all`
   alongside other built-ins). Registers an `:html` renderer (the native
-  `<details>` widget) and a `:lower` rule (`lower-rule`, the flattened
-  degradation every other target gets)."
-  {:name "collapsable" :emit {:html render-html} :lower lower-rule})
+  `<details>` widget, `renderer-v2`-marked -- TASK-89's v2 contract) and a
+  `:lower` rule (`lower-rule`, the flattened degradation every other
+  target gets). No `:trusted?`: every Block/Inline this renderer emits
+  goes through ordinary hiccup elements and `ctx`'s own `:render-blocks`,
+  never a `[:raw ...]` node, so this extension proves an untrusted one can
+  still produce rich structured output -- just never raw, unescaped
+  text."
+  {:name "collapsable" :emit {:html (registry/renderer-v2 render-html)} :lower lower-rule})

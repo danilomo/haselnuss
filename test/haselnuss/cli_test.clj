@@ -15,7 +15,8 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [haselnuss.cli :as cli]
-            [haselnuss.json :as json])
+            [haselnuss.json :as json]
+            [haselnuss.registry :as registry])
   (:import (java.awt.image BufferedImage)
            (java.io StringReader)
            (java.nio.file Files)
@@ -309,7 +310,162 @@
   (testing "and HTML, which has no such hazard, reports nothing"
     (let [dir (fixture-dir! (str/replace document "pic.png" "pic\\x.png"))
           {:keys [diagnostics]} (build! dir {})]
-      (is (empty? diagnostics)))))
+      (is (empty? diagnostics))))
+  (testing "TASK-89 review finding #2's own regression: an Image :src with
+            an UNBALANCED BRACE -- the other of the two hazards
+            image-path-hazards checks for, on ordinary core content, no
+            extension or :raw involved -- also reaches the CLI's own
+            diagnostics. This used to work before TASK-89 (haselnuss.cli
+            called the AST-based check unconditionally), broke silently
+            when that call was replaced with a text-based scan whose
+            regex could not locate an argument containing a brace, and is
+            fixed here by locating the argument's real closing brace
+            directly (haselnuss.emit.latex/includegraphics-arg-end)"
+    (let [dir (fixture-dir! (str/replace document "pic.png" "pic{x.png"))
+          {:keys [diagnostics]} (build! dir {:target "latex"})]
+      (is (= [:unescapable-image-path] (map :type diagnostics))
+          "must not be silently empty -- that was the regression")
+      (is (str/includes? (:message (first diagnostics)) "unbalanced brace"))))
+  (testing "and the combined hazard (both a backslash and an unbalanced
+            brace in the same path) also reaches the CLI's own
+            diagnostics, naming both"
+    (let [dir (fixture-dir! (str/replace document "pic.png" "pic\\x{y.png"))
+          {:keys [diagnostics]} (build! dir {:target "latex"})]
+      (is (= [:unescapable-image-path] (map :type diagnostics)))
+      (is (str/includes? (:message (first diagnostics)) "backslash"))
+      (is (str/includes? (:message (first diagnostics)) "unbalanced brace")))))
+
+(deftest unescapable-image-path-diagnostic-stray-closing-brace-test
+  (testing "TASK-89 review comments #16/#17: an Image :src whose own
+            hazard is a stray CLOSING brace with no matching open before
+            it (a narrower shape than finding #2's own stray-OPEN
+            regression above) is now an ACCEPTED, documented limitation
+            rather than something this pipeline detects, for a core
+            Image the same as for any other `\\includegraphics{...}`
+            occurrence -- haselnuss.cli went through two rounds
+            (comment #11's AST-based fallback, comment #12's dedup
+            machinery for it) of trying to close this specific gap, both
+            of which review comments #16/#17 then found their own real,
+            blocking bugs in (a false negative unrelated to this shape at
+            all, and a plain regression in ordinary duplicate-diagnostic
+            collapsing) -- so the AST-based fallback and the
+            reconciliation it needed were removed rather than patched a
+            sixth time, and this shape genuinely goes unreported now.
+            `unescapable-image-path-text-diagnostics`'s own
+            depth-tracking reads the argument as closing at the FIRST
+            `}` (this src's own, not a stray one), so it sees a balanced,
+            hazard-free argument where the AST value is not -- see that
+            function's own docstring, and haselnuss.registry's
+            `:trusted?` docstring, for the accepted reasoning. The
+            severity is bounded, not silent-success: a real `pdflatex`
+            run on a document like this still fails to compile (TASK-89
+            review comment #11's own live verification), just without
+            this earlier, more specific warning naming the path"
+    (let [dir (fixture-dir! (str/replace document "pic.png" "pic}x.png"))
+          {:keys [diagnostics]} (build! dir {:target "latex"})]
+      (is (empty? diagnostics)
+          "the documented, accepted gap -- not silently reintroducing the
+           AST-based fallback that review comments #16/#17 found needed
+           its own now-removed reconciliation machinery to stay correct"))))
+
+(defn- widget-registry
+  "`cli/build-registry`, with one further directive registered: a TRUSTED
+  v2 LaTeX renderer named \"widget\" whose entire output is the literal
+  `raw-tex` string, spliced verbatim via `[:raw ...]` (TASK-89's own
+  escape hatch, gated on `:trusted?`). Meant to be installed with
+  `with-redefs` over `cli/build-registry` itself (TASK-89 review comments
+  #8/#11/#13's own technique): `haselnuss.cli` has no extension-injection
+  hook yet -- that is TASK-90's job -- so this is the only way to route a
+  custom directive through the REAL `cli/run`/`cli/build` pipeline today.
+
+  Captures `cli/build-registry`'s CURRENT value in `build-registry`
+  before building its own replacement function, rather than referring to
+  `cli/build-registry` again from inside the returned closure: inside a
+  `with-redefs` binding form the var is not yet rebound while its OWN
+  binding expression (a call to this function) runs, so capturing it here
+  is what lets the replacement call the ORIGINAL `build-registry`.
+  Referring to the var again from inside the closure would call the
+  replacement itself once installed, recursing until the stack overflows
+  -- found live while building this helper."
+  [raw-tex]
+  (let [build-registry cli/build-registry
+        widget {:name "widget"
+                :trusted? true
+                :emit {:latex (registry/renderer-v2 (fn [_directive _ctx] [:raw raw-tex]))}}]
+    (fn
+      ([] (registry/register (build-registry) widget))
+      ([labels] (registry/register (build-registry labels) widget)))))
+
+(deftest unescapable-image-path-diagnostic-independent-hazards-test
+  (testing "TASK-89 review comments #16/#18: an ordinary core Image's own
+            hazard and an UNRELATED trusted extension's own independent
+            :raw hazard, both STRAY-OPEN-brace shaped -- the one shape
+            `unescapable-image-path-text-diagnostics` genuinely detects
+            for either kind of content -- are both reported, as two
+            separate diagnostics. This used to need real reconciliation
+            machinery (TASK-89 review comment #13's own multiset fix, and
+            two further blocking bugs found in it, comments #16/#17)
+            because an AST-based scan and a text-based scan of
+            OVERLAPPING content both fed `:diagnostics`; now that the
+            AST-based check is not called from haselnuss.cli at all
+            (comments #16/#18), the text-based scan is the ONLY source of
+            this diagnostic type, so two genuinely independent hazards
+            simply both show up -- there is nothing left to de-duplicate
+            or mis-attribute"
+    (with-redefs [cli/build-registry (widget-registry "\\includegraphics{bar{baz")]
+      (let [{:keys [diagnostics]}
+            (cli/run "![alt](foo{qux)\n\n:::{widget}\nx\n:::\n" {:target "latex"})]
+        (is (= 2 (count diagnostics))
+            "the core image's own hazard and the extension's independent
+             one are unrelated and both real -- neither may be dropped")
+        ;; "foo{qux}", not "foo{qux": the core image's own hazard never
+        ;; finds a true close (the stray `{` desyncs depth, so the
+        ;; renderer's own closing brace only brings depth back to 1, not
+        ;; 0), so the text-based scan's own documented fallback -- run to
+        ;; the end of the line -- captures that trailing `}` too
+        ;; (`haselnuss.emit.latex/includegraphics-arg-end`'s own
+        ;; docstring). Confirmed live rather than assumed.
+        (is (= #{"foo{qux}" "bar{baz"} (set (map :src diagnostics))))))))
+
+(deftest dangling-cross-ref-repeated-reference-is-not-collapsed-test
+  (testing "TASK-89 review comment #21: two references to the SAME
+            missing cross-reference id -- an ordinary, plausible
+            authoring mistake, not a contrived edge -- produce TWO
+            :dangling-cross-ref warnings, not one, on both targets. This
+            is haselnuss.resolver's own, unmodified design (confirmed by
+            its own resolver-test coverage,
+            multiple-dangling-cross-refs-all-produce-warnings-test, and
+            by its own docstring: one warning per OCCURRENCE, not
+            de-duplicated per key) -- haselnuss.cli's own diagnostics
+            assembly does not, and structurally need not, de-duplicate
+            anything: `diagnostics` (resolver/lower/overlay-level) and
+            the final text-based scan are fully disjoint in type and
+            source, with nothing left to reconcile between them, so
+            `run` simply concatenates them.
+
+            A `distinct` briefly lived in haselnuss.cli's own final
+            :diagnostics assembly (comments #19-20) on the belief that it
+            RESTORED this exact pre-TASK-89 behavior for a repeated
+            dangling reference -- comment #21 checked that directly
+            against the actual pre-TASK-89 commit (a git worktree at
+            d751e26, this task's own AC #10 baseline) rather than against
+            this task's own prose about it, and found the claim false:
+            pre-TASK-89 `run` never de-duplicated anything anywhere, and
+            two references to the same missing id always produced two
+            identical warnings, both surfaced. This test pins THAT, the
+            real original (and current) behavior, rather than the
+            plausible-sounding but incorrect '1' this task's own review
+            briefly shipped and mis-described as a restoration"
+    (testing "latex"
+      (let [{:keys [diagnostics]}
+            (cli/run "See @fig:missing and again @fig:missing.\n" {:target "latex"})]
+        (is (= 2 (count diagnostics)))
+        (is (every? #(= :dangling-cross-ref (:type %)) diagnostics))))
+    (testing "html"
+      (let [{:keys [diagnostics]}
+            (cli/run "See @fig:missing and again @fig:missing.\n" {:target "html"})]
+        (is (= 2 (count diagnostics)))
+        (is (every? #(= :dangling-cross-ref (:type %)) diagnostics))))))
 
 (deftest unrecoverable-errors-test
   (testing "AC #5: a directive with no representation for the target and
@@ -591,7 +747,7 @@
               silently discarded -- --computed-numbers=false used to turn
               the flag ON"
       (doseq [arg ["--computed-numbers=false" "--help=nonsense" "--version=nonsense"
-                   "--no-stylesheet=false"]]
+                   "--no-stylesheet=false" "--trusted-extensions=nonsense"]]
         (let [{:keys [status err]} (main-run arg input)]
           (is (= 2 status) arg)
           (is (str/includes? err "takes no value") arg))))
@@ -804,6 +960,244 @@
         (let [{:keys [status err]} (main-run "--target" target (str (io/file dir "doc.hdoc")))]
           (is (= 0 status) (str target ": " err))
           (is (str/includes? (slurp (io/file dir extension)) "Included prose.") target))))))
+
+(deftest overlay-test
+  (testing "AC #1: an unused --overlay file existing on disk changes
+            nothing about a build that never names it -- byte-for-byte
+            identical output, the headline invariant doc-5 requires"
+    (let [dir (fixture-dir!)
+          without (:output (build! dir {}))]
+      (spit (io/file dir "unused.hdoc") ":::{prepend target=sec:nope}\nx\n:::\n")
+      (is (= without (:output (build! dir {}))))))
+  (testing "AC #2/#3: a real two-file overlay build works on both HTML
+            and LaTeX targets -- prepend/append content from separate
+            files accumulates in --overlay order, then in-file order,
+            and numbers/cross-references exactly as if authored inline"
+    (let [dir (fixture-dir!)
+          overlay-a (str (io/file dir "overlay-a.hdoc"))
+          overlay-b (str (io/file dir "overlay-b.hdoc"))]
+      (spit overlay-a (str ":::{prepend target=sec:intro}\nFrom A, prepended.\n:::\n\n"
+                           ":::{append target=sec:intro}\nFrom A, appended.\n:::\n"))
+      (spit overlay-b ":::{append target=sec:intro}\nFrom B, appended.\n:::\n")
+      (doseq [target ["html" "latex"]]
+        (let [{:keys [output]} (build! dir {:target target :overlay [overlay-a overlay-b]})]
+          (is (str/includes? output "From A, prepended.") target)
+          (is (str/includes? output "From A, appended.") target)
+          (is (str/includes? output "From B, appended.") target)
+          (is (< (.indexOf output "From A, appended.") (.indexOf output "From B, appended."))
+              (str target ": file order, then in-file order"))))))
+  (testing "a missing --overlay path is a hard build failure naming it,
+            not a diagnostic -- it is a path typed on the command line,
+            not a reference embedded in document prose"
+    (let [dir (fixture-dir!)
+          {:keys [status err]} (main-run "--overlay" (str (io/file dir "nowhere.hdoc"))
+                                         (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err "overlay file not found"))
+      (is (str/includes? err "nowhere.hdoc"))
+      (is (not (.exists (io/file dir "doc.html"))))))
+  (testing "AC #5: malformed overlay content -- a stray paragraph, a
+            missing target=, and a dangling target -- is each a distinct
+            warning, dropped, and the build still exits 0 with the rest
+            of both the overlay and the base document intact"
+    (let [dir (fixture-dir!)
+          overlay (str (io/file dir "overlay.hdoc"))]
+      (spit overlay (str "A stray paragraph.\n\n"
+                         ":::{append}\nno target at all\n:::\n\n"
+                         ":::{prepend target=sec:nope}\ndangling\n:::\n"))
+      (let [{:keys [status err]} (main-run "--overlay" overlay (str (io/file dir "doc.hdoc")))]
+        (is (= 0 status) err)
+        (is (str/includes? err "unexpected top-level para"))
+        (is (str/includes? err "no target="))
+        (is (str/includes? err "does not resolve to a Section, Figure, Table, MathBlock"))
+        (is (.exists (io/file dir "doc.html")))
+        (is (str/includes? (slurp (io/file dir "doc.html")) "Introduction")))))
+  (testing "an overlay can target a Section that exists only AFTER
+            base-document include-expansion -- e.g. a chapter pulled in
+            from another file -- since overlay application runs after it"
+    (let [dir (fixture-dir! "---\ntitle: A Book\n---\n\n!include chapters/methods.hdoc\n")
+          chapters (io/file dir "chapters")
+          overlay (str (io/file dir "overlay.hdoc"))]
+      (.mkdirs chapters)
+      (spit (io/file chapters "methods.hdoc") "# Methods {#sec:methods}\n\nBase prose.\n")
+      (spit overlay ":::{append target=sec:methods}\nOverlay prose.\n:::\n")
+      (let [{:keys [status err]} (main-run "--overlay" overlay (str (io/file dir "doc.hdoc")))
+            html (slurp (io/file dir "doc.html"))]
+        (is (= 0 status) err)
+        (is (str/includes? html "Base prose."))
+        (is (str/includes? html "Overlay prose."))
+        (is (< (.indexOf html "Base prose.") (.indexOf html "Overlay prose."))))))
+  (testing "AC #4: an !include written inside an overlay file resolves
+            against THAT FILE's own directory, with the same cycle
+            detection the base document gets -- an overlay that includes
+            itself is a cycle, not a hang"
+    (let [dir (fixture-dir!)
+          overlay-dir (io/file dir "overlays")
+          overlay (str (io/file overlay-dir "overlay.hdoc"))]
+      (.mkdirs overlay-dir)
+      (spit (io/file overlay-dir "shared.hdoc")
+            ":::{append target=sec:intro}\nShared overlay prose.\n:::\n")
+      (spit overlay "!include shared.hdoc\n")
+      (let [{:keys [status err]} (main-run "--overlay" overlay (str (io/file dir "doc.hdoc")))
+            html (slurp (io/file dir "doc.html"))]
+        (is (= 0 status) err)
+        (is (str/includes? html "Shared overlay prose."))))
+    (let [dir (fixture-dir!)
+          overlay (str (io/file dir "self.hdoc"))]
+      (spit overlay "!include self.hdoc\n")
+      (let [{:keys [status err]} (main-run "--overlay" overlay (str (io/file dir "doc.hdoc")))]
+        (is (= 0 status) err)
+        (is (str/includes? err "include cycle")))))
+  (testing "TASK-83.2 AC #1/#2: a real --overlay describe merges a prop
+            onto the base document's own fig:tree -- a non-Section node
+            -- on both HTML and LaTeX targets, and the merged value is
+            never rendered as VISIBLE BODY content by either emitter"
+    (let [dir (fixture-dir!)
+          overlay (str (io/file dir "describe.hdoc"))]
+      (spit overlay ":::{describe target=fig:tree alt=\"A hazel tree in early spring.\"}\n:::\n")
+      (testing "LaTeX has no generic attr.props target at all (emit/
+                latex's own documented limitation) -- the merged value
+                is absent from the .tex output entirely"
+        (let [{:keys [output]} (build! dir {:target "latex" :overlay [overlay]})]
+          (is (not (str/includes? output "A hazel tree in early spring.")))))
+      (testing "HTML renders it as a tag attribute on the <figure>
+                element -- present in the source, but never as a
+                visible text node"
+        (let [{:keys [output]} (build! dir {:target "html" :overlay [overlay]})]
+          (is (str/includes? output "alt=\"A hazel tree in early spring.\""))
+          (is (not (str/includes? output ">A hazel tree in early spring.<")))))))
+  (testing "TASK-83.2 AC #3: a describe prop colliding with one already
+            set on the target node in the BASE document is a non-fatal
+            warning, the build still exits 0, and the base document's
+            own value is kept rather than silently overwritten. Uses
+            eq:mass (a MathBlock), not fig:tree: a promoted image Figure
+            deliberately keeps its OWN authored props on the nested
+            Image rather than the Figure itself (`convert-block`'s own
+            documented rationale), so it cannot exercise a collision on
+            the FIGURE node's own attr.props the way a MathBlock can"
+    (let [dir (fixture-dir! (str "# Intro {#sec:intro}\n\n"
+                                 "$$\nE = mc^2\n$$ {#eq:mass credit=\"original\"}\n"))
+          overlay (str (io/file dir "describe.hdoc"))]
+      (spit overlay ":::{describe target=eq:mass credit=\"overlay\"}\n:::\n")
+      (let [{:keys [status err]} (main-run "--overlay" overlay (str (io/file dir "doc.hdoc")))
+            html (slurp (io/file dir "doc.html"))]
+        (is (= 0 status) err)
+        (is (str/includes? err "credit"))
+        (is (str/includes? err "was not applied"))
+        (is (str/includes? html "credit=\"original\""))
+        (is (not (str/includes? html "credit=\"overlay\"")))))))
+
+(defn- write-file!
+  [dir filename content]
+  (let [f (io/file dir filename)]
+    (spit f content)
+    (str f)))
+
+(def ^:private callout-extension-source
+  "One author-defined directive -- `callout` -- for `sidecar-extensions-
+  test` (TASK-90 AC #13): a labeled note box on `:html` (real hiccup,
+  rendering its own `:blocks` through `ctx`'s own `:render-blocks`, the
+  same TASK-89 AC #2 composability `haselnuss.extensions.collapsable`
+  exercises) and a plain, note-prefixed paragraph on `:latex` -- a
+  FRAGMENT (a plain, harmless string literal alongside the same
+  `:render-blocks` `Rendered` result), not `haselnuss.ext/raw`, so this
+  worked example proves an UNTRUSTED sidecar can already produce real,
+  structured, composed output on both targets -- mirroring `collapsable`'s
+  own \"no :trusted? -- proving an untrusted extension can still produce
+  rich structured output\" precedent."
+  (str "{:name \"callout\"\n"
+       " :emit {:html (fn [directive ctx]\n"
+       "               [:div {:class \"callout\"} ((:render-blocks ctx) (:blocks directive))])\n"
+       "        :latex (fn [directive ctx]\n"
+       "               [\"Note: \" ((:render-blocks ctx) (:blocks directive))])}}"))
+
+(deftest sidecar-extensions-test
+  (testing "AC #1/#13: a sidecar file defines a directive's HTML and
+            LaTeX rendering, loaded by --extensions with no recompile,
+            and renders end to end on BOTH targets through the real CLI"
+    (let [dir (fixture-dir! ":::{callout}\nA warning from the author's own extension.\n:::\n")
+          ext (write-file! dir "callout.clj" callout-extension-source)]
+      (let [{:keys [output]} (build! dir {:target "html" :extensions [ext]})]
+        (is (well-formed? output))
+        (is (str/includes? output "<div class=\"callout\">"))
+        (is (str/includes? output "A warning from the author's own extension.")))
+      (let [{:keys [output]} (build! dir {:target "latex" :extensions [ext]})]
+        (is (str/includes? output "Note: A warning from the author's own extension."))
+        (testing "and it actually compiles under a real pdflatex, not just
+                  string-matches -- the same standard this file already
+                  holds every other LaTeX-producing feature to"
+          (let [[ok? detail] (compiles? dir output)]
+            (is ok? detail))))))
+  (testing "omitting --extensions entirely leaves an unrelated build
+            byte-for-byte unaffected, and the same directive name is still
+            reported as unknown -- --extensions is additive, not a global
+            switch that changes how unregistered directives are treated"
+    (let [dir (fixture-dir! ":::{callout}\nx\n:::\n")
+          {:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err "no representation for directive \"callout\""))))
+  (testing "a missing --extensions path is a hard build failure naming
+            it, not a diagnostic -- mirroring --overlay's own established
+            treatment of a path typed on the command line"
+    (let [dir (fixture-dir!)
+          {:keys [status err]} (main-run "--extensions" (str (io/file dir "nowhere.clj"))
+                                         (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err "extension file not found"))
+      (is (str/includes? err "nowhere.clj"))
+      (is (not (.exists (io/file dir "doc.html"))))))
+  (testing "AC #10: a malformed sidecar file is refused with an error
+            naming it, through the real CLI path -- haselnuss.extensions.
+            sidecar-test covers every malformed shape directly; this is
+            the one confirming that error actually reaches stderr/exit 1
+            here rather than only being thrown internally"
+    (let [dir (fixture-dir!)
+          ext (write-file! dir "bad.clj" "{:emit {:html (fn [d c] 1)}}")
+          {:keys [status err]} (main-run "--extensions" ext (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err "malformed extension"))
+      (is (str/includes? err "bad.clj"))))
+  (testing "AC #3/#6: host interop and reaching this project's own
+            classpath from a sidecar file are refused through the real
+            CLI path too, not only when haselnuss.extensions.sidecar is
+            called directly"
+    (let [dir (fixture-dir!)
+          ext (write-file! dir "interop.clj"
+                           "{:name \"x\" :emit {:html (fn [d c] (System/exit 0))}}")
+          {:keys [status err]} (main-run "--extensions" ext (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err "System/exit")))))
+
+(deftest trusted-extensions-test
+  (testing "AC #11: without --trusted-extensions, a sidecar's own
+            [:raw ...] attempt is refused through the real emitter's
+            render-directive -- the same ::untrusted-raw-output TASK-89
+            already gives a host-defined untrusted renderer, not a
+            second, different mechanism"
+    (let [dir (fixture-dir! ":::{widget}\n:::\n")
+          ext (write-file! dir "widget.clj"
+                           (str "{:name \"widget\" :emit {:latex "
+                                "(fn [d c] (haselnuss.ext/raw \"\\\\textbf{RAW}\"))}}"))
+          {:keys [status err]} (main-run "--target" "latex" "--extensions" ext
+                                         (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err "not :trusted"))
+      (is (not (.exists (io/file dir "doc.tex"))))))
+  (testing "AC #11: --trusted-extensions allows the identical file's
+            [:raw ...] output through verbatim, and it defaults to off --
+            the SAME file, without the flag, is refused above"
+    (let [dir (fixture-dir! ":::{widget}\n:::\n")
+          ext (write-file! dir "widget.clj"
+                           (str "{:name \"widget\" :emit {:latex "
+                                "(fn [d c] (haselnuss.ext/raw \"\\\\textbf{RAW}\"))}}"))
+          {:keys [output]} (build! dir {:target "latex" :extensions [ext]
+                                        :trusted-extensions true})]
+      (is (str/includes? output "\\textbf{RAW}"))))
+  (testing "--trusted-extensions with no --extensions at all does
+            nothing -- there is no sidecar renderer for it to trust"
+    (let [dir (fixture-dir!)
+          {:keys [status]} (main-run "--trusted-extensions" (str (io/file dir "doc.hdoc")))]
+      (is (= 0 status)))))
 
 (deftest mapped-directive-references-test
   (testing "TASK-40 AC #3: a cross-reference to every mapped directive

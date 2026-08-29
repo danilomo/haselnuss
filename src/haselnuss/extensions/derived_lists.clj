@@ -23,22 +23,39 @@
 
   This namespace owns the *data* -- which names are list placeholders,
   which derivation each prints, which LaTeX command builds it natively,
-  and what each is called in each language -- plus the registry entries
-  that keep them alive through `haselnuss.lower`. It owns no rendering,
-  for the same reason `haselnuss.extensions.front-matter` owns none: a
-  list entry carries Inline content (a heading, a caption), and the
-  registry's `(fn [directive target])` renderer signature gives an
-  extension no way to reach an emitter's own `render-inlines`. What is
-  registered is a marker, `list-renderer`, recognized by both emitters
-  and never called.
+  and what each is called in each language. It still owns no RENDERING
+  code of its own -- that is each emitter's own business, and lives
+  there (`haselnuss.emit.html`/`haselnuss.emit.latex`'s own
+  `derived-list-renderer`/`register-derived-lists`) -- but until TASK-89
+  it could not even register a *real* renderer for the same reason
+  `haselnuss.extensions.front-matter` still cannot: a list entry carries
+  Inline content (a heading, a caption), and the OLD `(fn [directive
+  target] -> string)` renderer signature gave an extension no way to
+  reach an emitter's own `render-inlines` at all, so what got registered
+  here was a marker, recognized by both emitters and never called, with
+  each emitter drawing a list itself through a special case checked
+  AHEAD of the registry lookup.
 
-  One namespace rather than a table inside each emitter, and this is
-  the decision worth recording: the two targets need the SAME facts
-  about a list -- which derivation it prints, and what it is called in
-  the document's language -- and a heading word that existed twice
-  would be two places for \"Lista de Figuras\" to drift. What differs
-  between the targets is only how the list is drawn, which is each
-  emitter's own business and lives there.
+  TASK-89's `(fn [node ctx] -> data)` contract removes that limitation --
+  `ctx` carries `:render-inlines`, so a real renderer CAN reach it -- and
+  with it the reason for both the marker and the special case: each
+  emitter's own `register-derived-lists` now installs a genuine
+  `renderer-v2`-marked `:emit` entry for every name below, so
+  `render-directive` finds it through the ordinary registry lookup, the
+  same way it finds any other extension's own. This namespace therefore
+  registers nothing at all any more -- `haselnuss.cli` calls
+  `register-derived-lists` on both emitters directly, the same way it
+  already calls `haselnuss.emit.latex/register-environments` -- and is
+  left holding only the data both emitters read: `lists`, `spec`,
+  `heading-word` and `entry-inlines`.
+
+  One namespace rather than a table inside each emitter for the data
+  that survives, and this is the decision worth recording: the two
+  targets need the SAME facts about a list -- which derivation it
+  prints, and what it is called in the document's language -- and a
+  heading word that existed twice would be two places for \"Lista de
+  Figuras\" to drift. What differs between the targets is only how the
+  list is drawn, which is each emitter's own business and lives there.
 
   A registry `:lower` rule is the one shape this deliberately does NOT
   take, tempting though it is (`haselnuss.cli` already closes such a
@@ -140,40 +157,11 @@
                     :else [inline])))
         inlines))
 
-(defn list-renderer
-  "The marker registered as every list placeholder's own per-target
-  renderer. Registering *something* is what makes `haselnuss.lower/lower`
-  keep the directive rather than demand a fallback the author has no way
-  to declare (the same reason
-  `haselnuss.extensions.front-matter/front-matter-renderer` exists);
-  both emitters recognize a placeholder through `spec` and draw the list
-  themselves, so this is never called.
-
-  A function that throws rather than an inert value, for the reason
-  `haselnuss.emit.latex/environment-renderer` records in full: the
-  registry is one table shared across targets, and a consumer that
-  called whatever non-nil `:emit` value it found would otherwise splice
-  something meaningless into its output."
-  [directive target]
-  (throw (ex-info
-          (str "the derived-list marker was called as a renderer for directive "
-               (pr-str (:name directive)) " on target " (pr-str target)
-               ": a list placeholder is drawn by the emitter itself from the resolver's"
-               " own derivations, never dispatched through the registry")
-          {:type ::list-marker-called :block directive :target target})))
-
-(def extensions
-  "One `haselnuss.registry/register`-shaped entry per list-placeholder
-  name, each carrying the `list-renderer` marker for both targets.
-
-  No `:kind`: a list is not a numbering target, so nothing can
-  cross-reference one -- and it prints numbers that belong to other
-  nodes. No `:lower` either: it has a representation on both targets
-  this project emits, so it never degrades. A third target would find
-  no representation and stop the build naming the directive, which is
-  the honest answer for a target that has no way to build a table of
-  contents."
-  (mapv (fn [list-name]
-          {:name list-name
-           :emit {:html list-renderer :latex list-renderer}})
-        (sort (keys lists))))
+;; TASK-89 removed `list-renderer` and `extensions` from here: the
+;; per-target marker they built is no longer needed now that
+;; `haselnuss.emit.html/register-derived-lists` and
+;; `haselnuss.emit.latex/register-derived-lists` each install a REAL
+;; `renderer-v2`-marked renderer (see this namespace's own docstring for
+;; the full reasoning) directly into a registry -- `haselnuss.cli` calls
+;; both, so a build's own registry never has an entry for a
+;; list-placeholder name that this namespace supplied itself.

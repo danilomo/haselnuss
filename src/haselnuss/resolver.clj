@@ -6,6 +6,15 @@
   `expand-includes` (TASK-38), which must run before everything below so
   an included chapter's own nodes number and resolve as if they had been
   typed into the including file -- sec9
+  step 0.5 -- splicing `prepend`/`append` overlay-directive content,
+  collected from one or more SEPARATE files, into a Section of the base
+  document by id (TASK-83.1), and merging `describe` overlay-directive
+  props into the `attr.props` of any Section/Figure/Table/MathBlock/
+  referenceable Directive the base document carries by id (TASK-83.2),
+  via `apply-overlays`, which runs after step 0 (an overlay can target a
+  node that exists only post-include-expansion) and before step 1 (so
+  spliced content numbers and cross-references as if authored inline,
+  the same reasoning step 0 uses for itself) -- sec9
   step 1 -- numbering every labeled node from a per-kind counter, via
   `number-document` (TASK-11) -- sec9 step 2 -- resolving `CrossRef`
   inlines to their target's computed label and a link, via
@@ -39,7 +48,9 @@
   An unlabeled Section consumes no counter and is transparent for nesting
   purposes: its children inherit its own unchanged enclosing path."
   (:require [clojure.data.json :as json]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [haselnuss.ast :as ast]
+            [haselnuss.walk :as walk]))
 
 (def default-lexicon
   "The built-in label lexicon (SPEC.md sec6.1's `LabelLexicon`): every
@@ -426,6 +437,321 @@
                               []))]
        {:document (assoc document :blocks expanded)
         :warnings @warnings}))))
+
+;; --- Overlay application (TASK-83.1/TASK-83.2, doc-5) ----------------------
+;;
+;; sec9 step 0.5, in effect: `apply-overlays` applies `prepend`/`append`/
+;; `describe` overlay directives -- collected from one or more SEPARATE
+;; files, each an ordinary `.hdoc` whose top-level Blocks are expected to be
+;; entirely such directives -- to the base document, each by the target
+;; node's `attr.id`: `prepend`/`append` splice Blocks into the start/end of
+;; a Section (part/chapter/section, any level); `describe` merges flat
+;; metadata into `attr.props` on any of the five referenceable node kinds
+;; `describable-block-types` names. Runs after `expand-includes` (an overlay
+;; can target a node that exists only post-include-expansion, e.g. a
+;; chapter pulled in from another file) and before `number-document` (so
+;; spliced content numbers and cross-references exactly as if authored
+;; inline) -- the same ordering argument `expand-includes` already makes for
+;; itself, one step later.
+;;
+;; Two-phase, unlike `expand-includes`'s pure in-place replace: splicing
+;; happens at a different tree location than collection, so nothing here
+;; can be a single recursive replace.
+;;
+;; `apply-overlays` needs no `:load`/I/O callback (unlike `expand-includes`):
+;; reading each overlay file, and running `expand-includes` over its OWN
+;; `!include`s, is `haselnuss.cli/load-overlays!`'s job, so this namespace
+;; stays free of file I/O and of any dependency on `haselnuss.parser` --
+;; the plain Block vectors it reads here already sat through that pass.
+
+(defn- overlay-directive-block?
+  "True when `block` is a top-level overlay directive this pass recognizes
+  -- `prepend`/`append` (sec9 step 0.5's content-injection convention,
+  TASK-83.1) or `describe` (TASK-83.2's flat-metadata convention).
+  Anything else -- a paragraph, a section, an unrelated or misspelled
+  directive name -- is unrecognized top-level overlay content (see
+  `overlay-plan`)."
+  [block]
+  (and (= :directive (:t block)) (contains? #{"prepend" "append" "describe"} (:name block))))
+
+(defn- overlay-plan
+  "Walks every overlay source's own top-level Blocks ONLY (never
+  recursing into a directive's nested Blocks, which are the content to
+  inject, not more directives) building `{target-id {:prepend [Block]
+  :append [Block] :props {k v}}}` plus a `{:warnings [...]}` collection,
+  in `sources`' own order then each source's in-file order -- which is
+  exactly the file-order-then-in-file-order accumulation AC #3 asks for,
+  since a later `(fnil into [])`/`(fnil merge {})` for the same key
+  always appends/overwrites.
+
+  `sources` is a seq of Block vectors, one per overlay file, already
+  include-expanded by the caller (`haselnuss.cli/load-overlays!`).
+
+  `prepend`/`append` accumulate their own nested `:blocks` under `:prepend`/
+  `:append`; `describe` merges every prop other than `target` from its own
+  `attr.props` into `:props`, via a plain `merge` -- a later `describe`
+  aimed at the same id and the same prop key silently wins over an earlier
+  one AT THIS STAGE (this pass has no notion yet of what the base document
+  already carries). The one prop collision doc-5/AC #3 actually asks to be
+  diagnosed -- a `describe` prop colliding with a value already set on the
+  TARGET NODE itself -- can only be checked once splicing has found that
+  node, so `:overlay-prop-overwritten` is produced by `splice-overlay-block`
+  (see `merge-overlay-props`), not here. A `describe` with `target=` but no
+  other props contributes nothing to the plan at all -- there is nothing to
+  merge, so no `:props` entry is created for that id, and (unless some
+  OTHER overlay directive also targets it) `apply-overlays` reports it as a
+  `:dangling-overlay-target` like any other id nothing ends up matching.
+
+  Three non-fatal diagnostics, each dropping only the offending block
+  rather than the rest of the overlay (this codebase's own
+  diagnose-don't-silently-drop convention, `expand-includes`'s own
+  precedent), shared across all three recognized directive names:
+  - `:overlay-directive-id-ignored` -- a `prepend`/`append`/`describe`
+    directive that carries its OWN `attr.id` (e.g. `:::{prepend #foo
+    target=ch:x}`): that id is discarded once the directive node itself
+    is consumed by splicing, so flagging it here is the only chance to
+    tell an author it can never be referenced. Non-fatal: the directive
+    is still processed for its `target=`.
+  - `:overlay-missing-target` -- `target=` absent or blank (a typo like
+    `taget=`, or a bare `:::{prepend}`), distinct from a target that IS
+    named but does not resolve to anything (`:dangling-overlay-target`,
+    diagnosed by `apply-overlays` once splicing is done, since only it
+    knows what the base document actually contains).
+  - `:overlay-unexpected-content` -- any top-level block that is not a
+    recognized directive (`overlay-directive-block?`) -- including a
+    directive whose name is not `prepend`/`append`/`describe` at all.
+    This is what keeps \"the base document never sees a stray paragraph
+    from an overlay file\" airtight: dropped here, never merged in."
+  [sources]
+  (let [warnings (volatile! [])
+        warn! (fn [w] (vswap! warnings conj w))
+        plan (volatile! {})]
+    (doseq [blocks sources
+            block blocks]
+      (if (overlay-directive-block? block)
+        (let [kind (keyword (:name block))
+              target (get-in block [:attr :props "target"])
+              own-id (get-in block [:attr :id])]
+          (when own-id
+            (warn! {:type :overlay-directive-id-ignored
+                    :id own-id
+                    :directive (:name block)
+                    :message (str "the id \"" own-id "\" on this \"" (:name block)
+                                  "\" directive is discarded once its content is spliced into"
+                                  " its target -- it can never be referenced")}))
+          (if (str/blank? target)
+            (warn! {:type :overlay-missing-target
+                    :directive (:name block)
+                    :message (str "a \"" (:name block) "\" directive has no target= (or it is"
+                                  " blank); its content was dropped")})
+            (case kind
+              (:prepend :append)
+              (vswap! plan update-in [target kind] (fnil into []) (:blocks block))
+              :describe
+              (let [extra-props (dissoc (get-in block [:attr :props]) "target")]
+                (when (seq extra-props)
+                  (vswap! plan update-in [target :props] (fnil merge {}) extra-props))))))
+        (warn! {:type :overlay-unexpected-content
+                :node-type (:t block)
+                :message (str "unexpected top-level " (name (:t block)) " in an overlay file"
+                              " (only prepend/append/describe directives are recognized there);"
+                              " it was dropped")})))
+    {:plan @plan :warnings @warnings}))
+
+(def ^:private describable-block-types
+  "The Block `:t` variants a `describe` directive's `target=` may match
+  (TASK-83.2, doc-5 section 2.2's own enumeration: \"any node carrying
+  attr.id -- Section, Figure, Table, MathBlock, referenceable Directive\").
+  Deliberately narrower than every Block variant `ast.clj` lets carry an
+  `:attr` with an `:id` -- List/CodeBlock/BlockQuote do too (confirmed
+  against `ast.clj`'s `::block` schema, and independently against
+  `haselnuss.emit.latex/anchor-bearing-block-types`, which includes them
+  as LaTeX label anchors) -- but doc-5's own text bounds `describe`'s
+  target set to exactly these five, the same set `prepend`/`append`'s
+  `:section`-only match is a strict subset of. Inline `:attr`-carriers
+  (`:span`/`:link`/`:image`) are excluded for the same reason `emit/latex`
+  gives them: they are not this kind of referenceable/anchorable node
+  either."
+  #{:section :figure :table :math-block :directive})
+
+(defn- merge-overlay-props
+  "`block`'s own `attr.props` with `props` (a `describe` plan entry's
+  merged prop map, `overlay-plan`'s `:props`) merged in, one key at a
+  time. A key already present in `block`'s OWN `attr.props` -- i.e. one
+  the base document itself set, or an earlier overlay pass already wrote
+  via a DIFFERENT call to this fn -- is a non-fatal
+  `:overlay-prop-overwritten` diagnostic (doc-5 section 2.2, AC #3)
+  rather than a silent overwrite: `block`'s own value is kept and the new
+  one is dropped, the same drop-the-offending-write-and-diagnose shape
+  every other overlay diagnostic here already has
+  (`:overlay-missing-target`/`:overlay-unexpected-content` both drop
+  rather than apply anyway)."
+  [block id props ctx]
+  (reduce (fn [block [k v]]
+            (if (contains? (get-in block [:attr :props]) k)
+              (do ((:warn! ctx) {:type :overlay-prop-overwritten
+                                 :id id
+                                 :key k
+                                 :message (str "describe overlay prop \"" k "\" for \"" id
+                                               "\" was not applied -- \"" id "\" already has"
+                                               " its own value for that prop")})
+                  block)
+              (assoc-in block [:attr :props k] v)))
+          block
+          props))
+
+(declare splice-overlay-block splice-overlay-blocks)
+
+(defn- splice-overlay-inlines
+  "`splice-overlay-block` applied wherever an Inline can hold a Block --
+  mirrors `expand-inlines`'s own traversal exactly, for the same reason:
+  a Section tucked inside a footnote is still a Section an overlay might
+  target."
+  [inlines ctx]
+  (mapv
+   (fn [inline]
+     (case (:t inline)
+       :note (update inline :blocks splice-overlay-blocks ctx)
+       (:emph :strong :strike :small-caps :sub :sup :span :link)
+       (update inline :inlines splice-overlay-inlines ctx)
+       :cite (update inline :items
+                     (partial mapv (fn [item]
+                                     (cond-> item
+                                       (:prefix item) (update :prefix splice-overlay-inlines ctx)
+                                       (:suffix item) (update :suffix splice-overlay-inlines ctx)))))
+       inline))
+   inlines))
+
+(defn- splice-overlay-block
+  "One Block of the BASE document, recursed into first (so a nested
+  target is patched too, and a target nested several levels down splices
+  exactly as one at the top would), then patched at itself against
+  `entry`, the plan entry (if any) for its own `attr.id` (`ctx` is
+  `{:plan plan :matched! (fn [id]) :warn! (fn [diagnostic])}`, `matched!`
+  recording that the id was found so `apply-overlays` can diagnose the
+  ones that never were; `warn!` collecting `merge-overlay-props`' own
+  `:overlay-prop-overwritten` diagnostics).
+
+  Two independent things can happen at a matching node, and either, both,
+  or neither may apply depending on what kind of Block it is and what
+  `entry` actually holds:
+  - `prepend`/`append` splice into `:blocks` ONLY when the node is a
+    `:section` (doc-5 section 1's own restriction) and `entry` carries
+    `:prepend`/`:append` content.
+  - `describe`'s props merge into `:attr.props` (`merge-overlay-props`)
+    ONLY when the node's `:t` is in `describable-block-types` and `entry`
+    carries non-empty `:props`.
+
+  `matched!` fires per aspect actually applied, not merely because
+  `entry` exists for the id -- a `prepend`/`append` entry that names a
+  non-`:section` id (an author error `describe`'s own wider match must
+  not paper over) still reads as dangling even if that same id also
+  happens to match a `describe` entry's props elsewhere.
+
+  Covers `block-children`'s FULL variant set, including a Figure's
+  `:content` -- deliberately UNLIKE `expand-blocks`, which skips it for
+  its own reason (one Block slot cannot hold a splice of many). That
+  reason does not apply to a rebuild walk like this one (each base Block
+  maps to exactly one, possibly modified, Block back), and a target could
+  in principle sit inside a Figure's `:content` (schema-unrestricted,
+  `ast.clj:151-155`) -- so this still has to reach in and recurse, or a
+  target nested there would wrongly read as dangling. Skipping this
+  container is exactly the traversal-drift `block-children`/
+  `expand-blocks` already showed real bugs from (TASK-38 review finding
+  6); `overlay-splice-reaches-every-container-test` pins the full set."
+  [block ctx]
+  (let [block (case (:t block)
+                (:section :block-quote :directive)
+                (update block :blocks splice-overlay-blocks ctx)
+                :list (update block :items (partial mapv #(splice-overlay-blocks % ctx)))
+                :figure (update block :content splice-overlay-block ctx)
+                :table (-> block
+                           (update :head update :cells
+                                   (partial mapv #(update % :blocks splice-overlay-blocks ctx)))
+                           (update :rows
+                                   (partial mapv
+                                            (fn [row]
+                                              (update row :cells
+                                                      (partial mapv #(update % :blocks
+                                                                             splice-overlay-blocks
+                                                                             ctx)))))))
+                :para (update block :inlines splice-overlay-inlines ctx)
+                block)
+        id (get-in block [:attr :id])
+        entry (when id (get (:plan ctx) id))
+        prepend-append? (and entry (= :section (:t block))
+                             (or (seq (:prepend entry)) (seq (:append entry))))
+        describe? (and entry (contains? describable-block-types (:t block)) (seq (:props entry)))
+        block (if prepend-append?
+                (do ((:matched! ctx) id)
+                    (update block :blocks
+                            (fn [own] (into (vec (:prepend entry)) (into own (:append entry))))))
+                block)
+        block (if describe?
+                (do ((:matched! ctx) id)
+                    (merge-overlay-props block id (:props entry) ctx))
+                block)]
+    block))
+
+(defn- splice-overlay-blocks
+  "`splice-overlay-block` mapped over `blocks` -- a REBUILD walk (`mapv`,
+  one Block in for one Block out), unlike `expand-blocks`'s `mapcat` (one
+  `:include` in for zero-to-many Blocks out): splicing happens at a
+  different tree location than collection, so nothing here replaces a
+  node in place the way an include does."
+  [blocks ctx]
+  (mapv #(splice-overlay-block % ctx) blocks))
+
+(defn apply-overlays
+  "Splices every `prepend`/`append`/`describe` directive collected from
+  `sources` (a seq of Block vectors, one per overlay file -- see
+  `overlay-plan`) into `document`, returning `{:document document'
+  :warnings warnings}` (TASK-83.1, TASK-83.2).
+
+  With no sources (nil or `[]`, the default an absent `--overlay` flag
+  leaves `resolve-document` with) this is a no-op returning `document`
+  unchanged and no warnings -- the headline invariant doc-5 requires: a
+  base document builds byte-for-byte identically whether or not an
+  overlay file exists on disk, as long as it is never named.
+
+  `warnings` is `overlay-plan`'s own (`:overlay-directive-id-ignored`/
+  `:overlay-missing-target`/`:overlay-unexpected-content`), in the order
+  it produced them, followed by every `:overlay-prop-overwritten`
+  diagnostic `merge-overlay-props` produced during splicing, in traversal
+  order, followed by one `:dangling-overlay-target` diagnostic per plan
+  key that matched no describable node in `document` at all -- checked
+  only after splicing finishes, since only then is it certain nothing in
+  `document` (including a node nested inside another overlay's own
+  injected content) ever carried that id.
+
+  A target id shared by two or more nodes -- a pre-existing id collision
+  in the base document -- gets the overlay applied to ALL of them:
+  deterministic, no hidden first-match-wins state, though also no
+  diagnostic of its own here, since `structural-diagnostics`'s own
+  `duplicate-id-diagnostics` -- which `resolve-document` runs later,
+  over this pass's own output -- already reports the collision."
+  [document sources]
+  (if (empty? sources)
+    {:document document :warnings []}
+    (let [{:keys [plan warnings]} (overlay-plan sources)
+          collected (volatile! (vec warnings))
+          matched (volatile! #{})
+          ctx {:plan plan
+               :matched! (fn [id] (vswap! matched conj id))
+               :warn! (fn [w] (vswap! collected conj w))}
+          spliced (splice-overlay-blocks (:blocks document) ctx)
+          dangling (into []
+                         (keep (fn [id]
+                                 (when-not (contains? @matched id)
+                                   {:type :dangling-overlay-target
+                                    :id id
+                                    :message (str "overlay target \"" id "\" does not resolve"
+                                                  " to a Section, Figure, Table, MathBlock, or"
+                                                  " referenceable Directive in the base"
+                                                  " document")})))
+                         (keys plan))]
+      {:document (assoc document :blocks spliced)
+       :warnings (into @collected dangling)})))
 
 (defn- front-matter-block?
   "True when Block `block` is a front-matter directive per
@@ -926,6 +1252,13 @@
 ;; walked for `CrossRef`s. Fallback content is target-specific degradation
 ;; material consumed by TASK-17's later `lower` pass, orthogonal to this
 ;; resolution step over the document's primary content.
+;;
+;; Every position above is reached through `haselnuss.walk/rewrite`
+;; (TASK-86), driven off the schema `haselnuss.ast/registry` itself
+;; declares, rather than a hand-written recursive function per node kind --
+;; see `cross-ref-scope`/`resolve-cross-refs-node`, below `resolve-cross-ref`
+;; itself (unchanged by this port: `rewrite`'s own `:rewrite-fn` still calls
+;; it exactly the same way, one `:cross-ref` node at a time).
 
 (defn- resolve-cross-ref
   "Resolves a single `:cross-ref` inline node against `labels` (a
@@ -953,112 +1286,55 @@
        :label label
        :message (str "dangling cross-reference: no target with id \"" label "\"")}]]))
 
-(defn- resolve-seq
-  "Maps `resolve-one` (a `node -> [node' warnings]` function) over `xs`,
-  returning `[xs' warnings']` with every element's own (already-a-vector)
-  `warnings` concatenated in `xs`'s order."
-  [resolve-one xs]
-  (reduce (fn [[acc warnings] x]
-            (let [[x' w] (resolve-one x)]
-              [(conj acc x') (into warnings w)]))
-          [[] []]
-          xs))
+(def ^:private cross-ref-scope
+  "`haselnuss.walk/rewrite`'s own `:scope` for `resolve-cross-refs`
+  (TASK-86): every reference kind a `:cross-ref` Inline can be reached
+  through -- `::block`/`::inline` for the tree itself, `::row`/`::cell` so
+  a Table's own `:head`/`:rows` reach down to each cell's `:blocks`,
+  `::cite-item` so a Cite's own `:items` reach their `:prefix`/`:suffix`
+  (which can themselves hide a footnote, or another CrossRef -- see
+  `cross-ref-nested-in-structural-positions-test`), and `::meta` so one
+  `rewrite` call rooted at the Document also reaches `meta.title`. Exactly
+  `haselnuss.lower`'s own `scope` (TASK-85), for exactly the same reasons:
+  resolving a CrossRef has no ordering dependency on its own descendants
+  (a CrossRef carries no nested Inlines of its own to resolve first) any
+  more than lowering a Directive does, so nothing here needs the
+  narrower, deliberately-excludes-`::cite-item` scope `resolve-citations`
+  needs below (see `citation-scope`).
 
-(declare resolve-block)
+  `::attr`/`::col` are absent because neither schema carries a reference of
+  its own to descend through either way (mirrors `haselnuss.lower`).
+  `::fallback` is absent DELIBERATELY, unchanged from before this port (see
+  this section's own top-of-namespace comment): a Directive's own
+  `:fallback` is target-specific degradation material for `haselnuss.
+  lower`'s later pass, not part of the document a CrossRef resolves
+  against."
+  #{::ast/block ::ast/inline ::ast/cell ::ast/row ::ast/cite-item ::ast/meta})
 
-(defn- resolve-blocks
-  "`resolve-block` mapped over every Block in `blocks`, in order."
-  [labels blocks]
-  (resolve-seq (partial resolve-block labels) blocks))
+(defn- resolve-cross-refs-node
+  "The CrossRef-resolution pass's own `:rewrite-fn` (TASK-86): a
+  `:cross-ref` Inline is `resolve-cross-ref`'s alone to resolve; every
+  other node this pass reaches -- via `haselnuss.walk/rewrite`'s own
+  schema-derived recursion (`cross-ref-scope`), not a hand-written
+  traversal function per node kind -- has no opinion of its own and is
+  returned unchanged, `[node]`, so only its own child-bearing fields (if
+  it has any) are ever touched.
 
-(declare resolve-inline)
-
-(defn- resolve-inlines
-  "`resolve-inline` mapped over every Inline in `inlines`, in order."
-  [labels inlines]
-  (resolve-seq (partial resolve-inline labels) inlines))
-
-(defn- resolve-cite-item
-  "Resolves any `CrossRef`s nested in CiteItem `item`'s optional `:prefix`/
-  `:suffix` Inlines (sec4.4), leaving an absent field absent rather than
-  becoming `[]` (mirroring TASK-9's own prefix/suffix-presence contract)."
-  [labels {:keys [prefix suffix] :as item}]
-  (let [[prefix' pw] (if prefix (resolve-inlines labels prefix) [nil []])
-        [suffix' sw] (if suffix (resolve-inlines labels suffix) [nil []])]
-    [(cond-> item
-       prefix (assoc :prefix prefix')
-       suffix (assoc :suffix suffix'))
-     (into pw sw)]))
-
-(defn- resolve-inline
-  "Resolves any `:cross-ref` node reachable from `inline`: itself, if
-  `inline` is one, else recursing into every nested-Inline/nested-Block
-  field an Inline variant can carry (sec4.4) -- `:inlines` for
-  `:emph`/`:strong`/`:strike`/`:small-caps`/`:sub`/`:sup`/`:span`/`:link`,
-  `:items` for `:cite` (via `resolve-cite-item`), `:blocks` for a footnote
-  `:note`. Every other variant (`:str`/`:space`/`:soft-break`/`:line-break`/
-  `:code`/`:math-inline`/`:image`) carries neither and is returned
-  unchanged."
-  [labels inline]
-  (case (:t inline)
-    :cross-ref (resolve-cross-ref labels inline)
-    (:emph :strong :strike :small-caps :sub :sup :span :link)
-    (let [[inlines' warnings] (resolve-inlines labels (:inlines inline))]
-      [(assoc inline :inlines inlines') warnings])
-    :cite
-    (let [[items' warnings] (resolve-seq (partial resolve-cite-item labels) (:items inline))]
-      [(assoc inline :items items') warnings])
-    :note
-    (let [[blocks' warnings] (resolve-blocks labels (:blocks inline))]
-      [(assoc inline :blocks blocks') warnings])
-    [inline []]))
-
-(defn- resolve-cell
-  "Resolves any `CrossRef`s in Cell `cell`'s own `:blocks`."
-  [labels cell]
-  (let [[blocks' warnings] (resolve-blocks labels (:blocks cell))]
-    [(assoc cell :blocks blocks') warnings]))
-
-(defn- resolve-row
-  "`resolve-cell` mapped over Row `row`'s `:cells`, in order."
-  [labels row]
-  (let [[cells' warnings] (resolve-seq (partial resolve-cell labels) (:cells row))]
-    [(assoc row :cells cells') warnings]))
-
-(defn- resolve-block
-  "Resolves any `:cross-ref` node reachable from `block`, recursing into
-  every nested-Inline/nested-Block field a Block variant can carry (sec4.3)
-  -- a Section's `:heading` and `:blocks`; a Para's `:inlines`; a List's
-  `:items` (a vector of Block vectors); a Figure's `:content` and
-  `:caption`; a Table's `:head`/`:rows` (via `resolve-row`) and `:caption`;
-  a BlockQuote or Directive's `:blocks`. Every other variant (`:code-block`/
-  `:math-block`/`:include`/`:thematic-break`) carries neither and is
-  returned unchanged."
-  [labels block]
-  (case (:t block)
-    :section
-    (let [[heading' hw] (resolve-inlines labels (:heading block))
-          [blocks' bw] (resolve-blocks labels (:blocks block))]
-      [(assoc block :heading heading' :blocks blocks') (into hw bw)])
-    :para
-    (let [[inlines' warnings] (resolve-inlines labels (:inlines block))]
-      [(assoc block :inlines inlines') warnings])
-    :list
-    (let [[items' warnings] (resolve-seq (partial resolve-blocks labels) (:items block))]
-      [(assoc block :items items') warnings])
-    :figure
-    (let [[content' cw] (resolve-block labels (:content block))
-          [caption' capw] (resolve-inlines labels (:caption block))]
-      [(assoc block :content content' :caption caption') (into cw capw)])
-    :table
-    (let [[head' hw] (resolve-row labels (:head block))
-          [rows' rw] (resolve-seq (partial resolve-row labels) (:rows block))
-          [caption' capw] (resolve-inlines labels (:caption block))]
-      [(assoc block :head head' :rows rows' :caption caption') (into (into hw rw) capw)])
-    (:block-quote :directive)
-    (let [[blocks' warnings] (resolve-blocks labels (:blocks block))]
-      [(assoc block :blocks blocks') warnings])
-    [block []]))
+  `warn!` is the mutable side channel `haselnuss.walk`'s own namespace
+  docstring calls for: `rewrite`'s `:rewrite-fn` returns replacement nodes
+  only, with no channel of its own for `resolve-cross-ref`'s own `[node'
+  warnings]` diagnostics, so this closes over a caller-supplied `(fn [w])`
+  and calls it once per warning `resolve-cross-ref` produced for this node
+  (zero or one) -- the same single-diagnostic-at-a-time `warn!` shape this
+  namespace's own `expand-includes`/`apply-overlays` already use, called in
+  the exact order `rewrite` visits nodes (document order, per
+  `cross-ref-scope`)."
+  [labels warn! ref-kind node]
+  (if (and (= ref-kind ::ast/inline) (= :cross-ref (:t node)))
+    (let [[node' warnings] (resolve-cross-ref labels node)]
+      (run! warn! warnings)
+      [node'])
+    [node]))
 
 (defn resolve-cross-refs
   "The `CrossRef` resolution pass (SPEC.md sec9 step 2): resolves every
@@ -1076,16 +1352,21 @@
   dangling reference encountered, in document order -- `document'` never
   contains a raw crash, only a visible placeholder plus a diagnostic,
   mirroring `resolve`'s own `{ast, meta, diagnostics}` shape at this
-  narrower, single-step scale (sec9)."
+  narrower, single-step scale (sec9).
+
+  Walked via `haselnuss.walk/rewrite` (TASK-86, `cross-ref-scope`/
+  `resolve-cross-refs-node`), rooted at the Document itself so one call
+  reaches both `:blocks` and `meta.title` -- `::meta` is in
+  `cross-ref-scope` for exactly that reason, mirroring how
+  `haselnuss.lower/lower` reaches `meta.title` the same way (TASK-85)."
   ([document] (resolve-cross-refs document (number-document document)))
   ([document labels]
-   (let [title (get-in document [:meta :title])
-         [title' tw] (if title (resolve-inlines labels title) [nil []])
-         [blocks' bw] (resolve-blocks labels (:blocks document))
-         document' (cond-> document
-                     title (assoc-in [:meta :title] title')
-                     true (assoc :blocks blocks'))]
-     {:document document' :warnings (into tw bw)})))
+   (let [warnings (volatile! [])
+         warn! (fn [w] (vswap! warnings conj w))
+         walker {:table walk/table :scope cross-ref-scope
+                 :rewrite-fn (partial resolve-cross-refs-node labels warn!)}
+         document' (first (walk/rewrite walker ::ast/document document))]
+     {:document document' :warnings @warnings})))
 
 ;; Citation resolution and bibliography generation (TASK-13, sec7/sec9 step 3)
 ;;
@@ -1394,8 +1675,9 @@
 
 (defn- resolve-cite-node
   "Formats Cite node `cite`'s own `:text` (its `:items` are assumed
-  already resolved for any nested Cites -- see `cite-resolve-inline`),
-  using `style` and `citation-table` (a `build-citation-table` result).
+  already resolved for any nested Cites -- see `resolve-citations-node`,
+  TASK-86, which guarantees this before ever calling here), using `style`
+  and `citation-table` (a `build-citation-table` result).
   `bare?` (true exactly when every item's `:mode` is `:author`) is
   computed once here and threaded into both `:item-core` (so it can
   self-punctuate a bare author-in-text mention, review fix for TASK-13)
@@ -1427,57 +1709,81 @@
                        items)]
     [(assoc cite :text text) warnings]))
 
-;; Structural walks below mirror TASK-12's resolve-block/resolve-inline
-;; coverage (every Block/Inline variant that can carry nested Inlines/
-;; Blocks per sec4.3/4.4), but are deliberately new and self-contained
-;; rather than a refactor of that already-reviewed code -- they reuse only
-;; the generic `resolve-seq` helper defined above. Two concerns are kept
-;; separate since bibliography ordering/numbering needs the *whole*
-;; document's distinct key set before any single Cite can be formatted:
-;; `cite-keys-in-*` (a plain collecting walk, no transform) gathers every
-;; CiteItem :key in document order; `cite-resolve-*` (a transforming walk,
-;; threading warnings like TASK-12's resolve-*) formats every reachable
-;; Cite node's :text.
+;; Two concerns are kept separate since bibliography ordering/numbering
+;; needs the *whole* document's distinct key set before any single Cite can
+;; be formatted:
+;;
+;; `cite-keys-in-*` below gathers every CiteItem `:key` in document order --
+;; a plain read-only collecting walk with no transform, exactly `fold`'s own
+;; contract (TASK-87) -- via `cite-keys-walker`/`cite-keys-visit` below.
+;;
+;; Formatting every reachable Cite node's own `:text` is, since TASK-86,
+;; `resolve-citations-node`, below `build-citation-table`: `haselnuss.walk/
+;; rewrite`'s schema-derived recursion (`citation-scope`) reaches every
+;; position this walk does too, with ONE deliberate exception -- see
+;; `citation-scope`'s own docstring for why a Cite's `:items` (`::cite-
+;; item`) has to stay out of `:scope` and be walked manually instead,
+;; unlike `resolve-cross-refs`. `cite-keys-scope` makes the identical
+;; exclusion, for the identical reason -- see there.
 
-(declare cite-keys-in-block)
+(def ^:private cite-keys-scope
+  "`haselnuss.walk/fold`'s own `:scope` for `cite-keys-in-*` (TASK-87):
+  `cross-ref-scope` minus `::meta` (this pass is called separately over
+  `meta.title` and `:blocks`, mirroring `resolve-citations`'s own two call
+  sites below, so nothing here ever roots at the Document itself) and
+  minus `::cite-item`, excluded for exactly `citation-scope`'s own reason
+  applied one pass earlier: a Cite's own `:items` need to contribute their
+  `:key`s as ONE BATCH, ahead of any key nested inside an item's own
+  `:prefix`/`:suffix` (see `cite-keys-visit`'s own docstring) -- an order
+  `fold`'s automatic per-item recursion cannot produce on its own, since it
+  would interleave each item's own key with that SAME item's nested
+  content before ever reaching the next item. Citation numbers are
+  assigned by first-appearance order over this exact sequence
+  (`build-citation-table`), so getting this order wrong is an observable,
+  rendered-output bug (a document whose first Cite hides a nested Cite in
+  an early item's own prefix would number citations differently), not a
+  cosmetic one."
+  #{::ast/block ::ast/inline ::ast/cell ::ast/row})
+
+(declare cite-keys-walker)
+
+(defn- cite-keys-visit
+  "`cite-keys-walker`'s own `:visit` (TASK-87): every other node this walk
+  reaches contributes nothing directly (a citation key only ever lives on
+  a CiteItem, never a Block or Inline itself) and is left to `fold`'s own
+  recursion into its child-bearing fields. A `:cite` Inline is the one
+  exception, handled ENTIRELY here rather than through `:items`
+  (`::cite-item`, deliberately out of `cite-keys-scope`): first every
+  item's own `:key`, in item order (mirrors the pre-TASK-87 `cite-keys-in-
+  inline`'s own `(map :key (:items inline))`), THEN, for each item in that
+  SAME order, any key nested inside its own `:prefix` then `:suffix`
+  (each walked recursively with this same walker) -- reproducing the pre-
+  TASK-87 `:cite` case's own two-pass order exactly, which a naive
+  per-item interleaved dispatch would not (see `cite-keys-scope`)."
+  [acc _path ref-kind node]
+  (if (and (= ref-kind ::ast/inline) (= :cite (:t node)))
+    (let [nested-keys-in (fn [acc inlines]
+                           (reduce (fn [acc inline] (walk/fold cite-keys-walker acc ::ast/inline inline))
+                                   acc inlines))]
+      (reduce (fn [acc item] (-> acc (nested-keys-in (:prefix item)) (nested-keys-in (:suffix item))))
+              (into acc (map :key (:items node)))
+              (:items node)))
+    acc))
+
+(def ^:private cite-keys-walker
+  {:table walk/table :scope cite-keys-scope :visit cite-keys-visit})
 
 (defn- cite-keys-in-blocks
+  "Every CiteItem `:key` reachable from `blocks`, in document order
+  (TASK-87: `cite-keys-walker`, walked via `haselnuss.walk/fold`)."
   [blocks]
-  (mapcat cite-keys-in-block blocks))
-
-(declare cite-keys-in-inline)
+  (reduce (fn [acc block] (walk/fold cite-keys-walker acc ::ast/block block)) [] blocks))
 
 (defn- cite-keys-in-inlines
+  "Every CiteItem `:key` reachable from `inlines`, in document order
+  (TASK-87: `cite-keys-walker`, walked via `haselnuss.walk/fold`)."
   [inlines]
-  (mapcat cite-keys-in-inline inlines))
-
-(defn- cite-keys-in-inline
-  [inline]
-  (case (:t inline)
-    :cite (concat (map :key (:items inline))
-                  (mapcat (fn [item]
-                            (concat (cite-keys-in-inlines (:prefix item))
-                                    (cite-keys-in-inlines (:suffix item))))
-                          (:items inline)))
-    (:emph :strong :strike :small-caps :sub :sup :span :link)
-    (cite-keys-in-inlines (:inlines inline))
-    :note (cite-keys-in-blocks (:blocks inline))
-    []))
-
-(defn- cite-keys-in-cell
-  [cell]
-  (cite-keys-in-blocks (:blocks cell)))
-
-(defn- cite-keys-in-block
-  [block]
-  (case (:t block)
-    :section (concat (cite-keys-in-inlines (:heading block)) (cite-keys-in-blocks (:blocks block)))
-    :para (cite-keys-in-inlines (:inlines block))
-    :list (mapcat cite-keys-in-blocks (:items block))
-    :figure (concat (cite-keys-in-block (:content block)) (cite-keys-in-inlines (:caption block)))
-    :table (concat (mapcat cite-keys-in-cell (table-cells block)) (cite-keys-in-inlines (:caption block)))
-    (:block-quote :directive) (cite-keys-in-blocks (:blocks block))
-    []))
+  (reduce (fn [acc inline] (walk/fold cite-keys-walker acc ::ast/inline inline)) [] inlines))
 
 (defn- build-citation-table
   "A map from each *resolvable* key in `keys-in-order` (one already found
@@ -1492,88 +1798,94 @@
           (map-indexed (fn [i k] [k {:entry (get bibliography k) :number (inc i)}]))
           found)))
 
-(declare cite-resolve-block)
+(def ^:private citation-scope
+  "`haselnuss.walk/rewrite`'s own `:scope` for `resolve-citations` (TASK-86)
+  -- `cross-ref-scope` with ONE deliberate difference: `::cite-item` is OUT
+  of scope here, unlike there.
 
-(defn- cite-resolve-blocks
-  [ctx blocks]
-  (resolve-seq (partial cite-resolve-block ctx) blocks))
+  Formatting a Cite node's own `:text` (`resolve-cite-node`) needs its
+  CiteItems' `:prefix`/`:suffix` ALREADY resolved: a nested Cite there must
+  already carry its own `:text` before the outer Cite's `:text` splices it
+  in verbatim (`item-inline-text`), exactly what resolving `:items` before
+  ever calling `resolve-cite-node` guaranteed before this port. `rewrite`
+  cannot express that ordering with a plain per-node dispatch at `::inline`:
+  `(:rewrite-fn walker)` always runs BEFORE `rewrite` recurses into
+  whatever it returns, never after (see `haselnuss.walk/rewrite`'s own
+  docstring), so a naive dispatch would compute a Cite's `:text` from its
+  STILL-unresolved items -- observably wrong output, not just a different
+  code path, since the outer Cite's own `:text` would then embed a nested
+  Cite with no `:text` of its own.
 
-(declare cite-resolve-inline)
+  Excluding `::cite-item` from `:scope` is what makes the fix safe rather
+  than merely convenient: the ONLY field anywhere in `haselnuss.ast/
+  registry` whose type ever refers to `::cite-item` is a Cite's own
+  `:items` (confirmed against `ast.clj` directly), so nothing else in the
+  schema ever needs it in scope, and excluding it stops `rewrite`'s own
+  automatic recursion from EVER reaching a CiteItem on its own. That is
+  what lets `resolve-citations-node`'s own `:cite` branch walk `:items`
+  itself FIRST (recursively, with this same scope, so a nested Cite
+  resolves correctly at any depth), THEN call `resolve-cite-node`, with no
+  risk of `rewrite`'s later automatic descent into the very same,
+  already-resolved `:items` running `resolve-cite-node` on it a SECOND
+  time -- which would not just waste work but double-count any nested
+  dangling-citation warning."
+  #{::ast/block ::ast/inline ::ast/cell ::ast/row ::ast/meta})
 
-(defn- cite-resolve-inlines
-  [ctx inlines]
-  (resolve-seq (partial cite-resolve-inline ctx) inlines))
+(declare resolve-citations-node)
 
-(defn- cite-resolve-cite-item
-  "Resolves any nested Cites reachable through CiteItem `item`'s own
-  `:prefix`/`:suffix` Inlines, leaving an absent field absent (mirrors
-  TASK-12's `resolve-cite-item`)."
-  [ctx {:keys [prefix suffix] :as item}]
-  (let [[prefix' pw] (if prefix (cite-resolve-inlines ctx prefix) [nil []])
-        [suffix' sw] (if suffix (cite-resolve-inlines ctx suffix) [nil []])]
-    [(cond-> item
-       prefix (assoc :prefix prefix')
-       suffix (assoc :suffix suffix'))
-     (into pw sw)]))
+(defn- citation-walker
+  "The Cite-resolution pass's own `haselnuss.walk/rewrite` walker
+  (TASK-86): `:scope` is `citation-scope` (see there for why `::cite-item`
+  is deliberately excluded) and `:rewrite-fn` is `resolve-citations-node`
+  itself, partially applied over `ctx`. Built both by the top-level call in
+  `resolve-citations` and by `resolve-citations-node`'s own recursive call
+  into a Cite's CiteItems' `:prefix`/`:suffix` content -- see there for why
+  that one recursion has to be manual rather than left to `rewrite`'s own
+  automatic per-field descent."
+  [ctx]
+  {:table walk/table :scope citation-scope :rewrite-fn (partial resolve-citations-node ctx)})
 
-(defn- cite-resolve-inline
-  "Resolves any `:cite` node reachable from `inline`: itself (after first
-  resolving any nested Cites in its own items' prefix/suffix, then
-  formatting its own `:text` via `resolve-cite-node`), else recursing into
-  every nested-Inline/nested-Block field an Inline variant can carry
-  (sec4.4), exactly mirroring TASK-12's `resolve-inline` coverage."
-  [ctx inline]
-  (case (:t inline)
-    :cite
-    (let [[items' iw] (resolve-seq (partial cite-resolve-cite-item ctx) (:items inline))
-          [cite' cw] (resolve-cite-node ctx (assoc inline :items items'))]
-      [cite' (into iw cw)])
-    (:emph :strong :strike :small-caps :sub :sup :span :link)
-    (let [[inlines' w] (cite-resolve-inlines ctx (:inlines inline))]
-      [(assoc inline :inlines inlines') w])
-    :note
-    (let [[blocks' w] (cite-resolve-blocks ctx (:blocks inline))]
-      [(assoc inline :blocks blocks') w])
-    [inline []]))
+(defn- resolve-citations-node
+  "The Cite-resolution pass's own `:rewrite-fn` (TASK-86, `ctx` is `{:style
+  :citation-table :warn!}`): a `:cite` Inline is resolved HERE, not left to
+  `rewrite`'s own automatic recursion into its `:items` (out of
+  `citation-scope` -- see there), because `resolve-cite-node` needs those
+  items' own nested Cites (if any) already resolved first.
 
-(defn- cite-resolve-cell
-  [ctx cell]
-  (let [[blocks' w] (cite-resolve-blocks ctx (:blocks cell))]
-    [(assoc cell :blocks blocks') w]))
+  So this walks `:items` itself: `resolve-nested` recurses into each
+  CiteItem's own `:prefix`/`:suffix` via `walk/rewrite` (`citation-walker`,
+  the SAME scope/ctx, so a Cite nested arbitrarily deep inside another
+  Cite's own CiteItem resolves correctly, one level of recursion per level
+  of nesting), producing `items'` -- CiteItems whose own `:prefix`/`:suffix`
+  are already, correctly resolved, mirroring TASK-9's own prefix/suffix-
+  presence contract (`update` only touches a field the item actually has).
+  `resolve-cite-node` is then called on `(assoc node :items items')`, and
+  ITS OWN warnings (dangling-citation, one per unresolved key in `:items`,
+  TASK-13 AC #4) are reported through `warn!` -- `ctx`'s own mutable side
+  channel (`haselnuss.walk`'s own namespace docstring: `rewrite`'s
+  `:rewrite-fn` returns replacement nodes only, so a caller wanting a side
+  log closes over one itself), in the exact order this recursion visits
+  nodes: any NESTED Cite's own warnings first (via `resolve-nested`, since
+  `items'` is computed before `resolve-cite-node` runs on the outer node),
+  then this node's own, mirroring the pre-port `cite-resolve-inline`'s own
+  `(into iw cw)` ordering exactly.
 
-(defn- cite-resolve-row
-  [ctx row]
-  (let [[cells' w] (resolve-seq (partial cite-resolve-cell ctx) (:cells row))]
-    [(assoc row :cells cells') w]))
-
-(defn- cite-resolve-block
-  "Resolves any `:cite` node reachable from `block`, exactly mirroring
-  TASK-12's `resolve-block` coverage of Block variants (sec4.3)."
-  [ctx block]
-  (case (:t block)
-    :section
-    (let [[heading' hw] (cite-resolve-inlines ctx (:heading block))
-          [blocks' bw] (cite-resolve-blocks ctx (:blocks block))]
-      [(assoc block :heading heading' :blocks blocks') (into hw bw)])
-    :para
-    (let [[inlines' w] (cite-resolve-inlines ctx (:inlines block))]
-      [(assoc block :inlines inlines') w])
-    :list
-    (let [[items' w] (resolve-seq (partial cite-resolve-blocks ctx) (:items block))]
-      [(assoc block :items items') w])
-    :figure
-    (let [[content' cw] (cite-resolve-block ctx (:content block))
-          [caption' capw] (cite-resolve-inlines ctx (:caption block))]
-      [(assoc block :content content' :caption caption') (into cw capw)])
-    :table
-    (let [[head' hw] (cite-resolve-row ctx (:head block))
-          [rows' rw] (resolve-seq (partial cite-resolve-row ctx) (:rows block))
-          [caption' capw] (cite-resolve-inlines ctx (:caption block))]
-      [(assoc block :head head' :rows rows' :caption caption') (into (into hw rw) capw)])
-    (:block-quote :directive)
-    (let [[blocks' w] (cite-resolve-blocks ctx (:blocks block))]
-      [(assoc block :blocks blocks') w])
-    [block []]))
+  Every other node this pass reaches -- via `haselnuss.walk/rewrite`'s own
+  schema-derived recursion, not a hand-written traversal function per node
+  kind -- has no opinion of its own and is returned unchanged, `[node]`."
+  [ctx ref-kind node]
+  (if (and (= ref-kind ::ast/inline) (= :cite (:t node)))
+    (let [walker (citation-walker ctx)
+          resolve-nested (fn [inlines] (into [] (mapcat #(walk/rewrite walker ::ast/inline %)) inlines))
+          items' (mapv (fn [item]
+                         (cond-> item
+                           (:prefix item) (update :prefix resolve-nested)
+                           (:suffix item) (update :suffix resolve-nested)))
+                       (:items node))
+          [node' warnings] (resolve-cite-node ctx (assoc node :items items'))]
+      (run! (:warn! ctx) warnings)
+      [node'])
+    [node]))
 
 ;; Bibliography-section id disambiguation (TASK-13 review fix, AC #3)
 ;;
@@ -1586,31 +1898,90 @@
 ;; CrossRef to the author's own "sec:bibliography" node would silently
 ;; retarget to the generated bibliography, with no warning at all.
 ;;
-;; `ids-in-block`/`ids-in-blocks` below collect every id already in play,
-;; mirroring `block-children`'s own Block-nested-Block traversal (reused
-;; directly, since it is a plain structural helper with no numbering-
-;; specific behavior of its own) -- deliberately scoped to Block `:attr
-;; :id`s only, exactly the id namespace `number-document`'s label table
-;; is built from (see `id->kind`'s own docstring: a numbering target is
-;; always a Block, never a Link/Image/Span Inline's own id), since that is
-;; precisely the collision this fix closes. `unique-bibliography-id` then
-;; picks the base id its own division calls for ("sec:bibliography", or
-;; "ch:bibliography" in a chaptered document -- TASK-63) when that is
-;; free, else the first numbered-suffix variant not already taken, and -- mirroring this namespace's own
-;; "never change behavior silently" convention (the dangling-cross-ref/
-;; dangling-citation warnings above) -- reports the collision as a build
-;; warning rather than just quietly picking a different id with no trace.
+;; `ids-in-blocks` below (TASK-87: `ids-walker`/`ids-visit`, via
+;; `haselnuss.walk/fold`) collects every id already in play -- deliberately
+;; scoped to Block `:attr.id`s only, exactly the id namespace
+;; `number-document`'s label table is built from (see `id->kind`'s own
+;; docstring: a numbering target is always a Block, never a Link/Image/Span
+;; Inline's own id), since that is precisely the collision this fix closes.
+;; `unique-bibliography-id` then picks the base id its own division calls
+;; for ("sec:bibliography", or "ch:bibliography" in a chaptered document --
+;; TASK-63) when that is free, else the first numbered-suffix variant not
+;; already taken, and -- mirroring this namespace's own "never change
+;; behavior silently" convention (the dangling-cross-ref/dangling-citation
+;; warnings above) -- reports the collision as a build warning rather than
+;; just quietly picking a different id with no trace.
+;;
+;; `ids-scope` reaches every position `block-children`'s own (pre-TASK-87)
+;; Block-nested-Block traversal did -- including a footnote nested inside a
+;; Cite's own `:prefix`/`:suffix`, which `block-children`'s `:para` case
+;; reached via `inline-blocks` -- PLUS one position it did not: a footnote
+;; nested inside a Section's own `:heading` or a Figure/Table's own
+;; `:caption`, not just a Para's `:inlines`. `haselnuss.walk/fold`'s
+;; `:scope` filters by reference KIND (`::inline`), not by which node's
+;; field it is, so it cannot single out "reachable through a Para" the way
+;; the old, hand-written traversal did.
+;;
+;; HONEST NOTE ON TASK-87's OWN AC #2 ("collected ... ids ... identical to
+;; before, including order and duplicate handling"): this widening means
+;; that wording does NOT hold literally for `ids-in-blocks`. It is a
+;; disclosed, deliberate, verified-safe change, not an oversight glossed
+;; over as "identical" -- confirmed empirically (clojure-reviewer, TASK-87
+;; review, and independently reproduced from a git worktree pinned at the
+;; pre-TASK-87 commit): given a Section whose `:heading` and a Figure whose
+;; `:caption` each carry a footnote wrapping the SAME id-bearing MathBlock,
+;; the pre-TASK-87 `ids-in-block` returns `(nil nil nil)` for the pair (the
+;; footnotes are invisible to it), while this walk returns `[nil "the-id"
+;; nil nil "the-id"]` -- a strict superset, not a mere reorder. It is safe
+;; specifically because of what `ids-in-blocks` feeds and nothing more
+;; general than that: its one caller, `existing-block-ids`, converts
+;; straight to a SET for collision-avoidance when choosing the generated
+;; bibliography section's own id (order and duplicate COUNT are already
+;; irrelevant to it), and `duplicate-id-diagnostics` independently re-
+;; checks the FINAL document regardless of what this pass finds -- so a
+;; wider reach here can only let `unique-bibliography-id` notice a real,
+;; pre-existing collision it used to miss (and proactively pick a
+;; different id, with its own warning), never manufacture a false one.
+;; This is the class of fix the schema-derived walker exists for (doc-6):
+;; the old, hand-written `block-children`-based walk had a narrower reach
+;; than `inline-blocks`' own `::inline`-vs-`::block` distinction could
+;; ever express in the first place, and this port's `:scope` mechanism
+;; cannot silently keep repeating that narrowing -- it has no notion of
+;; "this `::inline` field, but not that one". Reverting to the narrower,
+;; pre-TASK-87 reach would mean deliberately reintroducing that gap, which
+;; is not what "identical to before" is worth doing here.
 
-(defn- ids-in-block
-  "`block`'s own `attr.id` (nil if absent), followed by every id reachable
-  from its descendant Blocks (via `block-children`, mirroring
-  `number-block`'s own traversal)."
-  [block]
-  (cons (get-in block [:attr :id]) (mapcat ids-in-block (block-children block))))
+(def ^:private ids-scope
+  "`haselnuss.walk/fold`'s own `:scope` for `ids-in-blocks` (TASK-87): every
+  reference kind `inline-blocks` (this pass's own pre-TASK-87 footnote
+  reachability, reused by `block-children`'s `:para` case) could reach a
+  nested Block through -- `::inline` for a Para's own `:inlines`, `::cite-
+  item` for a Cite's own `:prefix`/`:suffix` -- plus `::row`/`::cell` for a
+  Table's own cells, exactly `block-children`'s own coverage there. See
+  this section's own top-of-namespace comment (\"HONEST NOTE ON TASK-87's
+  OWN AC #2\") for the one documented, verified-safe way this genuinely
+  reaches MORE than the pre-TASK-87 walk did -- not merely a reorder."
+  #{::ast/block ::ast/inline ::ast/cell ::ast/row ::ast/cite-item})
+
+(defn- ids-visit
+  "`ids-walker`'s own `:visit` (TASK-87): `(get-in node [:attr :id])` (nil
+  included, mirroring the pre-TASK-87 `ids-in-block`'s own unconditional
+  `cons`) for every Block this walk reaches, nothing for anything else --
+  a numbering target, and therefore a candidate for `existing-block-ids`,
+  is always a Block (see this section's own top-of-namespace comment)."
+  [acc _path ref-kind node]
+  (if (= ref-kind ::ast/block)
+    (conj acc (get-in node [:attr :id]))
+    acc))
+
+(def ^:private ids-walker
+  {:table walk/table :scope ids-scope :visit ids-visit})
 
 (defn- ids-in-blocks
+  "Every Block `attr.id` (nil included) reachable from `blocks`, in
+  document order (TASK-87: `ids-walker`, walked via `haselnuss.walk/fold`)."
   [blocks]
-  (mapcat ids-in-block blocks))
+  (reduce (fn [acc block] (walk/fold ids-walker acc ::ast/block block)) [] blocks))
 
 (defn- existing-block-ids
   "Every non-nil Block `attr.id` already present anywhere in `document`."
@@ -1770,7 +2141,13 @@
   `resolve-cross-refs`/`derive-toc` rather than re-derived from the AST.
   Purely additive: every existing caller destructuring `:document`/
   `:warnings` (this namespace's own `resolve-document`, every
-  `resolve-citations` test) is unaffected."
+  `resolve-citations` test) is unaffected.
+
+  Walked via `haselnuss.walk/rewrite` (TASK-86, `citation-scope`/
+  `citation-walker`/`resolve-citations-node`), rooted at the Document
+  itself so one call reaches both `:blocks` and `meta.title` -- mirroring
+  `resolve-cross-refs`'s own TASK-86 port -- with `citation-scope`'s own
+  deliberate `::cite-item` exclusion accounted for (see there)."
   ([document]
    (resolve-citations document (if-let [path (get-in document [:meta :bibliography])]
                                  (load-bibliography path)
@@ -1790,9 +2167,10 @@
          keys-in-order (distinct (concat (cite-keys-in-inlines title)
                                          (cite-keys-in-blocks (:blocks document))))
          citation-table (build-citation-table bibliography keys-in-order)
-         ctx {:style style :citation-table citation-table}
-         [title' tw] (if title (cite-resolve-inlines ctx title) [nil []])
-         [blocks' bw] (cite-resolve-blocks ctx (:blocks document))
+         walk-warnings (volatile! [])
+         ctx {:style style :citation-table citation-table
+              :warn! (fn [w] (vswap! walk-warnings conj w))}
+         document' (first (walk/rewrite (citation-walker ctx) ::ast/document document))
          resolvable-keys (filter #(contains? citation-table %) keys-in-order)
          ordered-keys (if-let [sort-key (:sort-key? style)]
                         (sort-by #(sort-key % (get bibliography %)) resolvable-keys)
@@ -1803,15 +2181,13 @@
                                     (unique-bibliography-id (existing-block-ids document)
                                                             (chaptered? document))
                                     [nil []])
-         document' (cond-> document
-                     title (assoc-in [:meta :title] title')
-                     true (assoc :blocks (vec blocks'))
-                     (seq ordered-keys)
-                     (update :blocks conj
-                             (bibliography-section style bibliography ordered-keys lang bib-id
-                                                   bib-level)))]
-     {:document document'
-      :warnings (-> style-warnings (into tw) (into bw) (into bib-id-warnings))
+         document'' (cond-> document'
+                      (seq ordered-keys)
+                      (update :blocks conj
+                              (bibliography-section style bibliography ordered-keys lang bib-id
+                                                    bib-level)))]
+     {:document document''
+      :warnings (-> style-warnings (into @walk-warnings) (into bib-id-warnings))
       :ordered-keys (vec ordered-keys)
       :bibliography-id bib-id
       ;; The word that Section prints as its own heading (TASK-64).
@@ -2154,8 +2530,8 @@
 ;; locations" for a duplicate id (AC #1) cannot mean a source position.
 ;; Instead, a location is a structural descriptor: the node's own `:t` plus
 ;; a `:path`. For a purely Block-nested location the path is a vector of
-;; `block-children` indices from the document root down to, and including,
-;; the node itself (unchanged from this pass's original shape). A location
+;; bare indices from the document root down to, and including, the node
+;; itself (unchanged from this pass's original shape, TASK-15). A location
 ;; reached through an Inline-bearing field instead has its path extended
 ;; with that field's own keyword (`:title`/`:heading`/`:inlines`/`:caption`/
 ;; `:items`/`:prefix`/`:suffix`/`:blocks` for a footnote `:note`'s own
@@ -2171,28 +2547,111 @@
 ;; unique document-wide anchor`) -- there is no Block-only carve-out in the
 ;; spec, and any future HTML emitter would render two same-id nodes, Block
 ;; or Inline, as an invalid duplicate `id="..."` attribute either way.
-;; `id-locations-in-block`/`id-locations-in-inline` below walk every
-;; nested-Inline/nested-Block field a Block/Inline variant can carry
-;; (sec4.3/4.4), mirroring `resolve-block`/`resolve-inline`'s own
-;; exhaustive coverage (TASK-12), NOT `id->kind`'s narrower, numbering-
-;; specific "a numbering target is always a Block" convention (TASK-11) --
-;; that rule decides which nodes are *numbering-eligible*, a different and
-;; narrower question than generic id-uniqueness-as-anchor, and does not
-;; transfer here. (This pass's first revision made exactly that mistake --
-;; scoping duplicate-id checking to Block-level ids only -- caught by
-;; clojure-reviewer on this task.)
+;; `id-locations-in-block`/`id-locations-in-inline` below (TASK-87, via
+;; `haselnuss.walk/fold` -- two walkers, see below) walk every nested-
+;; Inline/nested-Block field a Block/Inline variant can carry (sec4.3/4.4),
+;; mirroring `resolve-block`/`resolve-inline`'s own exhaustive coverage
+;; (TASK-12), NOT `id->kind`'s narrower, numbering-specific "a numbering
+;; target is always a Block" convention (TASK-11) -- that rule decides
+;; which nodes are *numbering-eligible*, a different and narrower question
+;; than generic id-uniqueness-as-anchor, and does not transfer here. (This
+;; pass's first revision made exactly that mistake -- scoping duplicate-id
+;; checking to Block-level ids only -- caught by clojure-reviewer on this
+;; task.)
 ;;
-;; No double-counting: a `:para` Block's own `block-children` (footnote-
-;; embedded Blocks, reached via `inline-blocks`) is deliberately NOT walked
-;; as a Block-descendant path in `id-locations-in-block` -- its `:para`
-;; case instead relies solely on `id-locations-in-inline`'s own `:note`
-;; handling to reach those SAME footnote-embedded Blocks (through
-;; `:inlines` rather than `block-children`), so nothing is ever reported
-;; twice. Every other Block variant's `block-children`-derived nesting
-;; (Section/List/BlockQuote/Directive/Figure/Table) has no such overlap
-;; with its own Inline-bearing fields (`:heading`/`:caption`, neither of
-;; which `block-children` ever inspects), so those keep using
-;; `block-children` directly, unchanged.
+;; Two walkers, not one (TASK-87): a single `fold` call cannot reproduce
+;; the path convention above unmodified, since `fold`'s own path always
+;; carries the schema field name at every hop (e.g. `:blocks 0`), while
+;; the Block-nested convention above -- unchanged since TASK-15, and
+;; pinned by `resolver-test.clj`'s own `duplicate-id` fixtures, which this
+;; file cannot touch -- drops the field name for a purely Block-to-Block
+;; hop (a bare index only, e.g. `[0 0]`) and keeps it everywhere else. So:
+;; `id-locations-in-block` walks with `:scope` #{`::block` `::row`
+;; `::cell`} ONLY (no `::inline`), which makes every field-name keyword
+;; `fold` contributes within THAT walker unambiguously a Block-to-Block
+;; hop -- `compact-block-suffix` strips it back out, keeping the index(es)
+;; that followed (or synthesizing a single `0` for a `:one` position with
+;; none of its own, e.g. Figure's own `:content` -- `block-children`'s own
+;; pre-TASK-87 single-element-vector convention for exactly that
+;; position). `id-locations-in-inline` walks with `:scope` #{`::inline`
+;; `::cite-item`} instead, and uses `fold`'s own path UNCHANGED -- the
+;; pre-TASK-87 walk already kept field names uniformly on the Inline side
+;; (`:inlines`/`:items`/`:prefix`/`:suffix`), which is exactly `fold`'s own
+;; convention too (confirmed field-by-field, including CiteItem's own
+;; declared `:prefix`-before-`:suffix` order).
+;;
+;; A footnote `:note`'s own `:blocks` is the one position that crosses from
+;; the Inline walker to the Block one, and is why `::block` is excluded
+;; from the Inline walker's `:scope` rather than folded in alongside
+;; `::inline`: `fold`'s own automatic recursion has no way to know that a
+;; Note's `:blocks` keeps its field name (the Inline side's own
+;; convention) while a Section's does not (the Block side's own), since
+;; both are literally the keyword `:blocks`, both `::block`-typed --
+;; indistinguishable from the field name and ref-kind alone. Excluding
+;; `::block` here (mirroring `citation-scope`'s own precedent for
+;; excluding `::cite-item`, one pass earlier) forces `:note` to be a
+;; DELIBERATE, manual exception in `id-locations-inline-visit` -- the one
+;; place this walk still keeps the `:blocks` keyword for a Block-typed
+;; position -- rather than something the two walkers could silently
+;; disagree about.
+;;
+;; This design accepts two documented behavior differences from the pre-
+;; TASK-87 walk. Neither is exercised by any `resolver-test.clj` fixture
+;; (checked directly against every `:path` assertion it pins, not
+;; assumed), and neither ever reaches rendered document output (id-
+;; locations feeds only a `:duplicate-id` diagnostic, never anything
+;; emitted) -- but they are NOT equally inert, and are recorded here
+;; exactly as each was independently verified (clojure-reviewer, TASK-87
+;; review; reproduced from a git worktree pinned at the pre-TASK-87
+;; commit):
+;;
+;; - A Table cell's or a List item's own nested Block now carries a path
+;;   that preserves which row/cell or item it came from (`compact-block-
+;;   suffix` keeps every index `fold` contributes), rather than the old
+;;   `block-children`/`table-cells`' own lossy `mapcat`-everything-
+;;   together flattening, which collapsed two different cells' own nested
+;;   Blocks to indistinguishable bare indices. This one is fully inert: a
+;;   `:duplicate-id` diagnostic's own message text is built from
+;;   `:node-type` alone (`duplicate-id-diagnostics`, below), never
+;;   `:path`, so no observable text ever depends on which of the two path
+;;   shapes a Table/List position gets.
+;;
+;; - A block's own directly-authored `:heading`/`:caption` content is now
+;;   reported immediately after the block itself, ahead of its nested
+;;   Block descendants, rather than after them (`id-locations-block-
+;;   visit` computes both together, before `fold`'s own recursion into
+;;   the remaining, Block-typed fields that follow) -- which also makes
+;;   this pass's own Section ordering consistent with `cite-keys-in-
+;;   block`'s (TASK-87 again), which already put heading before blocks.
+;;   HONEST NOTE ON TASK-87's OWN AC #2 ("id locations are identical to
+;;   before, including order"): unlike the Table/List path change above,
+;;   this one is NOT inert. `duplicate-id-diagnostics`' own message
+;;   string joins `:node-type` names in `:locations` order, so for a
+;;   document where a duplicate id spans a block's own `:heading`/
+;;   `:caption` AND that SAME block's own nested-Block descendant, the
+;;   exact text of a real `:duplicate-id` build warning changes -- e.g. a
+;;   Section whose `:heading` and whose one nested Figure both collide
+;;   with `meta.title` and a sibling Image reports `:node-type` order
+;;   `(:span :figure :span :image)` before this port and `(:span :span
+;;   :figure :image)` after (confirmed both ways). This is a disclosed,
+;;   deliberate change, not an oversight glossed over as "identical": the
+;;   NEW order is `:heading` before `:blocks`, which is the schema's own
+;;   TRUE declaration order (`haselnuss.walk/table`'s `:section` entry
+;;   lists `:heading` before `:blocks`, confirmed against the derived
+;;   table directly) -- the old, hand-written `id-locations-in-block`
+;;   instead visited a Section's nested `:blocks` before its own
+;;   `:heading`, an inconsistency nobody had reason to notice by hand
+;;   (this SAME pass's own `cite-keys-in-block`, written independently,
+;;   already used heading-before-blocks). That is exactly the class of
+;;   bug this milestone exists to close (doc-6): a human had to remember
+;;   the right traversal order for every node type, by hand, in every
+;;   pass, and this one case quietly disagreed with its own sibling pass
+;;   for no documented reason. Reverting to the old order would mean
+;;   deliberately reintroducing that inconsistency instead of fixing it,
+;;   which is not what "identical to before" is worth doing here -- but
+;;   it is a real, user-visible change to a warning's exact wording for a
+;;   narrow class of documents, and is recorded as exactly that rather
+;;   than waved through as equivalent to the Table/List change above.
 ;;
 ;; Scope limit on the extension registry (AC #2): TASK-16 ("Implement the
 ;; extension registry") is a not-yet-implemented sibling task, not a
@@ -2420,95 +2879,122 @@
                                          " level")})))))
         (:blocks document)))
 
-(declare id-locations-in-inline)
+(defn- compact-block-suffix
+  "The portion of a `haselnuss.walk/fold`-computed path AFTER a known
+  prefix, collapsed from `fold`'s own field-name-plus-index convention
+  down to `block-children`'s pre-TASK-87 bare-index one (TASK-87 -- see
+  this section's own top-of-namespace comment): every field-name keyword
+  is dropped, keeping the index(es) that immediately followed it, or
+  contributing a synthetic `0` when none followed at all (a `:one`
+  position, e.g. Figure's own `:content`) -- `block-children`'s own
+  single-element-vector convention for exactly that position. Safe to
+  apply unconditionally here because `id-locations-block-walker`'s own
+  `:scope` excludes `::inline` entirely, so every field-name keyword
+  `fold` can possibly contribute within it is, by construction, a
+  Block-to-Block hop -- never a footnote `:note`'s own `:blocks`, which is
+  reachable only through `::inline` and is handled by the OTHER walker
+  instead (`id-locations-inline-visit`)."
+  [suffix]
+  (loop [segs (seq suffix) acc []]
+    (if-not segs
+      acc
+      (let [seg (first segs) more (rest segs)]
+        (if (keyword? seg)
+          (let [[indices remaining] (split-with integer? more)]
+            (recur (seq remaining) (into acc (if (seq indices) indices [0]))))
+          (recur (seq more) (conj acc seg)))))))
 
-(defn- id-locations-in-inlines
-  "`id-locations-in-inline` mapped over `inlines`, each at `path` extended
-  by its own index."
-  [path inlines]
-  (into [] (mapcat (fn [i inline] (id-locations-in-inline (conj path i) inline))
-                   (range) inlines)))
-
-(defn- id-locations-in-cite-item
-  "Every `[id location]` pair reachable from CiteItem `item`'s own
-  `:prefix`/`:suffix` Inlines at structural `path` (mirrors `resolve-cite-
-  item`/`cite-resolve-cite-item`'s own `:prefix`/`:suffix`-only coverage --
-  a CiteItem carries no `Attr`/`:id` of its own, sec4.4)."
-  [path item]
-  (into (id-locations-in-inlines (conj path :prefix) (:prefix item))
-        (id-locations-in-inlines (conj path :suffix) (:suffix item))))
+(def ^:private id-locations-block-scope
+  "`haselnuss.walk/fold`'s own `:scope` for `id-locations-in-block`
+  (TASK-87): `::block` for a nested Block, plus `::row`/`::cell` so a
+  Table's own `:head`/`:rows` reach down to each cell's own `:blocks` --
+  deliberately EXCLUDING `::inline` (see this section's own top-of-
+  namespace comment for why: it is what makes `compact-block-suffix` safe
+  to apply unconditionally within this walker)."
+  #{::ast/block ::ast/row ::ast/cell})
 
 (declare id-locations-in-block)
 
-(defn- id-locations-in-inline
-  "Every `[id location]` pair for an id anywhere reachable from Inline
-  `inline` at structural `path`: `inline`'s own `attr.id` (`:link`/`:image`/
-  `:span` only -- the only Inline variants that carry an `Attr` at all, per
-  `ast.clj`'s `::inline` schema, sec4.4) paired with `{:node-type (:t
-  inline) :path path}`, followed by every id found recursively -- mirrors
-  `resolve-inline`/`cite-resolve-inline`'s own exhaustive Inline-variant
-  coverage: `:inlines` for `:emph`/`:strong`/`:strike`/`:small-caps`/`:sub`/
-  `:sup`/`:span`/`:link`, `:items` for `:cite` (via `id-locations-in-cite-
-  item`), `:blocks` for a footnote `:note` (recursing back into
-  `id-locations-in-block`, since a footnote can carry labeled Blocks too --
-  this is the ONLY path by which a `:para`'s footnote-embedded Blocks are
-  reached by this pass; see this section's top-of-namespace comment on
-  avoiding double-counting)."
-  [path inline]
-  (let [own (when-let [id (get-in inline [:attr :id])]
-              [[id {:node-type (:t inline) :path path}]])]
-    (into (vec own)
-          (case (:t inline)
-            (:emph :strong :strike :small-caps :sub :sup :span :link)
-            (id-locations-in-inlines (conj path :inlines) (:inlines inline))
-            :cite
-            (into [] (mapcat (fn [i item] (id-locations-in-cite-item (conj path :items i) item))
-                             (range) (:items inline)))
-            :note
-            (into [] (mapcat (fn [i block] (id-locations-in-block (conj path :blocks i) block))
-                             (range) (:blocks inline)))
-            []))))
+(defn- id-locations-inline-visit
+  "`id-locations-inline-walker`'s own `:visit` (TASK-87): every Inline
+  this walk reaches contributes its own `attr.id` (`:link`/`:image`/
+  `:span` only -- the only Inline variants that carry an `Attr` at all,
+  sec4.4), paired with `{:node-type :path}` at `fold`'s own path,
+  UNCHANGED (see this section's own top-of-namespace comment for why the
+  Inline side needs no compaction, unlike the Block side). `fold`'s own
+  recursion already covers every other position this walk needs --
+  `:inlines` for `:emph`/`:strong`/`:strike`/`:small-caps`/`:sub`/`:sup`/
+  `:span`/`:link`, and `:items` then each item's own `:prefix`/`:suffix`
+  for `:cite`, via `id-locations-inline-walker`'s own `::cite-item` scope
+  -- EXCEPT a footnote `:note`'s own `:blocks`, `::block`-typed and
+  therefore out of this walker's `:scope`: handled here instead,
+  recursing into `id-locations-in-block` (the OTHER walker) for each of
+  `:note`'s own `:blocks`, at `path` extended by the field's own `:blocks`
+  keyword -- the one field name this side keeps for a Block-typed
+  position (see this section's own top-of-namespace comment)."
+  [acc path ref-kind node]
+  (let [own (when-let [id (get-in node [:attr :id])]
+              [[id {:node-type (:t node) :path path}]])
+        acc (into acc own)]
+    (if (and (= ref-kind ::ast/inline) (= :note (:t node)))
+      (into acc (mapcat (fn [i block] (id-locations-in-block (conj path :blocks i) block))
+                        (range) (:blocks node)))
+      acc)))
+
+(def ^:private id-locations-inline-walker
+  {:table walk/table :scope #{::ast/inline ::ast/cite-item} :visit id-locations-inline-visit})
+
+(defn- id-locations-in-inlines
+  "Every `[id location]` pair reachable from `inlines`, each at `path`
+  extended by its own index (TASK-87: `id-locations-inline-walker`,
+  walked via `haselnuss.walk/fold`)."
+  [path inlines]
+  (into [] (mapcat (fn [i inline] (walk/fold id-locations-inline-walker [] ::ast/inline inline (conj path i)))
+                   (range) inlines)))
+
+(defn- id-locations-block-visit
+  "`id-locations-block-walker`'s own `:visit` (TASK-87; `prefix-len` is
+  the length of the caller-supplied starting path -- see `id-locations-
+  in-block`): every Block this walk reaches contributes its own
+  `attr.id` (if any), paired with `{:node-type :path}` at the legacy path
+  (`compact-block-suffix` applied to whatever `fold` contributed beyond
+  `prefix-len`, appended onto the unchanged prefix itself), followed
+  immediately by every id in its own direct Inline-bearing field, if
+  any -- a Section's `:heading`, a Para's `:inlines`, a Figure or Table's
+  `:caption` -- via `id-locations-in-inlines`, at that SAME legacy path
+  extended by the field's own keyword. `fold`'s own recursion into this
+  node's remaining Block-typed fields (its nested Blocks) runs
+  afterwards, once this function returns -- see this section's own
+  top-of-namespace comment (\"HONEST NOTE ON TASK-87's OWN AC #2\") for
+  the one documented, verified, user-visible ordering difference this
+  produces relative to the pre-TASK-87 walk: this now matches the
+  schema's own TRUE declaration order (`:heading` before `:blocks`), not
+  the pre-TASK-87 walk's own, inconsistent-with-its-sibling-pass order."
+  [prefix-len acc path _ref-kind node]
+  (let [legacy-path (into (subvec path 0 prefix-len) (compact-block-suffix (subvec path prefix-len)))
+        own (when-let [id (get-in node [:attr :id])]
+              [[id {:node-type (:t node) :path legacy-path}]])
+        own-inline (case (:t node)
+                     :section (id-locations-in-inlines (conj legacy-path :heading) (:heading node))
+                     :para (id-locations-in-inlines (conj legacy-path :inlines) (:inlines node))
+                     (:figure :table) (id-locations-in-inlines (conj legacy-path :caption) (:caption node))
+                     [])]
+    (-> acc (into own) (into own-inline))))
+
+(defn- id-locations-block-walker
+  "The `id-locations-in-block`-family walker rooted at a starting path of
+  length `prefix-len` (TASK-87) -- a fresh one per call, since
+  `id-locations-block-visit` closes over `prefix-len` to know where its
+  own legacy-path compaction should start (see there)."
+  [prefix-len]
+  {:table walk/table :scope id-locations-block-scope :visit (partial id-locations-block-visit prefix-len)})
 
 (defn- id-locations-in-block
-  "Every `[id location]` pair for an id -- Block-level `attr.id`, or an
-  Inline-level Link/Image/Span's own `attr.id` reached through this
-  block's own Inline-bearing fields -- reachable from `block` at
-  structural `path`: `block`'s own id (if any) paired with `{:node-type
-  (:t block) :path path}`, followed by:
-  - every id found among `block`'s nested Blocks, via `block-children`
-    (reused, already excludes a Directive's own `:fallback`), each at
-    `path` extended by its own index among those children -- EXCEPT for a
-    `:para` Block, whose `block-children` (footnote-embedded Blocks, via
-    `inline-blocks`) is deliberately skipped here so it is not walked
-    twice (see below);
-  - every id found in `block`'s own direct Inline-bearing field, if any,
-    via `id-locations-in-inlines` at `path` extended by that field's own
-    keyword: a Section's `:heading`, a Para's `:inlines` (a `:para`'s ONLY
-    source of nested ids in this walk -- including its own footnote-
-    embedded Blocks, reached via `id-locations-in-inline`'s own `:note`
-    handling instead of `block-children`, so nothing is counted twice), a
-    Figure or Table's `:caption`.
-  A List/BlockQuote/Directive/Table's other nested-Block fields (`:items`/
-  `:blocks`/table cells) have no Inline-bearing field of their own at this
-  level; their own nested Blocks (found via `block-children`, e.g. a List
-  item's Para, a Table cell's Para) are still reached by the ordinary
-  recursive call above, and each of THOSE blocks' own Inline-bearing
-  fields is covered the same way once recursion reaches them."
+  "Every `[id location]` pair (see this section's own top-of-namespace
+  comment) reachable from `block` at structural `path` (TASK-87:
+  `id-locations-block-walker`, walked via `haselnuss.walk/fold`)."
   [path block]
-  (let [own (when-let [id (get-in block [:attr :id])]
-              [[id {:node-type (:t block) :path path}]])
-        block-descendants
-        (if (= :para (:t block))
-          []
-          (into [] (mapcat (fn [i child] (id-locations-in-block (conj path i) child))
-                           (range) (block-children block))))
-        inline-descendants
-        (case (:t block)
-          :section (id-locations-in-inlines (conj path :heading) (:heading block))
-          :para (id-locations-in-inlines (conj path :inlines) (:inlines block))
-          (:figure :table) (id-locations-in-inlines (conj path :caption) (:caption block))
-          [])]
-    (into (vec own) (into block-descendants inline-descendants))))
+  (walk/fold (id-locations-block-walker (count path)) [] ::ast/block block path))
 
 (defn- id-locations-in-document
   "Every `[id location]` pair (see `id-locations-in-block`/`id-locations-
@@ -2777,10 +3263,21 @@
   reason every other pass's do: they explain what the passes after them
   did or did not see.
 
+  Overlay application (`apply-overlays`, TASK-83.1/TASK-83.2) runs next,
+  as sec9 step 0.5 -- after include expansion (an overlay can target a
+  node that exists only post-include-expansion, e.g. a chapter pulled in
+  from another file), before numbering (so spliced content numbers and
+  cross-references exactly as if authored inline, the same reasoning
+  include expansion uses for itself) -- and its own warnings follow
+  `include-warnings` in the returned `:diagnostics`, for the same reason.
+
   `([document])` uses every pass's own defaults. `([document opts])` takes
   an options map: `:includes` (`expand-includes`' own opts, default
   none -- so no expansion happens and every `:include` is left standing),
-  `:lexicon` (`number-document`'s second arg, default
+  `:overlay-sources` (`apply-overlays`' own second arg, default nil/`[]`
+  -- so no overlay is applied and, as long as no caller passes any, a
+  document resolves byte-for-byte identically to a build with this
+  feature absent entirely), `:lexicon` (`number-document`'s second arg, default
   `default-lexicon`), `:bibliography` (a pre-loaded map, default: load
   `meta.bibliography` via `load-bibliography` if present, else `{}`,
   mirroring `resolve-citations`'s own 1-arg-arity default exactly),
@@ -2800,7 +3297,7 @@
   ([document] (resolve-document document {}))
   ([document opts]
    (let [{:keys [lexicon bibliography citation-styles directive-registry directive-kinds includes
-                 front-matter-names sublabel-names]
+                 overlay-sources front-matter-names sublabel-names]
           :or {directive-registry #{} directive-kinds {} front-matter-names #{}
                sublabel-names #{}}} opts
          lexicon (or lexicon default-lexicon)
@@ -2812,6 +3309,14 @@
          ;; `expand-includes`' own opts map; with none, or with none
          ;; carrying a `:load`, this is a no-op.
          {document :document include-warnings :warnings} (expand-includes document includes)
+         ;; Step 0.5 (TASK-83.1/TASK-83.2): after include expansion (an
+         ;; overlay can target a node that only exists post-expansion),
+         ;; before numbering (so spliced content numbers and cross-
+         ;; references exactly as if authored inline). `overlay-sources`
+         ;; is nil/`[]` by default, which is a no-op -- see
+         ;; `apply-overlays`' own docstring for the byte-identical-build
+         ;; invariant this keeps.
+         {document :document overlay-warnings :warnings} (apply-overlays document overlay-sources)
          ;; Numbering runs over the BODY only (TASK-54): a front-matter
          ;; block is not part of the numbered document, and everything
          ;; downstream of this table -- every CrossRef's own text, the
@@ -2849,7 +3354,7 @@
       ;; Warning order follows the passes, which now run citations
       ;; first (TASK-64) -- a reader tracing a build reads them in the
       ;; order the passes produced them.
-      :diagnostics (-> [] (into include-warnings) (into cite-warnings)
+      :diagnostics (-> [] (into include-warnings) (into overlay-warnings) (into cite-warnings)
                        (into cr-warnings) (into diagnostics))
       :labels labels
       :ordered-keys ordered-keys

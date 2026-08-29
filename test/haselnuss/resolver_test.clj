@@ -1642,6 +1642,304 @@
       (resolver/expand-includes doc {:load loader :base-dir "/x"})
       (is (= "/elsewhere/ch.hdoc" @seen)))))
 
+;; --- Overlay application (TASK-83.1, doc-5) ---------------------------------
+
+(defn- overlay-directive
+  "A `prepend`/`append` overlay directive Block: `directive-name`
+  (\"prepend\"/\"append\"), a `target=` prop (nil/blank omits or blanks
+  the prop, so a mistyped or bare directive is reproducible), its own
+  nested `blocks`, and -- only when `own-id` is given -- an `attr.id` of
+  its own, the shape the `:overlay-directive-id-ignored` diagnostic is
+  about."
+  ([directive-name target blocks] (overlay-directive directive-name target blocks nil))
+  ([directive-name target blocks own-id]
+   {:t :directive
+    :name directive-name
+    :attr (cond-> (assoc attr :props (if target {"target" target} {}))
+            own-id (assoc :id own-id))
+    :blocks blocks}))
+
+(defn- describe-directive
+  "A `describe` overlay directive Block (TASK-83.2): a `target=` prop
+  (nil/blank omits or blanks it, same reproducibility as
+  `overlay-directive`'s own `target` arg), `props` merged alongside it
+  (the extra prop keys a real `:::{describe target=... k=v ...}` would
+  carry), and -- only when `own-id` is given -- an `attr.id` of its own."
+  ([target props] (describe-directive target props nil))
+  ([target props own-id]
+   {:t :directive
+    :name "describe"
+    :attr (cond-> (assoc attr :props (merge (if target {"target" target} {}) props))
+            own-id (assoc :id own-id))
+    :blocks []}))
+
+(deftest apply-overlays-test
+  (testing "AC #2/#3: prepend/append inject at the start/end of the
+            target Section's own :blocks, and multiple overlay SOURCES
+            accumulate in file order, then in-file order"
+    (let [target (section "ch:intro" [(para {:t :str :text "own"})])
+          doc {:meta {} :blocks [target]}
+          overlay-a [(overlay-directive "prepend" "ch:intro" [(para {:t :str :text "pre-a"})])
+                     (overlay-directive "append" "ch:intro" [(para {:t :str :text "post-a"})])]
+          overlay-b [(overlay-directive "prepend" "ch:intro" [(para {:t :str :text "pre-b"})])
+                     (overlay-directive "append" "ch:intro" [(para {:t :str :text "post-b"})])]
+          {:keys [document warnings]} (resolver/apply-overlays doc [overlay-a overlay-b])]
+      (is (empty? warnings))
+      (is (= [(para {:t :str :text "pre-a"}) (para {:t :str :text "pre-b"})
+              (para {:t :str :text "own"})
+              (para {:t :str :text "post-a"}) (para {:t :str :text "post-b"})]
+             (get-in document [:blocks 0 :blocks])))))
+  (testing "AC #1: no overlay sources at all is a no-op -- the exact
+            document comes back unchanged, which is the byte-for-byte-
+            identical-build invariant an absent --overlay flag relies on"
+    (let [doc {:meta {} :blocks [(section "ch:intro" [])]}]
+      (is (= {:document doc :warnings []} (resolver/apply-overlays doc nil)))
+      (is (= {:document doc :warnings []} (resolver/apply-overlays doc [])))))
+  (testing "a target nested several Sections deep is patched too, having
+            recursed into children first"
+    (let [nested (section "ch:outer" [(section "sec:inner" [])])
+          doc {:meta {} :blocks [nested]}
+          overlay [(overlay-directive "append" "sec:inner" [(para {:t :str :text "deep"})])]
+          {:keys [document]} (resolver/apply-overlays doc [overlay])]
+      (is (= [(para {:t :str :text "deep"})]
+             (get-in document [:blocks 0 :blocks 0 :blocks])))))
+  (testing "AC #5: a target naming no Section anywhere in the base
+            document is a non-fatal :dangling-overlay-target diagnostic
+            -- distinct from a missing target= -- and drops nothing else
+            in the document"
+    (let [doc {:meta {} :blocks [(section "ch:intro" [])]}
+          overlay [(overlay-directive "prepend" "ch:nope" [(para {:t :str :text "x"})])]
+          {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+      (is (= [{:type :dangling-overlay-target :id "ch:nope"}]
+             (mapv #(select-keys % [:type :id]) warnings)))
+      (is (= [] (get-in document [:blocks 0 :blocks])))))
+  (testing "AC #5: a missing or blank target= is its own diagnostic,
+            distinct from a dangling one, and the directive's content is
+            dropped rather than silently kept or guessed at"
+    (let [doc {:meta {} :blocks [(section "ch:intro" [])]}]
+      (doseq [target [nil "" "   "]]
+        (let [overlay [(overlay-directive "append" target [(para {:t :str :text "x"})])]
+              {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+          (is (= [:overlay-missing-target] (mapv :type warnings)) (pr-str target))
+          (is (= [] (get-in document [:blocks 0 :blocks])) (pr-str target))))))
+  (testing "a prepend/append directive's OWN id is discarded once its
+            content is spliced into the target -- flagged rather than
+            silently lost, and the splice still happens via target="
+    (let [doc {:meta {} :blocks [(section "ch:intro" [])]}
+          overlay [(overlay-directive "prepend" "ch:intro" [(para {:t :str :text "x"})]
+                                      "stray:id")]
+          {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+      (is (= [{:type :overlay-directive-id-ignored :id "stray:id"}]
+             (mapv #(select-keys % [:type :id]) warnings)))
+      (is (= [(para {:t :str :text "x"})] (get-in document [:blocks 0 :blocks])))))
+  (testing "AC #5: unrecognized top-level content in an overlay file --
+            a stray paragraph, or a directive that is none of prepend/
+            append/describe -- is dropped and diagnosed, never merged
+            into the base document"
+    (let [doc {:meta {} :blocks [(section "ch:intro" [])]}]
+      (doseq [block [(para {:t :str :text "stray"})
+                     (overlay-directive "footnote" "fig:tree" [])]]
+        (let [{:keys [document warnings]} (resolver/apply-overlays doc [[block]])]
+          (is (= [:overlay-unexpected-content] (mapv :type warnings)) (pr-str block))
+          (is (= [] (get-in document [:blocks 0 :blocks])) (pr-str block))))))
+  (testing "pitfall 5 (doc-5): an id collision INTRODUCED by overlay
+            content needs no bespoke check here -- apply-overlays runs
+            strictly before duplicate-id-diagnostics, via
+            resolve-document, so an id collision it introduces is caught
+            by the existing pass automatically"
+    (let [doc {:meta {} :blocks [(section "ch:intro" [(section "sec:dup" [])])]}
+          overlay [(overlay-directive "append" "ch:intro" [(section "sec:dup" [])])]
+          {:keys [diagnostics]} (resolver/resolve-document doc {:overlay-sources [overlay]})]
+      (is (some #(= :duplicate-id (:type %)) diagnostics))))
+  (testing "pitfall 6 (doc-5): a target id shared by more than one
+            Section -- a pre-existing collision in the base document --
+            gets the overlay spliced into BOTH, deterministically"
+    (let [doc {:meta {} :blocks [(section "ch:x" []) (section "ch:x" [])]}
+          overlay [(overlay-directive "append" "ch:x" [(para {:t :str :text "z"})])]
+          {:keys [document]} (resolver/apply-overlays doc [overlay])]
+      (is (= [(para {:t :str :text "z"})] (get-in document [:blocks 0 :blocks])))
+      (is (= [(para {:t :str :text "z"})] (get-in document [:blocks 1 :blocks])))))
+  (testing "resolve-document runs overlay application AFTER include
+            expansion, so an overlay can target a Section that exists
+            only post-include-expansion -- e.g. a chapter pulled in from
+            another file -- and BEFORE numbering, so spliced content
+            numbers and cross-references exactly as if authored inline"
+    (let [loader (stub-loader {"ch.hdoc" {:meta {} :blocks [(section "sec:m" [])]}})
+          doc {:meta {} :blocks [(include-block "ch.hdoc")]}
+          overlay [(overlay-directive "append" "sec:m" [(figure "fig:tree")])]
+          {:keys [document diagnostics labels]}
+          (resolver/resolve-document doc {:includes {:load loader :base-dir "/x"}
+                                          :overlay-sources [overlay]})]
+      (is (empty? diagnostics))
+      (is (= "Figure 1.1" (get-in labels ["fig:tree" :text])))
+      (is (= :figure (get-in document [:blocks 0 :blocks 0 :t]))))))
+
+(deftest overlay-splice-reaches-every-container-test
+  (testing "every Block variant that can hold a Section -- block-
+            children's FULL set -- gets an append spliced when that
+            Section sits nested inside it. Pinned as a set rather than
+            left to inspection, for the same reason `include-expansion-
+            reaches-every-container-test` is: a variant reachable by
+            `block-children` but missed by `splice-overlay-block` is a
+            target overlay content silently never reaches. UNLIKE that
+            test, Figure's :content IS reached and spliced here --
+            `splice-overlay-block` is a rebuild walk (one Block in, one
+            Block, possibly patched, back out), so there is nowhere it
+            cannot recurse, and a Section id could in principle sit in a
+            Figure's :content, which is schema-unrestricted (ast.clj
+            151-155)"
+    (let [target (section "ch:x" [])
+          appended (para {:t :str :text "Z"})
+          overlay [(overlay-directive "append" "ch:x" [appended])]
+          containers
+          {:section [{:t :section :level 1 :heading [] :blocks [target] :attr attr}
+                     [:blocks 0 :blocks 0 :blocks]]
+           :block-quote [{:t :block-quote :blocks [target]} [:blocks 0 :blocks 0 :blocks]]
+           :directive [{:t :directive :name "n" :attr attr :blocks [target]}
+                       [:blocks 0 :blocks 0 :blocks]]
+           :list [{:t :list :ordered false :items [[target]] :attr attr}
+                  [:blocks 0 :items 0 0 :blocks]]
+           :table [{:t :table :head {:cells [{:blocks [target] :attr attr}]} :rows []
+                    :caption [] :colspec [] :attr attr}
+                   [:blocks 0 :head :cells 0 :blocks 0 :blocks]]
+           ;; A footnote's Blocks -- the parser cannot put a Section
+           ;; there, but `haselnuss.json` can, mirroring the include
+           ;; test's own reasoning for this same variant.
+           :para [(para {:t :note :blocks [target]}) [:blocks 0 :inlines 0 :blocks 0 :blocks]]
+           ;; The one deliberate divergence from the include test: this
+           ;; walk rebuilds rather than splices-in-place, so Figure's
+           ;; :content has somewhere to put its own patched Block back.
+           :figure [{:t :figure :content target :caption [] :attr attr}
+                    [:blocks 0 :content :blocks]]}]
+      (doseq [[variant [block path]] containers]
+        (let [{:keys [document]} (resolver/apply-overlays {:meta {} :blocks [block]} [overlay])]
+          (is (= [appended] (get-in document path)) (str variant)))))))
+
+;; --- describe (TASK-83.2, doc-5 section 2.2) --------------------------------
+
+(deftest describe-overlay-test
+  (testing "AC #1: describe merges every prop other than target= into
+            attr.props of whichever describable node -- Section, Figure,
+            Table, MathBlock, or referenceable Directive -- carries that
+            id anywhere in the base document"
+    (doseq [[kind node] {:section (section "ch:intro" [])
+                         :figure (figure "fig:tree")
+                         :table (table "tbl:yields")
+                         :math-block (math-block "eq:one")
+                         :directive (theorem "thm:main")}]
+      (let [id (get-in node [:attr :id])
+            doc {:meta {} :blocks [node]}
+            overlay [(describe-directive id {"alt" "described"})]
+            {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+        (is (empty? warnings) (str kind))
+        (is (= "described" (get-in document [:blocks 0 :attr :props "alt"])) (str kind)))))
+  (testing "unlike prepend/append (Section-only), a describe target
+            nested several Sections deep on a non-Section node is still
+            found -- recursion happens before the match, same as every
+            other overlay splice"
+    (let [nested (section "ch:outer" [(figure "fig:tree")])
+          doc {:meta {} :blocks [nested]}
+          overlay [(describe-directive "fig:tree" {"alt" "described"})]
+          {:keys [document]} (resolver/apply-overlays doc [overlay])]
+      (is (= "described" (get-in document [:blocks 0 :blocks 0 :attr :props "alt"])))))
+  (testing "describe's target set is bounded to doc-5's own five kinds
+            (Section/Figure/Table/MathBlock/referenceable Directive) --
+            a List/CodeBlock/BlockQuote also carries attr.id per ast.clj
+            but is deliberately not a describe target: its own props are
+            left untouched and the overlay reads as dangling, exactly as
+            if the id resolved to nothing at all"
+    (doseq [[kind node] {:list {:t :list :ordered false :tight true :items [] :attr (id-attr "lst:x")}
+                         :code-block {:t :code-block :text "x" :attr (id-attr "cb:x")}
+                         :block-quote {:t :block-quote :blocks [] :attr (id-attr "bq:x")}}]
+      (let [id (get-in node [:attr :id])
+            doc {:meta {} :blocks [node]}
+            overlay [(describe-directive id {"alt" "described"})]
+            {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+        (is (= [{:type :dangling-overlay-target :id id}]
+               (mapv #(select-keys % [:type :id]) warnings))
+            (str kind))
+        (is (= {} (get-in document [:blocks 0 :attr :props])) (str kind)))))
+  (testing "AC #3: a prop key already present on the target node's own
+            attr.props is a non-fatal :overlay-prop-overwritten
+            diagnostic, and the target's own value is kept rather than
+            silently overwritten -- other, non-colliding keys still
+            merge normally"
+    (let [described (assoc (figure "fig:tree")
+                           :attr (assoc (id-attr "fig:tree") :props {"alt" "own"}))
+          doc {:meta {} :blocks [described]}
+          overlay [(describe-directive "fig:tree" {"alt" "overlay" "credit" "someone"})]
+          {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+      (is (= [{:type :overlay-prop-overwritten :id "fig:tree" :key "alt"}]
+             (mapv #(select-keys % [:type :id :key]) warnings)))
+      (is (= {"alt" "own" "credit" "someone"} (get-in document [:blocks 0 :attr :props])))))
+  (testing "AC #4: the same missing-target/dangling-target/directive-own-
+            id diagnostics prepend/append get also apply to describe"
+    (testing "missing (nil) target="
+      (let [doc {:meta {} :blocks [(figure "fig:tree")]}
+            overlay [(describe-directive nil {"alt" "x"})]
+            {:keys [warnings]} (resolver/apply-overlays doc [overlay])]
+        (is (= [:overlay-missing-target] (mapv :type warnings)))))
+    (testing "a target= naming no describable node anywhere is dangling"
+      (let [doc {:meta {} :blocks [(figure "fig:tree")]}
+            overlay [(describe-directive "fig:nope" {"alt" "x"})]
+            {:keys [warnings]} (resolver/apply-overlays doc [overlay])]
+        (is (= [{:type :dangling-overlay-target :id "fig:nope"}]
+               (mapv #(select-keys % [:type :id]) warnings)))))
+    (testing "the directive's own id is discarded and diagnosed, same as prepend/append"
+      (let [doc {:meta {} :blocks [(figure "fig:tree")]}
+            overlay [(describe-directive "fig:tree" {"alt" "x"} "stray:id")]
+            {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+        (is (= [{:type :overlay-directive-id-ignored :id "stray:id"}]
+               (mapv #(select-keys % [:type :id]) warnings)))
+        (is (= "x" (get-in document [:blocks 0 :attr :props "alt"]))))))
+  (testing "a describe naming target= but no other props merges nothing
+            and contributes no plan entry -- distinct from a genuine
+            missing target=, since here target= IS present and valid"
+    (let [doc {:meta {} :blocks [(figure "fig:tree")]}
+          overlay [(describe-directive "fig:tree" {})]
+          {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+      (is (empty? warnings))
+      (is (= {} (get-in document [:blocks 0 :attr :props])))))
+  (testing "pitfall 6 (doc-5), extended to describe: a target id shared
+            by more than one node -- a pre-existing collision in the
+            base document -- gets the props merged into BOTH,
+            deterministically, no hidden first-match-wins state"
+    (let [doc {:meta {} :blocks [(figure "fig:x") (figure "fig:x")]}
+          overlay [(describe-directive "fig:x" {"alt" "described"})]
+          {:keys [document]} (resolver/apply-overlays doc [overlay])]
+      (is (= "described" (get-in document [:blocks 0 :attr :props "alt"])))
+      (is (= "described" (get-in document [:blocks 1 :attr :props "alt"]))))))
+
+(deftest describe-splice-reaches-every-container-test
+  (testing "TASK-83.2: a describe target reaches a Figure -- one of the
+            non-Section describable kinds -- nested inside every Block
+            variant that can hold one, mirroring `overlay-splice-
+            reaches-every-container-test`'s own container set exactly.
+            The traversal itself is unchanged from TASK-83.1 (the same
+            `case` in `splice-overlay-block`); what TASK-83.2 adds is
+            that the post-recursion match no longer requires `:section`"
+    (let [target (figure "fig:x")
+          overlay [(describe-directive "fig:x" {"alt" "described"})]
+          containers
+          {:section [{:t :section :level 1 :heading [] :blocks [target] :attr attr}
+                     [:blocks 0 :blocks 0 :attr :props "alt"]]
+           :block-quote [{:t :block-quote :blocks [target]}
+                         [:blocks 0 :blocks 0 :attr :props "alt"]]
+           :directive [{:t :directive :name "n" :attr attr :blocks [target]}
+                       [:blocks 0 :blocks 0 :attr :props "alt"]]
+           :list [{:t :list :ordered false :items [[target]] :attr attr}
+                  [:blocks 0 :items 0 0 :attr :props "alt"]]
+           :table [{:t :table :head {:cells [{:blocks [target] :attr attr}]} :rows []
+                    :caption [] :colspec [] :attr attr}
+                   [:blocks 0 :head :cells 0 :blocks 0 :attr :props "alt"]]
+           :para [(para {:t :note :blocks [target]})
+                  [:blocks 0 :inlines 0 :blocks 0 :attr :props "alt"]]
+           :figure [{:t :figure :content target :caption [] :attr attr}
+                    [:blocks 0 :content :attr :props "alt"]]}]
+      (doseq [[variant [block path]] containers]
+        (let [{:keys [document]} (resolver/apply-overlays {:meta {} :blocks [block]} [overlay])]
+          (is (= "described" (get-in document path)) (str variant)))))))
+
 ;; ---------------------------------------------------------------------
 ;; TASK-53: chapters as the top-level division.
 ;; ---------------------------------------------------------------------

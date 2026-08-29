@@ -18,7 +18,8 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [haselnuss.cli :as cli]
-            [haselnuss.extensions.derived-lists :as derived-lists])
+            [haselnuss.emit.html :as html]
+            [haselnuss.registry :as registry])
   (:import (java.awt.image BufferedImage)
            (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)
@@ -278,18 +279,27 @@
       (testing "and it compiles"
         (is (some? (pdf-text dir computed)))))))
 
-(deftest the-list-marker-is-never-called-test
-  (testing "both emitters draw a list themselves, so the renderer the
-            registry holds for a placeholder is a marker -- calling it is
-            a named error rather than something meaningless spliced into
-            an output (the contract
-            haselnuss.extensions.front-matter/front-matter-renderer
-            already has)"
-    (let [directive {:t :directive :name "toc" :blocks [] :attr {:classes [] :props {}}}
-          e (is (thrown? clojure.lang.ExceptionInfo (derived-lists/list-renderer directive :html)))]
-      (is (= :haselnuss.extensions.derived-lists/list-marker-called (:type (ex-data e))))
-      (is (str/includes? (ex-message e) "\"toc\""))
-      (is (str/includes? (ex-message e) ":html")))))
+(deftest a-caller-can-override-the-built-in-list-renderer-test
+  (testing "TASK-89 AC #3: a list placeholder is dispatched through the
+            ordinary registry now (haselnuss.emit.html/
+            register-derived-lists installs a REAL renderer, no longer a
+            marker checked for and never called -- see that function's
+            own docstring, which replaces this namespace's former
+            list-renderer/extensions), not a special case render-directive
+            checks ahead of the registry. Proven by overriding the
+            built-in \"toc\" renderer with a caller's own and getting
+            THAT renderer's own output, not the built-in table of
+            contents -- something a hard-coded special case ahead of the
+            registry could never let a caller do"
+    (let [registry (-> (html/register-derived-lists {})
+                       (registry/register {:name "toc"
+                                           :emit {:html (registry/renderer-v2
+                                                         (fn [_directive _ctx] [:p "custom toc"]))}}))
+          document {:meta {} :blocks [{:t :directive :name "toc" :attr {:classes [] :props {}}
+                                       :blocks []}]}
+          html-out (html/emit-document document {:registry registry})]
+      (is (str/includes? html-out "<p>custom toc</p>"))
+      (is (not (str/includes? html-out "<nav")) "the built-in nav-based rendering never ran"))))
 
 (deftest list-headings-follow-the-documents-language-test
   (testing "the heading each list prints is text this project prints, not

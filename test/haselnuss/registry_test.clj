@@ -12,7 +12,8 @@
   with no adapter, per that task's own documented expectation."
   (:require [clojure.test :refer [deftest is testing]]
             [haselnuss.registry :as registry]
-            [haselnuss.resolver :as resolver]))
+            [haselnuss.resolver :as resolver]
+            [sci.core :as sci]))
 
 (defn- attr
   [id]
@@ -21,6 +22,15 @@
 (defn- directive
   [directive-name id]
   {:t :directive :name directive-name :blocks [] :attr (attr id)})
+
+(defn- sample-var-renderer
+  "A `def`-backed renderer local to this test file, marked by
+  `renderer-v2-test` -- never a shared `clojure.core` Var like `identity`,
+  since `renderer-v2` mutates a Var's metadata in place (see its own
+  docstring) and this suite must not leave that mutation on a Var some
+  unrelated namespace also uses."
+  [node ctx]
+  [node ctx])
 
 (deftest register-test
   (testing "AC #1: an extension can be registered with a name, an
@@ -40,12 +50,19 @@
              (:kind entry)))
       (is (= html-renderer (get-in entry [:emit :html])))
       (is (= latex-renderer (get-in entry [:emit :latex])))
-      (is (= lower-fn (:lower entry)))))
+      (is (= lower-fn (:lower entry)))
+      (is (false? (:trusted entry)) "defaults to untrusted when :trusted? is not supplied")))
   (testing "every field except :name is optional -- registering with only
             a name still produces a usable entry with an empty renderer
             map and no kind/lower"
     (let [entry (registry/lookup (registry/register {} {:name "collapsable"}) "collapsable")]
-      (is (= {:name "collapsable" :kind nil :emit {} :lower nil} entry))))
+      (is (= {:name "collapsable" :kind nil :emit {} :lower nil :trusted false} entry))))
+  (testing "TASK-89 AC #8: :trusted? true is stored as a boolean :trusted
+            on the entry, coerced even from a truthy non-boolean value"
+    (let [entry (registry/lookup (registry/register {} {:name "chart" :trusted? true}) "chart")]
+      (is (true? (:trusted entry))))
+    (let [entry (registry/lookup (registry/register {} {:name "chart" :trusted? :yes}) "chart")]
+      (is (true? (:trusted entry)) "coerced to a real boolean, not stored as the truthy value itself")))
   (testing "registering the same name again replaces the previous entry
             entirely, mirroring plain assoc semantics"
     (let [registry (-> {}
@@ -168,3 +185,63 @@
                :message "unknown directive \"mystery\": not registered in the extension registry"}]
              diagnostics))
       (is (empty? (resolver/structural-diagnostics doc (registry/register registry {:name "mystery"})))))))
+
+(deftest renderer-v2-test
+  (testing "TASK-89: an unmarked renderer -- the legacy (fn [node target])
+            shape every extension registered before TASK-89 used -- is not
+            v2, which is what keeps every such registration calling and
+            splicing exactly as it always has"
+    (is (false? (registry/v2? (fn [_node _target] "html"))))
+    (is (false? (registry/v2? nil)) "no renderer at all is not v2 either"))
+  (testing "renderer-v2 marks a plain function, which stays just as
+            callable as before -- an aware consumer calls it with ctx
+            instead of target, but the function itself is unchanged"
+    (let [f (fn [node ctx] [node ctx])
+          marked (registry/renderer-v2 f)]
+      (is (true? (registry/v2? marked)))
+      (is (= [:n :c] (marked :n :c)) "still an ordinary 2-argument function")))
+  (testing "renderer-v2 marks a Var in place (Var does not implement IObj,
+            so with-meta/vary-meta cannot produce a new marked value the
+            way they do for a plain function -- alter-meta! is the one
+            that works, confirmed live over the nREPL before choosing it),
+            returning the same Var rather than a value with-meta could
+            have produced. Marks this test file's own local Var, never a
+            shared clojure.core one -- alter-meta! is a real, process-wide
+            mutation of whatever Var it is handed"
+    (let [marked (registry/renderer-v2 #'sample-var-renderer)]
+      (is (var? marked))
+      (is (= #'sample-var-renderer marked))
+      (is (true? (registry/v2? marked)))
+      (is (true? (registry/v2? #'sample-var-renderer)) "the Var itself now carries the tag")))
+  (testing "TASK-90: renderer-v2 marks a sci.lang.Var -- a DIFFERENT class
+            from clojure.lang.Var, the shape a SCI-sandboxed sidecar
+            file's own (defn ...) produces (haselnuss.extensions.sidecar)
+            -- exactly the same way, since it shares the same relevant
+            shape: no IObj (with-meta/vary-meta throw), but IReference
+            (alter-meta! works). A throwaway sci context local to this
+            test, never anything haselnuss.extensions.sidecar itself
+            builds, since this is checking renderer-v2 in isolation"
+    (let [sci-var (sci/eval-string* (sci/init {}) "(defn f [node ctx] [node ctx]) #'f")]
+      (is (= "sci.lang.Var" (.getName (class sci-var))) "sanity: really a sci.lang.Var, not host Var")
+      (is (false? (var? sci-var)) "and specifically not a clojure.lang.Var")
+      (is (thrown? ClassCastException (vary-meta sci-var assoc ::x true))
+          "confirms sci.lang.Var doesn't implement IObj either, the reason this branch exists")
+      (let [marked (registry/renderer-v2 sci-var)]
+        (is (= sci-var marked) "the same Var, marked in place")
+        (is (true? (registry/v2? marked)))
+        (is (true? (registry/v2? sci-var)) "the Var itself now carries the tag")
+        (is (= [:n :c] (marked :n :c)) "still callable from host code exactly like the sci fn always was"))))
+  (testing "renderer-v2 preserves any metadata the function already
+            carried, rather than replacing it outright"
+    (let [f (vary-meta (fn [_node _ctx] nil) assoc ::pre-existing true)
+          marked (registry/renderer-v2 f)]
+      (is (true? (::pre-existing (meta marked))))
+      (is (true? (registry/v2? marked)))))
+  (testing "a v2-marked renderer round-trips through register/lookup/
+            renderer exactly like any other -- the marker travels with the
+            function value stored in the registry, not with how it got
+            there"
+    (let [registry (registry/register {} {:name "chart"
+                                          :emit {:html (registry/renderer-v2
+                                                        (fn [node _ctx] node))}})]
+      (is (true? (registry/v2? (registry/renderer (registry/lookup registry "chart") :html)))))))

@@ -390,7 +390,8 @@
   environment declaration with it (see `preamble`). That registration is
   what makes `lower` keep a mapped directive at all; see
   `environment-renderer` for why the value stored there is a marker this
-  emitter recognizes by identity rather than an ordinary renderer.
+  emitter recognizes via its own metadata (TASK-88) rather than treating
+  as an ordinary renderer.
 
   (Today's one built-in *extension*, `collapsable`, registers no `:latex`
   renderer at all -- TASK-18 AC #2 -- so `lower` always resolves it to
@@ -459,7 +460,10 @@
     authored. An Image `:src` is a FILENAME rather than a URI, where the
     same rewrite would look up a file that doesn't exist on disk, so it
     stays fully verbatim and a build instead warns when it carries either
-    hazard (`unescapable-image-path-diagnostics`).
+    hazard (`unescapable-image-path-text-diagnostics`, the one
+    `haselnuss.cli` actually calls; `unescapable-image-path-diagnostics`
+    is the AST-based sibling, still correct and still tested but not
+    currently wired into that pipeline -- see its own docstring).
   - Section -> `\\label{label-id id}` immediately after `\\section{...}`
     (etc.) when `attr.id` is present -- not required by any of this
     task's own ACs, but a direct parity call with `haselnuss.emit.html`'s
@@ -1162,58 +1166,86 @@
                             "{" (:key item) "}"))
                      items)))))
 
+(def built-in-inline-handlers
+  "The built-in `:t -> (fn [ctx inline] -> tex-fragment)` table
+  `render-inline` dispatches through (TASK-88): every Inline variant this
+  namespace's own docstring documents, contributed as data rather than as
+  `case` branches, so `emit-context`'s own `:inline-handlers` opt can
+  merge in a node type neither this file nor `haselnuss.emit.html` has
+  ever heard of, for one document, with no edit here (AC #2/#4).
+
+  Most entries reference an existing render function directly, since its
+  own signature already matches this table's `(ctx inline)` contract
+  (`render-cross-ref`, `render-cite`); the rest are small adapter `fn`s
+  wrapping a narrower-signatured helper that needs no `ctx` of its own
+  (`render-image`), or inlining what used to be a one-line `case` body
+  directly."
+  {:str (fn [_ctx inline] (escape-tex (:text inline)))
+   :space (fn [_ctx _inline] " ")
+   :soft-break (fn [_ctx _inline] "\n")
+   :line-break (fn [_ctx _inline] "\\\\\n")
+   :emph (fn [ctx inline] (render-wrapped ctx inline "\\emph{" "}"))
+   :strong (fn [ctx inline] (render-wrapped ctx inline "\\textbf{" "}"))
+   ;; A stylistic strikethrough (base LaTeX has no such command at all;
+   ;; `ulem`'s `\sout` is the standard choice, mirroring
+   ;; `haselnuss.emit.html`'s own `<s>` -- presentational, not `<del>`'s
+   ;; "this was deleted" edit semantics).
+   :strike (fn [ctx inline] (render-wrapped ctx inline "\\sout{" "}"))
+   :small-caps (fn [ctx inline] (render-wrapped ctx inline "\\textsc{" "}"))
+   :sub (fn [ctx inline] (render-wrapped ctx inline "\\textsubscript{" "}"))
+   :sup (fn [ctx inline] (render-wrapped ctx inline "\\textsuperscript{" "}"))
+   :code (fn [_ctx inline] (str "\\texttt{" (escape-tex (:text inline)) "}"))
+   ;; Link :target passed through `latex-safe-url`, not `escape-tex` --
+   ;; see namespace docstring for why (hyperref's own URL-argument
+   ;; scanning, not ordinary text escaping, and confirmed empirically
+   ;; that escape-tex actively breaks it) and `latex-safe-url`'s own
+   ;; docstring for the two characters it does rewrite (TASK-78).
+   :link (fn [ctx inline]
+           (render-wrapped ctx inline (str "\\href{" (latex-safe-url (:target inline)) "}{") "}"))
+   ;; Image :src likewise passed through verbatim -- see namespace
+   ;; docstring (graphicx's own filename-argument handling already
+   ;; tolerates a raw underscore etc; no AC requires rendering :alt,
+   ;; which LaTeX has no visual equivalent for).
+   :image (fn [_ctx inline] (render-image inline))
+   :span (fn [ctx inline] (render-wrapped ctx inline "" ""))
+   ;; A footnote marker is its own definition's Blocks, sec4.4 -- LaTeX's
+   ;; own \footnote is self-numbering/self-placing, so (unlike
+   ;; haselnuss.emit.html) no footnotes accumulator is threaded anywhere
+   ;; in this namespace at all (AC #4, see namespace docstring).
+   :note (fn [ctx inline] (str "\\footnote{" (render-blocks ctx (:blocks inline)) "}"))
+   ;; Raw :tex passed through completely verbatim (AC #3) -- this is
+   ;; already TeX, not authored prose, so escape-tex must never run over
+   ;; it (see namespace docstring). The closing delimiter sits on its own
+   ;; line, NOT concatenated onto :tex's own last line (review comment
+   ;; #4, this task's own fatal bug): an un-escaped, entirely plausible
+   ;; `%` in :tex would otherwise TeX-comment out the emitter's own
+   ;; closing "\)" along with the rest of that line.
+   :math-inline (fn [_ctx inline] (str "\\(" (:tex inline) "\n\\)"))
+   ;; TASK-23: both mode-dependent -- see each function's own docstring.
+   :cross-ref render-cross-ref
+   :cite render-cite})
+
+(defn- unsupported-inline!
+  "The declared default `render-inline` dispatches an unrecognized Inline
+  `:t` to (TASK-88 AC #3): raises the same `ex-info` (`:type
+  ::unsupported-inline`) this namespace has always raised for a variant
+  outside its documented scope, naming it -- unchanged from the `case`
+  fallthrough this default replaces, so the failure mode a caller already
+  handles for keeps working."
+  [_ctx inline]
+  (throw (ex-info
+          (str "latex emitter does not support inline type " (pr-str (:t inline)))
+          {:type ::unsupported-inline :inline inline})))
+
 (defn- render-inline
-  "Renders one Inline (`haselnuss.ast/Inline`) to a LaTeX fragment. Covers
-  this task's documented Inline scope (see namespace docstring); every
-  other variant raises `ex-info` (`:type ::unsupported-inline`)."
+  "Renders one Inline (`haselnuss.ast/Inline`) to a LaTeX fragment: looks
+  `inline`'s own `:t` up in `ctx`'s `:inline-handlers` table (TASK-88 AC
+  #1 -- `built-in-inline-handlers` merged with any document-specific
+  additions `emit-context`'s own `:inline-handlers` opt supplied) and
+  calls the handler found there, or `unsupported-inline!` when there is
+  none."
   [ctx inline]
-  (case (:t inline)
-    :str (escape-tex (:text inline))
-    :space " "
-    :soft-break "\n"
-    :line-break "\\\\\n"
-    :emph (render-wrapped ctx inline "\\emph{" "}")
-    :strong (render-wrapped ctx inline "\\textbf{" "}")
-    ;; A stylistic strikethrough (base LaTeX has no such command at all;
-    ;; `ulem`'s `\sout` is the standard choice, mirroring
-    ;; `haselnuss.emit.html`'s own `<s>` -- presentational, not `<del>`'s
-    ;; "this was deleted" edit semantics).
-    :strike (render-wrapped ctx inline "\\sout{" "}")
-    :small-caps (render-wrapped ctx inline "\\textsc{" "}")
-    :sub (render-wrapped ctx inline "\\textsubscript{" "}")
-    :sup (render-wrapped ctx inline "\\textsuperscript{" "}")
-    :code (str "\\texttt{" (escape-tex (:text inline)) "}")
-    ;; Link :target passed through `latex-safe-url`, not `escape-tex` --
-    ;; see namespace docstring for why (hyperref's own URL-argument
-    ;; scanning, not ordinary text escaping, and confirmed empirically
-    ;; that escape-tex actively breaks it) and `latex-safe-url`'s own
-    ;; docstring for the two characters it does rewrite (TASK-78).
-    :link (render-wrapped ctx inline (str "\\href{" (latex-safe-url (:target inline)) "}{") "}")
-    ;; Image :src likewise passed through verbatim -- see namespace
-    ;; docstring (graphicx's own filename-argument handling already
-    ;; tolerates a raw underscore etc; no AC requires rendering :alt,
-    ;; which LaTeX has no visual equivalent for).
-    :image (render-image inline)
-    :span (render-wrapped ctx inline "" "")
-    ;; A footnote marker is its own definition's Blocks, sec4.4 -- LaTeX's
-    ;; own \footnote is self-numbering/self-placing, so (unlike
-    ;; haselnuss.emit.html) no footnotes accumulator is threaded anywhere
-    ;; in this namespace at all (AC #4, see namespace docstring).
-    :note (str "\\footnote{" (render-blocks ctx (:blocks inline)) "}")
-    ;; Raw :tex passed through completely verbatim (AC #3) -- this is
-    ;; already TeX, not authored prose, so escape-tex must never run over
-    ;; it (see namespace docstring). The closing delimiter sits on its own
-    ;; line, NOT concatenated onto :tex's own last line (review comment
-    ;; #4, this task's own fatal bug): an un-escaped, entirely plausible
-    ;; `%` in :tex would otherwise TeX-comment out the emitter's own
-    ;; closing "\)" along with the rest of that line.
-    :math-inline (str "\\(" (:tex inline) "\n\\)")
-    ;; TASK-23: both mode-dependent -- see each function's own docstring.
-    :cross-ref (render-cross-ref ctx inline)
-    :cite (render-cite ctx inline)
-    (throw (ex-info
-            (str "latex emitter does not support inline type " (pr-str (:t inline)))
-            {:type ::unsupported-inline :inline inline}))))
+  ((get (:inline-handlers ctx) (:t inline) unsupported-inline!) ctx inline))
 
 (defn- render-inlines
   "`render-inline` mapped and concatenated over every Inline in `inlines`,
@@ -1962,7 +1994,8 @@
   the AST is exactly how a scan like this rots.
 
   `:fallback` is the one field not walked, mirroring every other pass's
-  scope limit for it (`haselnuss.resolver/resolve-block`,
+  scope limit for it (`haselnuss.resolver/resolve-cross-refs`, walked via
+  `haselnuss.walk/rewrite`'s own `cross-ref-scope` since TASK-86;
   `kind-role-diagnostics`): it is degradation material for
   `haselnuss.lower`, and in a lowered document either already applied or
   never going to be, so counting a reference inside one would warn about
@@ -2080,13 +2113,53 @@
   it). A seq of human-readable phrases, in that order, or nil when `src`
   has neither -- used by `unescapable-image-path-diagnostics` (TASK-78)
   to build one message naming everything wrong with a given path, rather
-  than one warning per hazard for the same path."
-  [^String src]
-  (seq (cond-> []
-         (str/includes? src "\\")
-         (conj "a backslash, which LaTeX reads as the start of a command")
-         (not (balanced-braces? src))
-         (conj "an unbalanced brace, which desynchronizes \\includegraphics's own argument grouping"))))
+  than one warning per hazard for the same path.
+
+  Two arities: `[src]` derives the brace verdict itself, via
+  `balanced-braces? src` directly -- correct when `src` is the AST-level
+  value itself, the only shape `unescapable-image-path-diagnostics`
+  hands it. `[src balanced?]` takes that verdict as given instead
+  (`unescapable-image-path-text-diagnostics`, TASK-89 review finding #2's
+  own regression fix, is the one caller that needs this): its own
+  `includegraphics-arg-end` derives balance by depth-tracking the
+  EMITTED text starting from an already-consumed outer `{` -- a
+  DIFFERENT starting depth than `balanced-braces?`'s own fresh-string
+  assumption -- so re-deriving it here from a substring that scan
+  extracts would silently disagree with the scan's own, correct verdict
+  (confirmed live while building the fix: for a src like `\"pic{x.png\"`,
+  the substring the depth-aware scan is forced to fall back to once it
+  cannot find a true close, `\"pic{x.png}\"`, reads as BALANCED under a
+  fresh `balanced-braces?` check, even though the scan itself already
+  knows -- correctly -- that it never found one)."
+  ([^String src] (image-path-hazards src (balanced-braces? src)))
+  ([^String src balanced?]
+   (seq (cond-> []
+          (str/includes? src "\\")
+          (conj "a backslash, which LaTeX reads as the start of a command")
+          (not balanced?)
+          (conj "an unbalanced brace, which desynchronizes \\includegraphics's own argument grouping")))))
+
+(defn- image-path-hazard-diagnostic
+  "The `{:type :unescapable-image-path :src :message}` warning `src`
+  itself earns from `image-path-hazards`, or nil when it carries none --
+  the one place that diagnostic's own shape is built, so
+  `unescapable-image-path-diagnostics` (AST-based, TASK-78) and
+  `unescapable-image-path-text-diagnostics` (text-based, TASK-89 review
+  finding #2) build warnings from the same message-shaping code rather
+  than two copies of it drifting apart, whatever `src` each is handed
+  (see each function's own docstring for the cases their OWN `src`
+  values can genuinely differ in). `balanced?`, when supplied, is passed
+  straight through to `image-path-hazards`'s own two-argument arity --
+  see its docstring for the one case a caller must supply a pre-computed
+  verdict rather than let this re-derive one from `src` alone."
+  ([src] (image-path-hazard-diagnostic src (balanced-braces? src)))
+  ([src balanced?]
+   (when-let [hazards (image-path-hazards src balanced?)]
+     {:type :unescapable-image-path
+      :src src
+      :message (str "image path \"" src "\" contains "
+                    (str/join " and " hazards)
+                    "; \\includegraphics will not compile it")})))
 
 (defn unescapable-image-path-diagnostics
   "One `{:type :unescapable-image-path :src :message}` warning per Image
@@ -2103,18 +2176,257 @@
   character-diagnostics` already documents refusing for the same field.
   So there is no fix to apply here, only a warning naming what is wrong
   and where -- the same trade this emitter makes for every other
-  character or construct it cannot safely rewrite on an author's behalf."
+  character or construct it cannot safely rewrite on an author's behalf.
+
+  AST-based -- kept public as the direct, document-level check (this
+  namespace's own test suite exercises it that way), but NOT currently
+  called by `haselnuss.cli` (TASK-89 review comments #16-18): it was,
+  briefly, alongside `unescapable-image-path-text-diagnostics`
+  (TASK-89 review comment #11 -- finding #2's own original fix, comment
+  #6, had removed the call entirely, and comment #11 found a real,
+  if narrow, coverage gap in doing so), but reconciling the two --
+  telling \"the text-based scan's own re-detection of a hazard this
+  function already reported\" apart from \"a genuinely different hazard
+  that happens to normalize to the same comparison key\" -- proved to
+  need a comparison key with no notion of WHICH occurrence a diagnostic
+  is about, and every fix to that key/cap logic (comments #12-14) closed
+  one live-reproduced false positive or false negative and opened
+  another (comments #13, #16, #17). `haselnuss.cli` went back to calling
+  only `unescapable-image-path-text-diagnostics` (TASK-89 review comment
+  #18's own call, made explicitly instead of patching the reconciliation
+  a sixth time) rather than keep chasing that; see that function's own
+  docstring for what running only it, rather than both, means it no
+  longer catches. This function itself did not change and is not wrong
+  -- it is simply unused by that one caller today. A future caller
+  wanting the AST-level view specifically (this namespace's own tests,
+  for instance) still has it."
   [document]
   (into []
         (comp (filter #(= :image (:t %)))
-              (keep (fn [{:keys [src]}]
-                      (when-let [hazards (image-path-hazards src)]
-                        {:type :unescapable-image-path
-                         :src src
-                         :message (str "image path \"" src "\" contains "
-                                       (str/join " and " hazards)
-                                       "; \\includegraphics will not compile it")}))))
+              (keep (comp image-path-hazard-diagnostic :src)))
         (ast-nodes document)))
+
+(def ^:private includegraphics-open-re
+  "`\\includegraphics`, with or without its optional `[...]` option list,
+  up to and including its required argument's own OPENING `{` --
+  everything from immediately after this match onward is the argument
+  itself, located by `includegraphics-arg-end`.
+
+  Deliberately does NOT also match the argument's own closing `}` (TASK-89
+  review finding #2's own regression: the original version captured the
+  argument with a `[^{}]* \\}` shape, a character class that structurally
+  cannot locate the true close once the argument itself contains a brace
+  -- the exact shape of one of the two hazards this diagnostic exists to
+  catch. `includegraphics-arg-end` walks forward from here instead,
+  tracking depth the way `balanced-braces?` does, rather than asking a
+  regex to skip over content it cannot know the shape of in advance."
+  #"\\includegraphics(?:\[[^\]]*\])?\{")
+
+(defn- includegraphics-arg-end
+  "`[end balanced?]` for `\\includegraphics{`'s own argument in `text`,
+  `start` the index right after that opening brace
+  (`includegraphics-open-re`'s own match end): `end` the index of the
+  argument's own closing `}`, `balanced?` true, when depth-tracking --
+  starting at depth 1, for the ALREADY-CONSUMED opening brace, exactly
+  mirroring `balanced-braces?`'s own algorithm one level in -- finds it
+  before running out of `text`, reaching a newline, OR reaching `bound`
+  (the index of the NEXT `\\includegraphics{` occurrence's own leading
+  `\\`, when there is one on the same line -- `unescapable-image-path-
+  text-diagnostics` supplies `(count text)` when there is none, so this
+  bound is never tighter than end-of-`text` already is); `balanced?`
+  false otherwise (`end` the index of whichever of those three stopped
+  the scan).
+
+  The `bound` parameter exists for one purpose: two `\\includegraphics`
+  calls sharing a line -- two images in the same paragraph -- with the
+  FIRST one hazardous and never closing within its own text would
+  otherwise let this scan run straight into the SECOND occurrence's own
+  `\\includegraphics[...]{...}`, treating its braces as more of the
+  first argument's own nesting and reporting a `:src` spanning both
+  images (confirmed live while hardening this fix). Stopping at the next
+  occurrence's own start does not change the verdict a genuinely
+  well-formed argument gets, the same way the newline bound does not:
+  `render-image` always finishes one `\\includegraphics[...]{...}`,
+  including its own closing brace, before starting the next, so depth
+  always returns to 0 for a well-formed argument strictly before
+  reaching either bound.
+
+  Depth-tracking to the FIRST point depth returns to zero, deliberately,
+  rather than finding the LAST `}` before some bound (TASK-89 review
+  comment #11 -- an earlier version of this function tried exactly that,
+  measured live where it goes wrong, and was reverted): `render-image`
+  sometimes wraps its own `\\includegraphics[...]{...}` in ANOTHER
+  brace-delimited construct immediately after it -- `\\adjustbox{scale=
+  ...}{\\includegraphics[...]{...}}` for a scaled Image (`render-image`'s
+  own docstring) -- so the text right after a genuinely well-formed
+  argument's own true close can itself contain another `}` belonging to
+  something else entirely. \"Find the LAST `}` before a bound\" read
+  THAT wrapper's own closing brace as part of the argument for an
+  ORDINARY, hazard-free scaled Image (`test/fixtures/thesis.hdoc`'s own
+  `tree.png`, confirmed live: reported `:src \"tree.png}\"`, a FALSE
+  positive on real, shipped content) -- exactly the false-negative-to-
+  false-positive trade this task's own review has repeatedly warned
+  against making. Depth-tracking has no such failure mode: since depth
+  starts at 1 for the brace this function's own caller already consumed,
+  it returns to 0 at EXACTLY `\\includegraphics`'s own true close no
+  matter how many outer wrappers follow it, because every one of those
+  wrappers' own closing braces comes strictly after that point and so is
+  never reached at all.
+
+  What depth-tracking gets WRONG instead: a src whose own hazard is a
+  stray CLOSING brace -- depth returns to zero at that FIRST stray `}`,
+  which is the src's own, not `render-image`'s, so the argument reads as
+  balanced and hazard-free when it is not. `haselnuss.cli` briefly ran
+  `unescapable-image-path-diagnostics` (AST-based) alongside this one to
+  close that gap for core-authored content specifically (TASK-89 review
+  comment #11), but reconciling the two scans' own overlapping output
+  proved to need a comparison key with no notion of which occurrence a
+  diagnostic is about, and repeated fixes to that key kept opening new,
+  live-reproduced false positives and false negatives of their own
+  (TASK-89 review comments #13, #16, #17) -- so `haselnuss.cli` stopped
+  running the AST-based check at all (comment #18) rather than patch the
+  reconciliation again, and this stray-CLOSING-brace shape is now an
+  accepted, documented limitation for ANY `\\includegraphics{...}`
+  occurrence, core-authored or not. See `unescapable-image-path-text-
+  diagnostics`'s own docstring for the full accounting.
+
+  A newline bound as well as end-of-`text`: `render-image` never itself
+  inserts one INSIDE the `\\includegraphics[...]{...}` it builds (an
+  Image `:src` is a single-line filename), so a genuinely balanced
+  argument always resolves well before either -- but an argument that
+  never closes at all has nothing else stopping the scan, and TEXT
+  `text` is a whole document, not one image. Confirmed live while
+  building the original fix: without the newline bound, a src like
+  `\"a{b.png\"` at the end of a short document made this scan consume
+  everything up to and including `\\end{document}` looking for a brace to
+  balance against, an unreadable `:src` for a diagnostic whose whole
+  point is telling the author where to look. Stopping at the same line
+  keeps the reported text close to what the author actually wrote,
+  without changing the verdict either bound produces: reaching either
+  one before depth returns to 0 means `balanced?` false either way, and
+  a genuinely balanced argument is never affected by a bound it never
+  reaches.
+
+  When no closing brace ever brings depth back to 0, the argument never
+  closes at all as far as this scan can tell -- which IS the
+  unbalanced-brace hazard, so stopping instead of giving up still lets a
+  caller see a correct verdict, computed HERE during the scan itself
+  rather than re-derived from `(subs text start end)` afterward: that
+  substring, checked fresh (depth starting at 0, `balanced-braces?`'s
+  own assumption), can read as balanced even when this scan correctly
+  knows it never found a true close -- e.g. a src `\"pic{x.png\"`,
+  wrapped as emitted text, forces this scan to fall back to
+  `\"pic{x.png}\"` for lack of a real closing brace, and THAT string
+  happens to look balanced on its own (one open, one close, properly
+  nested) even though the scan that produced it never resolved. Callers
+  must use the `balanced?` this returns, not recompute one.
+
+  `(subs text start end)` is the argument itself either way -- the
+  substring `image-path-hazards`' own backslash check runs on, which
+  needs no depth context and reads the same string either way."
+  [^String text start bound]
+  (loop [i start depth 1]
+    (if (or (>= i bound) (= \newline (.charAt text i)))
+      [i false]
+      (let [c (.charAt text i)
+            depth' (cond (= c \{) (inc depth) (= c \}) (dec depth) :else depth)]
+        (if (zero? depth')
+          [i true]
+          (recur (inc i) depth'))))))
+
+(defn unescapable-image-path-text-diagnostics
+  "One `{:type :unescapable-image-path :src :message}` warning
+  (`image-path-hazard-diagnostic`) per `\\includegraphics{...}` argument
+  found anywhere in already-emitted LaTeX `text`, for each one
+  `image-path-hazards` flags -- the argument located by
+  `includegraphics-open-re`/`includegraphics-arg-end` (depth-aware -- see
+  that function's own docstring for why, including the design history of
+  a \"find the last `}` instead\" alternative this task's own review
+  measured breaking on real content and rejected).
+
+  Exists to close a real gap `unescapable-image-path-diagnostics` cannot
+  (TASK-89 review finding #2): that function walks `document`'s own AST
+  `:image` nodes, which is everything a document's author can write
+  directly -- but a v2 renderer's `[:raw ...]` node (TASK-89, honored
+  only for a `:trusted` registration) can write literal
+  `\\includegraphics{...}` text that never becomes an `:image` AST node
+  at any stage, since `RenderData` has no dedicated image-shaped node at
+  all -- `:raw` is the only way a v2 renderer can produce anything
+  image-like. Scanning the emitted TEXT instead, the same way
+  `untypesettable-character-diagnostics` already does for TASK-76's own
+  character hazard, sees it regardless of whether it came from an
+  authored Image or a trusted renderer's raw output.
+
+  `haselnuss.cli` calls ONLY this function for the image-path-hazard
+  check today (TASK-89 review comment #18), not `unescapable-image-path-
+  diagnostics` (AST-based) alongside it: an earlier round (TASK-89 review
+  comment #11) ran both, to close a real, narrow coverage gap this
+  function's own stray-CLOSING-brace limitation (below) left for
+  core-authored content specifically -- but reconciling two scans that
+  see genuinely OVERLAPPING content (every core Image reaches this
+  function too, as its own emitted `\\includegraphics{...}`) needed a
+  comparison key that could tell \"the same hazard, seen twice\" apart
+  from \"two different hazards that happen to normalize to the same
+  key,\" and every fix to that key kept closing one live-reproduced
+  false positive or false negative and opening another (TASK-89 review
+  comments #12-14, #16, #17 -- five distinct bugs across four review
+  rounds in that reconciliation alone). Rather than patch it a sixth
+  time, `haselnuss.cli` went back to this function as the ONLY source of
+  `:unescapable-image-path` diagnostics (comment #18's own call): it
+  sees every hazard a core Image's own emitted `\\includegraphics{...}`
+  can carry AND, since it scans text rather than the AST, a `:trusted`
+  `[:raw ...]` node's own hazard too -- which `unescapable-image-path-
+  diagnostics` never contributes anything for at all, since that never
+  becomes an `:image` AST node at any stage. With only one source, two
+  genuinely different hazards simply both get reported, with nothing to
+  reconcile or mis-attribute; the trade is the one documented limitation
+  below, now universal rather than narrowed to `:trusted` output alone.
+
+  Two documented, honest residual limitations (in the spirit of doc-6's
+  own \"the honest limit... belongs in the documentation rather than
+  papered over\"), both UNIVERSAL -- for a core-authored Image exactly as
+  much as for a `:trusted` renderer's own `[:raw ...]` output, since
+  `haselnuss.cli` no longer runs a second, AST-based check that could
+  narrow either to `:raw`-only:
+
+  - this pattern is fixed to the one command name `image-path-hazards`
+    was built for, `\\includegraphics` -- a `:raw` node writing some
+    OTHER path-bearing command (a raw `\\href`, an `\\input`, a
+    hand-written macro that itself wraps `\\includegraphics` a layer
+    down) is not recognized by this scan and warns about nothing, the
+    same silent-success shape TASK-78 exists to close, just not closed
+    here. `haselnuss.registry`'s own `:trusted?` docstring names this
+    limitation too, where a caller decides whether to trust a renderer
+    at all, which is the more honest place for it than a comment code
+    arrives at only by already suspecting there is something to find.
+  - a src whose OWN hazard is a stray CLOSING brace with no matching
+    open before it (`\"a}b.png\"`, rather than the far more common
+    stray-OPEN shape `\"pic{x.png\"` this scan and its own tests are
+    built around) resolves differently here than checking the raw value
+    directly would (`includegraphics-arg-end`'s own docstring has the
+    full reasoning): depth-tracking finds the FIRST `}` -- the src's own
+    stray one, not a true close -- and reads the argument as balanced and
+    hazard-free, for a core Image exactly as much as for `:raw` output.
+    Severity is bounded, not silent success: a document with this exact
+    shape still fails to compile under a real `pdflatex` (TASK-89 review
+    comment #11's own live verification), just without this earlier,
+    more specific warning naming the path -- an accepted, tested trade
+    (`test/haselnuss/cli_test.clj`'s own
+    `unescapable-image-path-diagnostic-stray-closing-brace-test`), not an
+    undiscovered gap."
+  [^String text]
+  (let [starts (loop [matcher (re-matcher includegraphics-open-re text) starts []]
+                 (if (.find matcher)
+                   (recur matcher (conj starts [(.start matcher) (.end matcher)]))
+                   starts))
+        text-length (.length text)]
+    (into []
+          (keep-indexed
+           (fn [i [_ arg-start]]
+             (let [bound (or (first (get starts (inc i))) text-length)
+                   [end balanced?] (includegraphics-arg-end text arg-start bound)]
+               (image-path-hazard-diagnostic (subs text arg-start end) balanced?))))
+          starts)))
 
 (def ^:private origin-words
   "How `untypesettable-character-diagnostics` names each place emitted
@@ -2348,7 +2660,7 @@
          (keep (fn [[directive-name spec]] (when (:sub spec) directive-name)))
          environments)))
 
-(defn environment-renderer
+(def environment-renderer
   "The marker `register-environments` stores as a mapped directive's own
   `:latex` renderer (TASK-24). Registering *something* there is the whole
   point: `haselnuss.lower/lower`'s own AC #1 branch keeps a `:directive`
@@ -2360,26 +2672,44 @@
   it needs for the directive's own content lives, which the registry's
   `(fn [directive target])` signature gives an extension no way to reach
   (see `haselnuss.extensions.collapsable`'s own docstring on that same
-  limitation). `render-directive` therefore recognizes this marker by
-  identity and never calls it.
+  limitation). `render-directive` therefore recognizes this marker via
+  its own metadata (`environment-marker?`, TASK-88 AC #7) and never
+  calls it -- not by comparing it against this Var's own value by
+  identity, the way it used to: that only ever worked because the exact
+  same function value had to reach `render-directive` unchanged, and a
+  metadata tag travels with the function value itself rather than
+  depending on which Var happens to hold it.
 
   Deliberately a *function that throws*, not an inert value (TASK-24
   review findings #3/#4). It has to survive two different consumers:
-  `render-directive` compares it by identity, so its callability is
-  irrelevant there; but every *other* consumer of `:emit` -- notably
-  `haselnuss.emit.html/render-directive` -- calls whatever non-nil value
-  it finds, and the registry is one table shared across targets. An
-  inert keyword (this function's first version) is itself `IFn`, so such
-  a consumer would splice the literal `:latex` into its output and ship
-  silently corrupted HTML; a function that throws makes the same mistake
-  a loud, named error instead."
-  [directive target]
-  (throw (ex-info
-          (str "the latex directive-environment marker was called as a renderer for directive "
-               (pr-str (:name directive)) " on target " (pr-str target)
-               ": it is a marker recognized by haselnuss.emit.latex/render-directive only, "
-               "never a renderer for another target")
-          {:type ::environment-marker-called :block directive :target target})))
+  `render-directive` recognizes it and never calls it; but every *other*
+  consumer of `:emit` -- notably `haselnuss.emit.html/render-directive`
+  -- calls whatever non-nil value it finds, and the registry is one
+  table shared across targets. An inert keyword (this function's first
+  version) is itself `IFn`, so such a consumer would splice the literal
+  `:latex` into its output and ship silently corrupted HTML; a function
+  that throws makes the same mistake a loud, named error instead."
+  (with-meta
+    (fn [directive target]
+      (throw (ex-info
+              (str "the latex directive-environment marker was called as a renderer for directive "
+                   (pr-str (:name directive)) " on target " (pr-str target)
+                   ": it is a marker recognized by haselnuss.emit.latex/render-directive only, "
+                   "never a renderer for another target")
+              {:type ::environment-marker-called :block directive :target target})))
+    {::environment-marker true}))
+
+(defn- environment-marker?
+  "True when `renderer` is the `environment-renderer` marker (TASK-88 AC
+  #7), recognized via its own `::environment-marker` metadata rather
+  than by comparing it against `environment-renderer`'s own Var value by
+  identity: an ordinary anonymous `fn`, a Var-backed renderer
+  (`#'my-ns/render` -- `(meta #'my-ns/render)` carries no such key) or a
+  multimethod all correctly read back false here, exactly as `(not=
+  renderer environment-renderer)` did, with no need to know which
+  specific function value they are not."
+  [renderer]
+  (::environment-marker (meta renderer)))
 
 (defn register-environments
   "Registers `environments` (default `default-directive-environments`)
@@ -2823,22 +3153,167 @@
            (unnumbered-label ctx (:attr directive))
            (apply str lines)))))
 
+(defrecord Rendered
+  ;; TASK-89: the wrapper `ctx`'s `:render-blocks`/`:render-inlines`
+  ;; callbacks return -- "this TeX string was already produced by this
+  ;; namespace's own render pipeline (which already escaped/composed
+  ;; whatever needed it via `escape-tex`), splice it verbatim" -- see
+  ;; `RenderData`'s own docstring for why this is a distinct type from
+  ;; the trust-gated `[:raw ...]` rather than the same mechanism: see
+  ;; `haselnuss.emit.html/Rendered`'s own docstring, which this mirrors
+  ;; exactly, for the full reasoning (unforgeable by a v2 renderer's own
+  ;; code today, and unreachable outright once TASK-90's sandbox excludes
+  ;; this namespace from its allowed-namespace list).
+           [tex])
+
+(defprotocol ^:private RenderData
+  (render-data [node ctx]
+    "Serializes a v2 renderer's return value `node` (TASK-89) to a TeX
+    string, applying exactly the escaping (and, by extension, the
+    TASK-76/78 unrepresentable-character/URL reporting, since that runs
+    as a later pass over the whole EMITTED text regardless of which
+    renderer produced which part of it) this namespace's own core
+    rendering already gets, over a deliberately small vocabulary --
+    smaller than doc-6's own illustrative `[:env ...]`/`[:cmd ...]`
+    sketch, because no directive migrated onto this contract needs a
+    dynamically-named command or environment (a name is always a literal
+    in the renderer's own source, never author-controlled), so
+    name-validation machinery nothing yet needs is not built speculatively:
+
+    - `nil` -- `\"\"`.
+    - a `String` or `Keyword` -- `escape-tex`-ed text (a Keyword renders
+      as its own bare `name`).
+    - a `Number` -- `str`-ed then `escape-tex`-ed.
+    - a vector `[:raw s]` -- `s` spliced verbatim, no escaping -- the one
+      way to emit genuinely raw TeX -- but ONLY when `ctx`'s own
+      `:trusted?` is true (set by `render-directive` from the DISPATCHED
+      entry's own `:trusted`, never something a renderer's own code
+      controls); otherwise a loud `ex-info` naming the directive.
+    - any other vector, or any `ISeq` (a `map`/`for`/`list` result) -- a
+      fragment: every child `render-data`-ed and concatenated.
+    - a `Rendered` (this namespace's own) -- spliced verbatim,
+      unconditionally: already-rendered, already-`escape-tex`-ed output
+      from `ctx`'s `:render-blocks`/`:render-inlines` callbacks.
+    - anything else -- a loud `ex-info` naming the value and its class."))
+
+(defn- untrusted-raw-output!
+  "Raises the `ex-info` (`:type ::untrusted-raw-output`) a `[:raw ...]`
+  node in `ctx`'s current v2 renderer's return value gets when that
+  renderer's own registry entry is not `:trusted` (`register`'s own
+  `:trusted?`, TASK-89 AC #8) -- naming the directive, never a silent
+  downgrade to escaped text (which would corrupt genuine TeX syntax) or a
+  silent splice (exactly the injection this contract exists to close
+  off). Mirrors `haselnuss.emit.html`'s own function of the same name."
+  [ctx]
+  (throw (ex-info
+          (str "directive " (pr-str (:directive-name ctx)) "'s renderer returned a [:raw ...] "
+               "node, but its own registry entry is not :trusted -- only a registration with "
+               ":trusted? true (haselnuss.registry/register) may emit unescaped output")
+          {:type ::untrusted-raw-output :directive-name (:directive-name ctx)})))
+
+(extend-protocol RenderData
+  nil
+  (render-data [_ _ctx] "")
+
+  String
+  (render-data [s _ctx] (escape-tex s))
+
+  clojure.lang.Keyword
+  (render-data [k _ctx] (escape-tex (name k)))
+
+  Number
+  (render-data [n _ctx] (escape-tex (str n)))
+
+  Rendered
+  (render-data [r _ctx] (:tex r))
+
+  clojure.lang.IPersistentVector
+  (render-data [v ctx]
+    (if (= :raw (first v))
+      (if (:trusted? ctx) (second v) (untrusted-raw-output! ctx))
+      (apply str (map #(render-data % ctx) v))))
+
+  clojure.lang.ISeq
+  (render-data [s ctx] (apply str (map #(render-data % ctx) s)))
+
+  Object
+  (render-data [x _ctx]
+    (throw (ex-info
+            (str "latex emitter cannot serialize a v2 renderer's return value of type "
+                 (pr-str (class x)) ": " (pr-str x))
+            {:type ::unrenderable-data :value x}))))
+
+(defn- derived-list-renderer
+  "`render-derived-list`, adapted to TASK-89's v2 contract (`registry/
+  renderer-v2` wraps this before `register-derived-lists` installs it):
+  `[directive ctx] -> Rendered`, rather than `[ctx spec directive] ->
+  string`.
+
+  Deliberately the thinnest possible adapter, not a rewrite of a
+  correct, already-tested, mode-aware (native vs. computed-numbers)
+  function into a richer vocabulary: `render-derived-list` and everything
+  it calls (`toc-lines`/`float-list-line`/`escape-tex`/`render-inlines`)
+  already are this namespace's own core code. Wrapping its unmodified
+  output in `Rendered` says exactly what is true (\"this namespace
+  already rendered and escaped this\") without touching intricate,
+  mode-branching logic for no safety benefit -- see
+  `haselnuss.emit.html/derived-list-renderer`'s own docstring, which
+  mirrors this reasoning exactly."
+  [directive ctx]
+  (->Rendered (render-derived-list ctx (derived-lists/spec directive) directive)))
+
+(defn register-derived-lists
+  "Registers a real `:latex` renderer (`derived-list-renderer`, TASK-89)
+  for every list-placeholder name `haselnuss.extensions.derived-lists`
+  defines, merging into an existing entry of the same name exactly the
+  way `register-environments` already does for its own per-target
+  mapping -- see that function's own docstring for why merging, not
+  replacing, matters here. A name with no existing entry is registered
+  fresh, with no `:kind`/`:lower` (`haselnuss.extensions.derived-lists`'s
+  own docstring: a list is not a numbering target, and has a
+  representation on every target this project emits).
+
+  This is what makes `render-directive` need no special case for a list
+  placeholder ahead of the registry any more (TASK-89 AC #3): dispatch
+  finds a real, `renderer-v2`-marked renderer through the ordinary
+  registry lookup, the same as it does for `register-environments`'s own
+  mapped directives."
+  [registry]
+  (reduce (fn [reg list-name]
+            (if-let [entry (registry/lookup reg list-name)]
+              (assoc reg list-name (assoc-in entry [:emit :latex]
+                                             (registry/renderer-v2 derived-list-renderer)))
+              (registry/register reg {:name list-name
+                                      :emit {:latex (registry/renderer-v2 derived-list-renderer)}})))
+          registry
+          (sort (keys derived-lists/lists))))
+
 (defn- render-directive
   "Renders Directive `directive`, in the order this namespace resolves its
   three possible representations:
 
-  1. A real `:latex` renderer registered for `directive`'s own `:name`
-     in `ctx`'s `:registry` -- called with the `(fn [directive target]
-     -> string)` signature `haselnuss.extensions.collapsable`/
-     `haselnuss.emit.html` established, its return value spliced in
-     verbatim. First, so a custom extension can always override a
-     built-in environment mapping for the same name. \"Real\" means
-     anything callable that is not `environment-renderer`: recognizing
-     the marker by identity, rather than by asking whether the value is
-     `fn?`, is what keeps an ordinary Var or multimethod renderer
-     working (TASK-24 review finding #4 -- `(fn? #'my-ns/render)` is
-     false, so a `fn?` test silently rejected two normal idioms the
-     HTML emitter still accepts).
+  1. A registered `:latex` renderer for `directive`'s own `:name` in
+     `ctx`'s `:registry` -- either contract (TASK-89 --
+     `haselnuss.registry/register`'s own `:emit` docstring has the full
+     split):
+     - a v2 renderer (`registry/v2?`) is called `(renderer directive
+       ctx')`, `ctx'` this call's own `ctx` plus `:directive-name`,
+       `:trusted?` (this directive's own registry entry, AC #8) and
+       `:render-blocks`/`:render-inlines` (AC #2 -- plain callbacks here,
+       unlike the HTML emitter's own footnote-threading versions, since a
+       LaTeX footnote is an ordinary inline `\\footnote{...}`, needing no
+       accumulator at all). Its return value is DATA this namespace
+       serializes via `render-data`/`RenderData` (AC #1), not a string
+       spliced verbatim.
+     - a legacy renderer (anything callable that is not the
+       `environment-renderer` marker, `environment-marker?`, TASK-88 AC
+       #7 -- recognized via its own metadata, not by asking whether the
+       value is `fn?`, which is what keeps an ordinary Var or multimethod
+       renderer working: TASK-24 review finding #4) is called `(renderer
+       directive :latex)`, its returned string spliced in verbatim --
+       exactly this namespace's own pre-TASK-89 behavior (AC #7).
+     First, so a custom extension can always override a built-in
+     environment mapping for the same name.
   2. Otherwise, an entry for that name in `ctx`'s `:directive-
      environments` mapping table (TASK-24) -> `render-environment`.
   3. Otherwise `ex-info` (`:type ::unsupported-block`) naming the
@@ -2849,19 +3324,19 @@
      aborted there with `::no-representation` (TASK-24 AC #3), long
      before this emitter sees it."
   [{:keys [registry directive-environments] :as ctx} {directive-name :name :as directive}]
-  (let [renderer (some-> registry (registry/lookup directive-name) (registry/renderer :latex))
-        spec (get directive-environments directive-name)
-        list-spec (derived-lists/spec directive)]
+  (let [entry (some-> registry (registry/lookup directive-name))
+        renderer (registry/renderer entry :latex)
+        spec (get directive-environments directive-name)]
     (cond
-      ;; A list placeholder is drawn here, from the resolver's own
-      ;; derivations or by handing the job to LaTeX (TASK-59), rather
-      ;; than through the marker the registry holds for it -- which of
-      ;; the two depends on the emission MODE, something no registry
-      ;; renderer is given. First, like every other case here, so the
-      ;; marker is never called.
-      list-spec (render-derived-list ctx list-spec directive)
+      (and (ifn? renderer) (registry/v2? renderer))
+      (let [ctx' (assoc ctx
+                        :directive-name directive-name
+                        :trusted? (boolean (:trusted entry))
+                        :render-blocks (fn [blocks] (->Rendered (render-blocks ctx blocks)))
+                        :render-inlines (fn [inlines] (->Rendered (render-inlines ctx inlines))))]
+        (render-data (renderer directive ctx') ctx'))
 
-      (and (ifn? renderer) (not= renderer environment-renderer))
+      (and (ifn? renderer) (not (environment-marker? renderer)))
       (renderer directive :latex)
 
       spec (render-environment ctx spec directive)
@@ -2963,143 +3438,180 @@
        " :load option -- haselnuss.cli always supplies one, so this AST did not"
        " come through it)"))
 
-(defn- render-block
-  "Renders one Block (`haselnuss.ast/Block`) to a LaTeX fragment. Covers
-  every Block variant `haselnuss.ast` defines except `:include`
-  (Section/Para/List/CodeBlock/BlockQuote/Directive -- TASK-21;
-  Figure/Table/MathBlock -- TASK-22; `:thematic-break` -- TASK-37);
-  `:include` raises `::unresolved-include` and anything outside the
-  schema entirely raises `::unsupported-block` -- see this namespace's
-  own docstring for why."
+(defn- render-section
+  "Renders Section `block`, or, when it is the generated bibliography
+  Section in native mode, `bibliography-block` instead (AC #2)."
   [ctx block]
-  (case (:t block)
-    :section
-    (if (generated-bibliography-section? ctx block)
-      (bibliography-block ctx)
-      ;; TASK-23 review finding #3: computed-numbers mode uses the
-      ;; *starred* sectioning command. `article` numbers every heading it
-      ;; is given, while the resolver numbers only `sec:`-labeled ones --
-      ;; so an unstarred computed-mode heading reads "2 Methods" beside a
-      ;; cross-reference to it reading "Section 1", the exact self-
-      ;; contradiction `\caption*`/`\tag` exist to prevent.
-      ;;
-      ;; TASK-41: starred, and then the resolver's own number baked into
-      ;; the heading text, exactly as `\caption*` and `\tag` already bake
-      ;; in theirs. Before this, neither target printed a section number
-      ;; at all, so a document could say "See Section 1" above a heading
-      ;; reading only "Why hazel". Baking it in is what prints a number
-      ;; WITHOUT reintroducing article's own counter, which is the whole
-      ;; reason the command is starred. `section-number-prefix` prints
-      ;; the bare number and nothing for an unnumbered Section; see
-      ;; `haselnuss.emit.html/section-number-html` for the decision and
-      ;; why an unnumbered heading needs nothing to fill the gap.
-      (str "\\" (section-command ctx (:level block))
-           (when (or (:computed-numbers ctx) (:unnumbered ctx)) "*")
-           "{" (section-number-prefix ctx (:attr block))
-           (render-inlines ctx (:heading block)) "}"
-           (unnumbered-label ctx (:attr block)) "\n"
-           (render-blocks ctx (:blocks block))))
+  (if (generated-bibliography-section? ctx block)
+    (bibliography-block ctx)
+    ;; TASK-23 review finding #3: computed-numbers mode uses the
+    ;; *starred* sectioning command. `article` numbers every heading it
+    ;; is given, while the resolver numbers only `sec:`-labeled ones --
+    ;; so an unstarred computed-mode heading reads "2 Methods" beside a
+    ;; cross-reference to it reading "Section 1", the exact self-
+    ;; contradiction `\caption*`/`\tag` exist to prevent.
+    ;;
+    ;; TASK-41: starred, and then the resolver's own number baked into
+    ;; the heading text, exactly as `\caption*` and `\tag` already bake
+    ;; in theirs. Before this, neither target printed a section number
+    ;; at all, so a document could say "See Section 1" above a heading
+    ;; reading only "Why hazel". Baking it in is what prints a number
+    ;; WITHOUT reintroducing article's own counter, which is the whole
+    ;; reason the command is starred. `section-number-prefix` prints
+    ;; the bare number and nothing for an unnumbered Section; see
+    ;; `haselnuss.emit.html/section-number-html` for the decision and
+    ;; why an unnumbered heading needs nothing to fill the gap.
+    (str "\\" (section-command ctx (:level block))
+         (when (or (:computed-numbers ctx) (:unnumbered ctx)) "*")
+         "{" (section-number-prefix ctx (:attr block))
+         (render-inlines ctx (:heading block)) "}"
+         (unnumbered-label ctx (:attr block)) "\n"
+         (render-blocks ctx (:blocks block)))))
 
-    :para (render-inlines ctx (:inlines block))
+(defn- render-para
+  "Renders Para `block` (sec4.3: `:inlines`) through the ordinary Inline
+  pipeline -- a Para contributes no LaTeX wrapper of its own; a blank
+  line between Blocks is `render-blocks`' own paragraph-break convention."
+  [ctx block]
+  (render-inlines ctx (:inlines block)))
 
-    ;; A List or CodeBlock carrying an id the resolver DID number (its
-    ;; prefix is a recognized kind) is anchored in computed-numbers mode
-    ;; only (TASK-40). Neither construct steps a LaTeX counter, so in
-    ;; native mode a `\label` here would bind to whatever counter was
-    ;; stepped last and a `\Cref` to it would confidently print the
-    ;; enclosing section's number -- the same silently-wrong output
-    ;; `render-environment` refuses to emit, and the reason these two
-    ;; stay `??` there. Computed mode has no such hazard: the printed
-    ;; reference text comes from the resolver, and `\phantomsection`
-    ;; (via `unnumbered-label`) makes the anchor this node rather than
-    ;; its section.
-    :list (str (counterless-label ctx (:attr block)) (render-list ctx block))
-
-    ;; verbatim is catcode-literal: block's own :text needs zero escaping
-    ;; (see namespace docstring for why this, over a package requiring a
-    ;; syntax-highlighting dependency no AC asks for) -- but see
-    ;; `verbatim-env` for the one hazard escaping alone can't fix: :text
-    ;; containing the literal substring "\end{verbatim}" itself.
-    :code-block
-    (let [env (verbatim-env (:text block))]
-      (str (counterless-label ctx (:attr block))
-           ;; TASK-57 AC #3. `verbatim` has no language concept, and
-           ;; pulling in `listings`/`minted` to get one is a dependency
-           ;; no AC asks for and would cost this emitter the "compiles
-           ;; under a standard toolchain" property TASK-21 AC #1 set. A
-           ;; comment carries the authored value to anything that reads
-           ;; the `.tex` -- a later highlighting pass, a human, a diff --
-           ;; instead of discarding it, which is what happened before.
-           (when-let [lang (:lang block)]
-             (str "% haselnuss: language " (escape-tex lang) "\n"))
-           "\\begin{" env "}\n" (:text block) "\n\\end{" env "}"))
-
-    ;; Same counterless treatment as :list/:code-block above, and it
-    ;; matters more than for either of those (TASK-51): a BlockQuote is
-    ;; what an id-bearing directive lowers INTO when it has no native
-    ;; renderer for this target -- both collapsable extensions build one
-    ;; carrying the directive's own `attr` -- so this was the one place
-    ;; such a directive's anchor disappeared entirely, leaving even
-    ;; computed mode's `\hyperref` pointing at nothing. (A directive the
-    ;; environment table maps never takes that path here: it has a
-    ;; native `:latex` renderer, so `haselnuss.cli/environment-lower-rule`
-    ;; degrades it for other targets only.)
-    :block-quote
+(defn- render-code-block
+  "Renders CodeBlock `block` (sec4.3: `:lang?`/`:text`/`:attr`) as a
+  `verbatim`-family environment (`verbatim-env`, core LaTeX, no package):
+  its content is copied catcode-literally, so `:text` needs zero
+  escaping -- see namespace docstring for the full rationale, including
+  the one hazard escaping alone can't fix (`:text` containing the literal
+  substring `\\end{verbatim}` itself). `:lang`, when present, survives
+  only as a comment (TASK-57 AC #3): `verbatim` has no language concept
+  of its own. `counterless-label` anchors `:attr.id` in computed-numbers
+  mode only (TASK-40) -- see namespace docstring."
+  [ctx block]
+  (let [env (verbatim-env (:text block))]
     (str (counterless-label ctx (:attr block))
-         "\\begin{quote}\n" (render-blocks ctx (:blocks block)) "\n\\end{quote}")
+         ;; TASK-57 AC #3. `verbatim` has no language concept, and
+         ;; pulling in `listings`/`minted` to get one is a dependency
+         ;; no AC asks for and would cost this emitter the "compiles
+         ;; under a standard toolchain" property TASK-21 AC #1 set. A
+         ;; comment carries the authored value to anything that reads
+         ;; the `.tex` -- a later highlighting pass, a human, a diff --
+         ;; instead of discarding it, which is what happened before.
+         (when-let [lang (:lang block)]
+           (str "% haselnuss: language " (escape-tex lang) "\n"))
+         "\\begin{" env "}\n" (:text block) "\n\\end{" env "}")))
 
-    :figure (render-figure ctx block)
+(defn- render-block-quote
+  "Renders BlockQuote `block` (sec4.3: `:blocks`) as `quote`, its own
+  `:blocks` rendered through the ordinary visitor. Same counterless
+  treatment as `render-code-block`/List above, and it matters more than
+  for either of those (TASK-51): a BlockQuote is what an id-bearing
+  directive lowers INTO when it has no native renderer for this target
+  -- both collapsable extensions build one carrying the directive's own
+  `attr` -- so this was the one place such a directive's anchor
+  disappeared entirely, leaving even computed mode's `\\hyperref`
+  pointing at nothing. (A directive the environment table maps never
+  takes that path here: it has a native `:latex` renderer, so
+  `haselnuss.cli/environment-lower-rule` degrades it for other targets
+  only.)"
+  [ctx block]
+  (str (counterless-label ctx (:attr block))
+       "\\begin{quote}\n" (render-blocks ctx (:blocks block)) "\n\\end{quote}"))
 
-    :table (render-table ctx block)
+(defn- render-math-block
+  "Renders MathBlock `block` (sec4.3: `:tex`/`:attr`): an id-bearing
+  MathBlock is a numbered, labelable `equation`; id-less is plain
+  unnumbered display math -- see namespace docstring for the full
+  rationale. `:tex` passed through completely verbatim (AC #3), same as
+  `:math-inline`."
+  [ctx block]
+  (let [{:keys [tex attr]} block
+        ;; TASK-23: in computed-numbers mode a numbered equation carries
+        ;; the resolver's own number via amsmath's \tag, so it agrees
+        ;; with what a \hyperref to it prints, instead of `equation`'s
+        ;; own independent counter. No entry in :labels means there is
+        ;; no computed number to tag with -- documented in the namespace
+        ;; docstring as falling back to LaTeX's counter.
+        tag (when (:computed-numbers ctx)
+              (:number (get (:labels ctx) (:id attr))))]
+    (cond
+      ;; Computed mode, id-bearing, but the resolver assigned no
+      ;; number (an unrecognized kind prefix): amsmath's unnumbered
+      ;; `equation*`, with `\\phantomsection` giving hyperref an
+      ;; anchor the uncounted environment cannot. Falling back to
+      ;; `equation`'s own counter here -- which this branch used to do
+      ;; -- reintroduced exactly the cross-format drift computed mode
+      ;; exists to remove: LaTeX printed a number beside the equation
+      ;; while `haselnuss.emit.html` printed none, since it has no
+      ;; computed number to print either (TASK-27 review).
+      (and (:id attr) (:computed-numbers ctx) (not tag))
+      (str "\\phantomsection\n\\begin{equation*}\n" tex "\n"
+           (attr-label attr) "\n\\end{equation*}")
 
-    ;; An id-bearing MathBlock is a numbered, labelable `equation`;
-    ;; id-less is plain unnumbered display math -- see namespace docstring
-    ;; for the full rationale. `:tex` passed through completely verbatim
-    ;; (AC #3), same as :math-inline above.
-    :math-block
-    (let [{:keys [tex attr]} block
-          ;; TASK-23: in computed-numbers mode a numbered equation carries
-          ;; the resolver's own number via amsmath's \tag, so it agrees
-          ;; with what a \hyperref to it prints, instead of `equation`'s
-          ;; own independent counter. No entry in :labels means there is
-          ;; no computed number to tag with -- documented in the namespace
-          ;; docstring as falling back to LaTeX's counter.
-          tag (when (:computed-numbers ctx)
-                (:number (get (:labels ctx) (:id attr))))]
-      (cond
-        ;; Computed mode, id-bearing, but the resolver assigned no
-        ;; number (an unrecognized kind prefix): amsmath's unnumbered
-        ;; `equation*`, with `\\phantomsection` giving hyperref an
-        ;; anchor the uncounted environment cannot. Falling back to
-        ;; `equation`'s own counter here -- which this branch used to do
-        ;; -- reintroduced exactly the cross-format drift computed mode
-        ;; exists to remove: LaTeX printed a number beside the equation
-        ;; while `haselnuss.emit.html` printed none, since it has no
-        ;; computed number to print either (TASK-27 review).
-        (and (:id attr) (:computed-numbers ctx) (not tag))
-        (str "\\phantomsection\n\\begin{equation*}\n" tex "\n"
-             (attr-label attr) "\n\\end{equation*}")
+      (:id attr)
+      (str "\\begin{equation}\n" tex "\n"
+           (when tag (str "\\tag{" (escape-tex tag) "}\n"))
+           (attr-label attr) "\n\\end{equation}")
+      ;; Closing delimiter on its own line -- same fatal raw-`%` fix as
+      ;; :math-inline above; the id-bearing `equation` branch above was
+      ;; never affected since its own template already separates
+      ;; tex/label/end onto their own lines.
+      :else (str "\\[" tex "\n\\]"))))
 
-        (:id attr)
-        (str "\\begin{equation}\n" tex "\n"
-             (when tag (str "\\tag{" (escape-tex tag) "}\n"))
-             (attr-label attr) "\n\\end{equation}")
-        ;; Closing delimiter on its own line -- same fatal raw-`%` fix as
-        ;; :math-inline above; the id-bearing `equation` branch above was
-        ;; never affected since its own template already separates
-        ;; tex/label/end onto their own lines.
-        :else (str "\\[" tex "\n\\]")))
+(def built-in-block-handlers
+  "The built-in `:t -> (fn [ctx block] -> tex-fragment)` table
+  `render-block` dispatches through (TASK-88): every Block variant
+  `haselnuss.ast` defines except `:include` (Section/Para/List/
+  CodeBlock/BlockQuote/Directive -- TASK-21; Figure/Table/MathBlock --
+  TASK-22; `:thematic-break` -- TASK-37), plus `:include` itself -- see
+  this namespace's own docstring for why it raises `::unresolved-include`
+  rather than rendering. Contributed as data rather than as `case`
+  branches (AC #2), so `emit-context`'s own `:block-handlers` opt can
+  merge in a node type this file has never heard of, for one document,
+  with no edit here (AC #4).
 
-    :directive (render-directive ctx block)
+  Most entries reference an existing render function directly, since its
+  own signature already matches this table's `(ctx block)` contract
+  (`render-section`, `render-para`, `render-code-block`, `render-figure`,
+  `render-table`, `render-block-quote`, `render-math-block`,
+  `render-directive`); the rest are small adapter `fn`s: `:list` wraps
+  `render-list` with the same `counterless-label` anchoring
+  `render-code-block`'s own docstring explains (a List steps no LaTeX
+  counter, so it is anchored in computed-numbers mode only, TASK-40),
+  `:thematic-break` is a fixed string and `:include` always throws."
+  {:section render-section
+   :para render-para
+   :list (fn [ctx block] (str (counterless-label ctx (:attr block)) (render-list ctx block)))
+   :code-block render-code-block
+   :block-quote render-block-quote
+   :figure render-figure
+   :table render-table
+   :math-block render-math-block
+   :directive render-directive
+   :thematic-break (fn [_ctx _block] thematic-break-rule)
+   :include (fn [_ctx block]
+              (throw (ex-info (unresolved-include-message block)
+                              {:type ::unresolved-include :block block})))})
 
-    :thematic-break thematic-break-rule
+(defn- unsupported-block!
+  "The declared default `render-block` dispatches an unrecognized Block
+  `:t` to (TASK-88 AC #3): raises the same `ex-info` (`:type
+  ::unsupported-block`) this namespace has always raised for a variant
+  outside its documented scope, naming it -- unchanged from the `case`
+  fallthrough this default replaces, so the failure mode a caller already
+  handles for keeps working."
+  [_ctx block]
+  (throw (ex-info
+          (str "latex emitter does not support block type " (pr-str (:t block)))
+          {:type ::unsupported-block :block block})))
 
-    :include (throw (ex-info (unresolved-include-message block)
-                             {:type ::unresolved-include :block block}))
-
-    (throw (ex-info
-            (str "latex emitter does not support block type " (pr-str (:t block)))
-            {:type ::unsupported-block :block block}))))
+(defn- render-block
+  "Renders one Block (`haselnuss.ast/Block`) to a LaTeX fragment: looks
+  `block`'s own `:t` up in `ctx`'s `:block-handlers` table (TASK-88 AC #1
+  -- `built-in-block-handlers` merged with any document-specific
+  additions `emit-context`'s own `:block-handlers` opt supplied) and
+  calls the handler found there, or `unsupported-block!` when there is
+  none."
+  [ctx block]
+  ((get (:block-handlers ctx) (:t block) unsupported-block!) ctx block))
 
 (defn- render-blocks
   "`render-block` mapped over every Block in `blocks`, in order, joined by
@@ -3702,8 +4214,16 @@
      :environments environments
      :chapters chapters?
      :ctx {:registry (:registry opts)
+           ;; TASK-89: see haselnuss.emit.html's own ctx for why this is
+           ;; here even though no built-in extension needs it yet.
+           :target :latex
            :directive-environments environments
            :computed-numbers computed?
+           ;; TASK-88: merged fresh for this one call, never mutating
+           ;; built-in-block-handlers/built-in-inline-handlers themselves
+           ;; -- see emit-document's own docstring.
+           :block-handlers (merge built-in-block-handlers (:block-handlers opts))
+           :inline-handlers (merge built-in-inline-handlers (:inline-handlers opts))
            ;; TASK-53/TASK-82: read from the document itself, never from
            ;; an opt, so the class, the sectioning commands and the
            ;; resolver's own float numbering are all decided by the same
@@ -3839,6 +4359,16 @@
     is the additive form. A caller must also register the matching
     `register-environments` so `haselnuss.lower/lower` keeps those
     directives (see `register-environments`).
+  - `:block-handlers`/`:inline-handlers` (TASK-88, default `{}`) -- extra
+    `:t -> (fn [ctx node] -> tex-fragment)` entries merged ON TOP of
+    `built-in-block-handlers`/`built-in-inline-handlers` for this call
+    alone, so a caller can render a Block/Inline `:t` this namespace has
+    never heard of without editing it (or override a built-in entry):
+    see `render-block`/`render-inline`. Freshly merged every call, into a
+    plain local map handed only to this one document's `ctx` -- nothing
+    here is a process-global table, so one document's addition never
+    reaches a later, unrelated `emit-document`/`emit-preamble`/
+    `emit-front-matter` call in the same process.
   - `:fragment` (default false) -- emit ONLY the rendered body (TASK-52):
     no `\\documentclass`, no preamble, no `\\begin{document}`/
     `\\end{document}`, and no `meta-preamble` title block. The result is

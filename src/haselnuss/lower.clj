@@ -36,14 +36,17 @@
   stderr, build continues) and an unrecoverable build error (non-zero
   exit).
 
-  This namespace requires only `haselnuss.registry`, not
-  `haselnuss.resolver` -- a caller wires `parse -> resolve -> lower ->
-  emit` together explicitly (sec3), exactly mirroring `haselnuss.registry`
-  itself staying independent of `haselnuss.resolver`."
+  This namespace requires `haselnuss.ast` (the schema `haselnuss.walk`
+  derives its traversal table from), `haselnuss.walk` itself (TASK-85: every
+  position but `lower-directive`'s own four-way branch is reached through
+  its schema-derived `rewrite`, not a hand-written traversal function per
+  node kind) and `haselnuss.registry` -- not `haselnuss.resolver` -- so a
+  caller wires `parse -> resolve -> lower -> emit` together explicitly
+  (sec3), exactly mirroring `haselnuss.registry` itself staying independent
+  of `haselnuss.resolver`."
   (:require [haselnuss.ast :as ast]
-            [haselnuss.registry :as registry]))
-
-(declare lower-blocks)
+            [haselnuss.registry :as registry]
+            [haselnuss.walk :as walk]))
 
 ;; Fallback application (sec4.5, AC #3)
 ;;
@@ -217,11 +220,12 @@
     the invalid one, and reading it as \"nothing invalid\" is the exact
     defect TASK-44's first version had (AC #4).
 
-  Called on a branch's raw output, before `lower-blocks` recurses into
-  it, so the block reported is the one the caller's rule returned rather
-  than something derived from it. A Directive nested in that output is
-  itself a valid Block, so it passes here and is validated on its own
-  terms when the recursion lowers it.
+  Called on a branch's raw output, before `lower-directive`'s own
+  chain-closing recursion or `haselnuss.walk/rewrite`'s schema-derived one
+  processes it further, so the block reported is the one the caller's
+  rule returned rather than something derived from it. A Directive nested
+  in that output is itself a valid Block, so it passes here and is
+  validated on its own terms when the recursion lowers it.
 
   That ordering tightens one shape that used to work by accident, and
   it is a real tightening rather than a bug fixed (found by review):
@@ -262,14 +266,14 @@
   "The sec8.3 4-way branch for one `:directive` Block `directive`, against
   `target` (a keyword, e.g. `:html`/`:latex`) and `registry` (a
   `haselnuss.registry` map). Returns the vector of 0..N Blocks `directive`
-  lowers to, each already run back through `lower-blocks` so any Directive
-  nested in the chosen representation is itself lowered (sec8.3: \"emitters
-  never meet an unknown node\").
+  lowers to.
 
   - AC #1: a native renderer registered for `target` -> `directive` is left
-    as-is (still one element, itself unchanged) other than recursively
-    lowering its own `:blocks` (still part of the tree an emitter will walk
-    when it renders this directive's body).
+    as-is, `[directive]`, one element, itself unchanged -- including its own
+    `:blocks`, which `lower`'s own `haselnuss.walk/rewrite` call still
+    recursively lowers afterward, since `:blocks` is one of Directive's own
+    schema-declared child fields (still part of the tree an emitter will
+    walk when it renders this directive's body).
   - AC #2: no native renderer, but the registry entry's own `:lower` rule
     (`(fn [directive target] -> Block[] | nil)`, sec8.2) returns a non-empty
     result -> replaced with that result.
@@ -283,11 +287,25 @@
   before it is spliced in (`validate-lowered!`, TASK-49) -- the
   `:fallback` ones by the `:kind` they took, so the error names the one
   that needs fixing. The AC #1 branch is not validated: it keeps the
-  Directive the document already contained, which no rule produced."
+  Directive the document already contained, which no rule produced.
+
+  Every validated replacement that is ITSELF still a `:directive` is
+  itself run back through this same function (TASK-85): `haselnuss.walk/
+  rewrite`, which drives every other position in this pass, only recurses
+  into the schema child fields of a node `:rewrite-fn` returns -- it does
+  not re-offer a same-position replacement to `:rewrite-fn` a second time
+  -- so a registry `:lower` rule or a `:blocks`/`:transform` fallback
+  whose own output is directly a further Directive (`haselnuss.lower-
+  test`'s own \"a lower rule's own output is itself recursively lowered\"
+  fixture) would otherwise reach an emitter unlowered. Every OTHER kind of
+  nested content, however deeply nested, needs no such help: it sits at a
+  genuine schema child position somewhere in what gets returned here, and
+  `rewrite` reaches it on its own once this function returns (sec8.3:
+  \"emitters never meet an unknown node\")."
   [{:keys [target registry transform-rules] :as ctx} directive]
   (let [entry (registry/lookup registry (:name directive))]
     (if (some? (registry/renderer entry target))
-      [(update directive :blocks (partial lower-blocks ctx))]
+      [directive]
       (let [lower-fn (:lower entry)
             lowered (when lower-fn (lower-fn directive target))
             fallback (:fallback directive)
@@ -315,128 +333,61 @@
                        :name (:name directive)
                        :id (get-in directive [:attr :id])
                        :target target})))]
-        (lower-blocks ctx (validate-lowered! directive target branch blocks))))))
+        (mapcat (fn [block]
+                  (if (= :directive (:t block))
+                    (lower-directive ctx block)
+                    [block]))
+                (validate-lowered! directive target branch blocks))))))
 
-;; Generic tree traversal -- mirrors `haselnuss.resolver/resolve-block`/
-;; `resolve-inline`'s own exhaustive per-variant recursion (every position
-;; those functions reach: a Section's `:heading`, a Figure/Table's
-;; `:caption`, a Cite item's `:prefix`/`:suffix`, a footnote `:note`'s own
-;; nested Blocks, and `meta.title`), not `block-children`'s narrower
-;; numbering-only field set -- since `lower`, like `resolve-cross-refs`/
-;; `resolve-citations`, is a rewrite pass over the whole tree, not a
-;; read-only structural scan like `structural-diagnostics`.
+;; Traversal (TASK-85): every position but `lower-directive`'s own decision
+;; is reached through `haselnuss.walk/rewrite`, driven off the schema
+;; `haselnuss.ast/registry` itself declares, rather than a hand-written
+;; recursive function per node kind -- a Section's `:heading`, a Figure/
+;; Table's `:caption`, a Cite item's `:prefix`/`:suffix`, a footnote
+;; `:note`'s own nested Blocks, `meta.title`, and any other child-bearing
+;; field, however deeply nested, are reached because the schema says so,
+;; not because this namespace enumerates them.
 ;;
-;; Unlike those single-node-in/single-node-out passes, a `:directive` can
-;; lower to zero, one, or many Blocks (a `:blocks`/`:transform` fallback or
-;; a registry `:lower` rule can each return any number, and `:drop` always
-;; returns zero) -- so every Block-list-valued position (`:blocks`, a
-;; List's `:items`, a Table cell's `:blocks`) is rewritten with `mapcat`,
-;; not a 1:1 `map`. A Figure's own `:content` must stay exactly one Block
-;; (sec4.3 requires it); the parser never places a bare Directive there
-;; (`haselnuss.parser`'s own standalone-figure-image conversion always
-;; wraps an Image in a `:para`), so lowering it is expected to normally
-;; yield exactly one Block -- if it ever doesn't, that is itself a build
-;; error (`::invalid-figure-content`) naming the offending Figure rather
-;; than silently reshaping the AST into something schema-invalid.
+;; `rewrite` already generalizes both of `lower-directive`'s own
+;; irregularities: a `:many`/`:many-of-many` position (`:blocks`, a List's
+;; `:items`, a Table cell's `:blocks`) accepts each element independently
+;; expanding to zero, one or several nodes -- what a `:blocks`/`:transform`
+;; fallback or a registry `:lower` rule can each return, `:drop` always
+;; returning zero -- and a `:one` position (Figure's `:content`, sec4.3
+;; requires it stay exactly one Block) raises `::walk/arity-error` naming
+;; the field and the node if a substitution ever comes back some other
+;; count, generalizing this namespace's own former Figure-only
+;; `::invalid-figure-content` check (unreferenced by any test, confirmed
+;; before removing it) to every such position in the schema.
 
-(defn- lower-content
-  "Lowers Figure `content` (a single Block, sec4.3) and asserts the result
-  is still exactly one Block, since Figure's `:content` cannot hold a
-  Block[]. Raises `::invalid-figure-content` rather than silently
-  reshaping the AST if `content` (in practice never a bare `:directive`,
-  per `haselnuss.parser`'s own standalone-figure-image convention) ever
-  lowers to a count other than one."
-  [ctx content]
-  (let [lowered (lower-blocks ctx [content])]
-    (if (= 1 (count lowered))
-      (first lowered)
-      (throw (ex-info
-              (str "figure content lowered to " (count lowered)
-                   " blocks instead of exactly 1")
-              {:type ::invalid-figure-content :content content :lowered lowered})))))
+(def ^:private scope
+  "Every reference kind `lower` needs `haselnuss.walk/rewrite`'s own
+  `:scope` to include: `::block`/`::inline` for the tree itself, `::row`/
+  `::cell` so a Table's own `:head`/`:rows` reach down to each cell's
+  `:blocks`, `::cite-item` so a Cite's own `:items` reach their
+  `:prefix`/`:suffix` (which can themselves hide a footnote), and `::meta`
+  so one `rewrite` call rooted at the Document also reaches `meta.title`
+  (`lower`, below).
 
-(defn- lower-cell
-  "Lowers Cell `cell`'s own `:blocks` (mirrors `haselnuss.resolver/
-  resolve-cell`)."
-  [ctx cell]
-  (update cell :blocks (partial lower-blocks ctx)))
+  `::attr`/`::col` are absent because neither schema (sec4.1/4.3) holds a
+  reference of its own to descend through either way. `::fallback` is
+  absent deliberately, unchanged from before this port (see this
+  namespace's own top-of-file 'Scope' note): a Directive's own `:fallback`
+  is read as data, by `lower-directive`/`fallback-blocks` directly, never
+  walked as a subtree in its own right."
+  #{::ast/block ::ast/inline ::ast/cell ::ast/row ::ast/cite-item ::ast/meta})
 
-(defn- lower-row
-  "`lower-cell` mapped over Row `row`'s `:cells` (mirrors
-  `haselnuss.resolver/resolve-row`)."
-  [ctx row]
-  (update row :cells (partial mapv (partial lower-cell ctx))))
-
-(declare lower-inlines)
-
-(defn- lower-cite-item
-  "Lowers any Directive nested (via a footnote) in CiteItem `item`'s
-  optional `:prefix`/`:suffix` Inlines (mirrors `haselnuss.resolver/
-  resolve-cite-item`), leaving an absent field absent."
-  [ctx {:keys [prefix suffix] :as item}]
-  (cond-> item
-    prefix (assoc :prefix (lower-inlines ctx prefix))
-    suffix (assoc :suffix (lower-inlines ctx suffix))))
-
-(defn- lower-inline
-  "Lowers any Directive reachable from `inline` (mirrors
-  `haselnuss.resolver/resolve-inline`'s own exhaustive per-variant
-  recursion): recurses into `:inlines` for `:emph`/`:strong`/`:strike`/
-  `:small-caps`/`:sub`/`:sup`/`:span`/`:link`, `:items` for `:cite` (via
-  `lower-cite-item`), and `:blocks` for a footnote `:note` (via
-  `lower-blocks` -- the one place a Block-carrying Inline can hide a
-  Directive). Every other variant carries neither and is returned
-  unchanged. Always returns exactly one Inline -- Inlines are never
-  spliced/replaced by this pass, only their nested Blocks are rewritten."
-  [ctx inline]
-  (case (:t inline)
-    (:emph :strong :strike :small-caps :sub :sup :span :link)
-    (update inline :inlines (partial lower-inlines ctx))
-    :cite (update inline :items (partial mapv (partial lower-cite-item ctx)))
-    :note (update inline :blocks (partial lower-blocks ctx))
-    inline))
-
-(defn- lower-inlines
-  "`lower-inline` mapped over every Inline in `inlines`, in order."
-  [ctx inlines]
-  (mapv (partial lower-inline ctx) inlines))
-
-(defn- lower-block
-  "Lowers `block`, returning the vector of 0..N Blocks it lowers to
-  (mirrors `haselnuss.resolver/resolve-block`'s own exhaustive per-variant
-  recursion, generalized from a 1:1 `assoc` to a `mapcat`-friendly vector
-  result since only a `:directive` can ever produce a count other than
-  one): a Section's `:heading` (via `lower-inlines`) and `:blocks`; a
-  Para's `:inlines`; a List's `:items` (a vector of Block vectors); a
-  Figure's `:content` (via `lower-content`, kept singular) and `:caption`;
-  a Table's `:head`/`:rows` (via `lower-row`) and `:caption`; a BlockQuote's
-  `:blocks`; a `:directive` (via `lower-directive`, sec8.3's 4-way branch).
-  Every other variant (`:code-block`/`:math-block`/`:include`/
-  `:thematic-break`) carries neither and is returned unchanged."
-  [ctx block]
-  (case (:t block)
-    :section [(-> block
-                  (update :heading (partial lower-inlines ctx))
-                  (update :blocks (partial lower-blocks ctx)))]
-    :para [(update block :inlines (partial lower-inlines ctx))]
-    :list [(update block :items (partial mapv (partial lower-blocks ctx)))]
-    :figure [(-> block
-                 (update :content (partial lower-content ctx))
-                 (update :caption (partial lower-inlines ctx)))]
-    :table [(-> block
-                (update :head (partial lower-row ctx))
-                (update :rows (partial mapv (partial lower-row ctx)))
-                (update :caption (partial lower-inlines ctx)))]
-    :block-quote [(update block :blocks (partial lower-blocks ctx))]
-    :directive (lower-directive ctx block)
-    [block]))
-
-(defn- lower-blocks
-  "`lower-block` mapped-and-concatenated over every Block in `blocks`, in
-  order (a `mapcat`, not a 1:1 `map`, since a `:directive` can lower to any
-  number of Blocks)."
-  [ctx blocks]
-  (into [] (mapcat (partial lower-block ctx)) blocks))
+(defn- lower-node
+  "The walker's own `:rewrite-fn` (TASK-85): a `:directive` Block is
+  `lower-directive`'s alone to decide; every other node this pass reaches
+  -- via `haselnuss.walk/rewrite`'s own schema-derived recursion, not a
+  hand-written traversal function per node kind -- has no opinion of its
+  own and is returned unchanged, `[node]`, so only its own child-bearing
+  fields (if it has any) are ever touched."
+  [ctx ref-kind node]
+  (if (and (= ref-kind ::ast/block) (= :directive (:t node)))
+    (lower-directive ctx node)
+    [node]))
 
 (defn lower
   "The `lower(target, registry)` pass (SPEC.md sec8.3): reduces every
@@ -487,7 +438,5 @@
   ([document target registry opts]
    (let [ctx {:target target :registry registry
               :transform-rules (:transform-rules opts {})}
-         title (get-in document [:meta :title])]
-     (cond-> document
-       title (assoc-in [:meta :title] (lower-inlines ctx title))
-       true (update :blocks (partial lower-blocks ctx))))))
+         walker {:table walk/table :scope scope :rewrite-fn (partial lower-node ctx)}]
+     (first (walk/rewrite walker ::ast/document document)))))

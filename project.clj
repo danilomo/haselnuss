@@ -10,7 +10,15 @@
                  [com.vladsch.flexmark/flexmark-ext-attributes "0.64.8"]
                  [com.vladsch.flexmark/flexmark-ext-tables "0.64.8"]
                  [com.vladsch.flexmark/flexmark-ext-footnotes "0.64.8"]
-                 [clj-commons/clj-yaml "1.0.29"]]
+                 [clj-commons/clj-yaml "1.0.29"]
+                 ;; TASK-90: the sandboxed evaluator for author-defined sidecar
+                 ;; extensions (doc-6 decision #4) -- an explicitly configured
+                 ;; `sci/init` context, never the host `eval`. 0.12.51 is the
+                 ;; newest release available in this environment (also the
+                 ;; version TASK-89's own review used to verify the
+                 ;; `sci.lang.Var` behavior `haselnuss.registry/renderer-v2`
+                 ;; now accounts for -- see that function's docstring).
+                 [org.babashka/sci "0.12.51"]]
   :plugins [[lein-cljfmt "0.9.2"]]
   :main ^:skip-aot haselnuss.cli
   :target-path "target/%s"
