@@ -2,7 +2,12 @@
   "Constructs every Block/Inline/Fallback node variant from SPEC.md sec4 as
   plain Clojure data and checks it validates against the malli schemas in
   haselnuss.ast (TASK-2 AC #5), plus a few structural/negative cases for the
-  other acceptance criteria."
+  other acceptance criteria. `explain-summary-test` (TASK-111) covers
+  `explain-summary`: a bad `:t`/`:kind` names the actual offending value and
+  every value that would have matched rather than malli's own generic
+  'invalid dispatch value', an ordinary field problem still reads in the
+  schema's own field vocabulary, and neither ever inlines the raw schema
+  data or a Java object identity hash."
   (:require [clojure.test :refer [deftest is testing]]
             [haselnuss.ast :as ast]))
 
@@ -122,6 +127,31 @@
     (is (not (ast/valid? ast/Block {:level 1})))
     (is (not (ast/valid? ast/Inline {:t :str})))
     (is (not (ast/valid? ast/Fallback {:kind :bogus})))))
+
+(deftest explain-summary-test
+  (testing "nil explanation (a valid value) summarizes to nil"
+    (is (nil? (ast/explain-summary (ast/explain ast/Block {:t :para :inlines []})))))
+  (testing "a bad :t (TASK-111's own dogfooding example) names the actual
+            offending value and every value that would have matched,
+            without inlining the full block schema or a Java object hash"
+    (let [summary (ast/explain-summary
+                   (ast/explain ast/Block {:t :not-a-real-node-type :nonsense true}))]
+      (is (re-find #":not-a-real-node-type" summary))
+      (is (re-find #":section" summary) "names a valid Block type")
+      (is (re-find #":thematic-break" summary) "names every valid Block type, not just one")
+      (is (not (re-find #"\[:multi" summary)) "never inlines the raw schema data")
+      (is (not (re-find #"@" summary)) "never inlines a Java object identity hash")
+      (is (< (count summary) 300) "far short of the ~1500 characters (pr-str explanation)")))
+  (testing "the same treatment for a bad :kind on Fallback, not only Block (AC #3)"
+    (let [summary (ast/explain-summary (ast/explain ast/Fallback {:kind :bogus}))]
+      (is (re-find #":bogus" summary))
+      (is (re-find #":drop" summary))
+      (is (not (re-find #"\[:multi" summary)))))
+  (testing "an ordinary field problem (not a dispatch failure) reads in the
+            schema's own field vocabulary"
+    (let [summary (ast/explain-summary (ast/explain ast/Block {:t :para}))]
+      (is (re-find #":inlines" summary))
+      (is (re-find #"missing required key" summary)))))
 
 (deftest document-test
   (testing "a Document is Meta plus top-level Blocks, with open-ended front matter"

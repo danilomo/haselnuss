@@ -1430,11 +1430,19 @@
   the way a real loader does for anything else. Keyed by name rather than
   by path so a fixture reads as the document it is, while path resolution
   and cycle detection still run against real `java.io.File` semantics --
-  `getCanonicalPath` does not require the file to exist."
+  `getCanonicalPath` does not require the file to exist.
+
+  Throws a real `java.io.FileNotFoundException` for an unknown name, not a
+  generic `ex-info` -- TASK-105's `expand-includes` distinguishes
+  `:unreadable-include` (warn and drop) from a genuine parse failure
+  (propagate) by catching `java.io.IOException` specifically, which is
+  exactly what a real `slurp` throws for a missing file (confirmed against
+  a real `slurp`); a stub that raised anything else here would exercise
+  the wrong branch."
   [docs]
   (fn [^java.io.File file]
     (or (get docs (.getName file))
-        (throw (ex-info (str file " (No such file or directory)") {})))))
+        (throw (java.io.FileNotFoundException. (str file " (No such file or directory)"))))))
 
 (deftest include-expansion-test
   (testing "AC #2: an :include is replaced by the referenced document's
@@ -1616,16 +1624,67 @@
       (is (= [(para {:t :str :text "A"})] (:blocks document))))))
 
 (deftest include-failure-modes-test
-  (testing "an included file that itself fails to PARSE is a diagnostic
-            like any other unreadable src, not a build abort: :load
-            throwing is :load throwing, whatever the reason"
+  (testing "TASK-105 AC #1: an included file that itself fails to PARSE is
+            NOT the same failure mode as a missing src -- :load throwing
+            anything other than a java.io.IOException propagates, naming
+            the file, rather than being warned about and dropped"
     (let [loader (fn [^java.io.File file]
                    (throw (ex-info (str "unsupported inline construct in " (.getName file)) {})))
-          doc {:meta {} :blocks [(para {:t :str :text "kept"}) (include-block "broken.hdoc")]}
+          doc {:meta {} :blocks [(para {:t :str :text "kept"}) (include-block "broken.hdoc")]}]
+      (try
+        (resolver/expand-includes doc {:load loader :base-dir "/x"})
+        (is false "expand-includes should have thrown")
+        (catch clojure.lang.ExceptionInfo e
+          (is (str/includes? (ex-message e) "broken.hdoc"))
+          (is (str/includes? (ex-message e) "unsupported inline construct"))
+          (is (= :haselnuss.resolver/unparseable-include (:type (ex-data e))))
+          (is (= "broken.hdoc" (:src (ex-data e))))))))
+  (testing "TASK-105 AC #3: the same propagation happens for a malformed
+            file reached through a CHAIN of includes, not only a direct
+            one -- nothing here catches it on the way back up"
+    (let [loader (fn [^java.io.File file]
+                   (case (.getName file)
+                     "a.hdoc" {:meta {} :blocks [(include-block "b.hdoc")]}
+                     "b.hdoc" (throw (ex-info "malformed front matter in b.hdoc" {}))))
+          doc {:meta {} :blocks [(include-block "a.hdoc")]}]
+      (try
+        (resolver/expand-includes doc {:load loader :base-dir "/x"})
+        (is false "expand-includes should have thrown")
+        (catch clojure.lang.ExceptionInfo e
+          (is (str/includes? (ex-message e) "b.hdoc"))
+          (is (= "b.hdoc" (:src (ex-data e))))))))
+  (testing "TASK-105 AC #2: a MISSING included file keeps its existing
+            warn-and-continue behaviour -- only a file that was actually
+            read but failed to parse becomes fatal"
+    (let [loader (stub-loader {})
+          doc {:meta {} :blocks [(para {:t :str :text "kept"}) (include-block "gone.hdoc")]}
           {:keys [document warnings]} (resolver/expand-includes doc {:load loader :base-dir "/x"})]
       (is (= [:unreadable-include] (mapv :type warnings)))
-      (is (str/includes? (:message (first warnings)) "unsupported inline construct"))
       (is (= [(para {:t :str :text "kept"})] (:blocks document)))))
+  (testing "review finding: a warn-and-continue include (a missing file)
+            earlier in the SAME expand-includes walk is not silently
+            dropped when a LATER include in that walk turns out to be
+            unparseable and fails the build -- the fatal ex-info's own
+            ex-data carries :warnings, everything this call already
+            collected before the throw, since the pass never reaches its
+            own normal return (and hence never returns @warnings at all)
+            once anything throws"
+    (let [loader (fn [^java.io.File file]
+                   (case (.getName file)
+                     "gone.hdoc" (throw (java.io.FileNotFoundException.
+                                         (str file " (No such file or directory)")))
+                     "broken.hdoc" (throw (ex-info "malformed front matter in broken.hdoc" {}))))
+          doc {:meta {} :blocks [(para {:t :str :text "kept"})
+                                 (include-block "gone.hdoc")
+                                 (include-block "broken.hdoc")]}]
+      (try
+        (resolver/expand-includes doc {:load loader :base-dir "/x"})
+        (is false "expand-includes should have thrown")
+        (catch clojure.lang.ExceptionInfo e
+          (is (str/includes? (ex-message e) "broken.hdoc"))
+          (is (= [:unreadable-include] (mapv :type (:warnings (ex-data e))))
+              "the earlier gone.hdoc warning survives on the fatal exception")
+          (is (= "gone.hdoc" (:src (first (:warnings (ex-data e))))))))))
   (testing "ids colliding across files are diagnosed exactly as they
             would be within one file -- which is the point of expanding
             before every other pass runs"
@@ -1742,6 +1801,36 @@
         (let [{:keys [document warnings]} (resolver/apply-overlays doc [[block]])]
           (is (= [:overlay-unexpected-content] (mapv :type warnings)) (pr-str block))
           (is (= [] (get-in document [:blocks 0 :blocks])) (pr-str block))))))
+  (testing "TASK-112: an unrecognized top-level DIRECTIVE is named in
+            the warning, along with its target= when it carries one --
+            the realistic case is a typo like prepnd for prepend"
+    (let [doc {:meta {} :blocks [(section "ch:intro" [])]}
+          {:keys [warnings]}
+          (resolver/apply-overlays doc [[(overlay-directive "prepnd" "ch:intro" [])]])]
+      (is (= [{:type :overlay-unexpected-content :directive "prepnd" :target "ch:intro"}]
+             (mapv #(select-keys % [:type :directive :target]) warnings)))
+      (is (= (str "unexpected top-level directive \"prepnd\" (target=ch:intro) in an"
+                  " overlay file (only prepend/append/describe directives are"
+                  " recognized there); it was dropped")
+             (:message (first warnings))))))
+  (testing "TASK-112: the same unrecognized directive with no target=
+            names it but omits the parenthetical -- there is nothing
+            to report there"
+    (let [doc {:meta {} :blocks [(section "ch:intro" [])]}
+          {:keys [warnings]}
+          (resolver/apply-overlays doc [[(overlay-directive "prepnd" nil [])]])]
+      (is (= (str "unexpected top-level directive \"prepnd\" in an overlay file"
+                  " (only prepend/append/describe directives are recognized there);"
+                  " it was dropped")
+             (:message (first warnings))))))
+  (testing "TASK-112: AC #3 -- the stray-paragraph case, which has no
+            name to add, is unchanged"
+    (let [doc {:meta {} :blocks [(section "ch:intro" [])]}
+          {:keys [warnings]}
+          (resolver/apply-overlays doc [[(para {:t :str :text "stray"})]])]
+      (is (= (str "unexpected top-level para in an overlay file (only prepend/append/"
+                  "describe directives are recognized there); it was dropped")
+             (:message (first warnings))))))
   (testing "pitfall 5 (doc-5): an id collision INTRODUCED by overlay
             content needs no bespoke check here -- apply-overlays runs
             strictly before duplicate-id-diagnostics, via
@@ -1909,6 +1998,63 @@
           {:keys [document]} (resolver/apply-overlays doc [overlay])]
       (is (= "described" (get-in document [:blocks 0 :attr :props "alt"])))
       (is (= "described" (get-in document [:blocks 1 :attr :props "alt"]))))))
+
+(deftest describe-prop-overwritten-across-describes-test
+  (testing "TASK-110 AC #1/#2: two describe directives -- in separate
+            --overlay sources -- setting the same prop on the same
+            target produce a :describe-prop-overwritten warning naming
+            the prop and the target, and the LATER describe still wins
+            (accumulation order unchanged, only now disclosed)"
+    (let [doc {:meta {} :blocks [(figure "fig:tree")]}
+          overlay-1 [(describe-directive "fig:tree" {"data-note" "one"})]
+          overlay-2 [(describe-directive "fig:tree" {"data-note" "two"})]
+          {:keys [document warnings]} (resolver/apply-overlays doc [overlay-1 overlay-2])]
+      (is (= [{:type :describe-prop-overwritten :id "fig:tree" :key "data-note"}]
+             (mapv #(select-keys % [:type :id :key]) warnings)))
+      (is (= "two" (get-in document [:blocks 0 :attr :props "data-note"])))))
+  (testing "TASK-110 AC #1/#2, reversed overlay order: the warning still
+            fires and the LATER describe (now overlay-1, named second on
+            the command line) still wins -- which value wins tracks
+            --overlay order, exactly as it already did before this fix"
+    (let [doc {:meta {} :blocks [(figure "fig:tree")]}
+          overlay-1 [(describe-directive "fig:tree" {"data-note" "one"})]
+          overlay-2 [(describe-directive "fig:tree" {"data-note" "two"})]
+          {:keys [document warnings]} (resolver/apply-overlays doc [overlay-2 overlay-1])]
+      (is (= [{:type :describe-prop-overwritten :id "fig:tree" :key "data-note"}]
+             (mapv #(select-keys % [:type :id :key]) warnings)))
+      (is (= "one" (get-in document [:blocks 0 :attr :props "data-note"])))))
+  (testing "TASK-110 AC #2, same overlay file: two describe directives
+            for the same target and prop within ONE source (in-file
+            order) warn exactly the same way as across two sources"
+    (let [doc {:meta {} :blocks [(figure "fig:tree")]}
+          overlay [(describe-directive "fig:tree" {"data-note" "one"})
+                   (describe-directive "fig:tree" {"data-note" "two"})]
+          {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+      (is (= [{:type :describe-prop-overwritten :id "fig:tree" :key "data-note"}]
+             (mapv #(select-keys % [:type :id :key]) warnings)))
+      (is (= "two" (get-in document [:blocks 0 :attr :props "data-note"])))))
+  (testing "TASK-110 AC #3: the pre-existing describe-vs-base-document
+            collision still produces its own :overlay-prop-overwritten
+            warning (not :describe-prop-overwritten) and still keeps the
+            base document's own value -- this fix leaves that path
+            untouched"
+    (let [described (assoc (figure "fig:tree")
+                           :attr (assoc (id-attr "fig:tree") :props {"data-note" "from-source"}))
+          doc {:meta {} :blocks [described]}
+          overlay [(describe-directive "fig:tree" {"data-note" "one"})]
+          {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+      (is (= [{:type :overlay-prop-overwritten :id "fig:tree" :key "data-note"}]
+             (mapv #(select-keys % [:type :id :key]) warnings)))
+      (is (= "from-source" (get-in document [:blocks 0 :attr :props "data-note"])))))
+  (testing "TASK-110 AC #4: two describe directives on the same target
+            but DIFFERENT props stay silent -- no collision, nothing to
+            disclose"
+    (let [doc {:meta {} :blocks [(figure "fig:tree")]}
+          overlay-1 [(describe-directive "fig:tree" {"data-note" "one"})]
+          overlay-2 [(describe-directive "fig:tree" {"credit" "someone"})]
+          {:keys [document warnings]} (resolver/apply-overlays doc [overlay-1 overlay-2])]
+      (is (empty? warnings))
+      (is (= {"data-note" "one" "credit" "someone"} (get-in document [:blocks 0 :attr :props]))))))
 
 (deftest describe-splice-reaches-every-container-test
   (testing "TASK-83.2: a describe target reaches a Figure -- one of the

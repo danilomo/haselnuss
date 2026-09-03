@@ -621,11 +621,26 @@ Surface syntax reuses the directive form:
 
 ### 8.5 Execution & trust model (settles D6)
 
-> **Not implemented, and unreachable so far.** Nothing here executes author-supplied code:
-> there is no `babel` block, no `--allow-exec` flag and no sandbox, because no built-in
-> extension needs to run anything. A `lower` rule is a Clojure function a *caller* registers,
-> so the trust boundary today is the ordinary one — whoever runs the build chose the code it
-> loads. The rules below stand as the policy any executing extension would have to meet.
+> **Not implemented, and unreachable so far, for what the rules below actually describe: a
+> `babel` block or `lower` rule executing code to *produce* a poster or a `results` block.**
+> There is still no `babel` block and no `--allow-exec` flag, because no built-in extension
+> needs to run anything to produce its own content — a `lower` rule bundled with this
+> codebase is a plain Clojure function a *caller* registers, not code a document's own author
+> supplies, so the trust boundary there stays the ordinary one: whoever runs the build chose
+> the code it loads.
+>
+> A *different* surface does run author-supplied code today, in a real sandbox, and is not a
+> roadmap item: `--extensions` (§8.2's own registry, populated from a sidecar `.clj` file
+> naming a directive's own renderer) and `--transform` (a sidecar `.clj` file of node-rewrite
+> rules that runs on the parsed document ahead of `resolve`, including for the `.hdoc` target,
+> §10) are both evaluated inside one forked sandbox per build — no host interop, no file or
+> process access, no `require` reaching this machine's own classpath, a wall-clock timeout,
+> and captured, size-capped output. That is the same "an author's own script, not a boundary
+> against a determined attacker" trust model the rules below anticipate for an executing
+> extension, applied to a directive's own rendering/rewriting code rather than to a
+> `lower`-time computation — its bounds, and their honest limits, are documented where an
+> author actually reads them, the README's "Author-defined extensions" and "Scripted
+> transformations" sections, rather than restated here.
 
 Any `lower` rule or `babel` block that *executes code* (to produce a poster/results) is
 **off by default**. The rules:
@@ -682,14 +697,24 @@ interface Emitter<T> {
   list at the end.
 - **LaTeX → PDF** — a configurable directive-name → environment mapping table; figures →
   `figure` + `\caption` + `\label`; math passthrough; native `\ref`/`\cite`.
+- **.hdoc** — writes the parsed AST straight back out as canonical `.hdoc` source (§5): the
+  same pre-`resolve`, pre-`lower` document the parser produced, not the visitor's own
+  resolved/numbered view — a Section carries no computed number, and a `!include` line is
+  written back unexpanded rather than followed. It re-spells canonically (one emphasis
+  delimiter, ATX headings, normalized wrapping) rather than preserving the original bytes,
+  so round-tripping through it is an AST fixed point, not a byte-identity guarantee — and,
+  since §8.5's sidecar rules run on the parsed document before this target's own early
+  return, this is also the target `--transform` (§8.5) writes a rewritten document back out
+  through.
 - **EPUB** — reuse HTML emitter output + packaging (nav/OPF/spine, zip).
 - **DITA** — later; an XML mapping over the same visitor.
 
-> **Not implemented.** Two of those four exist: HTML and LaTeX. EPUB and DITA have no emitter,
-> and a target with none stops the build naming the directive it cannot represent rather than
-> emitting something. The HTML emitter is Clojure that writes markup, not generalized React
-> components — the TypeScript reader this format was extracted from is not part of this
-> repository — and the PDF backend is whatever `pdflatex` the reader has, not `tectonic`.
+> **Not implemented.** Three of those five exist: HTML, LaTeX and `.hdoc`. EPUB and DITA have
+> no emitter, and a target with none stops the build naming the directive it cannot represent
+> rather than emitting something. The HTML emitter is Clojure that writes markup, not
+> generalized React components — the TypeScript reader this format was extracted from is not
+> part of this repository — and the PDF backend is whatever `pdflatex` the reader has, not
+> `tectonic`.
 
 Two things the LaTeX emitter does that the specification above does not mention, both needed
 by a real thesis:

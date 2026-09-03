@@ -16,11 +16,12 @@
             [clojure.test :refer [deftest is testing]]
             [haselnuss.cli :as cli]
             [haselnuss.json :as json]
+            [haselnuss.parser :as parser]
             [haselnuss.registry :as registry])
   (:import (java.awt.image BufferedImage)
            (java.io StringReader)
            (java.nio.file Files)
-           (java.nio.file.attribute FileAttribute)
+           (java.nio.file.attribute FileAttribute PosixFilePermissions)
            (javax.imageio ImageIO)
            (javax.xml.parsers DocumentBuilderFactory)
            (org.xml.sax InputSource)))
@@ -238,6 +239,59 @@
               {:t :emph :inlines [{:t :str :text "emphasis"}]}
               {:t :str :text " text."}]
              (:inlines para))))))
+
+(def ^:private hdoc-target-fixture
+  "A small document exercising exactly what the hdoc branch (TASK-98)
+  must NOT touch: an unresolved cross-reference and a directive that
+  would otherwise be numbered/degraded by a resolve or lower pass."
+  (str "# Introduction {#sec:intro}\n\n"
+       "See @fig:tree.\n\n"
+       "![A hazel tree.](pic.png){#fig:tree}\n\n"
+       ":::{theorem #thm:main}\n"
+       "All good things come to an end.\n"
+       ":::\n"))
+
+(deftest hdoc-target-test
+  (testing "AC #1/#2/#6 (TASK-98): --target hdoc writes the parsed
+            document back out as canonical .hdoc source, joining the json
+            branch exactly -- no resolve, no lower, no registry, and `run`
+            stays pure (no file I/O, called directly here)"
+    (let [{:keys [output diagnostics]} (cli/run hdoc-target-fixture {:target "hdoc"})]
+      (is (empty? diagnostics)
+          "the resolver never runs for this target, so it can report nothing")
+      (testing "a cross-reference survives unresolved -- the bare @fig:tree
+                token, not a baked-in \"Figure 1\""
+        (is (str/includes? output "@fig:tree"))
+        (is (not (str/includes? output "Figure 1"))))
+      (testing "a directive survives as a Directive, not degraded to a
+                BlockQuote -- the ::: fence, not a bold head"
+        (is (str/includes? output ":::{theorem #thm:main}"))
+        (is (not (str/includes? output "<strong>"))))
+      (testing "and re-parsing the written .hdoc gives back the identical
+                AST this call itself parsed -- the same doc-7 AST
+                fixed-point standard haselnuss.emit.hdoc-test holds this
+                emitter to, now proven through the CLI's own wiring"
+        (is (= (parser/parse hdoc-target-fixture)
+               (parser/parse output))))))
+  (testing "AC #1: the target is reachable through the file-based build
+            too, and --help lists it"
+    (let [dir (fixture-dir! hdoc-target-fixture)
+          out-path (str (io/file dir "canonical.hdoc"))
+          {:keys [output-path]} (build! dir {:target "hdoc" :output out-path})]
+      (is (= out-path output-path))
+      (is (.exists (io/file out-path)))))
+  (testing "AC #5: flags that only mean something to a resolved/lowered
+            build -- --computed-numbers, --fragment, --no-stylesheet and
+            --overlay -- have no effect here, the same way a latex-only
+            flag is already a no-op on --target html"
+    (let [plain (:output (cli/run hdoc-target-fixture {:target "hdoc"}))
+          flagged (:output (cli/run hdoc-target-fixture
+                                    {:target "hdoc" :computed-numbers true
+                                     :fragment true :no-stylesheet true
+                                     :overlay ["/does/not/exist.hdoc"]}))]
+      (is (= plain flagged)
+          "even an --overlay path that does not exist has no effect: the
+           branch never reaches load-overlays! at all"))))
 
 (deftest computed-numbers-flag-test
   (let [dir (fixture-dir!)
@@ -483,12 +537,68 @@
     (let [e (is (thrown? clojure.lang.ExceptionInfo
                          (cli/build {:input "/nonexistent/nope.hdoc" :target "html"})))]
       (is (= :haselnuss.cli/usage-error (:type (ex-data e))))))
+  (testing "TASK-113 AC #1: a directory given as the input is a usage
+            error too, but reports that it IS a directory rather than
+            reusing the missing-file message -- the path is there, it is
+            simply not a file, the same distinction
+            `haselnuss.resolver/expand-includes` already draws for an
+            `!include` one layer down"
+    (let [dir (str (Files/createTempDirectory "haselnuss-cli-test-dir"
+                                              (make-array FileAttribute 0)))
+          e (is (thrown? clojure.lang.ExceptionInfo
+                         (cli/build {:input dir :target "html"})))]
+      (is (= :haselnuss.cli/usage-error (:type (ex-data e))))
+      (is (str/includes? (ex-message e) "directory"))
+      (is (str/includes? (ex-message e) dir))
+      (is (not (str/includes? (ex-message e) "not found"))
+          "the message must not claim the directory is missing")))
   (testing "a document naming a bibliography that is not there fails by
             name, rather than silently dangling every citation"
     (let [dir (fixture-dir!)]
       (io/delete-file (io/file dir "refs.json"))
-      (let [e (is (thrown? clojure.lang.ExceptionInfo (build! dir {})))]
-        (is (= :haselnuss.cli/missing-bibliography (:type (ex-data e))))))))
+      (doseq [target ["html" "latex"]]
+        (let [e (is (thrown? clojure.lang.ExceptionInfo (build! dir {:target target})) target)]
+          (is (= :haselnuss.cli/missing-bibliography (:type (ex-data e))) target)
+          (is (str/includes? (ex-message e) (str (io/file dir "refs.json"))) target))))))
+
+(deftest json-hdoc-targets-tolerate-missing-bibliography-test
+  (testing "TASK-107 AC #1: a document declaring a bibliography converts
+            to --target json and --target hdoc with that bibliography
+            absent from disk -- neither target reads its content, only
+            (via the parser's own vocabulary) whether a bare @word is a
+            citation at all"
+    (let [dir (fixture-dir!)]
+      (io/delete-file (io/file dir "refs.json"))
+      (doseq [target ["json" "hdoc"]
+              ;; --output given explicitly for hdoc: its own derived path
+              ;; is doc.hdoc, the same as the input, which output-path
+              ;; already (correctly) refuses to overwrite -- unrelated to
+              ;; this test's own concern.
+              :let [out (str (io/file dir (str "out." target)))]]
+        (let [{:keys [output-path]} (build! dir {:target target :output out})]
+          (is (.exists (io/file output-path)) target)))))
+  (testing "AC #4: the meta.bibliography declaration still round-trips
+            through the hdoc target unchanged, even though the file it
+            names was never opened"
+    (let [dir (fixture-dir!)]
+      (io/delete-file (io/file dir "refs.json"))
+      (let [{:keys [output]} (build! dir {:target "hdoc" :output (str (io/file dir "out.hdoc"))})]
+        (is (str/includes? output "bibliography: refs.json")))))
+  (testing "AC #2: --in-place succeeds on such a document, since it
+            implies --target hdoc"
+    (let [dir (fixture-dir!)
+          input (str (io/file dir "doc.hdoc"))]
+      (io/delete-file (io/file dir "refs.json"))
+      (cli/build {:input input :target "hdoc" :in-place true})
+      (is (str/includes? (slurp input) "bibliography: refs.json"))))
+  (testing "AC #3: the html and latex targets keep failing, naming the
+            file, when a bibliography they need is missing -- unaffected
+            by the json/hdoc relaxation above"
+    (let [dir (fixture-dir!)]
+      (io/delete-file (io/file dir "refs.json"))
+      (doseq [target ["html" "latex"]]
+        (let [e (is (thrown? clojure.lang.ExceptionInfo (build! dir {:target target})) target)]
+          (is (= :haselnuss.cli/missing-bibliography (:type (ex-data e))) target))))))
 
 (deftest bibliography-resolution-test
   (testing "a relative meta.bibliography resolves against the DOCUMENT's
@@ -625,6 +735,16 @@
         status (binding [*err* err *out* out] (cli/main* args))]
     {:status status :out (str out) :err (str err)}))
 
+(defn- no-warnings?
+  "True if `err` -- captured stderr from `main-run` -- carries no
+  `haselnuss: warning:` line. NOT `(= \"\" err)`: TASK-100 moved every
+  `haselnuss: wrote <path>` progress line from stdout to stderr,
+  unconditionally, so a clean build's own stderr carries that line even
+  with no diagnostic at all -- only a build with a warning carries this
+  one."
+  [err]
+  (not (str/includes? err "haselnuss: warning:")))
+
 (deftest stderr-and-exit-status-test
   (testing "AC #4: every resolver diagnostic is printed to stderr as a
             warning, and the build still succeeds -- exit 0, output
@@ -636,7 +756,8 @@
           {:keys [status out err]} (main-run input)]
       (is (= 0 status))
       (is (.exists (io/file dir "doc.html")))
-      (is (str/includes? out "haselnuss: wrote"))
+      (is (= "" out) "TASK-100: stdout carries the document alone, never a progress line")
+      (is (str/includes? err "haselnuss: wrote"))
       (is (= 3 (count (re-seq #"haselnuss: warning: " err))) err)
       (is (str/includes? err "dangling cross-reference"))
       (is (str/includes? err "dangling citation"))
@@ -696,6 +817,47 @@
     (let [{:keys [status err]} (main-run "--" "--version")]
       (is (= 2 status))
       (is (str/includes? err "input file not found: --version")))))
+
+(deftest directory-vs-missing-vs-unreadable-input-test
+  (testing "TASK-113: the three ways the input path can fail to open get
+            three different, individually correct treatments -- this
+            pins all three together so a future change to one cannot
+            silently blur it back into another"
+    (testing "AC #2: a genuinely nonexistent path is reported as not
+              found, exit 2, with the usage text printed"
+      (let [{:keys [status err]} (main-run "/nonexistent/nope.hdoc")]
+        (is (= 2 status))
+        (is (str/includes? err "haselnuss: error: input file not found: /nonexistent/nope.hdoc"))
+        (is (str/includes? err "Usage: haselnuss"))))
+    (testing "AC #1: a directory is reported as a directory, not as
+              missing, still exit 2 with the usage text printed -- same
+              treatment as the nonexistent-path case above except for
+              the message itself, which is now true of what is actually
+              there"
+      (let [dir (str (Files/createTempDirectory "haselnuss-cli-test-dir"
+                                                (make-array FileAttribute 0)))
+            {:keys [status err]} (main-run dir)]
+        (is (= 2 status))
+        (is (str/includes? err (str "haselnuss: error: input path is a directory: " dir)))
+        (is (not (str/includes? err "not found")))
+        (is (str/includes? err "Usage: haselnuss"))))
+    (testing "AC #3: a file that exists but cannot be read keeps its
+              current message and exit code -- unaffected by the
+              directory check above, since it is a plain file as far as
+              `.isFile` is concerned"
+      (let [dir (fixture-dir! "# Hi {#sec:hi}\n\ntext\n")
+            input (io/file dir "doc.hdoc")
+            path (.toPath input)]
+        (Files/setPosixFilePermissions path (PosixFilePermissions/fromString "---------"))
+        (if (.canRead input)
+          ;; Running as a user this OS lets read its own unreadable
+          ;; file (root, most often) -- nothing meaningful to assert.
+          (println "skipping AC #3 permission test: file is still readable")
+          (let [{:keys [status err]} (main-run (str input))]
+            (is (= 1 status))
+            (is (str/includes? err (str "haselnuss: error: " input " (Permission denied)")))
+            (is (not (str/includes? err "Usage: haselnuss")))))
+        (Files/setPosixFilePermissions path (PosixFilePermissions/fromString "rw-r--r--"))))))
 
 (deftest arg-parsing-test
   (let [dir (fixture-dir! "# Hi {#sec:hi}\n\ntext\n")
@@ -785,6 +947,350 @@
       (is (str/includes? err "refusing to overwrite the bibliography file"))
       (is (= before (slurp bib)) "the bibliography must be left untouched"))))
 
+(deftest hdoc-target-input-overwrite-test
+  (testing "AC #3 (TASK-98): hdoc is the first target whose own default
+            extension (.hdoc) matches a typical input's, so with no
+            --output the derived path IS the input -- refused by the
+            existing overwrite guard, and the input left byte-identical"
+    (let [dir (fixture-dir! hdoc-target-fixture)
+          input (str (io/file dir "doc.hdoc"))
+          before (slurp input)
+          {:keys [status err]} (main-run "--target" "hdoc" input)]
+      (is (= 2 status))
+      (is (str/includes? err "refusing to overwrite the input file"))
+      (is (= before (slurp input)) "the input must be left byte-identical")))
+  (testing "AC #4: an explicit -o pointing at the input is refused the
+            same way, not just the derived default path"
+    (let [dir (fixture-dir! hdoc-target-fixture)
+          input (str (io/file dir "doc.hdoc"))
+          before (slurp input)
+          {:keys [status err]} (main-run "--target" "hdoc" "-o" input input)]
+      (is (= 2 status))
+      (is (str/includes? err "refusing to overwrite the input file"))
+      (is (= before (slurp input)) "the input must be left byte-identical")))
+  (testing "AC #1: --help lists hdoc alongside html/latex/json"
+    (let [{:keys [out]} (main-run "--help")]
+      (is (str/includes? out "hdoc")))))
+
+(deftest stdout-output-test
+  (testing "AC #1/#2 (TASK-100): --output - writes the converted document to
+            stdout, byte for byte the same as an ordinary build's own output
+            file, for every target -- and \"haselnuss: wrote\" moves to
+            stderr, unconditionally, so stdout carries the document alone"
+    (doseq [[target extra-args] [["html" []] ["latex" ["--computed-numbers"]] ["json" []] ["hdoc" []]]]
+      ;; --computed-numbers on latex only: the default fixture declares a
+      ;; bibliography and cites it, so a plain native-mode build would also
+      ;; generate a companion .bib -- exactly what AC #4, tested below, is
+      ;; about. Bake the numbers in instead, the same way a document
+      ;; emitted to HTML too already has to (see `usage`'s own text).
+      (let [dir (fixture-dir!)
+            input (str (io/file dir "doc.hdoc"))
+            expected-path (str (io/file dir "expected.out"))
+            {file-status :status file-err :err}
+            (apply main-run (concat ["--target" target] extra-args ["-o" expected-path input]))
+            {:keys [status out err]}
+            (apply main-run (concat ["--target" target] extra-args ["--output" "-" input]))]
+        (is (= 0 file-status) (str target ": " file-err))
+        (is (= 0 status) (str target ": " err))
+        (is (= (slurp expected-path) out)
+            (str target ": stdout must carry exactly what a normal build writes to a file"))
+        (is (not (str/includes? out "haselnuss:")) (str target ": nothing but the document on stdout"))
+        (is (str/includes? err "haselnuss: wrote -") (str target ": the progress line moved to stderr")))))
+  (testing "AC #3: the input-overwrite and bibliography-collision guards do
+            not fire for --output -, since - is not a path on disk for
+            either of them to check against"
+    (testing "hdoc target: with a real --output, the derived path -- the one
+              neither guard is ever consulted for here -- would otherwise
+              collide with the input itself (hdoc-target-input-overwrite-
+              test); --output - has no derived path at all"
+      (let [dir (fixture-dir! hdoc-target-fixture)
+            input (str (io/file dir "doc.hdoc"))
+            before (slurp input)
+            {:keys [status out err]} (main-run "--target" "hdoc" "--output" "-" input)]
+        (is (= 0 status) err)
+        (is (= before (slurp input)) "the input itself must be untouched")
+        (is (str/includes? out ":::{theorem #thm:main}") "the document reached stdout")))
+    (testing "json target: the derived output path would otherwise collide
+              with a same-named CSL-JSON bibliography (bibliography-output-
+              collision-test); --output - has no derived path to collide,
+              and the bibliography survives untouched"
+      (let [dir (fixture-dir! (str "---\nbibliography: doc.json\n---\n\n" "# Hi {#sec:hi}\n\ntext\n"))
+            input (str (io/file dir "doc.hdoc"))
+            bib (io/file dir "doc.json")
+            before (do (spit bib "[]") (slurp bib))
+            {:keys [status err]} (main-run "--target" "json" "--output" "-" input)]
+        (is (= 0 status) err)
+        (is (= before (slurp bib)) "the bibliography must be left untouched"))))
+  (testing "AC #4: a build that would also have to write a companion file
+            BESIDE the document is refused entirely, naming the file that
+            has nowhere to go, rather than writing the document to stdout
+            and silently dropping its companion"
+    (testing "a native-mode LaTeX bibliography -- the default fixture
+              declares one and cites it, so an ordinary native build
+              generates doc.bib beside doc.tex (generated-bibtex-database-
+              test)"
+      (let [dir (fixture-dir!)
+            input (str (io/file dir "doc.hdoc"))
+            {:keys [status err]} (main-run "--target" "latex" "--output" "-" input)]
+        (is (= 1 status))
+        (is (str/includes? err "has nowhere to go"))
+        ;; TASK-109 AC #3: named the exact same way the .tex itself would
+        ;; have been (absolute, here, since `input` -- and so the path
+        ;; `derived-output-path` names the companion after -- is), not
+        ;; the `.getAbsoluteFile`-derived absolute path this used to
+        ;; report regardless.
+        (is (str/includes? err (str (io/file dir "doc.bib"))))
+        (is (not (.exists (io/file dir "doc.bib"))))
+        (is (not (.exists (io/file dir "doc.tex")))
+            "the document itself must not have been written either")))
+    (testing "a --fragment build's own companion preamble -- --computed-
+              numbers keeps native mode's own .bib companion out of this
+              one, so only the preamble is at stake"
+      (let [dir (fixture-dir!)
+            input (str (io/file dir "doc.hdoc"))
+            {:keys [status err]} (main-run "--target" "latex" "--computed-numbers" "--fragment"
+                                           "--output" "-" input)]
+        (is (= 1 status))
+        (is (str/includes? err "has nowhere to go"))
+        (is (str/includes? err "doc-preamble.tex"))
+        (is (not (.exists (io/file dir "doc-preamble.tex"))))))
+    (testing "a front-matter block's own side file -- a front-matter block
+              only ever exists inside a --fragment build, and every
+              --fragment build also has a companion preamble
+              (`latex/emit-preamble` is unconditional on document
+              content), so the preamble refusal above always fires first
+              for this combination; there is no build that produces a
+              front-matter side file without also producing a preamble,
+              so `err` names the preamble here too, not the front-matter
+              file -- see the comment at `build`'s own
+              `refuse-stdout-companion!` call site. Both stay unwritten
+              either way, which is the guarantee this test exists to
+              pin down"
+      (let [dir (fixture-dir! (str ":::{abstract}\nShort abstract.\n:::\n\n"
+                                   "# Intro {#sec:i}\n\ntext\n"))
+            input (str (io/file dir "doc.hdoc"))
+            {:keys [status err]} (main-run "--target" "latex" "--fragment" "--output" "-" input)]
+        (is (= 1 status))
+        (is (str/includes? err "has nowhere to go"))
+        (is (str/includes? err "doc-preamble.tex"))
+        (is (not (.exists (io/file dir "doc-preamble.tex"))))
+        (is (not (.exists (io/file dir "doc-abstract-en.tex"))))))
+    (testing "and a mode with no companion at all still succeeds"
+      (let [dir (fixture-dir!)
+            input (str (io/file dir "doc.hdoc"))
+            {:keys [status err]} (main-run "--target" "latex" "--computed-numbers" "--output" "-" input)]
+        (is (= 0 status) err))))
+  (testing "AC #5: a literal file named - is still reachable"
+    (testing "--output=- names a literal file called - in the working
+              directory, not stdout: the = form is already exempt from the
+              flag-shaped value check --output - relies on, so a bare -
+              given that way is an ordinary value like any other. Written
+              and cleaned up within the test, since - with no directory
+              component is necessarily relative to wherever the process
+              itself runs, same as it would be for any other tool"
+      (let [dir (fixture-dir!)
+            input (str (io/file dir "doc.hdoc"))
+            dash-file (io/file "-")]
+        (try
+          (io/delete-file dash-file true)
+          (let [{:keys [status out err]} (main-run "--output=-" input)]
+            (is (= 0 status) err)
+            (is (= "" out) "the document went to the file, not to stdout")
+            (is (.isFile dash-file))
+            (is (str/starts-with? (slurp dash-file) "<!DOCTYPE html>")))
+          (finally
+            (io/delete-file dash-file true)))))
+    (testing "any other spelling ending in - (as ./- does, relative to
+              wherever the process runs) is an ordinary value too, for the
+              same reason -- it is not literally the single character -"
+      (let [dir (fixture-dir!)
+            input (str (io/file dir "doc.hdoc"))
+            dash-file (io/file dir "-")
+            {:keys [status out err]} (main-run "-o" (str dash-file) input)]
+        (is (= 0 status) err)
+        (is (= "" out))
+        (is (.isFile dash-file))
+        (is (str/starts-with? (slurp dash-file) "<!DOCTYPE html>")))))
+  (testing "AC #6: --help documents the convention"
+    (let [{:keys [out]} (main-run "--help")]
+      (is (str/includes? out "stdout")))))
+
+(def ^:private fixture-dir-entries
+  "The complete, fixed set of file names `fixture-dir!` writes into every
+  directory it creates -- `doc.hdoc` alongside the `refs.json` and
+  `pic.png` its own front matter and figure name -- regardless of which
+  `source` was given. What `in-place-test` compares a directory listing
+  against to prove no stray temp file was left behind, rather than the
+  single-file set an --in-place build's own directory would otherwise
+  naively be expected to hold."
+  #{"doc.hdoc" "refs.json" "pic.png"})
+
+(deftest in-place-test
+  (testing "AC #1 (TASK-101): --in-place writes the converted document
+            over the input file itself, nothing on stdout, and the file
+            now holds hdoc's own canonical re-spelling -- proven the
+            same AST-fixed-point way hdoc-target-test proves it for an
+            ordinary --target hdoc build"
+    (let [dir (fixture-dir! hdoc-target-fixture)
+          input (str (io/file dir "doc.hdoc"))
+          {:keys [status out err]} (main-run "--in-place" input)]
+      (is (= 0 status) err)
+      (is (= "" out) "the document went to the input file, not stdout")
+      (is (str/includes? err (str "haselnuss: wrote " input)))
+      (is (= (parser/parse hdoc-target-fixture) (parser/parse (slurp input))))
+      (testing "and the directory holds nothing else new -- no leftover
+                temp file from the write"
+        (is (= fixture-dir-entries (set (.list (io/file dir))))))))
+  (testing "AC #2: with no --target at all, --in-place implies hdoc"
+    (let [dir (fixture-dir! hdoc-target-fixture)
+          input (str (io/file dir "doc.hdoc"))
+          {:keys [status]} (main-run "--in-place" input)]
+      (is (= 0 status))
+      (is (= (parser/parse hdoc-target-fixture) (parser/parse (slurp input))))))
+  (testing "AC #2: an explicit --target hdoc is accepted alongside
+            --in-place -- it is the implied default made explicit, not a
+            conflict"
+    (let [dir (fixture-dir! hdoc-target-fixture)
+          input (str (io/file dir "doc.hdoc"))
+          {:keys [status]} (main-run "--in-place" "--target" "hdoc" input)]
+      (is (= 0 status))))
+  (testing "AC #2: an explicit --target naming anything else is refused,
+            naming the conflict, and the input is left untouched"
+    (doseq [target ["html" "latex" "json"]]
+      (let [dir (fixture-dir! hdoc-target-fixture)
+            input (str (io/file dir "doc.hdoc"))
+            before (slurp input)
+            {:keys [status err]} (main-run "--in-place" "--target" target input)]
+        (is (= 2 status) target)
+        (is (str/includes? err "--in-place requires --target hdoc") target)
+        (is (str/includes? err target) target)
+        (is (= before (slurp input)) "the input must be left byte-identical"))))
+  (testing "AC #3: --in-place together with --output is refused, whether
+            --output names a real path or the stdout sentinel, and the
+            input is left untouched"
+    (doseq [output-args [["-o" "elsewhere.hdoc"] ["--output" "-"]]]
+      (let [dir (fixture-dir! hdoc-target-fixture)
+            input (str (io/file dir "doc.hdoc"))
+            before (slurp input)
+            {:keys [status err]}
+            (apply main-run (concat ["--in-place"] output-args [input]))]
+        (is (= 2 status) output-args)
+        (is (str/includes? err "--in-place cannot be combined with --output") output-args)
+        (is (= before (slurp input)) "the input must be left byte-identical"))))
+  (testing "AC #4: a build made to fail partway -- here, a document whose
+            own parse fails, since --in-place forces the hdoc target and
+            that target has no resolve/lower pass left to fail in --
+            leaves the input byte-identical, re-read after the refused
+            build rather than trusted from the return value, the same
+            discipline destructive-and-invalid-input-test already uses"
+    (let [;; A directive fence nested inside a blockquote has no
+          ;; container-oblivious raw-line reading that reaches it (see
+          ;; haselnuss.emit.hdoc's own check-representable-nested-block!
+          ;; docstring), so flexmark reads the `{theorem #thm:x}`
+          ;; attribute group as ordinary inline content instead -- a
+          ;; genuine, deterministic parser/parse failure, not a
+          ;; hand-built AST shape.
+          bad "> :::{theorem #thm:x}\n> body\n> :::\n"
+          dir (fixture-dir! bad)
+          input (str (io/file dir "doc.hdoc"))
+          before (slurp input)
+          {:keys [status err]} (main-run "--in-place" input)]
+      (is (= 1 status) err)
+      (is (= before (slurp input)) "the input must be left byte-identical")
+      (is (= fixture-dir-entries (set (.list (io/file dir))))
+          "no leftover temp file from the attempted write either")))
+  (testing "AC #5: the write goes through a temp file in the input's own
+            directory and an atomic move, never a direct overwrite of the
+            input path itself -- proven by intercepting every `spit` call
+            build makes and checking what it was actually called with,
+            rather than trusting the source"
+    (let [;; A setext heading round-trips as an ATX one (canonical hdoc
+          ;; spelling, per haselnuss.emit.hdoc's own docstring), so the
+          ;; written file is provably NOT the same bytes as the input --
+          ;; unlike hdoc-target-fixture, which is already spelled
+          ;; canonically and would round-trip byte-identical, proving
+          ;; nothing about whether a write actually happened.
+          source "Title\n=====\n\ntext\n"
+          dir (fixture-dir! source)
+          input (str (io/file dir "doc.hdoc"))
+          before (slurp input)
+          original-spit spit
+          spit-targets (atom [])]
+      (with-redefs [spit (fn [f content]
+                           (swap! spit-targets conj (str (io/file f)))
+                           (original-spit f content))]
+        (cli/build {:input input :target "hdoc" :in-place true}))
+      (is (seq @spit-targets) "at least one intermediate write happened")
+      (is (not (contains? (set @spit-targets) (str (io/file input))))
+          "the input path itself must never be spit to directly")
+      (is (every? #(= (str (io/file dir)) (str (.getParentFile (io/file %)))) @spit-targets)
+          "every intermediate write sits in the SAME directory as the input, not /tmp or
+           anywhere else a rename could cross a filesystem boundary")
+      (is (not= before (slurp input)) "the build did take effect on the real input")
+      (is (str/starts-with? (slurp input) "# Title") "canonicalized to an ATX heading")
+      (is (= fixture-dir-entries (set (.list (io/file dir))))
+          "and no intermediate file was left behind once the move completed")))
+  (testing "AC #6: without --in-place, --target hdoc keeps refusing to
+            overwrite its own input -- unaffected by any of the above
+            (hdoc-target-input-overwrite-test covers this in full; this
+            is a light check that --in-place's own changes did not touch
+            the ordinary path)"
+    (let [dir (fixture-dir! hdoc-target-fixture)
+          input (str (io/file dir "doc.hdoc"))
+          before (slurp input)
+          {:keys [status err]} (main-run "--target" "hdoc" input)]
+      (is (= 2 status))
+      (is (str/includes? err "refusing to overwrite the input file"))
+      (is (= before (slurp input)))))
+  (testing "AC #7: --help documents the flag, including that it is the
+            only way to lift the input-overwrite refusal"
+    (let [{:keys [out]} (main-run "--help")]
+      (is (str/includes? out "--in-place"))
+      (is (str/includes? out "only way to lift"))))
+  (testing "regression (review): --in-place preserves the input file's own
+            POSIX permission bits across the atomic move, rather than the
+            JDK's own restrictive `createTempFile` default (owner-only,
+            600) landing on the input via `ATOMIC_MOVE` -- reproduced live
+            in review as a 644 input silently becoming 600 after a
+            successful build, since `Files/createTempFile` with no
+            `FileAttribute`s deliberately creates the most restrictive
+            permissions it can, and `ATOMIC_MOVE` carries the TEMP file's
+            own mode onto the target, not the target's original mode"
+    (let [dir (fixture-dir! hdoc-target-fixture)
+          input (str (io/file dir "doc.hdoc"))
+          path (.toPath (io/file input))
+          link-options (make-array java.nio.file.LinkOption 0)
+          ;; Deliberately non-default (neither `createTempFile`'s own
+          ;; 600 nor a typical umask-derived 644), so the assertion below
+          ;; cannot pass by coincidence.
+          before-perms (PosixFilePermissions/fromString "rw-r-----")]
+      (Files/setPosixFilePermissions path before-perms)
+      (let [{:keys [status err]} (main-run "--in-place" input)]
+        (is (= 0 status) err)
+        (is (= before-perms (Files/getPosixFilePermissions path link-options))
+            "the input's permission bits must survive the atomic move
+             unchanged"))))
+  (testing "regression (review, AC #4): a failure INSIDE write-in-place!
+            itself -- e.g. a full disk failing the temp-file write, AFTER
+            `run` has already produced the replacement output in full --
+            also leaves the input byte-identical with no leftover temp
+            file, exercising write-in-place!'s own catch branch directly.
+            The AC #4 test above only exercises a failure BEFORE
+            output-path/write-in-place! are ever reached (a parser/parse
+            error), so it cannot catch a regression here -- e.g. a
+            temp file left behind, or the exception being swallowed
+            instead of rethrown so build would wrongly report success"
+    (let [dir (fixture-dir! hdoc-target-fixture)
+          input (str (io/file dir "doc.hdoc"))
+          before (slurp input)]
+      (with-redefs [spit (fn [& _]
+                           (throw (java.io.IOException. "no space left on device")))]
+        (let [{:keys [status err]} (main-run "--in-place" input)]
+          (is (= 1 status) err)))
+      (is (= before (slurp input)) "the input must be left byte-identical")
+      (is (= fixture-dir-entries (set (.list (io/file dir))))
+          "no leftover temp file from the aborted write"))))
+
 (deftest prose-at-tokens-test
   (testing "TASK-47 AC #1/#2 end to end, which is the only place the
             \"and no build warning\" half is observable: the CLI hands the
@@ -798,7 +1304,7 @@
           {:keys [status err]} (main-run input)
           html (slurp (io/file dir "doc.html"))]
       (is (= 0 status) err)
-      (is (= "" err) "no dangling-reference or dangling-citation warning")
+      (is (no-warnings? err) "no dangling-reference or dangling-citation warning")
       (is (str/includes? html "Ping @user:homeserver and cc @someone about")
           "the prose tokens survive verbatim")
       (is (not (str/includes? html "??")) "and produce no placeholder")
@@ -865,7 +1371,7 @@
     (let [dir (fixture-dir! "# Intro {#sec:intro}\n\ncc @someone on this.\n")
           {:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))]
       (is (= 0 status) err)
-      (is (= "" err))
+      (is (no-warnings? err) err)
       (is (str/includes? (slurp (io/file dir "doc.html")) "cc @someone on this."))))
   (testing "a bracketed citation is explicit syntax, so an unknown key
             there still dangles loudly -- the filter must not silence the
@@ -893,7 +1399,7 @@
       (let [{:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))
             html (slurp (io/file dir "doc.html"))]
         (is (= 0 status) err)
-        (is (= "" err) "a document whose includes all resolve produces no diagnostics")
+        (is (no-warnings? err) "a document whose includes all resolve produces no diagnostics")
         (is (str/includes? html "<span class=\"section-number\">1</span> Methods</h1>")
             "the chapter was spliced in, and numbers as if typed in place")
         (is (str/includes? html "Prose from a nested include.")
@@ -936,16 +1442,48 @@
       (is (str/includes? err "include cycle"))
       (is (= 1 (count (re-seq #"Once\." html))) "the document's own body appears exactly once")
       (is (not (str/includes? err "duplicate id")))))
-  (testing "an included file that itself fails to parse is a warning, not
-            a build abort -- the same failure mode as a missing one"
+  (testing "TASK-105 AC #1: an included file that EXISTS but fails to
+            parse fails the whole build naming the file, rather than being
+            warned about and dropped -- the identical content converted on
+            its own is already a hard failure, and this is now the same
+            failure, not a warning that exits 0 with the chapter missing"
     (let [dir (fixture-dir! "# Intro {#sec:intro}\n\nKept.\n\n!include broken.hdoc\n")]
       (spit (io/file dir "broken.hdoc") ":::{!!!}\nx\n:::\n")
       (let [{:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))]
-        (is (= 0 status) err)
+        (is (= 1 status))
+        (is (str/includes? err "haselnuss: error:"))
         (is (str/includes? err "cannot include \"broken.hdoc\""))
-        (is (str/includes? (slurp (io/file dir "doc.html")) "Kept.")))))
-  (testing "a directory named as a src is unreadable like any other bad
-            path, not an unhandled exception"
+        (is (not (.exists (io/file dir "doc.html")))
+            "nothing is written on an unrecoverable error, same as any other"))))
+  (testing "review finding: a warn-and-continue include (a missing file)
+            earlier in the document is still printed as a warning when a
+            LATER include in the same document turns out to be unparseable
+            and fails the build -- and prints BEFORE the error, the same
+            warnings-before-error ordering AC #4/#5 already give any other
+            failure (see run-test's own coverage of that ordering)"
+    (let [dir (fixture-dir! (str "# Intro {#sec:intro}\n\nKept.\n\n"
+                                 "!include gone.hdoc\n\n"
+                                 "!include broken.hdoc\n"))]
+      (spit (io/file dir "broken.hdoc") ":::{!!!}\nx\n:::\n")
+      (let [{:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))]
+        (is (= 1 status))
+        (is (str/includes? err "haselnuss: warning: cannot include \"gone.hdoc\""))
+        (is (str/includes? err "haselnuss: error: cannot include \"broken.hdoc\""))
+        (is (< (.indexOf err "haselnuss: warning: cannot include \"gone.hdoc\"")
+               (.indexOf err "haselnuss: error: cannot include \"broken.hdoc\"")))
+        (is (not (.exists (io/file dir "doc.html")))))))
+  (testing "TASK-105 AC #3: the same fatal failure happens for a malformed
+            file reached through a CHAIN of includes, not only a direct one"
+    (let [dir (fixture-dir! "# Intro {#sec:intro}\n\nKept.\n\n!include a.hdoc\n")]
+      (spit (io/file dir "a.hdoc") "A.\n\n!include b.hdoc\n")
+      (spit (io/file dir "b.hdoc") ":::{!!!}\nx\n:::\n")
+      (let [{:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))]
+        (is (= 1 status))
+        (is (str/includes? err "cannot include \"b.hdoc\""))
+        (is (not (.exists (io/file dir "doc.html")))))))
+  (testing "TASK-105 AC #2: a directory named as a src stays a warning,
+            not a build abort -- unlike a parse failure, there is no
+            content there to lose"
     (let [dir (fixture-dir! "# Intro {#sec:intro}\n\nKept.\n\n!include subdir\n")]
       (.mkdirs (io/file dir "subdir"))
       (let [{:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))]
@@ -1012,6 +1550,18 @@
         (is (str/includes? err "does not resolve to a Section, Figure, Table, MathBlock"))
         (is (.exists (io/file dir "doc.html")))
         (is (str/includes? (slurp (io/file dir "doc.html")) "Introduction")))))
+  (testing "TASK-112: a misspelled directive name in an overlay file --
+            e.g. prepnd for prepend -- is named in the warning, along
+            with the target= it carries, so an author has a string to
+            search their overlay files for"
+    (let [dir (fixture-dir!)
+          overlay (str (io/file dir "overlay.hdoc"))]
+      (spit overlay ":::{prepnd target=ch:intro}\nbody\n:::\n")
+      (let [{:keys [status err]} (main-run "--overlay" overlay (str (io/file dir "doc.hdoc")))]
+        (is (= 0 status) err)
+        (is (str/includes? err "\"prepnd\""))
+        (is (str/includes? err "target=ch:intro"))
+        (is (.exists (io/file dir "doc.html"))))))
   (testing "an overlay can target a Section that exists only AFTER
             base-document include-expansion -- e.g. a chapter pulled in
             from another file -- since overlay application runs after it"
@@ -1086,6 +1636,54 @@
         (is (str/includes? err "was not applied"))
         (is (str/includes? html "credit=\"original\""))
         (is (not (str/includes? html "credit=\"overlay\"")))))))
+
+(deftest describe-overlay-overwritten-by-later-describe-test
+  (testing "TASK-110 AC #1/#2: two SEPARATE --overlay files each
+            describing the same prop on the same target -- the
+            realistic accessibility-pass/translation-pass shape from the
+            task -- produce a build warning naming the prop and the
+            target, the build still exits 0, and the LATER --overlay's
+            value (accumulation order, unchanged by this fix) is what
+            ends up in the output"
+    (let [dir (fixture-dir!)
+          overlay-1 (str (io/file dir "overlay-1.hdoc"))
+          overlay-2 (str (io/file dir "overlay-2.hdoc"))]
+      (spit overlay-1 ":::{describe target=fig:tree data-note=\"one\"}\n:::\n")
+      (spit overlay-2 ":::{describe target=fig:tree data-note=\"two\"}\n:::\n")
+      (let [{:keys [status err]} (main-run "--overlay" overlay-1 "--overlay" overlay-2
+                                           (str (io/file dir "doc.hdoc")))
+            html (slurp (io/file dir "doc.html"))]
+        (is (= 0 status) err)
+        (is (str/includes? err "data-note"))
+        (is (str/includes? err "fig:tree"))
+        (is (str/includes? html "data-note=\"two\""))
+        (is (not (str/includes? html "data-note=\"one\""))))))
+  (testing "TASK-110 AC #2: the same collision, this time as two
+            describe directives in ONE overlay file, warns the same way"
+    (let [dir (fixture-dir!)
+          overlay (str (io/file dir "overlay.hdoc"))]
+      (spit overlay (str ":::{describe target=fig:tree data-note=\"one\"}\n:::\n\n"
+                         ":::{describe target=fig:tree data-note=\"two\"}\n:::\n"))
+      (let [{:keys [status err]} (main-run "--overlay" overlay (str (io/file dir "doc.hdoc")))
+            html (slurp (io/file dir "doc.html"))]
+        (is (= 0 status) err)
+        (is (str/includes? err "data-note"))
+        (is (str/includes? err "fig:tree"))
+        (is (str/includes? html "data-note=\"two\"")))))
+  (testing "TASK-110 AC #4: two describe directives on the same target
+            but different props stay silent"
+    (let [dir (fixture-dir!)
+          overlay-1 (str (io/file dir "overlay-1.hdoc"))
+          overlay-2 (str (io/file dir "overlay-2.hdoc"))]
+      (spit overlay-1 ":::{describe target=fig:tree data-note=\"a note\"}\n:::\n")
+      (spit overlay-2 ":::{describe target=fig:tree credit=\"someone\"}\n:::\n")
+      (let [{:keys [status err]} (main-run "--overlay" overlay-1 "--overlay" overlay-2
+                                           (str (io/file dir "doc.hdoc")))
+            html (slurp (io/file dir "doc.html"))]
+        (is (= 0 status) err)
+        (is (not (str/includes? err "warning:")) err)
+        (is (str/includes? html "data-note=\"a note\""))
+        (is (str/includes? html "credit=\"someone\""))))))
 
 (defn- write-file!
   [dir filename content]
@@ -1194,10 +1792,305 @@
                                         :trusted-extensions true})]
       (is (str/includes? output "\\textbf{RAW}"))))
   (testing "--trusted-extensions with no --extensions at all does
-            nothing -- there is no sidecar renderer for it to trust"
+            nothing -- there is no sidecar renderer for it to trust -- but
+            TASK-108 AC #3 has it say so, as a warning"
     (let [dir (fixture-dir!)
-          {:keys [status]} (main-run "--trusted-extensions" (str (io/file dir "doc.hdoc")))]
-      (is (= 0 status)))))
+          {:keys [status err]} (main-run "--trusted-extensions" (str (io/file dir "doc.hdoc")))]
+      (is (= 0 status))
+      (is (str/includes? err "haselnuss: warning: --trusted-extensions grants nothing")))))
+
+(def ^:private irrelevant-flag-source
+  "A minimal document (TASK-108) exercising every target -- html, latex,
+  json and hdoc -- with none of the constructs (a footnote, a citation, a
+  figure) that would otherwise need a bibliography or an image file
+  beside it; `irrelevant-flag-diagnostic-test` runs `cli/run` directly
+  over this, the same `run-is-pure-test`/`hdoc-target-test` convention,
+  since the flags under test never reach the document at all."
+  "# Hi {#sec:hi}\n\ntext\n")
+
+(deftest irrelevant-flag-diagnostic-test
+  (testing "AC #1: --overlay and --extensions each report having no
+            effect on --target json or hdoc -- a path that does not even
+            exist on disk still reaches this diagnostic, since neither
+            branch ever reads it (`hdoc-target-test`'s own AC #5 finding)"
+    (doseq [target ["json" "hdoc"]]
+      (testing (str "--target " target)
+        (let [overlay (:diagnostics (cli/run irrelevant-flag-source
+                                             {:target target
+                                              :overlay ["/does/not/exist.hdoc"]}))
+              extensions (:diagnostics (cli/run irrelevant-flag-source
+                                                {:target target
+                                                 :extensions ["/does/not/exist.clj"]}))]
+          (is (= [:irrelevant-flag] (map :type overlay)))
+          (is (str/includes? (:message (first overlay)) "--overlay"))
+          (is (str/includes? (:message (first overlay)) (str "--target " target)))
+          (is (= [:irrelevant-flag] (map :type extensions)))
+          (is (str/includes? (:message (first extensions)) "--extensions"))
+          (is (str/includes? (:message (first extensions)) (str "--target " target)))))))
+  (testing "AC #2: --computed-numbers and --fragment each report no
+            effect off --target latex, and --no-stylesheet reports no
+            effect off --target html"
+    (doseq [[opts flag] [[{:computed-numbers true} "--computed-numbers"]
+                         [{:fragment true} "--fragment"]]]
+      (let [diagnostics (:diagnostics (cli/run irrelevant-flag-source
+                                               (merge {:target "html"} opts)))]
+        (is (= [:irrelevant-flag] (map :type diagnostics)) flag)
+        (is (str/includes? (:message (first diagnostics)) flag))))
+    (let [diagnostics (:diagnostics (cli/run irrelevant-flag-source
+                                             {:target "latex" :no-stylesheet true}))]
+      (is (= [:irrelevant-flag] (map :type diagnostics)))
+      (is (str/includes? (:message (first diagnostics)) "--no-stylesheet"))))
+  (testing "AC #3: --trusted-extensions with no --extensions at all
+            reports that it grants nothing, on every target -- the
+            privilege has an empty set of files to apply to independent
+            of what the target would otherwise have done with --extensions"
+    (doseq [target ["html" "latex" "json" "hdoc"]]
+      (let [diagnostics (:diagnostics (cli/run irrelevant-flag-source
+                                               {:target target :trusted-extensions true}))]
+        (is (= [:irrelevant-flag] (map :type diagnostics)) target)
+        (is (str/includes? (:message (first diagnostics)) "grants nothing") target))))
+  (testing "AC #4: the report is a warning on stderr -- the exit code and
+            the written output are unaffected, matching how an unknown
+            directive or a dangling reference is reported"
+    (let [dir (fixture-dir!)
+          plain (:output (build! dir {}))
+          {:keys [output diagnostics]} (build! dir {:trusted-extensions true})]
+      (is (= plain output) "the flag changed nothing about the emitted document")
+      (is (= [:irrelevant-flag] (map :type diagnostics)))
+      (let [{:keys [status err]} (main-run "--trusted-extensions" (str (io/file dir "doc.hdoc")))]
+        (is (= 0 status))
+        (is (.exists (io/file dir "doc.html")))
+        (is (not (str/includes? err "haselnuss: error:")))
+        (is (str/includes? err "haselnuss: warning: --trusted-extensions grants nothing")))))
+  (testing "AC #5: a build passing only flags that apply to its own
+            target reports none of these -- no new diagnostic, matching a
+            build with no such flag at all"
+    (let [dir (fixture-dir!)
+          ext (write-file! dir "callout.clj" callout-extension-source)
+          irrelevant-flag-count (fn [diagnostics]
+                                  (count (filter #(= :irrelevant-flag (:type %)) diagnostics)))]
+      (is (zero? (irrelevant-flag-count
+                  (:diagnostics (build! dir {:target "latex" :computed-numbers true})))))
+      (is (zero? (irrelevant-flag-count
+                  (:diagnostics (build! dir {:target "latex" :fragment true})))))
+      (is (zero? (irrelevant-flag-count
+                  (:diagnostics (build! dir {:target "html" :no-stylesheet true})))))
+      (is (zero? (irrelevant-flag-count
+                  (:diagnostics (build! dir {:target "html" :extensions [ext]
+                                             :trusted-extensions true}))))))))
+
+(defn- uppercase-heading-rule
+  "A `--transform` sidecar file source: one rule, matching every Section,
+  upper-casing its own heading text via `haselnuss.ext/map-text` -- the
+  same small worked example `haselnuss.ext-test`/`haselnuss.extensions.
+  rules-test` exercise directly, here reached through the real CLI flag."
+  []
+  (str "{:select :section\n"
+       " :transform (fn [node ctx]\n"
+       "              (update node :heading haselnuss.ext/map-text clojure.string/upper-case))}"))
+
+(deftest transform-flag-test
+  (testing "AC #1/#2: --transform loads rules from a sidecar file and
+            applies them on every target -- html, latex, json and hdoc
+            alike -- through the real CLI flag, with no --extensions
+            involved at all"
+    (let [dir (fixture-dir!)
+          rule (write-file! dir "upcase.clj" (uppercase-heading-rule))
+          source "# Intro {#sec:intro}\n\ntext\n"]
+      (is (str/includes? (:output (cli/run source {:target "html" :transform [rule]}))
+                         "INTRO</h1>"))
+      (is (str/includes? (:output (cli/run source {:target "latex" :transform [rule]}))
+                         "\\section{INTRO}"))
+      (is (str/includes? (:output (cli/run source {:target "json" :transform [rule]}))
+                         "INTRO"))
+      (is (str/includes? (:output (cli/run source {:target "hdoc" :transform [rule]}))
+                         "# INTRO"))))
+  (testing "AC #1: repeatable -- rules from every --transform file apply,
+            in FILE order, each as its own full pass over the document
+            (haselnuss.transform's own declaration-order contract,
+            TASK-102, applied here across files, not only within one)"
+    (let [dir (fixture-dir!)
+          suffix-a (write-file! dir "a.clj"
+                                (str "{:select :section :transform (fn [node ctx]\n"
+                                     "  (update node :heading haselnuss.ext/map-text #(str % \"-A\")))}"))
+          suffix-b (write-file! dir "b.clj"
+                                (str "{:select :section :transform (fn [node ctx]\n"
+                                     "  (update node :heading haselnuss.ext/map-text #(str % \"-B\")))}"))
+          source "# Intro {#sec:intro}\n\ntext\n"]
+      (is (str/includes? (:output (cli/run source {:target "html" :transform [suffix-a suffix-b]}))
+                         "Intro-A-B</h1>"))
+      (testing "the reverse --transform order produces the reverse suffix order"
+        (is (str/includes? (:output (cli/run source {:target "html" :transform [suffix-b suffix-a]}))
+                           "Intro-B-A</h1>")))))
+  (testing "AC #1: a single file's own last form may be a VECTOR of
+            rules, applied in that same declaration order"
+    (let [dir (fixture-dir!)
+          rule (write-file! dir "two.clj"
+                            (str "[{:select :section :transform (fn [n c]\n"
+                                 "   (update n :heading haselnuss.ext/map-text #(str % \"-1\")))}\n"
+                                 " {:select :section :transform (fn [n c]\n"
+                                 "   (update n :heading haselnuss.ext/map-text #(str % \"-2\")))}]"))
+          source "# Intro {#sec:intro}\n\ntext\n"]
+      (is (str/includes? (:output (cli/run source {:target "html" :transform [rule]}))
+                         "Intro-1-2</h1>"))))
+  (testing "omitting --transform entirely leaves a build byte-for-byte
+            unaffected"
+    (let [source "# Intro {#sec:intro}\n\ntext\n"]
+      (is (str/includes? (:output (cli/run source {:target "html"})) "Intro</h1>")))))
+
+(deftest transform-runs-pre-resolve-test
+  (testing "AC #3: a rule sees the document exactly as PARSED -- a
+            CrossRef here carries only its bare :label token, never a
+            resolver-computed :text, since the transform pass runs
+            before resolve-document ever does (doc-7 decision 1)"
+    (let [dir (fixture-dir!)
+          rule (write-file! dir "probe.clj"
+                            (str "{:select :cross-ref\n"
+                                 " :transform (fn [node ctx]\n"
+                                 "              (assoc node :suppress-prefix (contains? node :text)))}"))
+          source "# Intro {#sec:intro}\n\nSee @sec:intro.\n"
+          {:keys [output]} (cli/run source {:target "html" :transform [rule]})]
+      ;; :suppress-prefix true would have suppressed the "Section" word
+      ;; the resolver's own computed cross-reference text otherwise
+      ;; carries -- its ABSENCE here is exactly the assertion: the probe
+      ;; rule saw no :text key to check `contains?` true against, so it
+      ;; wrote false, and the resolver went on to compute :text normally.
+      (is (str/includes? output "Section 1"))))
+  (testing "AC #3: a rule cannot see the generated bibliography Section
+            either -- deleting every :section named \"Bibliography\"
+            (`haselnuss.resolver`'s own generated heading word, produced
+            only AFTER this pass runs) has no effect, because there is
+            nothing named that yet when the rule actually runs"
+    (let [dir (fixture-dir!)
+          rule (write-file! dir "no-op-on-bib.clj"
+                            (str "{:select {:t :section :text #\"Bibliography\"}\n"
+                                 " :transform (fn [node ctx] nil)}"))
+          source (str "---\nbibliography: refs.json\n---\n\n"
+                      "# Intro {#sec:intro}\n\n[@knuth1984].\n")
+          bib "[{\"id\":\"knuth1984\",\"author\":[{\"family\":\"Knuth\",\"given\":\"Donald\"}],\"issued\":{\"date-parts\":[[1984]]},\"title\":\"The TeXbook\"}]"]
+      (spit (io/file dir "refs.json") bib)
+      (let [{:keys [output diagnostics]}
+            (cli/run source {:target "html" :transform [rule] :base-dir dir})]
+        (is (str/includes? output "class=\"bibliography\"")
+            "the bibliography Section still exists -- the rule's selector matched nothing")
+        (is (some #(= :transform-rule-unmatched (:type %)) diagnostics)
+            "and that unmatched selector is reported (AC #6 of TASK-102)")))))
+
+(deftest transform-reports-unexpanded-includes-test
+  (testing "TASK-106: a --transform rule selecting every :section, run
+            against a master document holding one Section of its own plus
+            two chapters pulled in via !include, reports that it ran over a
+            partial document -- naming both skipped chapters concretely,
+            not merely that includes exist -- alongside the rule actually
+            renaming the one Section it COULD see"
+    (let [dir (fixture-dir! (str "# Preface {#ch:preface}\n\n"
+                                 "Written directly in the master file.\n\n"
+                                 "!include chapters/intro.hdoc\n"
+                                 "!include chapters/methods.hdoc\n"))
+          chapters (io/file dir "chapters")]
+      (.mkdirs chapters)
+      (spit (io/file chapters "intro.hdoc") "# Introduction {#ch:intro}\n\nText.\n")
+      (spit (io/file chapters "methods.hdoc") "# Method {#ch:methods}\n\nText.\n")
+      (let [rule (write-file! dir "rename.clj"
+                              (str "{:select :section\n"
+                                   " :transform (fn [node ctx]\n"
+                                   "              (assoc node :heading [{:t :str :text \"RENAMED\"}]))}"))
+            {:keys [status err]} (main-run "--transform" rule (str (io/file dir "doc.hdoc")))
+            html (slurp (io/file dir "doc.html"))]
+        (is (= 0 status) err)
+        (is (str/includes? err "--transform ran before 2 !includes were expanded")
+            "the build itself, not merely the pure core, surfaces the diagnostic")
+        (is (str/includes? err "chapters/intro.hdoc"))
+        (is (str/includes? err "chapters/methods.hdoc"))
+        (is (str/includes? html "RENAMED")
+            "the rule DID rename the one Section written directly in the master file")
+        (is (str/includes? html "Introduction")
+            "but the chapter pulled in via !include kept its own heading -- the")
+        (is (str/includes? html "Method")
+            "rule never reached either of the two chapters it ran before")))))
+
+(deftest transform-shares-sandbox-with-extensions-test
+  (testing "AC #4: --extensions and --transform, in the same build, share
+            ONE forked sci context -- a --transform file's own top-level
+            def is visible to an --extensions renderer loaded in the SAME
+            build, through the real CLI path, not only
+            haselnuss.extensions.rules-test's own direct load-transforms
+            coverage"
+    (let [dir (fixture-dir! ":::{counter}\n:::\n")
+          transform-file (write-file! dir "def-counter.clj"
+                                      (str "(def hits (atom 0))\n"
+                                           "{:select :section :transform (fn [n c] n)}"))
+          extension-file (write-file! dir "counter.clj"
+                                      (str "{:name \"counter\" :emit {:html "
+                                           "(fn [d c] [:span (swap! hits inc)])}}"))
+          {:keys [output]} (build! dir {:target "html"
+                                        :transform [transform-file]
+                                        :extensions [extension-file]})]
+      (is (str/includes? output "<span>1</span>")))))
+
+(deftest transform-errors-through-real-cli-test
+  (testing "AC #8: a missing --transform path is a hard build failure
+            naming it, mirroring --overlay/--extensions' own established
+            treatment"
+    (let [dir (fixture-dir!)
+          {:keys [status err]} (main-run "--transform" (str (io/file dir "nowhere.clj"))
+                                         (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err "transform file not found"))
+      (is (str/includes? err "nowhere.clj"))))
+  (testing "AC #8: a malformed rule is refused with an error naming the
+            file, through the real CLI path -- haselnuss.extensions.
+            rules-test covers every malformed shape directly; this
+            confirms the error actually reaches stderr/exit 1 here"
+    (let [dir (fixture-dir!)
+          rule (write-file! dir "bad.clj" "{:select :section}")
+          {:keys [status err]} (main-run "--transform" rule (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err "malformed transform rule"))
+      (is (str/includes? err "bad.clj"))))
+  (testing "AC #6: host interop from a --transform rule is refused
+            through the real CLI path too"
+    (let [dir (fixture-dir!)
+          rule (write-file! dir "interop.clj"
+                            "{:select :section :transform (fn [n c] (System/exit 0))}")
+          {:keys [status err]} (main-run "--transform" rule (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err "System/exit")))))
+
+(deftest transform-grants-no-trust-test
+  (testing "AC #10: a rule's own [:raw ...] attempt does not reach the
+            emitter, WITH or WITHOUT --trusted-extensions -- a transform
+            has no trust flag of its own to gate anything, because
+            haselnuss.transform's own return-value contract already
+            refuses a node that does not fit its position, and [:raw ...]
+            never does"
+    (let [dir (fixture-dir!)
+          rule (write-file! dir "raw.clj"
+                            "{:select :section :transform (fn [n c] (haselnuss.ext/raw \"x\"))}")
+          without-trust (main-run "--transform" rule (str (io/file dir "doc.hdoc")))
+          with-trust (main-run "--transform" rule "--trusted-extensions" (str (io/file dir "doc.hdoc")))]
+      (is (= 1 (:status without-trust)))
+      (is (str/includes? (:err without-trust) "does not fit"))
+      (is (= 1 (:status with-trust))
+          "--trusted-extensions changes nothing about this refusal")
+      (is (str/includes? (:err with-trust) "does not fit")))))
+
+(deftest transform-scoped-to-build-test
+  (testing "AC #7: a rule's own state (a def'd atom) does not survive
+            past the build that loaded it -- a SECOND, separate cli/run
+            call against the same rule file starts fresh, the same
+            isolation --extensions already has (mirrors haselnuss.
+            extensions.rules-test's own ac2-isolation-across-loads-test,
+            here through the real cli/run entry point)"
+    (let [dir (fixture-dir!)
+          rule (write-file! dir "stateful.clj"
+                            (str "(def hits (atom 0))\n"
+                                 "{:select :section :transform (fn [n c] (swap! hits inc) n)}"))
+          source "# Intro {#sec:intro}\n\ntext\n"]
+      (cli/run source {:target "json" :transform [rule]})
+      (is (str/includes? (:output (cli/run source {:target "json" :transform [rule]})) "Intro")
+          (str "a second, separate build against the identical rule file still succeeds -- "
+               "its own atom started over rather than raising on stale state")))))
 
 (deftest mapped-directive-references-test
   (testing "TASK-40 AC #3: a cross-reference to every mapped directive
@@ -1220,7 +2113,7 @@
           {:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))
           html (slurp (io/file dir "doc.html"))]
       (is (= 0 status) err)
-      (is (= "" err) "no dangling cross-reference for any of them")
+      (is (no-warnings? err) "no dangling cross-reference for any of them")
       (is (not (str/includes? html "??")))
       (doseq [[kind title] titles]
         (is (str/includes? html (str "<a href=\"#" kind ":x\">" title " 1</a>"))
@@ -1245,7 +2138,7 @@
                                            (str (io/file dir "doc.hdoc")))
             tex (slurp (io/file dir "doc.tex"))]
         (is (= 0 status) err)
-        (is (= "" err) "nothing to warn about: the reference has an anchor")
+        (is (no-warnings? err) "nothing to warn about: the reference has an anchor")
         (is (str/includes? tex "\\phantomsection\\label{thm:x}"))
         (is (str/includes? tex "\\hyperref[thm:x]{Theorem 1}"))
         ;; TWICE, and the second log is the one that counts: the first
@@ -1279,7 +2172,7 @@
             {:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))
             html (slurp (io/file dir "doc.html"))]
         (is (= 0 status) err)
-        (is (= "" err) err)
+        (is (no-warnings? err) err)
         (is (str/includes? html "id=\"thm:x\""))
         (is (str/includes? html "<a href=\"#thm:x\">Theorem 1</a>"))))
     (testing "a mapped directive is silent in native mode, since its own
@@ -1288,7 +2181,7 @@
                                    ":::{theorem #thm:x}\nBody.\n:::\n"))
             {:keys [status err]} (main-run "--target" "latex" (str (io/file dir "doc.hdoc")))]
         (is (= 0 status) err)
-        (is (= "" err) err)))))
+        (is (no-warnings? err) err)))))
 
 (deftest mismatched-directive-kind-warning-test
   (testing "TASK-48 AC #1/#2: a lemma tagged with a thm: id -- numbered
@@ -1317,7 +2210,7 @@
     (let [dir (fixture-dir! "# Body {#sec:body}\n\n:::{lemma #lem:x}\nA lemma.\n:::\n")
           {:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))]
       (is (= 0 status))
-      (is (= "" err) err))))
+      (is (no-warnings? err) err))))
 
 (deftest default-stylesheet-test
   (let [source (str "---\ntitle: Styled\nbibliography: refs.json\n---\n\n"
@@ -1500,11 +2393,65 @@
       (doseq [args [["--target" "latex" "--computed-numbers"] []]]
         (let [dir (fixture-dir! source)]
           (spit (io/file dir "refs.json") csl)
-          (let [{:keys [status out]} (apply main-run (concat args [(str (io/file dir "doc.hdoc"))]))]
+          (let [{:keys [status err]} (apply main-run (concat args [(str (io/file dir "doc.hdoc"))]))]
             (is (= 0 status))
             (is (not (.isFile (io/file dir "doc.bib"))) (pr-str args))
-            (is (= 1 (count (re-seq #"haselnuss: wrote" out)))
+            (is (= 1 (count (re-seq #"haselnuss: wrote" err)))
                 (str (pr-str args) ": one input, one output"))))))))
+
+(deftest bibtex-companion-path-matches-output-test
+  (testing "TASK-109: the generated .bib is announced the same KIND of
+            path the .tex beside it was -- relative or bare when the
+            output was, not always resolved to an absolute one. Every
+            other test above builds inside `fixture-dir!`'s own absolute
+            temp directory, where the bug this closes was invisible
+            (both paths happened to be absolute already); these two
+            write a relative/bare `--output` for real, against the
+            process's own working directory, the same way the existing
+            \"AC #5: a literal file named -\" test above already does,
+            with the same try/finally cleanup"
+    (testing "AC #2: a bare --output filename, with no directory
+              component at all, is the exact case `.getAbsoluteFile` was
+              added to give a non-nil parent -- at the cost, before this
+              task, of making the .bib absolute regardless"
+      (let [dir (fixture-dir!)
+            input (str (io/file dir "doc.hdoc"))
+            tex-file (io/file "haselnuss-task109-bare.tex")
+            bib-file (io/file "haselnuss-task109-bare.bib")]
+        (try
+          (io/delete-file tex-file true)
+          (io/delete-file bib-file true)
+          (let [{:keys [status err]}
+                (main-run "--target" "latex" "--output" (str tex-file) input)]
+            (is (= 0 status) err)
+            (is (.isFile tex-file))
+            (is (.isFile bib-file) "the database itself must land bare too, beside a bare .tex")
+            (is (str/includes? err (str "wrote " bib-file)))
+            (is (not (str/includes? err (.getAbsolutePath bib-file)))
+                (str "must not have been resolved to an absolute path:\n" err)))
+          (finally
+            (io/delete-file tex-file true)
+            (io/delete-file bib-file true)))))
+    (testing "AC #1: a relative --output with a directory component
+              announces a relative .bib beside it"
+      (let [dir (fixture-dir!)
+            input (str (io/file dir "doc.hdoc"))
+            rel-dir (io/file "haselnuss-task109-relative")
+            tex-file (io/file rel-dir "out.tex")
+            bib-file (io/file rel-dir "out.bib")]
+        (try
+          (.mkdirs rel-dir)
+          (let [{:keys [status err]}
+                (main-run "--target" "latex" "--output" (str tex-file) input)]
+            (is (= 0 status) err)
+            (is (.isFile bib-file))
+            (is (str/includes? err (str "wrote " bib-file)))
+            (is (not (str/includes? err (.getAbsolutePath bib-file)))
+                (str "must not have been resolved to an absolute path:\n" err)))
+          (finally
+            (io/delete-file tex-file true)
+            (io/delete-file bib-file true)
+            (io/delete-file rel-dir true)))))))
 
 (deftest bibliography-resource-is-portable-test
   (testing "an ordinary document keeps the emitter's own relative
@@ -1556,16 +2503,16 @@
             producing it silently"
     (let [dir (fixture-dir!)
           input (str (io/file dir "doc.hdoc"))
-          {:keys [status out]} (main-run "--target" "latex" "--fragment" input)
+          {:keys [status err]} (main-run "--target" "latex" "--fragment" input)
           tex (slurp (io/file dir "doc.tex"))
           preamble (slurp (io/file dir "doc-preamble.tex"))]
-      (is (= 0 status) out)
+      (is (= 0 status) err)
       (is (not (str/includes? tex "\\documentclass")))
       (is (not (str/includes? tex "\\begin{document}")))
       (is (not (str/includes? tex "\\usepackage")))
       (is (str/includes? tex "\\section{"))
       (is (str/includes? preamble "\\usepackage{hyperref}"))
-      (is (str/includes? out "doc-preamble.tex"))
+      (is (str/includes? err "doc-preamble.tex"))
       (testing "and the companion says WHERE to \\input it, which is
                 load-bearing: a citation package loaded ahead of the
                 natbib this file brings is a redefinition error in the

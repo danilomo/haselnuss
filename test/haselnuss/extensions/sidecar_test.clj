@@ -129,7 +129,7 @@
           [status error-type] (outcome #(sidecar/load-extensions [path] {:timeout-ms 200}))
           elapsed (- (System/currentTimeMillis) start)]
       (is (= :threw status))
-      (is (= :haselnuss.extensions.sidecar/extension-timeout error-type))
+      (is (= :haselnuss.sandbox/timeout error-type))
       (is (< elapsed 2000) "resolves close to the configured bound, not after realizing forever")))
   (testing "regression guard: realizing a lazy seq that itself PRINTS is
             captured the same way any other sandboxed output is (AC #9),
@@ -252,7 +252,7 @@
                                  "{:name \"x\" :emit {:html (fn [d c] (System/exit 0))}}")
           [status error-type message] (outcome #(sidecar/load-extensions [path]))]
       (is (= :threw status))
-      (is (= :haselnuss.extensions.sidecar/extension-evaluation-error error-type))
+      (is (= :haselnuss.sandbox/evaluation-error error-type))
       (is (str/includes? message "System/exit"))))
   (testing "AC #3, a different shape: constructing a java.io.File is
             refused the same way"
@@ -269,7 +269,7 @@
                                  "{:name \"x\" :emit {:html (fn [d c] (slurp \"/etc/hostname\"))}}")
           [status error-type message] (outcome #(sidecar/load-extensions [path]))]
       (is (= :threw status))
-      (is (= :haselnuss.extensions.sidecar/extension-evaluation-error error-type))
+      (is (= :haselnuss.sandbox/evaluation-error error-type))
       (is (str/includes? message "slurp")))))
 
 (deftest ac5-process-execution-refused-test
@@ -288,7 +288,7 @@
           [entry] (sidecar/load-extensions [path])
           [status error-type message] (outcome #((get-in entry [:emit :html]) {} {}))]
       (is (= :threw status))
-      (is (= :haselnuss.extensions.sidecar/extension-evaluation-error error-type))
+      (is (= :haselnuss.sandbox/evaluation-error error-type))
       (is (str/includes? message "clojure.java.shell")))))
 
 (deftest ac6-classpath-require-refused-test
@@ -301,7 +301,7 @@
           [entry] (sidecar/load-extensions [path])
           [status error-type message] (outcome #((get-in entry [:emit :html]) {} {}))]
       (is (= :threw status))
-      (is (= :haselnuss.extensions.sidecar/extension-evaluation-error error-type))
+      (is (= :haselnuss.sandbox/evaluation-error error-type))
       (is (str/includes? message "haselnuss.parser"))))
   (testing "AC #6, positive control: a namespace sci bundles itself
             (clojure.set) is NOT reached via this project's classpath at
@@ -333,7 +333,7 @@
           [status error-type message] (outcome #((get-in entry [:emit :html]) {} {}))
           elapsed (- (System/currentTimeMillis) start)]
       (is (= :threw status))
-      (is (= :haselnuss.extensions.sidecar/extension-timeout error-type))
+      (is (= :haselnuss.sandbox/timeout error-type))
       (is (str/includes? message "200ms"))
       (is (< elapsed 2000) "resolves close to the configured bound, not the 5s default")
       (testing "the abandoned worker thread this leaves running (see this
@@ -342,7 +342,7 @@
                 review: debugging a CPU-pegged process via top -H/jstack
                 needs exactly this, and the thread was unnamed before)"
         (let [names (->> (Thread/getAllStackTraces) .keySet (map #(.getName %)))]
-          (is (some #(and (str/includes? % "haselnuss-sidecar-worker")
+          (is (some #(and (str/includes? % "haselnuss-sandbox-worker")
                           (str/includes? % path))
                     names)))))))
 
@@ -359,7 +359,7 @@
           [entry] (sidecar/load-extensions [path] {:output-limit 100})
           [status error-type message] (outcome #((get-in entry [:emit :html]) {} {}))]
       (is (= :threw status))
-      (is (= :haselnuss.extensions.sidecar/oversized-extension-output error-type))
+      (is (= :haselnuss.sandbox/oversized-output error-type))
       (is (str/includes? message "100-character cap"))))
   (testing "a normal-sized output, well under the default cap, succeeds"
     (let [dir (scratch-dir!)
@@ -475,4 +475,4 @@
           [entry] (sidecar/load-extensions [path] {:timeout-ms 200})
           [status error-type] (outcome #((:lower entry) {} :latex))]
       (is (= :threw status))
-      (is (= :haselnuss.extensions.sidecar/extension-timeout error-type)))))
+      (is (= :haselnuss.sandbox/timeout error-type)))))

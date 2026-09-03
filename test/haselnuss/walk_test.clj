@@ -16,7 +16,19 @@
   position alike (AC #5); a `:scope` set controls which reference kinds
   either primitive descends into (AC #6); and a canary fails if any
   Block/Inline/Fallback variant in `haselnuss.ast/registry` has no entry
-  in the derived table (AC #7)."
+  in the derived table (AC #7).
+
+  `rewrite-post` (TASK-94) gets its own section below: it visits a node
+  AFTER its own children and never re-walks a callback's own return value
+  (TASK-94 AC #1), its callback receives `fold`'s own `[path ref-kind
+  node]` shape at every position including `:many-of-many` (TASK-94 AC
+  #2), the 0/1/many-at-a-list-position/exactly-1-at-a-`:one`-position
+  contract carries over from `rewrite` unchanged (TASK-94 AC #3), a
+  `:scope` set filters it exactly like `rewrite`/`fold` (TASK-94 AC #4, an
+  extension of the existing three-primitive scope test), and a rule that
+  wraps its own match in a fresh parent -- a documented infinite loop
+  under `rewrite`'s own pre-order semantics -- terminates under it after
+  wrapping exactly once (TASK-94 AC #7)."
   (:require [clojure.test :refer [deftest is testing]]
             [haselnuss.ast :as ast]
             [haselnuss.walk :as walk]))
@@ -256,9 +268,10 @@
 
 ;; --- scope filters descent (AC #6) -----------------------------------------
 
-(deftest scope-excludes-a-reference-kind-from-both-primitives-test
-  (testing "AC #6: a scope without ::inline never reaches a Section's
-            :heading or a Para's :inlines, for fold or rewrite alike"
+(deftest scope-excludes-a-reference-kind-from-all-three-primitives-test
+  (testing "AC #6 / TASK-94 AC #4: a scope without ::inline never reaches a
+            Section's :heading or a Para's :inlines, for fold, rewrite or
+            rewrite-post alike"
     (let [section {:t :section :level 1 :heading [(str-inline "H")]
                    :blocks [(para (str-inline "H"))] :attr attr}
           block-only #{::ast/block}]
@@ -272,6 +285,15 @@
                       [node]))
               result (first (walk/rewrite {:table walk/table :scope block-only :rewrite-fn dup}
                                           ::ast/block section))]
+          (is (= 1 (count (:heading result))))
+          (is (= 1 (count (:inlines (first (:blocks result))))))))
+      (testing "rewrite-post"
+        (let [dup (fn [_path ref-kind node]
+                    (if (and (= ref-kind ::ast/inline) (= :str (:t node)))
+                      [node node]
+                      [node]))
+              result (first (walk/rewrite-post {:table walk/table :scope block-only :rewrite-fn dup}
+                                               ::ast/block section))]
           (is (= 1 (count (:heading result))))
           (is (= 1 (count (:inlines (first (:blocks result)))))))))))
 
@@ -362,6 +384,149 @@
                                       ::ast/block directive))]
       (is (= :figure (:t result)))
       (is (= ["z" "z"] (map :text (:inlines (:content result))))))))
+
+;; --- rewrite-post: children first, then the node, never re-walked --------
+;; (TASK-94) -----------------------------------------------------------------
+
+(defn- visited-post
+  "Like `visited`, but runs `rewrite-post`: collects `[path type]` for every
+  node visited, in POST-order visiting order, leaving every node unchanged
+  (`[node]`) so the collected log is the only thing under test."
+  [scope ref-kind node]
+  (let [log (atom [])]
+    (walk/rewrite-post {:table walk/table :scope scope
+                        :rewrite-fn (fn [path visited-kind visited-node]
+                                      (swap! log conj
+                                             [path (walk/node-type (:discriminators walk/table)
+                                                                   visited-kind visited-node)])
+                                      [visited-node])}
+                       ref-kind node)
+    @log))
+
+(deftest rewrite-post-visits-a-section-in-post-order-with-fold-shaped-paths-test
+  (testing "TASK-94 AC #1/#2: every child visited (and, per the fixture,
+            recorded) before the node itself -- the reverse of fold/
+            rewrite's own pre-order -- while the path to each node is
+            exactly fold's own"
+    (let [section {:t :section :level 1
+                   :heading [(str-inline "H1") (str-inline "H2")]
+                   :blocks [(para (str-inline "a")) (para (str-inline "b"))]
+                   :attr attr}]
+      (is (= [[[:heading 0] :str]
+              [[:heading 1] :str]
+              [[:blocks 0 :inlines 0] :str]
+              [[:blocks 0] :para]
+              [[:blocks 1 :inlines 0] :str]
+              [[:blocks 1] :para]
+              [[] :section]]
+             (visited-post block-and-inline ::ast/block section))))))
+
+(deftest rewrite-post-reports-a-many-of-many-path-as-outer-then-inner-index-test
+  (testing "TASK-94 AC #2: List's :items (:many-of-many) paths as [:items
+            outer inner] in post order, matching fold's own path shape at
+            that position"
+    (let [a-list {:t :list :ordered false :tight true
+                  :items [[(para (str-inline "a"))]
+                          [(para (str-inline "b")) (para (str-inline "c"))]]
+                  :attr attr}]
+      (is (= [[[:items 0 0 :inlines 0] :str]
+              [[:items 0 0] :para]
+              [[:items 1 0 :inlines 0] :str]
+              [[:items 1 0] :para]
+              [[:items 1 1 :inlines 0] :str]
+              [[:items 1 1] :para]
+              [[] :list]]
+             (visited-post block-and-inline ::ast/block a-list))))))
+
+(deftest rewrite-post-reports-a-one-position-path-with-no-index-test
+  (testing "TASK-94 AC #2: a :one position (Figure's :content) has a path
+            with no trailing index, in post order"
+    (let [figure {:t :figure :content (para (str-inline "x"))
+                  :caption [(str-inline "cap")] :attr attr}]
+      (is (= [[[:content :inlines 0] :str]
+              [[:content] :para]
+              [[:caption 0] :str]
+              [[] :figure]]
+             (visited-post block-and-inline ::ast/block figure))))))
+
+(deftest rewrite-post-expands-a-many-position-to-zero-one-or-many-test
+  (testing "TASK-94 AC #3: each element of a :many position independently
+            vanishes, stays one node, or fans out to several -- the same
+            0/1/many contract rewrite itself has"
+    (let [rewrite-fn (fn [_path ref-kind node]
+                       (if (and (= ref-kind ::ast/inline) (= :str (:t node)))
+                         (case (:text node) "dup" [node node] "drop" [] [node])
+                         [node]))
+          section {:t :section :level 1 :heading []
+                   :blocks [(para (str-inline "a") (str-inline "dup")
+                                  (str-inline "drop") (str-inline "b"))]
+                   :attr attr}
+          result (first (walk/rewrite-post {:table walk/table :scope block-and-inline
+                                            :rewrite-fn rewrite-fn}
+                                           ::ast/block section))]
+      (is (= ["a" "dup" "dup" "b"]
+             (map :text (:inlines (first (:blocks result)))))))))
+
+(deftest rewrite-post-many-of-many-rewrites-each-inner-list-independently-test
+  (testing "TASK-94 AC #3: List's :items keeps its own outer count while
+            each item's own Blocks can still expand"
+    (let [directive->many (fn [_path ref-kind node]
+                            (if (and (= ref-kind ::ast/block) (= :directive (:t node)))
+                              [(para (str-inline "x")) (para (str-inline "y"))]
+                              [node]))
+          directive {:t :directive :name "n" :blocks [] :attr attr}
+          a-list {:t :list :ordered false :tight true
+                  :items [[directive] [(para (str-inline "kept"))]]
+                  :attr attr}
+          result (first (walk/rewrite-post {:table walk/table :scope block-and-inline
+                                            :rewrite-fn directive->many}
+                                           ::ast/block a-list))]
+      (is (= [2 1] (map count (:items result))))
+      (is (= ["x" "y"] (map (comp :text first :inlines) (first (:items result))))))))
+
+(deftest rewrite-post-raises-naming-the-field-when-a-one-position-gets-the-wrong-count-test
+  (testing "TASK-94 AC #3: a :one position (Figure's :content) that comes
+            back with a count other than one raises, naming the field and
+            the node -- unchanged from rewrite's own contract"
+    (let [duplicate-content (fn [_path ref-kind node]
+                              (if (and (= ref-kind ::ast/block) (= :para (:t node)))
+                                [node node]
+                                [node]))
+          figure {:t :figure :content (para (str-inline "x")) :caption [] :attr attr}]
+      (try
+        (walk/rewrite-post {:table walk/table :scope block-and-inline :rewrite-fn duplicate-content}
+                           ::ast/block figure)
+        (is false "expected ::walk/arity-error to be thrown")
+        (catch clojure.lang.ExceptionInfo e
+          (is (re-find #":content" (.getMessage e)))
+          (is (re-find #":figure" (.getMessage e)))
+          (let [data (ex-data e)]
+            (is (= ::walk/arity-error (:type data)))
+            (is (= :content (:field data)))
+            (is (= 2 (:count data)))
+            (is (= :figure (:t (:node data))))))))))
+
+(deftest rewrite-post-terminates-when-a-rule-wraps-its-own-match-test
+  (testing "TASK-94 AC #7: a rule that wraps every :para in a :block-quote
+            does not re-visit its own output -- rewrite's own pre-order
+            semantics would meet the freshly-wrapped :para again on the
+            very next step and wrap it forever, for a rule that is not
+            itself wrong"
+    (let [wrap-para-in-block-quote
+          (fn [_path ref-kind node]
+            (if (and (= ref-kind ::ast/block) (= :para (:t node)))
+              [{:t :block-quote :blocks [node] :attr attr}]
+              [node]))
+          section {:t :section :level 1 :heading []
+                   :blocks [(para (str-inline "a"))]
+                   :attr attr}
+          result (first (walk/rewrite-post {:table walk/table :scope block-and-inline
+                                            :rewrite-fn wrap-para-in-block-quote}
+                                           ::ast/block section))
+          wrapped (first (:blocks result))]
+      (is (= [:block-quote] (map :t (:blocks result))))
+      (is (= 1 (count (:blocks wrapped))) "wrapped exactly once, not forever")
+      (is (= :para (:t (first (:blocks wrapped))))))))
 
 ;; --- one call from ::document reaches meta.title AND blocks (AC #1) ------
 

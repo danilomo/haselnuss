@@ -12,7 +12,9 @@
   TypeScript spec (e.g. `:code-block` for `CodeBlock`, `:csl-style` for
   `cslStyle`, `:suppress-prefix` for `suppressPrefix`); every other field name
   and shape is a direct, 1:1 port of SPEC.md sec4."
-  (:require [malli.core :as m]))
+  (:require [clojure.string :as str]
+            [malli.core :as m]
+            [malli.error :as me]))
 
 (defn- dispatch-by
   "Malli `:multi` dispatch function for key `k` that coerces the dispatched
@@ -296,3 +298,104 @@
   it does conform."
   [schema value]
   (m/explain schema value))
+
+(defn- dispatch-value-message
+  "One `:malli.core/invalid-dispatch-value` error from `explain`'s own
+  `:errors` (TASK-111) turned into a message naming the actual offending
+  value and every value that WOULD have matched, e.g. `:not-a-real-node-
+  type does not match any of :section, :para, :list, ...` -- the one fact
+  `malli.error/humanize` never states for this error type (it says only
+  'invalid dispatch value', for every dispatch failure in every `:multi`
+  schema alike).
+
+  `err`'s own `:schema` is the `:multi` schema itself (a compiled malli
+  schema, not raw EDN): `(m/properties ...)`'s own `:dispatch` is exactly
+  the function `dispatch-by` built it from, applied here to `(:value
+  err)` (the whole invalid node) the same way malli itself just did, so
+  this reads the one field that actually failed (`:t` for Block/Inline,
+  `:kind` for Fallback) without this namespace needing to know which
+  field name a particular schema dispatches on. `(m/children (:schema
+  err))` is every variant `[tag ...]` pair of that same schema, in
+  declaration order -- exactly the vocabulary `dispatch-by`'s own
+  docstring calls 'the schema's dispatch keys'."
+  [err]
+  (let [dispatch (:dispatch (m/properties (:schema err)))
+        got (dispatch (:value err))
+        options (map first (m/children (:schema err)))]
+    (str (pr-str got) " does not match any of: " (str/join ", " (map pr-str options)))))
+
+(defn- humanized-leaf-message
+  "The readable message for one leaf `messages` (a vector of strings,
+  `malli.error/humanize`'s own leaf shape) found at `path` (a vector of
+  map keys/vector indices from the invalid value's own root) while
+  walking a `humanize` result -- `dispatch-messages` (`:in` ->
+  `dispatch-value-message` string, built once per `explain-summary` call)
+  takes over at exactly the paths where the underlying error was
+  `:malli.core/invalid-dispatch-value`, since humanize's own leaf there
+  ('invalid dispatch value') is useless on its own; every other leaf is
+  humanize's own messages, joined."
+  [dispatch-messages path messages]
+  (or (get dispatch-messages path) (str/join ", " messages)))
+
+(defn- flatten-humanized
+  "`humanized` (`malli.error/humanize`'s own return value, which mirrors
+  the invalid value's own map/vector shape -- a missing/mistyped `:inlines`
+  becomes `{:inlines [\"missing required key\"]}`) turned into `[path
+  message]` pairs, `path` the same vector of keys/indices `explain`'s own
+  `:in` already uses for the same location, so `dispatch-messages` (keyed
+  by that same `:in`) lines up with the paths this walk produces.
+
+  A leaf is a non-empty sequential all of whose elements are strings
+  (`humanized-leaf-message`'s own vector); this never collides with a
+  per-index array of sub-results (a `:blocks`-typed field's own vector),
+  since humanize always wraps each index's own messages one level deeper
+  -- `[nil [\"invalid dispatch value\"]]`, never a bare string beside a
+  nested result at the same level. `nil` (humanize's own 'this position
+  was valid') contributes nothing."
+  [dispatch-messages humanized]
+  (letfn [(walk [path node]
+            (cond
+              (nil? node) []
+              (map? node) (mapcat (fn [[k v]] (walk (conj path k) v)) node)
+              (and (sequential? node) (seq node) (every? string? node))
+              [[path (humanized-leaf-message dispatch-messages path node)]]
+              (sequential? node) (mapcat (fn [[i v]] (walk (conj path i) v))
+                                         (map-indexed vector node))
+              :else [[path (str node)]]))]
+    (walk [] humanized)))
+
+(defn explain-summary
+  "A short, readable account of every problem `explanation` (`explain`'s
+  own return value, or nil when the value conformed) reports, in the
+  schema's own field vocabulary -- never the raw malli schema data
+  `explanation` itself carries (every variant of a `:multi` schema, an
+  anonymous dispatch function, a Java object identity hash), which is
+  exactly what makes `(pr-str explanation)` unusable as a message a human
+  reads (TASK-111, found dogfooding a `--transform` sidecar with a typo'd
+  `:t`: a single `pr-str`'d explanation ran to roughly 1500 characters,
+  none of them the one fact -- `:not-a-real-node-type` is not a real
+  Block type -- an author actually needed).
+
+  `malli.error/humanize` already turns most of `explanation` into
+  concise, path-shaped messages (`flatten-humanized`'s own docstring);
+  this adds only what humanize leaves generic for a `:multi` schema's own
+  dispatch failure (`dispatch-value-message`), matched back to humanize's
+  own path by `:in`. Each `[path message]` pair becomes one line, `path`
+  prefixed on when non-empty (a nested problem, e.g. inside a Section's
+  own `:blocks`) and omitted when the whole value's own root is the
+  problem (the common case: a rule's `:transform` returned one wrong top-
+  level node), multiple lines joined with `\"; \"`.
+
+  nil in, nil out."
+  [explanation]
+  (when explanation
+    (let [dispatch-messages (into {}
+                                  (keep (fn [err]
+                                          (when (= :malli.core/invalid-dispatch-value (:type err))
+                                            [(:in err) (dispatch-value-message err)])))
+                                  (:errors explanation))
+          entries (flatten-humanized dispatch-messages (me/humanize explanation))]
+      (str/join "; "
+                (map (fn [[path message]]
+                       (if (seq path) (str path " " message) message))
+                     entries)))))

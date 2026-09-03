@@ -265,11 +265,33 @@
 ;; dropped: a Meta is a property of the document being built, and merging two
 ;; titles, two author lists or two bibliographies has no defensible answer.
 ;;
-;; Both failure modes are diagnostics, not exceptions, and both drop the
+;; Two failure modes are diagnostics, not exceptions, and both drop the
 ;; offending `:include` so the rest of the build proceeds (AC #3/#4): a file
-;; that cannot be read, and a cycle. A cycle is detected by canonical path
+;; that cannot be READ, and a cycle. A cycle is detected by canonical path
 ;; against the stack of files currently being expanded, so a diamond (two
 ;; chapters including one shared file) is fine while a true loop is not.
+;;
+;; A THIRD failure -- `:load` throwing for a file that WAS read but failed to
+;; PARSE -- is deliberately NOT one of those two (TASK-105). Before TASK-105
+;; this pass caught every exception `:load` raised alike, so a malformed
+;; included file -- an unclosed YAML flow sequence in its own front matter,
+;; an unsupported inline construct -- was warned about and its Blocks were
+;; spliced in as `[]`: a whole chapter vanished from the output while the
+;; build still exited 0, unlike the identical content converted on its own,
+;; which is a hard failure. Content the author wrote and intended to ship is
+;; not the same kind of "nothing to lose" as a file that never existed or a
+;; cycle that closes on itself (both of THOSE genuinely have no content to
+;; drop), so it does not get the same warn-and-drop treatment: `expand-one`
+;; below re-throws anything `:load` raises that is not a `java.io.IOException`
+;; (a missing file, a directory, a permission error -- exactly what `slurp`
+;; itself throws for each, confirmed against a real `slurp`), naming the
+;; offending file, and lets it propagate uncaught the same way an emit-stage
+;; error inside an included file already does (this namespace's own prior
+;; asymmetry finding). Catching by JVM exception type rather than adding a
+;; parser dependency here keeps the "free of `haselnuss.parser`" property
+;; this namespace's own docstring already commits to, while still matching
+;; exactly what `haselnuss.cli`'s real `:load` (`slurp` then `parser/parse`)
+;; actually raises for each case.
 
 (declare expand-blocks)
 
@@ -374,16 +396,46 @@
 
   Two failures produce a warning and drop the offending `:include`
   rather than throwing, so one bad reference does not cost an author the
-  rest of the build:
+  rest of the build -- neither has any content to lose:
 
   - `{:type :unreadable-include :src :path :message}` when `:load`
-    throws -- a missing file, a directory, a permission error, or a
-    parse error in the included document (AC #4).
+    throws a `java.io.IOException` -- a missing file, a directory, or a
+    permission error (AC #4). Exactly what a real `slurp` itself throws
+    for each (confirmed against a real `slurp`), which is what
+    `haselnuss.cli`'s own `:load` is built from.
   - `{:type :include-cycle :src :path :cycle :message}` when a file is
     already being expanded further up the stack (AC #3). Detected by
     canonical path, so a diamond -- two chapters including one shared
     file -- expands twice as it should, while a true loop stops at the
     edge that closes it.
+
+  A file that WAS read but failed to parse is neither of those (TASK-105
+  AC #1): `:load` throwing anything other than a `java.io.IOException` --
+  a malformed YAML front matter, an unsupported inline construct, any
+  other `haselnuss.parser/parse` failure -- propagates OUT of this
+  function uncaught, naming the offending file
+  (`::unparseable-include`'s own message), rather than being warned about
+  and spliced in as `[]`. Content the author wrote and intended to ship
+  is not the same kind of \"nothing to lose\" the two diagnostics above
+  are for, so it gets the same fate an emit-stage error inside an
+  included file already had before this task: the build stops rather
+  than silently dropping a chapter and exiting 0. This is true at any
+  include depth (TASK-105 AC #3) for free -- nothing here catches it on
+  the way back up through a chain of recursive `expand` calls.
+
+  That thrown `ex-info`'s own `ex-data` also carries `:warnings` -- every
+  `:unreadable-include`/`:include-cycle` THIS call already collected
+  from an earlier sibling include anywhere in the walk, before the fatal
+  one was reached (review finding on TASK-105, fixed same-day): without
+  it, an earlier warning was silently lost the moment a later include in
+  the same document turned out to be unparseable, since the normal
+  return -- the only place `warnings` was otherwise read back out of its
+  `volatile!` -- never happens once anything throws. A caller that
+  catches this exception (`haselnuss.cli/run` does, mirroring its own
+  `lower`/emit try/catch precedent) is expected to fold `:warnings` back
+  into whatever diagnostics it reports alongside the failure, the same
+  way `pdflatex` still shows every earlier warning on the way to a fatal
+  one instead of only the last line before it stopped.
 
   What the cycle guard bounds is recursion *depth*, not total work: a
   cycle-free DAG where each of N files includes the same two children
@@ -413,13 +465,61 @@
                             :message (str "include cycle: " (pr-str src) " is already being"
                                           " included, via " (str/join " -> " (conj (vec stack) path)))})
                     (let [included (try (load-document file)
-                                        (catch Exception e
+                                        ;; A missing file, a directory, a
+                                        ;; permission error -- confirmed
+                                        ;; against a real `slurp` to be
+                                        ;; exactly what it throws for
+                                        ;; each. Nothing here reads as
+                                        ;; content lost, so this stays a
+                                        ;; warning (TASK-105 AC #2).
+                                        (catch java.io.IOException e
                                           (warn! {:type :unreadable-include
                                                   :src src
                                                   :path path
                                                   :message (str "cannot include " (pr-str src)
                                                                 " (" path "): " (ex-message e))})
-                                          ::failed))]
+                                          ::failed)
+                                        ;; Anything else `:load` threw is a
+                                        ;; file that WAS read but failed to
+                                        ;; PARSE -- content the author
+                                        ;; wrote, so this does NOT warn and
+                                        ;; drop; it names the file and
+                                        ;; propagates, failing the build
+                                        ;; the same way the identical
+                                        ;; content fails on its own
+                                        ;; (TASK-105 AC #1/#3). `:warnings`
+                                        ;; is `@warnings` AT THIS INSTANT,
+                                        ;; not `[]` -- every
+                                        ;; `:unreadable-include`/
+                                        ;; `:include-cycle` this SAME
+                                        ;; `expand-includes` call already
+                                        ;; collected from an earlier
+                                        ;; sibling include, anywhere in the
+                                        ;; walk, before this one failed.
+                                        ;; Without this a warning for an
+                                        ;; earlier, unrelated bad include
+                                        ;; in the same document vanished
+                                        ;; the moment a LATER one turned
+                                        ;; out to be unparseable, since
+                                        ;; `expand-includes` never reaches
+                                        ;; its own normal return -- and
+                                        ;; hence never returns `@warnings`
+                                        ;; at all -- once anything throws
+                                        ;; (review finding on this task).
+                                        ;; `haselnuss.cli/run` reads this
+                                        ;; back out of `(ex-data e)` to
+                                        ;; fold it into `::diagnostics`
+                                        ;; alongside every other pass's,
+                                        ;; the same precedent its own
+                                        ;; `lower`/emit try/catches already
+                                        ;; set.
+                                        (catch Exception e
+                                          (throw (ex-info
+                                                  (str "cannot include " (pr-str src)
+                                                       " (" path "): " (ex-message e))
+                                                  {:type ::unparseable-include :src src :path path
+                                                   :warnings @warnings}
+                                                  e))))]
                       (if (= ::failed included)
                         []
                         ;; Recur with the included file's OWN directory
@@ -490,11 +590,14 @@
   `prepend`/`append` accumulate their own nested `:blocks` under `:prepend`/
   `:append`; `describe` merges every prop other than `target` from its own
   `attr.props` into `:props`, via a plain `merge` -- a later `describe`
-  aimed at the same id and the same prop key silently wins over an earlier
-  one AT THIS STAGE (this pass has no notion yet of what the base document
-  already carries). The one prop collision doc-5/AC #3 actually asks to be
-  diagnosed -- a `describe` prop colliding with a value already set on the
-  TARGET NODE itself -- can only be checked once splicing has found that
+  aimed at the same id and the same prop key wins over an earlier one AT
+  THIS STAGE (this pass has no notion yet of what the base document
+  already carries), same last-wins accumulation order as `prepend`/
+  `append` (TASK-110: winner unchanged, but no longer SILENT -- see
+  `:describe-prop-overwritten` below). The other prop collision doc-5/
+  AC #3 asks to be diagnosed -- a `describe` prop colliding with a value
+  already set on the TARGET NODE itself, e.g. a value the base document's
+  own author wrote -- can only be checked once splicing has found that
   node, so `:overlay-prop-overwritten` is produced by `splice-overlay-block`
   (see `merge-overlay-props`), not here. A `describe` with `target=` but no
   other props contributes nothing to the plan at all -- there is nothing to
@@ -502,10 +605,12 @@
   OTHER overlay directive also targets it) `apply-overlays` reports it as a
   `:dangling-overlay-target` like any other id nothing ends up matching.
 
-  Three non-fatal diagnostics, each dropping only the offending block
-  rather than the rest of the overlay (this codebase's own
-  diagnose-don't-silently-drop convention, `expand-includes`'s own
-  precedent), shared across all three recognized directive names:
+  Four non-fatal diagnostics, each dropping only the offending block (or,
+  for `:describe-prop-overwritten`, only the offending KEY -- the rest of
+  that directive's props still merge) rather than the rest of the
+  overlay (this codebase's own diagnose-don't-silently-drop convention,
+  `expand-includes`'s own precedent), shared across all three recognized
+  directive names except where noted:
   - `:overlay-directive-id-ignored` -- a `prepend`/`append`/`describe`
     directive that carries its OWN `attr.id` (e.g. `:::{prepend #foo
     target=ch:x}`): that id is discarded once the directive node itself
@@ -521,7 +626,22 @@
     recognized directive (`overlay-directive-block?`) -- including a
     directive whose name is not `prepend`/`append`/`describe` at all.
     This is what keeps \"the base document never sees a stray paragraph
-    from an overlay file\" airtight: dropped here, never merged in."
+    from an overlay file\" airtight: dropped here, never merged in.
+    TASK-112: when the dropped block IS a `:directive` (a misspelled or
+    unrelated name, e.g. `:::{sprinkle target=ch:intro}`), the message
+    names it and, when it carries one, its `target=` -- the only string
+    an author has to search their overlay files for. A stray paragraph
+    has no name to add, so that case is unchanged.
+  - `:describe-prop-overwritten` -- `describe`-only: a prop key already
+    written into the plan for this `target` by an EARLIER `describe`
+    directive (own file or an earlier `--overlay`) is about to be
+    overwritten by a later one. TASK-110: before this, the pre-splice
+    `merge` above made this silent -- indistinguishable, at build-output
+    time, from an author never having written the earlier value at all,
+    unlike the exact same kind of collision against the base document's
+    own value, which `:overlay-prop-overwritten` already caught. The
+    later value still wins (accumulation order, unchanged) -- this is a
+    disclosure, not a merge policy change."
   [sources]
   (let [warnings (volatile! [])
         warn! (fn [w] (vswap! warnings conj w))
@@ -550,12 +670,32 @@
               :describe
               (let [extra-props (dissoc (get-in block [:attr :props]) "target")]
                 (when (seq extra-props)
+                  (let [already-set (get-in @plan [target :props] {})]
+                    (doseq [k (keys extra-props)]
+                      (when (contains? already-set k)
+                        (warn! {:type :describe-prop-overwritten
+                                :id target
+                                :key k
+                                :message (str "describe overlay prop \"" k "\" for \"" target
+                                              "\" was set by an earlier describe overlay"
+                                              " directive too -- the earlier value was"
+                                              " overwritten")}))))
                   (vswap! plan update-in [target :props] (fnil merge {}) extra-props))))))
-        (warn! {:type :overlay-unexpected-content
-                :node-type (:t block)
-                :message (str "unexpected top-level " (name (:t block)) " in an overlay file"
-                              " (only prepend/append/describe directives are recognized there);"
-                              " it was dropped")})))
+        (if (= :directive (:t block))
+          (let [target (get-in block [:attr :props "target"])]
+            (warn! {:type :overlay-unexpected-content
+                    :node-type (:t block)
+                    :directive (:name block)
+                    :target target
+                    :message (str "unexpected top-level directive \"" (:name block) "\""
+                                  (when-not (str/blank? target) (str " (target=" target ")"))
+                                  " in an overlay file (only prepend/append/describe"
+                                  " directives are recognized there); it was dropped")}))
+          (warn! {:type :overlay-unexpected-content
+                  :node-type (:t block)
+                  :message (str "unexpected top-level " (name (:t block)) " in an overlay file"
+                                " (only prepend/append/describe directives are recognized there);"
+                                " it was dropped")}))))
     {:plan @plan :warnings @warnings}))
 
 (def ^:private describable-block-types
@@ -715,10 +855,11 @@
   overlay file exists on disk, as long as it is never named.
 
   `warnings` is `overlay-plan`'s own (`:overlay-directive-id-ignored`/
-  `:overlay-missing-target`/`:overlay-unexpected-content`), in the order
-  it produced them, followed by every `:overlay-prop-overwritten`
-  diagnostic `merge-overlay-props` produced during splicing, in traversal
-  order, followed by one `:dangling-overlay-target` diagnostic per plan
+  `:overlay-missing-target`/`:overlay-unexpected-content`/
+  `:describe-prop-overwritten`), in the order it produced them, followed
+  by every `:overlay-prop-overwritten` diagnostic `merge-overlay-props`
+  produced during splicing, in traversal order, followed by one
+  `:dangling-overlay-target` diagnostic per plan
   key that matched no describable node in `document` at all -- checked
   only after splicing finishes, since only then is it certain nothing in
   `document` (including a node nested inside another overlay's own

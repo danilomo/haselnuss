@@ -42,18 +42,22 @@
     `derive-toc`'s own default arity, disagreed.
 
   `lower`'s own `:transform-rules` option is deliberately NOT exposed
-  here (TASK-44 AC #4). Not an oversight, and not deferred work waiting
-  on a flag: an authored `.hdoc` cannot declare a `:fallback` of any
-  kind, because `haselnuss.parser` constructs no `:fallback` field at
-  all (see `haselnuss.lower`'s own docstring on being parser-inert), so
-  a `:transform` fallback is unreachable from a document this namespace
-  can be handed. A CLI option would be plumbing to a place no input can
-  get to -- and it would have to mean \"load and evaluate Clojure from
-  a path\", since a transform rule is a function, which is a large step
-  for a document converter to take for a feature no document can use.
-  The option becomes worth adding the day authored fallbacks do; until
-  then, an API caller reaches `lower` directly, which is how
-  `haselnuss.degradation-test` covers the variant.
+  here (TASK-44 AC #4) -- a different mechanism from the `--transform`
+  CLI flag below (TASK-103) despite the similar name: `lower`'s is about
+  RENDERING a Fallback node's `:transform` variant (sec8.3), never
+  authored from `.hdoc` at all; `--transform` is about REWRITING the
+  parsed document before resolve/lower/emit ever run. Not an oversight,
+  and not deferred work waiting on a flag: an authored `.hdoc` cannot
+  declare a `:fallback` of any kind, because `haselnuss.parser` constructs
+  no `:fallback` field at all (see `haselnuss.lower`'s own docstring on
+  being parser-inert), so a `:transform` fallback is unreachable from a
+  document this namespace can be handed. A CLI option would be plumbing to
+  a place no input can get to -- and it would have to mean \"load and
+  evaluate Clojure from a path\", since a transform rule is a function,
+  which is a large step for a document converter to take for a feature no
+  document can use. The option becomes worth adding the day authored
+  fallbacks do; until then, an API caller reaches `lower` directly, which
+  is how `haselnuss.degradation-test` covers the variant.
 
   Diagnostics vs errors (AC #4/#5) follow the split
   `haselnuss.resolver` and `haselnuss.lower` already drew between them:
@@ -63,7 +67,13 @@
   a section whose id prefix names a division other than the one its
   level is emitted as -- printed to stderr, and the build still produces its output
   file and exits 0, exactly as `pdflatex` finishes a document with
-  undefined references. An `ex-info` from any pass -- `lower`'s
+  undefined references. `run`'s own `irrelevant-flag-diagnostics`
+  (TASK-108) is the same kind of warning for a different source: a flag
+  that cannot affect the chosen target -- `--overlay`/`--extensions` on
+  `--target json`/`hdoc`, `--computed-numbers`/`--fragment` off `latex`,
+  `--no-stylesheet` off `html`, `--trusted-extensions` with no
+  `--extensions` at all -- rather than something the resolver found
+  inside the document. An `ex-info` from any pass -- `lower`'s
   `::no-representation` for a directive with no representation and no
   fallback, an emitter's `::unsupported-block`/`::unresolved-include`, a
   malformed directive from the parser -- is unrecoverable: nothing is
@@ -71,34 +81,44 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.walk :as walk]
+            [haselnuss.emit.hdoc :as hdoc]
             [haselnuss.emit.html :as html]
             [haselnuss.emit.latex :as latex]
             [haselnuss.extensions.collapsable :as collapsable]
             [haselnuss.extensions.front-matter :as front-matter]
+            [haselnuss.extensions.rules :as rules]
             [haselnuss.extensions.sidecar :as sidecar]
             [haselnuss.extensions.small-collapsable :as small-collapsable]
             [haselnuss.json :as json]
             [haselnuss.lower :as lower]
             [haselnuss.parser :as parser]
             [haselnuss.registry :as registry]
-            [haselnuss.resolver :as resolver])
+            [haselnuss.resolver :as resolver]
+            [haselnuss.sandbox :as sandbox]
+            [haselnuss.transform :as transform])
   (:gen-class))
 
 (def targets
   "The emission targets this CLI supports, each mapping to the file
   extension `output-path` gives its output when none was requested.
 
-  `json` (TASK-80) is not a rendering target like the other two: it
-  writes the parsed Document's own JSON interchange representation
-  (`haselnuss.json/->json`, SPEC.md sec11), with no resolve or lower
-  pass run over it at all -- see `run`'s own `emit-target` branch. Its
-  prose is written more compactly than `haselnuss.json`'s own faithful
-  encoding would: consecutive word/space Inlines (CommonMark's own
-  per-word tokenization) are folded into single `:str` runs before
-  encoding -- see `coalesce-prose`."
+  `json` (TASK-80) and `hdoc` (TASK-98) are not rendering targets like
+  `html`/`latex`: both write the parsed Document exactly AS PARSED, with
+  no resolve or lower pass run over it at all, and no
+  `haselnuss.registry` -- see `run`'s own `emit-target` branch. `json`
+  writes `haselnuss.json/->json`'s interchange representation (SPEC.md
+  sec11), its prose folded more compactly than that encoding's own
+  faithful round trip -- see `coalesce-prose`. `hdoc` (`haselnuss.emit.
+  hdoc/emit-document`) instead writes canonical `.hdoc` SOURCE -- the
+  same format `.hdoc` documents are authored in -- so it is a formatter
+  and, once transform rules exist, the write side of a scripted
+  transformation, rather than an interchange dump; see that namespace's
+  own docstring (\"THE CONTRACT\") for why it stops at exactly the same
+  point json does."
   {"html" {:target :html :extension ".html"}
    "latex" {:target :latex :extension ".tex"}
-   "json" {:target :json :extension ".json"}})
+   "json" {:target :json :extension ".json"}
+   "hdoc" {:target :hdoc :extension ".hdoc"}})
 
 (defn- environment-title
   "The head word a mapped environment prints of its own accord (its
@@ -445,12 +465,19 @@
    "\n"
    ["Usage: haselnuss [options] INPUT.hdoc"
     ""
-    "Converts a Haselnuss document to HTML, LaTeX, or its own JSON interchange"
-    "representation."
+    "Converts a Haselnuss document to HTML, LaTeX, its own JSON interchange"
+    "representation, or canonical .hdoc source."
     ""
     "Options:"
-    "  -t, --target TARGET     html (default), latex, or json"
-    "  -o, --output PATH       output file (default: INPUT with the target's extension)"
+    "  -t, --target TARGET     html (default), latex, json, or hdoc"
+    "  -o, --output PATH       output file (default: INPUT with the target's extension)."
+    "                          - writes the converted document to stdout instead, for"
+    "                          any target"
+    "      --in-place          write the converted document back over INPUT itself."
+    "                          Implies --target hdoc when no --target is given; refused,"
+    "                          naming the conflict, together with --output or a --target"
+    "                          other than hdoc. The only way to lift the input-overwrite"
+    "                          refusal below."
     "      --computed-numbers  latex only: bake in the resolver's computed numbers and"
     "                          citation text instead of emitting \\Cref/\\cite for LaTeX"
     "                          and BibTeX to resolve. Use this when the same document is"
@@ -465,14 +492,24 @@
     "                          meta.bibliography)"
     "      --overlay PATH      a .hdoc overlay file patching the base document via"
     "                          prepend/append/describe directives (repeatable; see"
-    "                          README \"Overlays\"). No effect on --target json."
+    "                          README \"Overlays\"). No effect on --target json or hdoc."
     "      --extensions PATH   a sidecar .clj file defining author directives, evaluated"
     "                          in a sandbox with no host interop, file, process or"
     "                          classpath access (repeatable; see README \"Author-defined"
-    "                          extensions\"). No effect on --target json."
+    "                          extensions\"). No effect on --target json or hdoc."
     "      --trusted-extensions  allow every --extensions file loaded this run to emit"
     "                          verbatim, unescaped output; off by default, and never"
     "                          settable by the sidecar file itself"
+    "      --transform PATH    a sidecar .clj file defining rules that select and rewrite"
+    "                          nodes of the parsed document before any other pass runs"
+    "                          (repeatable; applied in file order, then declaration order"
+    "                          within a file; see README \"Scripted transformations\")."
+    "                          Runs on EVERY target, including json and hdoc -- unlike"
+    "                          --overlay/--extensions, it has an effect there too, since"
+    "                          it is the only pass that runs before either at all. Shares"
+    "                          --extensions' own sandbox, with no host interop, file,"
+    "                          process or classpath access; --trusted-extensions grants"
+    "                          a transform nothing, since it never emits verbatim output"
     "      --no-stylesheet     html only: omit the default stylesheet the emitter"
     "                          otherwise inlines, for embedding the output in a page"
     "                          that brings its own CSS"
@@ -483,13 +520,58 @@
     "no resolve or lower pass runs over it, so it carries no computed numbers,"
     "cross-reference text or bibliography, and --computed-numbers, --fragment"
     "and --no-stylesheet have no effect on it. Prose is written compactly:"
-    "consecutive word/space tokens are folded into plain :str text runs."
+    "consecutive word/space tokens are folded into plain :str text runs. A"
+    "meta.bibliography this document declares need not exist on disk for this"
+    "target -- unlike html/latex, it never reads the file's content, only (if"
+    "the file happens to be present) which bare @word tokens are citations."
+    ""
+    "The hdoc target writes the parsed document back out as canonical .hdoc"
+    "source, the same pre-resolve, pre-lower AST the json target dumps -- and"
+    "the same tolerance of a missing meta.bibliography file, unchanged in the"
+    "output either way -- so --computed-numbers, --fragment, --no-stylesheet"
+    "and --overlay have no effect on it either. It re-spells canonically"
+    "rather than preserving the original bytes (one emphasis delimiter, ATX"
+    "headings, ...), so it is a formatter for .hdoc, not an identity"
+    "transform; running it with no --output is refused by the same overwrite"
+    "guard that protects every other target's input, since here the derived"
+    "output path shares the input's own extension."
+    ""
+    "--in-place lifts that one refusal, deliberately: it writes the converted"
+    "document back over the file it was read from, so it is the only flag in"
+    "this tool whose whole job is destroying the document you gave it. It"
+    "implies --target hdoc when no --target is given -- only hdoc output can"
+    "honestly overwrite a document being read as one -- and is refused, naming"
+    "the conflict, together with --output (two destinations is a mistake, not"
+    "a merge) or with any --target other than hdoc. The write itself goes"
+    "through a temp file in the SAME directory as the input, moved into place"
+    "atomically only once the whole build has succeeded, so a build that fails"
+    "partway -- a parse error, an unrepresentable construct, a full disk --"
+    "leaves the input exactly as it was. Without --in-place, --target hdoc"
+    "keeps refusing to overwrite its own input, as above."
+    ""
+    "--output - writes the converted document to stdout, the POSIX convention,"
+    "for every target -- and nothing else: the \"haselnuss: wrote <path>\" lines"
+    "below print to stderr instead, same as a warning or an error, so stdout"
+    "carries the document alone and a build can be piped. The overwrite and"
+    "bibliography-collision guards above do not apply, since - is not a path on"
+    "disk. A build that would also have to write a companion file -- a native-"
+    "mode LaTeX bibliography, a --fragment preamble, a front-matter side file --"
+    "is refused instead, naming the file that has nowhere to go, rather than"
+    "writing the document and silently dropping its companions. A literal file"
+    "named - is unaffected: pass ./- (a different string) or --output=- (an"
+    "explicit value, exempt from this convention the same way --flag=value is"
+    "already exempt from the next-argument-looks-like-a-flag check above)."
     ""
     "Resolver diagnostics (dangling references and citations, duplicate ids,"
     "unknown directives, id-prefix/role mismatches, directives whose id prefix"
     "names a different kind than the directive does, sections whose id prefix"
     "names a different division than their own level is emitted as) are printed"
     "to stderr as warnings on the html/latex targets; the build still succeeds."
+    ""
+    "A flag given that has no effect on the chosen target -- each option's own"
+    "note above -- is reported the same way, on every target: a warning on"
+    "stderr, the build unaffected. So is --trusted-extensions given with no"
+    "--extensions at all: the privilege it grants has nothing to apply to."
     ""
     "Exit codes:"
     "  0  the document was converted and written"
@@ -499,8 +581,8 @@
 
 (defn- parse-args
   "Parses `args` into `{:input :target :output :computed-numbers
-  :bibliography :overlay :extensions :trusted-extensions :help :version
-  :no-stylesheet :fragment}`, or throws
+  :bibliography :overlay :extensions :trusted-extensions :transform :help
+  :version :no-stylesheet :fragment :in-place}`, or throws
   `ex-info` (`:type ::usage-error`) for
   an unknown flag, a flag missing its value, a target that is not in
   `targets`, or anything other than exactly one positional input.
@@ -514,10 +596,33 @@
   bare `--` ending option parsing so an input path may start with a
   dash, and a check that an option's value is not itself a flag -- so
   `-t -o out.html doc.hdoc` reports the missing value rather than
-  silently setting the target to `\"-o\"`."
+  silently setting the target to `\"-o\"`.
+
+  `-o`/`--output` carries one further exception to that last rule
+  (TASK-100): a bare `-`, given as its OWN token (`-o -`/`--output -`),
+  is the one value this parser lets through despite looking flag-shaped
+  -- the POSIX convention for \"this stream, not a file\", read by
+  `output-path` as a request to write to stdout. Given instead as
+  `--output=-`, it is an ORDINARY value like any other, naming a literal
+  file called `-` in the working directory (as does `-o ./-`, since
+  `./-` is a different string than `-`) -- the `=` form is already
+  exempt from the flag-shaped check above (its value cannot be mistaken
+  for the next flag, having no separate token to be one), so this is the
+  one value where that existing exemption changes what gets built,
+  rather than only who is exempt from a rejection.
+
+  `:target` carries no default of its own here any more (TASK-101): the
+  DEFAULT html/hdoc split -- `--in-place` with no `--target` given
+  implies `hdoc`, everything else implies `html` -- is computed once, at
+  the bottom of this function, from whichever of `:target`/`:in-place`
+  the loop actually collected, precisely so that split can tell an
+  EXPLICIT `--target html` (refused alongside `--in-place`, see below)
+  apart from no `--target` at all (silently becomes `hdoc`) -- a
+  distinction a pre-seeded `\"html\"` default would have erased before
+  this function ever saw it."
   [args]
   (loop [[arg & more :as remaining] args
-         opts {:target "html"}
+         opts {}
          literal? false]
     (let [[arg inline-value] (if (and (not literal?) (str/starts-with? (str arg) "--")
                                       (str/includes? (str arg) "="))
@@ -525,16 +630,18 @@
                                [arg nil])
           _ (when (and inline-value
                        (contains? #{"--help" "--version" "--computed-numbers"
-                                    "--no-stylesheet" "--fragment" "--trusted-extensions"}
+                                    "--no-stylesheet" "--fragment" "--trusted-extensions"
+                                    "--in-place"}
                                   arg))
               ;; A value on a flag that takes none must be an error, not
               ;; silently discarded: `--computed-numbers=false` turned
               ;; the flag ON (found by review).
               (throw (ex-info (str "option " arg " takes no value") {:type ::usage-error})))
-          take-value (fn [flag]
+          take-value (fn [flag & {:keys [allow-dash?]}]
                        (cond
                          inline-value [inline-value more]
-                         (and (seq more) (not (str/starts-with? (first more) "-")))
+                         (and (seq more) (or (and allow-dash? (= "-" (first more)))
+                                             (not (str/starts-with? (first more) "-"))))
                          [(first more) (rest more)]
                          :else (throw (ex-info (str "option " flag " requires a value")
                                                {:type ::usage-error}))))]
@@ -547,11 +654,33 @@
           (:help opts) opts
           (:version opts) opts
           (nil? (:input opts)) (throw (ex-info "no input file given" {:type ::usage-error}))
-          (nil? (targets (:target opts)))
-          (throw (ex-info (str "unknown target " (pr-str (:target opts))
-                               " (expected one of: " (str/join ", " (sort (keys targets))) ")")
+          ;; TASK-101: --in-place's own two refusals are checked BEFORE
+          ;; the generic unknown-target check below, both because they
+          ;; are the more specific, more actionable message or an
+          ;; explicit --target that also happens to be bogus, and
+          ;; because an explicit --target other than hdoc need not even
+          ;; be a KNOWN target for this to be the right thing to say --
+          ;; "requires --target hdoc" already implies it.
+          (and (:in-place opts) (:output opts))
+          (throw (ex-info "--in-place cannot be combined with --output: pass one destination, not two"
                           {:type ::usage-error}))
-          :else opts)
+          (and (:in-place opts) (:target opts) (not= "hdoc" (:target opts)))
+          (throw (ex-info (str "--in-place requires --target hdoc, since only hdoc output can"
+                               " honestly overwrite the input it was read from; got --target "
+                               (pr-str (:target opts)))
+                          {:type ::usage-error}))
+          :else
+          (let [;; The one place `:target` gets its default (TASK-101):
+                ;; an explicit --target wins outright; absent one,
+                ;; --in-place implies hdoc (the only target that can
+                ;; honestly overwrite the input it was read from) and
+                ;; every other build keeps the pre-TASK-101 default.
+                target (or (:target opts) (if (:in-place opts) "hdoc" "html"))]
+            (when (nil? (targets target))
+              (throw (ex-info (str "unknown target " (pr-str target)
+                                   " (expected one of: " (str/join ", " (sort (keys targets))) ")")
+                              {:type ::usage-error})))
+            (assoc opts :target target)))
 
         (and (not literal?) (= "--" arg)) (recur more opts true)
 
@@ -566,8 +695,14 @@
           (recur rest-args (assoc opts :target value) literal?))
 
         (and (not literal?) (contains? #{"-o" "--output"} arg))
-        (let [[value rest-args] (take-value arg)]
-          (recur rest-args (assoc opts :output value) literal?))
+        (let [[value rest-args] (take-value arg :allow-dash? true)]
+          ;; TASK-100: `-` as its OWN token means stdout; `--output=-`
+          ;; takes `inline-value`'s branch of `take-value` instead, never
+          ;; reaching the flag-shaped check `allow-dash?` widens, so it
+          ;; stays an ordinary value naming a literal file called `-`.
+          (recur rest-args
+                 (assoc opts :output (if (and (not inline-value) (= "-" value)) :stdout value))
+                 literal?))
 
         (and (not literal?) (= "--bibliography" arg))
         (let [[value rest-args] (take-value arg)]
@@ -591,6 +726,25 @@
         (and (not literal?) (= "--trusted-extensions" arg))
         (recur more (assoc opts :trusted-extensions true) literal?)
 
+        ;; TASK-103: the third repeatable flag, exactly `--extensions`'s
+        ;; own shape -- an author may apply more than one transform file
+        ;; to a single build, in the order given (AC #1). No trust flag
+        ;; of its own (this namespace's own `usage` text, and
+        ;; `haselnuss.extensions.rules`'s own docstring, NO TRUST FLAG IS
+        ;; INVOLVED): `--trusted-extensions` is read only where `--
+        ;; extensions` is loaded, below.
+        (and (not literal?) (= "--transform" arg))
+        (let [[value rest-args] (take-value arg)]
+          (recur rest-args (update opts :transform (fnil conj []) value) literal?))
+
+        ;; TASK-101: a boolean flag, the same shape as --trusted-
+        ;; extensions above -- the target-defaulting and the two
+        ;; refusals it drives are all in the final `(empty? remaining)`
+        ;; branch, once every flag (including a LATER --target) has been
+        ;; seen.
+        (and (not literal?) (= "--in-place" arg))
+        (recur more (assoc opts :in-place true) literal?)
+
         (and (not literal?) (= "--computed-numbers" arg))
         (recur more (assoc opts :computed-numbers true) literal?)
 
@@ -610,18 +764,46 @@
 
         :else (recur more (assoc opts :input arg) literal?)))))
 
-(defn- output-path
-  "The path to write to: `opts`' own `:output` when given, else `:input`
-  with its extension replaced by the target's own (`targets`). An input
-  with no extension simply gains one.
+(defn- derived-output-path
+  "Where `output-path` writes when `opts` gives no explicit `:output`:
+  `input` with its extension replaced by the target's own (`targets`).
+  An input with no extension simply gains one.
 
   Stripping is guarded against a dotfile (`.hidden`), where the regex
   would otherwise consume the whole name and write a hidden `.html` in
   the *current directory* instead of beside the input -- the same
   empty-after-stripping trap `haselnuss.emit.latex/bib-resource-name`
-  already guards (its own TASK-23 review finding). The chosen path --
-  derived or explicit -- is then checked against the input, so a build
-  can never overwrite the document it is reading.
+  already guards (its own TASK-23 review finding).
+
+  Also `build`'s own name for what a companion file (a native-mode
+  `.bib`, a `--fragment` preamble, a front-matter side file) would have
+  been called, when `--output -` (TASK-100) has sent the document itself
+  to stdout instead of to a path any of them could sit beside -- see its
+  own `nominal-path`. Deriving that name from `input` rather than from
+  the literal `\"-\"` `output-path` returns in that case is what keeps a
+  refusal readable: \"doc.bib has nowhere to go\", not \"--bib has
+  nowhere to go\"."
+  [input target]
+  (let [file (io/file input)
+        parent (.getParent file)
+        base-name (.getName file)
+        stripped (str/replace base-name #"\.[^.]*$" "")
+        new-name (str (if (str/blank? stripped) base-name stripped)
+                      (:extension (targets target)))]
+    (if parent (str (io/file parent new-name)) new-name)))
+
+(defn- output-path
+  "The path to write to: `opts`' own `:output` when given, else
+  `derived-output-path`.
+
+  The chosen path -- derived or explicit -- is checked against the
+  input, so a build can never overwrite the document it is reading. That
+  guard matters more for `hdoc` (TASK-98) than for any earlier target:
+  it is the first whose own default extension (`.hdoc`) is the SAME as a
+  typical input's, so `haselnuss doc.hdoc --target hdoc` derives
+  `doc.hdoc` -- the input itself -- and is refused by this same check
+  with no target-specific code, exactly as `-o doc.hdoc doc.hdoc`
+  already is.
 
   `bib-path` (TASK-81), when given, is checked the same way: the json
   target's own default extension is `.json`, the same extension a
@@ -633,33 +815,58 @@
   html/latex practically never collide here (nobody names a CSL-JSON
   file `.html`/`.tex`), but the check is unconditional rather than
   target-gated, since it costs nothing and a target-specific carve-out
-  would be one more thing to keep in sync with `targets`."
-  [{:keys [input output target]} bib-path]
-  (let [file (io/file input)
-        path (or output
-                 (let [parent (.getParent file)
-                       base-name (.getName file)
-                       ;; Stripped from the BASE NAME, never the whole
-                       ;; path: doing it on the path turns ".hidden" into
-                       ;; the directory itself, and the result lands as a
-                       ;; stray ".html" in that directory rather than
-                       ;; beside the input.
-                       stripped (str/replace base-name #"\.[^.]*$" "")
-                       new-name (str (if (str/blank? stripped) base-name stripped)
-                                     (:extension (targets target)))]
-                   (if parent (str (io/file parent new-name)) new-name)))]
-    ;; Checked on the FINAL path, whichever branch chose it. Guarding
-    ;; only the derived one left `-o victim.hdoc victim.hdoc` destroying
-    ;; its own source -- while the message told the user to pass exactly
-    ;; that flag (found by review).
-    (when (= (.getAbsolutePath (io/file path)) (.getAbsolutePath file))
-      (throw (ex-info (str "refusing to overwrite the input file: " input)
-                      {:type ::usage-error})))
-    (when (and bib-path (= (.getAbsolutePath (io/file path)) (.getAbsolutePath (io/file bib-path))))
-      (throw (ex-info (str "refusing to overwrite the bibliography file: " bib-path
-                           " -- pass --output to write the converted document elsewhere")
-                      {:type ::usage-error})))
-    path))
+  would be one more thing to keep in sync with `targets`.
+
+  Neither guard applies to `--output -` (TASK-100, AC #3): both are
+  about a path on disk, `:stdout` is not one, and `derived-output-path`
+  is never even consulted -- there is no `:output`-less derivation to
+  guard, since `-` came from `opts` explicitly. `:stdout` itself is
+  returned unchanged, for `build` to recognize; a caller wanting the
+  display string for a message reads it off `opts` (`\"-\"`) or writes
+  its own, rather than this function inventing one no guard ever
+  checked.
+
+  `:in-place` (TASK-101) is the ONE flag that lifts the overwrite-input
+  guard above, and only that one: `path` becomes `input` itself,
+  bypassing `derived-output-path` entirely (an in-place build overwrites
+  the exact file it read, whatever its own extension -- it does not
+  reach for `.hdoc`, the way an ordinary `--target hdoc` build with no
+  `--output` would), and the overwrite-input check below is skipped
+  outright rather than checked and refused. The bibliography-collision
+  guard is NOT lifted -- it is a different guard, about a different
+  file, and `--in-place` says nothing about it. Both of `:in-place`'s own
+  refusals (paired with `:output`, paired with a `:target` other than
+  hdoc) are re-checked here too, even though `parse-args` already
+  refuses both -- `run`/`build` are public, so a caller reaching this
+  directly gets the same guarantee a caller going through the CLI does,
+  the same reason `run` itself re-validates `target` against `targets`."
+  [{:keys [input output target in-place]} bib-path]
+  (when (and in-place output)
+    (throw (ex-info "--in-place cannot be combined with --output: pass one destination, not two"
+                    {:type ::usage-error})))
+  (when (and in-place (not= "hdoc" target))
+    (throw (ex-info (str "--in-place requires --target hdoc, since only hdoc output can honestly"
+                         " overwrite the input it was read from; got --target " (pr-str target))
+                    {:type ::usage-error})))
+  (if (= :stdout output)
+    :stdout
+    (let [file (io/file input)
+          path (if in-place input (or output (derived-output-path input target)))]
+      ;; Checked on the FINAL path, whichever branch chose it. Guarding
+      ;; only the derived one left `-o victim.hdoc victim.hdoc` destroying
+      ;; its own source -- while the message told the user to pass exactly
+      ;; that flag (found by review). Skipped entirely under `:in-place`
+      ;; (TASK-101): deliberately overwriting the input is the whole
+      ;; point of that flag, not a mistake to catch.
+      (when (and (not in-place)
+                 (= (.getAbsolutePath (io/file path)) (.getAbsolutePath file)))
+        (throw (ex-info (str "refusing to overwrite the input file: " input)
+                        {:type ::usage-error})))
+      (when (and bib-path (= (.getAbsolutePath (io/file path)) (.getAbsolutePath (io/file bib-path))))
+        (throw (ex-info (str "refusing to overwrite the bibliography file: " bib-path
+                             " -- pass --output to write the converted document elsewhere")
+                        {:type ::usage-error})))
+      path)))
 
 (defn- bibliography-path
   "The CSL-JSON bibliography file to read for a document whose own
@@ -688,12 +895,27 @@
   a bare `FileNotFoundException` reach the user -- a document that names
   a bibliography and does not get one would otherwise silently produce
   every citation as a dangling `??`, which is a worse failure than
-  stopping."
-  [path]
-  (when path
-    (when-not (.isFile (io/file path))
-      (throw (ex-info (str "bibliography file not found: " path) {:type ::missing-bibliography})))
-    (resolver/load-bibliography path)))
+  stopping.
+
+  `required?` (TASK-107) is false only for `run`'s own json/hdoc
+  branch: neither target resolves a citation, so neither has any use for
+  the file's CONTENT, only (via `vocabulary`'s `:cite-keys`, in `run`)
+  for the same `@word`-is-a-citation classification html/latex would
+  make for the identical document -- worth having when the file happens
+  to be there, but not worth refusing an otherwise-successful build
+  over when it is not (see `run`'s own docstring). So a present file is
+  still loaded, and still fails loudly if it fails to parse as CSL-JSON
+  -- `required?` forgives ABSENCE only, not a bibliography that exists
+  and is broken -- while an absent one quietly yields nil, exactly as if
+  `path` itself had been nil (no bibliography declared at all)."
+  ([path] (load-bibliography! path true))
+  ([path required?]
+   (when path
+     (if (.isFile (io/file path))
+       (resolver/load-bibliography path)
+       (when required?
+         (throw (ex-info (str "bibliography file not found: " path)
+                         {:type ::missing-bibliography})))))))
 
 (defn- load-overlays!
   "Reads and parses every `--overlay` path in `paths` (TASK-83.1, doc-5),
@@ -807,6 +1029,72 @@
   [document]
   (walk/postwalk (fn [x] (cond-> x (vector? x) coalesce-inline-run)) document))
 
+(defn- irrelevant-flag-diagnostic
+  "One `{:type :irrelevant-flag :flag :message}` diagnostic (TASK-108),
+  the same `:type`/`:message` shape every `haselnuss.resolver` diagnostic
+  already uses, so `warn!` prints it exactly like a dangling reference or
+  an unknown directive -- no new stderr shape, no change to the exit
+  code."
+  [flag message]
+  {:type :irrelevant-flag :flag flag :message message})
+
+(defn- irrelevant-flag-diagnostics
+  "One `irrelevant-flag-diagnostic` (TASK-108) per flag in `opts` that
+  `usage` itself already documents as having no effect on `emit-target`,
+  or as granting nothing at all -- the seven spellings that acceptance
+  criterion this task fixed were found for:
+
+  - `--overlay`/`--extensions` given together with `--target json` or
+    `--target hdoc` (AC #1) -- `usage`'s own \"No effect on --target
+    json or hdoc\" for each.
+  - `--computed-numbers`/`--fragment` given on any target but `latex`,
+    or `--no-stylesheet` given on any target but `html` (AC #2) --
+    `usage`'s own \"latex only\"/\"html only\".
+  - `--trusted-extensions` given with no `--extensions` at all (AC #3):
+    the privilege it grants has an empty set of files to apply to,
+    independent of `emit-target` -- true even when an `--extensions` WAS
+    given but is itself irrelevant on this target (the first bullet
+    above already warns about that combination on its own).
+
+  Pure and independent of parsing or file I/O: every one of these is a
+  fact about the flag/target combination alone, decided entirely by
+  `opts` and `emit-target` -- the same information `parse-args` already
+  has by the time it returns (this task's own finding), just never
+  revisited once `run` knows the target. A warning, not a refusal (AC
+  #4): each flag is real and spelled correctly, so the build still
+  produces its output exactly as if the flag had been omitted (AC #5:
+  a build passing only applicable flags triggers none of these, so it
+  returns `[]`, same as the diagnostics list of a build with no
+  irrelevant flag at all)."
+  [opts emit-target]
+  (let [target (:target opts)]
+    (cond-> []
+      (and (contains? #{:json :hdoc} emit-target) (seq (:overlay opts)))
+      (conj (irrelevant-flag-diagnostic
+             "--overlay" (str "--overlay has no effect on --target " target)))
+
+      (and (contains? #{:json :hdoc} emit-target) (seq (:extensions opts)))
+      (conj (irrelevant-flag-diagnostic
+             "--extensions" (str "--extensions has no effect on --target " target)))
+
+      (and (not= :latex emit-target) (:computed-numbers opts))
+      (conj (irrelevant-flag-diagnostic
+             "--computed-numbers"
+             (str "--computed-numbers has no effect on --target " target)))
+
+      (and (not= :latex emit-target) (:fragment opts))
+      (conj (irrelevant-flag-diagnostic
+             "--fragment" (str "--fragment has no effect on --target " target)))
+
+      (and (not= :html emit-target) (:no-stylesheet opts))
+      (conj (irrelevant-flag-diagnostic
+             "--no-stylesheet" (str "--no-stylesheet has no effect on --target " target)))
+
+      (and (:trusted-extensions opts) (empty? (:extensions opts)))
+      (conj (irrelevant-flag-diagnostic
+             "--trusted-extensions"
+             "--trusted-extensions grants nothing with no --extensions given")))))
+
 (defn run
   "The pure core (AC #1/#2/#3): parses `source`, resolves it, lowers it
   for `opts`' own target, and emits it. Returns `{:output :diagnostics
@@ -816,17 +1104,31 @@
   BibTeX database native mode asks for (TASK-42), and (only for a
   `--fragment` LaTeX build, TASK-52) the companion preamble text the
   emitted body's host has to load. Reads nothing but the
-  bibliography the document itself names (see `bibliography-path`),
+  bibliography the document itself names (see `bibliography-path`) --
+  required to be PRESENT for every target except json/hdoc (TASK-107;
+  see this function's own `:json`/`:hdoc` paragraph below) --
   every `opts`' own `:overlay` path (TASK-83.1, `load-overlays!`, non-
-  json target only -- see its own docstring), and every `opts`' own
-  `:extensions` path (TASK-90, `haselnuss.extensions.sidecar/
-  load-extensions`, non-json target only, for the identical reason) --
-  and writes nothing: a caller decides what to do with the result.
-  `:trusted-extensions` (also non-json-only) is forwarded to that call as
-  `:trusted?`, gating whether every sidecar loaded THIS call may emit
-  unescaped output (`haselnuss.registry/register`'s own `:trusted?`); it
-  defaults to false and is never something a sidecar file can set for
-  itself.
+  json/hdoc target only -- see its own docstring), every `opts`' own
+  `:transform` path (TASK-103, `haselnuss.extensions.rules/
+  load-transforms` -- applied via `haselnuss.transform/transform-
+  document` immediately after parsing, on EVERY target, json/hdoc
+  included: see this function's own `:json`/`:hdoc` paragraph below,
+  doc-7 decision 1), and every `opts`' own `:extensions` path (TASK-90,
+  `haselnuss.extensions.sidecar/load-extensions`, non-json/hdoc target
+  only, for the same reason `:overlay` is) -- and writes nothing: a
+  caller decides what to do with the result. `:extensions` and
+  `:transform` share one forked `haselnuss.sandbox` context per call
+  (`sandbox-ctx`, below) rather than each getting its own (doc-7
+  decision 5). `:trusted-extensions` (also non-json/hdoc-only) is
+  forwarded to `load-extensions` as `:trusted?`, gating whether every
+  SIDECAR loaded THIS call may emit unescaped output
+  (`haselnuss.registry/register`'s own `:trusted?`); it defaults to
+  false and is never something a sidecar file can set for itself, and it
+  grants a `--transform` rule nothing at all -- `haselnuss.transform`'s
+  own return-value contract accepts plain AST data only, never a
+  `[:raw ...]` node, so there is nothing for this flag to gate there
+  (`haselnuss.extensions.rules`'s own docstring, NO TRUST FLAG IS
+  INVOLVED).
 
   `opts` additions beyond the CLI's own flags: `:bib-resource`, the
   `\\bibliography{}` argument native mode should name. `build` passes
@@ -839,18 +1141,56 @@
   unrecoverable half of the split this namespace's docstring describes
   (AC #5); `build`/`-main` turn it into a message and an exit code.
 
-  The `:json` target (TASK-80) is a deliberate exception to all of the
-  above: it returns right after `parser/parse`, with `:output` the
-  parsed Document's own JSON interchange representation
-  (`haselnuss.json/->json`, through `coalesce-prose` -- see its own
-  docstring) and empty `:diagnostics` -- no `resolve-document`, no
-  `build-registry`, no `lower`, no emitter runs at all. It still needs
+  The `:json` and `:hdoc` targets (TASK-80, TASK-98) are a deliberate
+  exception to all of the above, and to each other only in which emitter
+  they call: both return right after `parser/parse` and the `--transform`
+  pass immediately following it (TASK-103), with `:diagnostics` exactly
+  that pass's own `:transform-rule-unmatched` diagnostics (`[]` with no
+  `--transform` at all) -- no `resolve-document`, no `build-registry`, no
+  `lower`, no other emitter runs at all. `:json`'s `:output` is the
+  parsed (and possibly transformed) Document's own JSON interchange
+  representation (`haselnuss.json/->json`, through `coalesce-prose` --
+  see its own docstring); `:hdoc`'s is the same Document written back out
+  as canonical `.hdoc` source (`haselnuss.emit.hdoc/emit-document`, given
+  that Document directly -- no `coalesce-prose` step, since that
+  transform exists only to compact the JSON dump). Both still need
   `vocabulary` (so a bare `@key` parses as the same construct it would on
-  any other target), and therefore the same bibliography load `bib-path`/
-  `bibliography` do, but nothing past `parser/parse` -- resolution is
-  what would turn a `CrossRef`'s bare `:label` into resolved `:text`, and
-  the JSON target's whole point is the document exactly as parsed, not
-  that computed view of it."
+  any other target), and therefore the same `bib-path`/`bibliography`
+  computation the rest of this function does, but nothing past
+  `parser/parse`/`--transform` -- resolution is what would turn a
+  `CrossRef`'s bare `:label` into resolved `:text`, and the point of both
+  targets is the document exactly as parsed (or transformed), not that
+  computed view of it. Unlike every other target, though, neither one
+  requires the file to exist at all (TASK-107): the bibliography's own
+  CONTENT never reaches either target's output, only (through
+  `vocabulary`'s `:cite-keys`) which bare `@word` tokens parse as a
+  citation at all, so a file that IS there is still loaded and still
+  used for exactly that classification -- matching html/latex's own
+  reading of the same document -- while one that is not is treated as if
+  `meta.bibliography` had never been declared: `:cite-keys` comes back
+  empty, so no bare `@word` parses as a Cite for this build, the same
+  outcome a document with no bibliography at all already gets. `build`'s
+  own multi-file convention (a chapter whose CSL-JSON lives at the book
+  root) is exactly the case this exists for: formatting one chapter file
+  in isolation, or running it through `--in-place`, no longer requires
+  the bibliography to be sitting right beside it. A file that IS there
+  but fails to parse as CSL-JSON still fails the build loudly on every
+  target, json/hdoc included -- only ABSENCE is forgiven here, not
+  malformed content (`load-bibliography!`'s own docstring). A
+  consequence for `:hdoc` in particular: every flag that only means
+  something to a resolved/lowered build -- `:computed-numbers`, `:fragment`,
+  `:no-stylesheet`, `:overlay` (and, for the same reason,
+  `:extensions`/`:trusted-extensions`, since sidecar loading also sits
+  past this branch) -- is a no-op here, the same way a latex-only flag is
+  already a no-op on `--target html`. Not a SILENT one any more
+  (TASK-108): `flag-diagnostics`/`irrelevant-flag-diagnostics`, bound
+  once in the outer `let` before this branch is even chosen, reports each
+  one given as a warning, the exact contract every other diagnostic in
+  this namespace already follows -- the build still produces this exact
+  output, unaffected. `:transform` is the one flag in that list this
+  branch does NOT no-op: it is the whole reason this branch reads
+  `document` from the outer `let` rather than re-deriving it, rather than
+  the `parser/parse` result directly."
   [source {:keys [target computed-numbers] :as opts}]
   (when-not (targets target)
     ;; `run` and `build` are public, so a caller can reach them without
@@ -861,6 +1201,12 @@
                          " (expected one of: " (str/join ", " (sort (keys targets))) ")")
                     {:type ::usage-error})))
   (let [{emit-target :target} (targets target)
+        ;; TASK-108: a pure, command-line-only fact, so it is computed
+        ;; before anything is even read off disk and leads every other
+        ;; diagnostic below -- the same "ran first, chronologically"
+        ;; ordering `transform-diagnostics` gets for the same reason,
+        ;; one step earlier still since this needs no parse at all.
+        flag-diagnostics (irrelevant-flag-diagnostics opts emit-target)
         ;; Two registries, same extensions: the pre-numbering one only
         ;; supplies directive names and `:kind` fragments, while the
         ;; post-numbering one closes its degradation rules over the real
@@ -882,9 +1228,18 @@
         ;; than the whole document being parsed twice. One consequence,
         ;; small but real: a document with BOTH a parse error and a
         ;; missing bibliography now reports the missing bibliography,
-        ;; where it used to report the parse error.
+        ;; where it used to report the parse error -- true on every
+        ;; target EXCEPT json/hdoc (TASK-107, just below), which never
+        ;; make that report at all.
         bib-path (bibliography-path opts (:bibliography (parser/front-matter source)))
-        bibliography (load-bibliography! bib-path)
+        ;; TASK-107: required everywhere except the json/hdoc branch
+        ;; below, which reads this only for `vocabulary`'s `:cite-keys`
+        ;; (never the bibliography's own content) and, per that branch's
+        ;; own docstring, must not refuse a build over a file it was
+        ;; never going to open. A present file is still loaded either
+        ;; way -- and still fails loudly if it is there but malformed --
+        ;; so only ABSENCE is forgiven, and only for those two targets.
+        bibliography (load-bibliography! bib-path (not (contains? #{:json :hdoc} emit-target)))
         ;; ...but only where this codebase is the authority on what a
         ;; reference resolves to. Native-mode LaTeX is not that case: it
         ;; emits \\Cref/\\citet and lets LaTeX and BibTeX resolve them,
@@ -908,38 +1263,66 @@
                      ;; dangles.
                      {:kinds (into #{} (map name) (keys lexicon))
                       :cite-keys (set (keys bibliography))})
-        document (parser/parse source vocabulary)]
-    (if (= emit-target :json)
-      ;; TASK-80: the JSON target is the raw parsed AST, not a
-      ;; resolved/lowered view -- SPEC.md sec11 treats the JSON
-      ;; representation as the canonical interchange form derived
-      ;; straight from parsing, so no resolver diagnostic, directive
-      ;; registry, or lowering pass applies here at all. `coalesce-prose`
-      ;; is the one exception to "exactly as parsed": it folds CommonMark's
-      ;; own per-word :str/:space tokenization into plain-text :str runs,
-      ;; purely for a more compact dump -- see its own docstring.
-      {:diagnostics []
+        document (parser/parse source vocabulary)
+        ;; TASK-103, doc-7 decision 1: the transform pass runs HERE,
+        ;; immediately after parsing and before the json/hdoc-vs-resolve
+        ;; branch below, so it composes with EVERY target -- including
+        ;; json, the only other target that stops this early, and
+        ;; including a target that resolves and lowers, where a transform
+        ;; still runs on the document exactly as parsed, before any of
+        ;; that computed content exists to be seen. `sandbox-ctx`
+        ;; (`haselnuss.sandbox/fork`, `delay`-wrapped) is shared with
+        ;; `--extensions`' own `sidecar/load-extensions` call below (non-
+        ;; json/hdoc branch only) rather than each forking its own --
+        ;; `haselnuss.sandbox`'s own docstring, ISOLATION -- so a build
+        ;; using neither flag pays no sci init cost at all, and one using
+        ;; both shares a single fork. `rules/load-transforms` with no
+        ;; `--transform` paths at all returns `[]`, and `transform/
+        ;; transform-document` over `[]` rules is a no-op returning
+        ;; `document` unchanged with empty diagnostics -- no special case
+        ;; needed for the common "no --transform" build.
+        sandbox-ctx (delay (sandbox/fork))
+        transform-rules (rules/load-transforms (:transform opts) {:ctx sandbox-ctx})
+        {document :document transform-diagnostics :diagnostics}
+        (transform/transform-document document transform-rules)]
+    (if (contains? #{:json :hdoc} emit-target)
+      ;; TASK-80/TASK-98: the json and hdoc targets are both the raw
+      ;; parsed (and, since TASK-103, transformed) AST, not a resolved/
+      ;; lowered view -- SPEC.md sec11 treats the JSON representation as
+      ;; the canonical interchange form derived straight from parsing, and
+      ;; `haselnuss.emit.hdoc`'s own docstring ("THE CONTRACT") gives the
+      ;; identical reason for stopping at the same point, so no resolver
+      ;; diagnostic, directive registry, or lowering pass applies to
+      ;; either. `coalesce-prose` is a json-only step, folding
+      ;; CommonMark's own per-word :str/:space tokenization into
+      ;; plain-text :str runs purely for a more compact dump -- see its
+      ;; own docstring; `hdoc/emit-document` takes the parsed (and
+      ;; possibly transformed) Document as-is, with no such compaction.
+      {:diagnostics (into (vec flag-diagnostics) transform-diagnostics)
        :bibliography bibliography
        :ordered-keys nil
        :preamble nil
        :front-matter nil
-       :output (json/->json (coalesce-prose document))}
+       :output (case emit-target
+                 :json (json/->json (coalesce-prose document))
+                 :hdoc (hdoc/emit-document document))}
       (let [;; TASK-83.1. Read here, before `resolve-document` runs, and
-            ;; only on this (non-json) branch -- an `--overlay` combined
-            ;; with `--target json` has no effect, matching
-            ;; `--bibliography`'s own existing behavior there (the json
-            ;; target never calls `resolve-document` at all). A missing
-            ;; path is a hard failure (`load-overlays!`'s own `ex-info`);
-            ;; every overlay file's own `!include` warnings are threaded
-            ;; through below, alongside `resolve-document`'s.
+            ;; only on this (non-json/hdoc) branch -- an `--overlay`
+            ;; combined with `--target json` or `--target hdoc` has no
+            ;; effect, matching `--bibliography`'s own existing behavior
+            ;; there (neither target calls `resolve-document` at all). A
+            ;; missing path is a hard failure (`load-overlays!`'s own
+            ;; `ex-info`); every overlay file's own `!include` warnings
+            ;; are threaded through below, alongside `resolve-document`'s.
             {overlay-sources :sources overlay-load-warnings :warnings}
             (load-overlays! (:overlay opts) vocabulary)
         ;; TASK-90. Loaded here too, alongside overlays, for the same
-        ;; --target json exclusion (this whole branch is never reached on
-        ;; that target -- see `usage`'s own "No effect on --target json"
-        ;; for `--extensions`) and because a sidecar-defined directive has
-        ;; to be part of the registry BEFORE `resolve-document` runs, or
-        ;; it is reported as an unknown directive rather than dispatched.
+        ;; --target json/hdoc exclusion (this whole branch is never
+        ;; reached on either target -- see `usage`'s own "No effect on
+        ;; --target json or hdoc" for `--extensions`) and because a
+        ;; sidecar-defined directive has to be part of the registry
+        ;; BEFORE `resolve-document` runs, or it is reported as an
+        ;; unknown directive rather than dispatched.
         ;; A missing `--extensions` path, a malformed extension entry, or
         ;; a sidecar file that fails to evaluate (host interop, a file
         ;; read, a non-terminating top-level form, ...) are all hard
@@ -953,8 +1336,8 @@
         ;; deliberately NOT folded into `lexicon` above -- that is
         ;; computed once, before this branch, from the built-in registry
         ;; only, since `lexicon` also drives `vocabulary` for PARSING,
-        ;; which runs on both targets and is exactly what "no effect on
-        ;; --target json" means to keep true. This is the same
+        ;; which runs on every target and is exactly what "no effect on
+        ;; --target json or hdoc" means to keep true. This is the same
         ;; "without the lexicon a registered kind never numbers" caveat
         ;; this namespace's own docstring already names for `:kind` in
         ;; general (`build-registry`'s own docstring), now also true of
@@ -967,12 +1350,29 @@
         ;; not by inventing a new kind keyword.
             sidecar-extensions (sidecar/load-extensions
                                 (:extensions opts)
-                                {:trusted? (boolean (:trusted-extensions opts))})
+                                {:trusted? (boolean (:trusted-extensions opts))
+                                 :ctx sandbox-ctx})
             directive-registry (registry/register-all base-registry sidecar-extensions)
             {:keys [document diagnostics labels ordered-keys bibliography-id]}
-            (resolver/resolve-document document
-                                       (cond-> {:lexicon lexicon
-                                                :directive-registry directive-registry
+            ;; TASK-105 review finding: `resolve-document`'s only
+            ;; exception-throwing step is `expand-includes`, and once it
+            ;; throws (an included file that exists but fails to parse),
+            ;; its own `:warnings` -- every diagnostic THAT pass already
+            ;; collected from an earlier, unrelated include before the
+            ;; fatal one -- rides along in `(ex-data e)` rather than being
+            ;; lost with the rest of `resolve-document`'s never-reached
+            ;; return. This catch folds it into `::diagnostics` alongside
+            ;; `transform-diagnostics`/`overlay-load-warnings` (the two
+            ;; diagnostic sources that ran even earlier, before
+            ;; `resolve-document` was even called -- see this list's own
+            ;; ordering a few lines below, for the success path), the
+            ;; exact `lower`/emit try/catch precedent just below this one
+            ;; already sets for "warnings collected before a fatal error
+            ;; must still reach `main*`".
+            (try
+              (resolver/resolve-document document
+                                         (cond-> {:lexicon lexicon
+                                                  :directive-registry directive-registry
                                             ;; TASK-48. The same table
                                             ;; `build-registry` registers, read
                                             ;; for the kind each directive
@@ -981,8 +1381,8 @@
                                             ;; warning rather than two
                                             ;; different numbers in the two
                                             ;; targets.
-                                                :directive-kinds
-                                                (latex/directive-lexicon-kinds)
+                                                  :directive-kinds
+                                                  (latex/directive-lexicon-kinds)
                                             ;; TASK-54. Which directives
                                             ;; are front matter is the
                                             ;; extension's to say; what
@@ -991,7 +1391,7 @@
                                             ;; inside them, list none of
                                             ;; their sections -- is
                                             ;; `body-view`'s.
-                                                :front-matter-names front-matter-names
+                                                  :front-matter-names front-matter-names
                                             ;; TASK-56. Which directive
                                             ;; is a PANEL of the float
                                             ;; above it is the emitter
@@ -1006,8 +1406,8 @@
                                             ;; panels out from, so the
                                             ;; two cannot disagree
                                             ;; about what a panel is.
-                                                :sublabel-names
-                                                (latex/sublabel-directive-names)
+                                                  :sublabel-names
+                                                  (latex/sublabel-directive-names)
                                             ;; TASK-38. The resolver owns the
                                             ;; splicing, the cycle guard and
                                             ;; the diagnostics; reading and
@@ -1020,29 +1420,50 @@
                                             ;; one, so an `@`-token means the
                                             ;; same thing in a chapter as in
                                             ;; the document that includes it.
-                                                :includes
-                                                {:base-dir (:base-dir opts)
+                                                  :includes
+                                                  {:base-dir (:base-dir opts)
                                              ;; Puts the document itself
                                              ;; on the cycle stack, so a
                                              ;; loop back to the root is
                                              ;; caught like any other.
-                                                 :source-path (:input opts)
-                                                 :load (fn [file]
-                                                         (parser/parse (slurp file) vocabulary))}
+                                                   :source-path (:input opts)
+                                                   :load (fn [file]
+                                                           (parser/parse (slurp file) vocabulary))}
                                             ;; TASK-83.1. Already read
                                             ;; and include-expanded above
                                             ;; (`load-overlays!`); empty
                                             ;; with no `--overlay` at
                                             ;; all, which `apply-overlays`
                                             ;; treats as a no-op.
-                                                :overlay-sources overlay-sources}
-                                         bibliography (assoc :bibliography bibliography)))
+                                                  :overlay-sources overlay-sources}
+                                           bibliography (assoc :bibliography bibliography)))
+              (catch clojure.lang.ExceptionInfo e
+                (throw (ex-info (ex-message e)
+                                (assoc (ex-data e)
+                                       ::diagnostics
+                                       (into (vec flag-diagnostics)
+                                             (into (vec transform-diagnostics)
+                                                   (into (vec overlay-load-warnings)
+                                                         (:warnings (ex-data e))))))
+                                e))))
+            ;; TASK-108's own `flag-diagnostics` lead every other
+            ;; diagnostic in the list, ahead even of `transform-
+            ;; diagnostics`: it needs no parse at all, so it is known
+            ;; before `transform-diagnostics`'s own pass -- the first
+            ;; thing this function does with `source` -- has even run.
+            ;; TASK-103's own `transform-diagnostics` lead every other
+            ;; diagnostic behind it -- that pass ran first,
+            ;; chronologically, before parsing's own overlay/`!include`
+            ;; expansion or anything the resolver itself found.
             ;; `load-overlays!`'s OWN warnings (reading/expanding the
-            ;; overlay FILES themselves) lead `resolve-document`'s --
-            ;; that I/O happened here, before `resolve-document` was even
-            ;; called, unlike `:includes`, whose warnings `resolve-
-            ;; document` already folds in itself (see its own docstring).
-            diagnostics (into (vec overlay-load-warnings) diagnostics)
+            ;; overlay FILES themselves) come next, ahead of `resolve-
+            ;; document`'s -- that I/O happened here, before `resolve-
+            ;; document` was even called, unlike `:includes`, whose
+            ;; warnings `resolve-document` already folds in itself (see
+            ;; its own docstring).
+            diagnostics (into (vec flag-diagnostics)
+                              (into (vec transform-diagnostics)
+                                    (into (vec overlay-load-warnings) diagnostics)))
         ;; TASK-90. The same sidecar extensions merged into
         ;; `directive-registry` above, merged again onto the labels-aware
         ;; registry `lower`/the emitters actually dispatch through --
@@ -1296,6 +1717,33 @@
        "% which one it belongs in is your template's decision, not haselnuss's.\n"
        "% \\input it inside whatever environment your own template uses for it.\n"))
 
+(defn- path-beside
+  "The path of `new-name` in the same directory as `path`, spelled the
+  same way `path` itself was: relative when `path` is relative, absolute
+  when `path` is absolute, and bare -- not resolved against the process's
+  working directory -- when `path` has no directory component at all
+  (TASK-109).
+
+  That last case is `.getParent` returning nil, which the naive fix
+  (`.getAbsoluteFile` first, so a bare name always has a non-nil parent)
+  gets wrong on purpose: it makes EVERY bare output absolute, including
+  ones nothing asked to be. `output`, and every OTHER file `build` writes
+  beside it (a fragment's own preamble, a front-matter side file, both
+  through `sibling-path` below), already answer in whatever terms the
+  path they were given used; a companion silently switching to an
+  absolute one is the bug TASK-109 exists to close, not a case to
+  reintroduce here.
+
+  Shared by `sibling-path`, which derives `new-name` from `path`'s own
+  base name plus a suffix, and by `build`'s own generated-`.bib` path,
+  which derives `new-name` from the document's base name instead -- both
+  need the identical answer to \"what directory is this beside `path`\",
+  and only that."
+  [path new-name]
+  (if-let [parent (.getParent (io/file path))]
+    (str (io/file parent new-name))
+    new-name))
+
 (defn- sibling-path
   "The path of a file `build` writes beside its own output `path`, with
   `suffix` inserted before the output's extension -- so `thesis-body.tex`
@@ -1309,18 +1757,18 @@
   companions obvious from the name. An extensionless output simply gains
   the suffix, and a dotfile output (`.hidden`) keeps its whole name -- a
   leading dot is the file's name, not an extension, the same distinction
-  `output-path` already guards for the same shape."
+  `output-path` already guards for the same shape.
+
+  The directory `new-name` lands in, and whether that directory is
+  spelled relatively, absolutely, or not at all, is `path-beside`'s own
+  job, shared with the generated `.bib`'s path in `build` (TASK-109)."
   [path suffix]
-  (let [file (io/file path)
-        base-name (.getName file)
+  (let [base-name (.getName (io/file path))
         dot (.lastIndexOf base-name ".")
         [stem extension] (if (pos? dot)
                            [(subs base-name 0 dot) (subs base-name dot)]
-                           [base-name ""])
-        new-name (str stem suffix extension)]
-    (if-let [parent (.getParent file)]
-      (str (io/file parent new-name))
-      new-name)))
+                           [base-name ""])]
+    (path-beside path (str stem suffix extension))))
 
 (defn- front-matter-suffix
   "The `sibling-path` suffix for the front-matter block at position
@@ -1417,6 +1865,35 @@
                          "; move it aside or pass --output to write elsewhere")
                     {:type clobber-type :path path ::diagnostics diagnostics}))))
 
+(defn- refuse-stdout-companion!
+  "Raises when `--output -` (TASK-100) would also have to write `path`
+  BESIDE the document -- a native-mode `.bib` or a `--fragment` preamble
+  -- `description` naming which. A no-op when `path` is nil, so `build`
+  can call this unconditionally for every companion it might have
+  produced rather than guarding each call site itself.
+
+  `build` calls this for the `.bib` and the preamble only, not for a
+  front-matter side file: a front-matter block only exists inside a
+  `--fragment` build (`run` gates both by the same flag), and that build
+  always has a preamble too (`latex/emit-preamble` is unconditional on
+  document content), so the preamble call above always refuses first --
+  a third call naming the front-matter file would never be the one that
+  throws. See the comment at `build`'s own call site.
+
+  There is no honest way to put more than one file on a single stream,
+  so the whole build is refused, naming the file that has nowhere to
+  go, rather than writing the document to stdout and silently dropping
+  its companions -- the same shape `check-companion!` already gives a
+  same-named file it did not generate. `diagnostics` rides along in the
+  `ex-data` for the same reason it does there: `-main` still prints the
+  warnings collected before this failure."
+  [path description diagnostics]
+  (when path
+    (throw (ex-info (str path " has nowhere to go: --output - writes the document to a single stream, and"
+                         " this build also generates " description
+                         "; pass --output to a real path instead")
+                    {:type ::stdout-companion-refused :path path ::diagnostics diagnostics}))))
+
 (defn- write-companion!
   "Writes the file `build` generates BESIDE its own output -- the
   native-mode `.bib` (TASK-42) or a fragment's companion preamble
@@ -1440,15 +1917,80 @@
                       {:type unwritable-type :path path ::diagnostics diagnostics}
                       e)))))
 
+(defn- write-in-place!
+  "Writes `content` to `path` -- an INPUT file `build` is about to
+  overwrite under `--in-place` (TASK-101) -- without ever exposing a
+  half-written version of it: a fresh temp file, in the SAME directory
+  as `path` (so the move below can never cross a filesystem boundary,
+  which would silently turn `ATOMIC_MOVE` into a copy-then-delete, not
+  atomic at all), receives the WHOLE text first; only once that write has
+  fully succeeded is it moved onto `path` with
+  `java.nio.file.StandardCopyOption/ATOMIC_MOVE`, which a POSIX
+  filesystem performs via a single `rename(2)` call -- so `path` is,
+  at every instant another process could observe it, either every byte
+  of the OLD document or every byte of the NEW one, never a mix of the
+  two and never truncated.
+
+  `content` IS a plain string here, unlike `write-companion!`'s own
+  (deliberately a thunk there): building it can throw -- it runs
+  `haselnuss.emit.latex/csl-json->bibtex` over loaded CSL-JSON -- so that
+  function defers the call inside its own `try`. Nothing analogous is
+  left to defer here: `build` calls this only after `run` has already
+  produced `output` in full, so the only failures left to guard are I/O
+  ones (a full disk writing the temp file, a permissions problem moving
+  it) -- and either one deletes the temp file and rethrows, leaving
+  `path` itself untouched throughout: this function never opens `path`
+  for writing directly, only ever as the target of one atomic move.
+
+  Permissions matter too, not just bytes (found by review): the JDK
+  deliberately creates a fresh `createTempFile` with restrictive,
+  owner-only permissions, and `ATOMIC_MOVE` carries the TEMP file's own
+  mode onto `path`, not `path`'s original mode -- so without this, a
+  644 input would silently become 600 on every successful `--in-place`
+  build. To avoid that, the temp file is created WITH `path`'s current
+  POSIX permissions as a `FileAttribute` up front (`createTempFile`
+  itself, not a follow-up `setPosixFilePermissions`, so there is never a
+  moment where the temp file exists with the JDK's own restrictive
+  default) whenever `path` is on a POSIX filesystem --
+  `getPosixFilePermissions` throwing `UnsupportedOperationException` is
+  the documented signal that it is not (irrelevant to this project's own
+  Linux/macOS toolchain, but cheap to fall back on rather than let this
+  helper hard-fail on a platform the rest of the codebase never claimed
+  to support), in which case the temp file falls back to the JDK's own
+  default attributes exactly as before."
+  [path content]
+  (let [target (.toPath (.getAbsoluteFile (io/file path)))
+        dir (.getParent target)
+        attrs (try
+                (into-array
+                 java.nio.file.attribute.FileAttribute
+                 [(java.nio.file.attribute.PosixFilePermissions/asFileAttribute
+                   (java.nio.file.Files/getPosixFilePermissions
+                    target (make-array java.nio.file.LinkOption 0)))])
+                (catch UnsupportedOperationException _
+                  (make-array java.nio.file.attribute.FileAttribute 0)))
+        temp (java.nio.file.Files/createTempFile
+              dir "haselnuss-in-place-" ".tmp" attrs)]
+    (try
+      (spit (.toFile temp) content)
+      (java.nio.file.Files/move
+       temp target
+       (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/ATOMIC_MOVE]))
+      (catch Exception e
+        (java.nio.file.Files/deleteIfExists temp)
+        (throw e)))))
+
 (defn build
   "`run` over the file named by `opts`' own `:input`, writing the result
   to `output-path`. Returns `{:output-path :diagnostics :bibtex-path
-  :preamble-path}`, the last two being nil unless a BibTeX database or a
-  fragment's companion preamble was generated alongside. The output
-  file is written only on success -- an exception from any pass
-  propagates with nothing written, so a failed build never leaves a
-  half-converted document behind for a `make`-style tool to mistake for
-  a good one (AC #5).
+  :preamble-path :output}`, `:output-path` being the keyword `:stdout`
+  rather than a string when `opts`' own `:output` asked for one
+  (TASK-100), and `:bibtex-path`/`:preamble-path` being nil unless a
+  BibTeX database or a fragment's companion preamble was generated
+  alongside. The output is written only on success -- an exception from
+  any pass propagates with nothing written, so a failed build never
+  leaves a half-converted document behind for a `make`-style tool to
+  mistake for a good one (AC #5).
 
   Native-mode LaTeX writes a SECOND file (TASK-42): `<output>.bib`,
   generated by `haselnuss.emit.latex/csl-json->bibtex` from the CSL-JSON
@@ -1476,10 +2018,55 @@
   one (a read-only directory, say) aborts the build naming that file
   rather than leaving a `.tex` pointing confidently at a database or a
   preamble that is not there -- which is the silently-empty reference
-  list this task set out to eliminate, in another spelling."
-  [{:keys [input] :as opts}]
-  (when-not (.isFile (io/file input))
-    (throw (ex-info (str "input file not found: " input) {:type ::usage-error})))
+  list this task set out to eliminate, in another spelling.
+
+  `--output -` (TASK-100) writes the document to stdout instead, and has
+  no path a companion could sit beside; a build that would have written
+  one is refused entirely, naming it, by `refuse-stdout-companion!`,
+  called BEFORE any of the checks above -- there is nothing to check a
+  clobber against when nothing is going to be written in the first
+  place. A front-matter block never triggers a refusal of its own: it
+  only exists inside a `--fragment` build, which always has a companion
+  preamble too, so that refusal -- naming the preamble, not the
+  front-matter file -- always fires first; see the comment at this
+  function's own `refuse-stdout-companion!` call site.
+
+  `--in-place` (TASK-101) writes the very file `input` names, in place
+  of an ordinary derived/explicit `path` -- `output-path` itself is what
+  makes `path` equal `input` under this flag, and lifts the overwrite-
+  input guard that would otherwise refuse it (see that function's own
+  docstring) -- through `write-in-place!` rather than `spit`, so the
+  document this function just read `source` from is never truncated by
+  its own replacement: see that function's own docstring for the
+  temp-file-plus-atomic-move this buys. Since `output-path` also refuses
+  `--in-place` together with `--output` or any `--target` other than
+  `hdoc`, no native-mode `.bib`, `--fragment` preamble or front-matter
+  side file can ever coexist with it -- those are all LaTeX-only, and
+  `--in-place` forces `hdoc`."
+  [{:keys [input in-place] :as opts}]
+  (let [input-file (io/file input)]
+    (cond
+      ;; TASK-113: checked ahead of the plain `.isFile` test below so a
+      ;; directory gets its own true message instead of falling into
+      ;; "not found" -- the path IS there, it is just not a file, the
+      ;; same distinction `haselnuss.resolver/expand-includes` already
+      ;; makes for `!include` one layer down (its own "cannot include
+      ;; ... (Is a directory)", surfaced via a real `IOException`
+      ;; `slurp` throws for a directory). This check exists BEFORE
+      ;; anything reads the file, so it has no such exception to read
+      ;; the wording off; the message is spelled out directly instead.
+      (.isDirectory input-file)
+      (throw (ex-info (str "input path is a directory: " input) {:type ::usage-error}))
+      ;; Neither a directory nor a plain file: doesn't exist (the
+      ;; ordinary case), or is some other kind of filesystem entry this
+      ;; tool has no more specific word for. A file that DOES exist but
+      ;; cannot be READ (e.g. mode 000) is a plain file as far as
+      ;; `.isFile` is concerned, so it is not caught here at all -- it
+      ;; falls through to `slurp` below, which throws its own
+      ;; `IOException` ("... (Permission denied)"), left uncaught and
+      ;; reported by `main*`'s generic handler instead (AC #3).
+      (not (.isFile input-file))
+      (throw (ex-info (str "input file not found: " input) {:type ::usage-error}))))
   (let [opts (assoc opts :base-dir (.getParent (.getAbsoluteFile (io/file input))))
         source (slurp input)
         ;; The same declared-or-overridden bibliography `run` itself
@@ -1491,9 +2078,17 @@
         ;; Chosen before converting anything, so a bad destination is
         ;; reported without first doing the whole build's work.
         path (output-path opts bib-path)
+        ;; TASK-100: `path` is the keyword `:stdout`, not a path on disk,
+        ;; when `--output -` was given. A companion is still named after
+        ;; what the OUTPUT would have been called, for a readable refusal
+        ;; ("doc.bib has nowhere to go") rather than one derived from a
+        ;; sentinel ("--bib has nowhere to go") -- `derived-output-path`
+        ;; gives that name the same way `output-path` itself would have,
+        ;; had `--output` not been given at all.
+        nominal-path (if (= :stdout path) (derived-output-path input (:target opts)) path)
         native-latex? (and (= :latex (:target (targets (:target opts))))
                            (not (:computed-numbers opts)))
-        resource (when native-latex? (bibtex-resource path))
+        resource (when native-latex? (bibtex-resource nominal-path))
         {:keys [output diagnostics bibliography ordered-keys preamble front-matter]}
         (run source (cond-> opts resource (assoc :bib-resource resource)))
         ;; The condition is that the emitted .tex actually asks for this
@@ -1501,18 +2096,25 @@
         ;; from the same inputs. A document that declares a bibliography
         ;; but cites nothing emits no \bibliography{} at all, and would
         ;; otherwise have got an unused file written beside it.
+        ;;
+        ;; TASK-109: `path-beside`, not a hand-rolled `getParentFile` off
+        ;; `getAbsoluteFile`, so the announced path stays whatever kind
+        ;; `nominal-path` itself is -- relative beside a relative output,
+        ;; bare beside a bare one -- the same way `preamble-file`/
+        ;; `front-matter-files` below already answer through
+        ;; `sibling-path`, rather than the odd one out among this build's
+        ;; own companions.
         bibtex-path (when (and resource
                                (str/includes? output (str "\\bibliography{" resource "}")))
-                      (str (io/file (.getParentFile (.getAbsoluteFile (io/file path)))
-                                    (str resource ".bib"))))
+                      (path-beside nominal-path (str resource ".bib")))
         ;; Conditioned on `run` having produced one at all, which is
         ;; exactly "this was a --fragment LaTeX build" -- so the two
         ;; cannot disagree about whether the fragment has a companion.
-        preamble-file (when preamble (preamble-path path))
+        preamble-file (when preamble (preamble-path nominal-path))
         ;; TASK-54: one side file per front-matter block, paired with the
         ;; content that goes in it so the two cannot get out of step.
         front-matter-files (mapv (fn [index]
-                                   [(sibling-path path (front-matter-suffix front-matter index))
+                                   [(sibling-path nominal-path (front-matter-suffix front-matter index))
                                     (:content (nth front-matter index))])
                                  (range (count front-matter)))
         ;; TASK-42: computed once rather than inside the writer's own
@@ -1548,6 +2150,29 @@
                                            "}; a LaTeX document may have only one, so remove the"
                                            " host document's own \\bibliography command or BibTeX"
                                            " will drop one of the two databases")}))]
+    ;; TASK-100: checked before anything else -- `check-companion!`
+    ;; below reads each companion off DISK, which `--output -` gives it
+    ;; nothing to do, and refusing here first is what keeps this build
+    ;; from writing the document to stdout and only THEN discovering a
+    ;; companion has nowhere to go.
+    ;;
+    ;; No third call for `front-matter-files` (found by review, TASK-100):
+    ;; it would be unreachable. `run` gates `:front-matter` and `:preamble`
+    ;; by the exact same `fragment-latex?` (see the map built there), and
+    ;; `latex/emit-preamble` is a FIXED preamble -- every package it loads
+    ;; is unconditional on document content (its own docstring; verified
+    ;; at the REPL) -- so it never returns nil/blank. That makes
+    ;; `preamble-file` truthy every time `front-matter-files` could be
+    ;; non-empty, which means the `preamble-file` refusal just above
+    ;; always throws first for that combination; a build with a
+    ;; front-matter block therefore still writes nothing and is still
+    ;; refused, naming the preamble it also needed. If `run` ever stops
+    ;; deriving the two from the same flag, or `emit-preamble` stops being
+    ;; unconditional, this comment is the trip wire for bringing the
+    ;; front-matter-specific call back.
+    (when (= :stdout path)
+      (refuse-stdout-companion! bibtex-path "a BibTeX database" diagnostics)
+      (refuse-stdout-companion! preamble-file "a fragment's companion preamble" diagnostics))
     ;; Every companion is checked before ANY of them is written, so a
     ;; refused second file cannot leave a written first one behind
     ;; (found by review). `<output>.bib` is also a hand-maintained
@@ -1583,10 +2208,23 @@
                          :content #(str generated-front-matter-marker "\n"
                                         front-matter-file-instructions "\n"
                                         content)}))
-    (spit path output)
+    ;; TASK-100: `path` is never `:stdout` here with any companion left
+    ;; to drop -- the refusal above already threw for that combination --
+    ;; so writing the document itself to `*out*` instead of `spit`-ing it
+    ;; is the only difference that branch makes. TASK-101: `path` IS
+    ;; `input` under `--in-place` (`output-path`'s own doing), so that
+    ;; write goes through `write-in-place!`'s temp-file-plus-atomic-move
+    ;; instead of an ordinary `spit`, which would truncate the very file
+    ;; this function just finished reading `source` from before writing
+    ;; a single byte of the replacement.
+    (cond
+      (= :stdout path) (print output)
+      in-place (write-in-place! path output)
+      :else (spit path output))
     {:output-path path :diagnostics diagnostics :bibtex-path bibtex-path
      :preamble-path preamble-file
-     :front-matter-paths (mapv first front-matter-files)}))
+     :front-matter-paths (mapv first front-matter-files)
+     :output output}))
 
 (defn- warn!
   "Prints one resolver diagnostic to stderr as a warning (AC #4)."
@@ -1648,16 +2286,26 @@
                written :output-path preamble-file :preamble-path}
               (build opts)]
           (run! warn! diagnostics)
-          (println (str "haselnuss: wrote " written))
-          ;; Reported on its own line, not folded into the one above:
-          ;; native-mode LaTeX writes a second file (TASK-42), a
-          ;; --fragment build writes its companion preamble (TASK-52),
-          ;; and a build that quietly produced a file the user did not
-          ;; ask for is exactly the kind of surprise a converter should
-          ;; not have.
-          (when bibtex-path (println (str "haselnuss: wrote " bibtex-path)))
-          (when preamble-file (println (str "haselnuss: wrote " preamble-file)))
-          (run! (fn [file] (println (str "haselnuss: wrote " file))) front-matter-paths)
+          ;; TASK-100: every "wrote" line goes to stderr, not stdout --
+          ;; unconditionally, not only under --output -, since the two
+          ;; streams are fixed for the whole process and a line here
+          ;; would land in the middle of a document `build` already put
+          ;; on stdout for that case. `written` prints as "-", not
+          ;; ":stdout", the same token `--output -` was given on the
+          ;; command line, and the one `derived-output-path`'s own
+          ;; docstring points at for why a companion refusal does not
+          ;; reuse it as a name.
+          (binding [*out* *err*]
+            (println (str "haselnuss: wrote " (if (= :stdout written) "-" written)))
+            ;; Reported on its own line, not folded into the one above:
+            ;; native-mode LaTeX writes a second file (TASK-42), a
+            ;; --fragment build writes its companion preamble (TASK-52),
+            ;; and a build that quietly produced a file the user did not
+            ;; ask for is exactly the kind of surprise a converter should
+            ;; not have.
+            (when bibtex-path (println (str "haselnuss: wrote " bibtex-path)))
+            (when preamble-file (println (str "haselnuss: wrote " preamble-file)))
+            (run! (fn [file] (println (str "haselnuss: wrote " file))) front-matter-paths))
           0)))
     (catch clojure.lang.ExceptionInfo e
       ;; Warnings first, then the error that stopped the build -- the

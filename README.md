@@ -40,6 +40,50 @@ The jar's name deliberately carries no version, so `--version` is how you tell w
 one on disk is. It reads the version Leiningen packed in from `project.clj`, so the two
 cannot drift.
 
+`--output -` writes the converted document to stdout instead of to a file, the POSIX
+convention, for every target -- so a build can be piped straight into another program:
+
+```
+java -jar target/uberjar/haselnuss.jar paper.hdoc --output - | less
+```
+
+Every other progress line ("`haselnuss: wrote <path>`") already goes to stderr; a
+resolver diagnostic and an error do too, so `--output -` did not have to add a special
+case there, only obey the same rule everywhere: stdout carries the converted document and
+nothing else. The one thing `-` cannot mean here is a real file called `-`: the two
+overwrite/collision guards below have no path to check it against, and a build that would
+also have to write a companion file -- a native-mode LaTeX `.bib`, a `--fragment`
+preamble, a front-matter side file -- is refused instead, naming the file that has
+nowhere to go, rather than silently dropping it. A document that genuinely needs a file
+named `-` still gets one, through `./-` (a different string, so unaffected) or
+`--output=-` (an explicit value, exempt from the stdin/stdout convention the same way
+`--flag=value` is exempt from `-t -o out.html doc.hdoc`'s own "value looks like the next
+flag" rejection).
+
+`--in-place` writes the converted document back over the file it was read from -- the one
+flag in this tool whose whole job is deliberately overwriting the document you asked it to
+convert, so it is treated with the care that implies:
+
+```
+java -jar target/uberjar/haselnuss.jar paper.hdoc --in-place   # reformats paper.hdoc in place
+```
+
+It implies `--target hdoc` when no `--target` is given at all -- only `.hdoc` output can
+honestly overwrite a `.hdoc` input, and `hdoc` is the only target that produces it -- and is
+refused, naming the conflict, together with `--output` (two destinations is a mistake, not
+a merge, whether that second destination is a real path or `-`) or with a `--target` other
+than `hdoc`. The write itself goes through a temp file in the SAME directory as the input,
+moved into place with an atomic filesystem rename only once the whole build has already
+succeeded -- so a build that fails partway (a parse error, a construct the target cannot
+represent, a full disk) leaves the input exactly as it was, never half-written.
+
+Every other build in this tool refuses outright to write over the file it read from --
+`haselnuss doc.hdoc --target hdoc` derives `doc.hdoc` as its own default output path and is
+refused for exactly that reason, the same way `--target json` is refused below for a
+same-named bibliography. `--in-place` is the ONLY flag that lifts that refusal, and only for
+itself: pass it, and the tool trusts that overwriting the input is what you meant. Leave it
+off, and `--target hdoc` with no `--output` keeps refusing, as it always has.
+
 `--target json` is not a rendering target like the other two: it writes the parsed
 document's own `haselnuss.json` interchange representation (SPEC.md sec11) -- no
 resolve or lower pass runs, so it carries no computed section/figure numbers, no
@@ -718,9 +762,13 @@ in place — including a reference written in the including file to a label defi
 included one.
 
 A missing file and an include cycle are both build warnings naming the file, not errors:
-the offending include is dropped and the rest of the document still converts. To write the
-literal text, indent it four spaces or wrap it in backticks — the same shielding that
-protects a `:::` directive fence.
+the offending include is dropped and the rest of the document still converts. An included
+file that exists but fails to parse is different: it fails the whole build, naming the
+file, exactly as the same content would if it were the top-level document being
+converted — parsing it can drop authored content (a whole chapter, in the worst case), so
+it does not get the warn-and-drop treatment the other two do. To write the literal text,
+indent it four spaces or wrap it in backticks — the same shielding that protects a `:::`
+directive fence.
 
 `--computed-numbers` makes the LaTeX output carry the resolver's own
 computed numbers and citation text instead of emitting `\Cref`/`\cite`
@@ -819,10 +867,16 @@ target at all, so a `describe`d prop never appears in the `.tex` output. That is
 the "present but not shown unless something opts in" shape a use case like a per-figure
 textual description — for an eventual audiobook or accessibility pass — wants.
 
-A prop key colliding with one already set on the target node is its own non-fatal build
-warning, and the target's own value is kept rather than silently overwritten. `describe`
-shares every other diagnostic `prepend`/`append` already has: a missing or blank
-`target=`, a `target=` that resolves to nothing, its own id (if given one) being
+A prop key colliding with one already set on the target node — one the base document's
+own author wrote — is its own non-fatal build warning, and the target's own value is kept
+rather than silently overwritten. A prop key set by *more than one* `describe` — whether
+the two directives sit in one overlay file or in two named separately on the command
+line — is also a non-fatal build warning naming the prop and the target: the later
+`describe`, in `--overlay` order then in-file order, still wins (accumulation order is
+unchanged), but which value was discarded is no longer silent. Setting *different* props
+on the same target from more than one `describe` is not a collision and stays silent.
+`describe` shares every other diagnostic `prepend`/`append` already has: a missing or
+blank `target=`, a `target=` that resolves to nothing, its own id (if given one) being
 discarded, and being dropped as unrecognized top-level content when misspelled.
 
 Not in scope: a multi-paragraph or richly-marked-up description. `attr.props` is a flat
@@ -900,6 +954,140 @@ computation inside the sandbox is stopped from hanging the *build*, but is not g
 to be reclaimed instantly. Treat `--extensions` the way you would treat running someone
 else's script directly: fine for your own files, or a collaborator's; not a boundary for
 converting a document from someone you do not trust.
+
+### Scripted transformations
+
+A repeatable `--transform PATH` flag loads a plain Clojure file of *rules* — each one a node
+selector paired with a rewrite function — and applies them to the parsed document before
+anything else touches it:
+
+```
+haselnuss paper.hdoc --transform tidy.clj
+```
+
+`tidy.clj`:
+
+```clojure
+{:select :section
+ :transform (fn [node _ctx]
+              (update node :heading haselnuss.ext/map-text clojure.string/upper-case))}
+```
+
+The file's last form must evaluate to a rule map like this one, or a vector of several —
+the same "last form is the contract" convention `--extensions` uses. A rule is `{:select
+:transform :name? :scope?}`: `:select` decides which nodes it touches, `:transform` is
+called on each one as `(fn [node ctx] -> ...)`, and an optional `:name` labels the rule in
+any diagnostic or error it produces (falling back to its position among the file's own
+rules plus its own `:select`, so a message is never anonymous).
+
+**The selector vocabulary.** A selector is exactly one of four shapes:
+
+| shape                        | matches                                                        |
+| ----------------------------- | --------------------------------------------------------------- |
+| a keyword                     | shorthand for `{:t <keyword>}` — every node of that type        |
+| a map                         | every entry must match (AND)                                    |
+| a vector                      | any element, itself a selector, must match (OR)                 |
+| a function `(fn [node] -> truthy)` | called directly on the node                                 |
+
+A map key reads the node's own same-named field — `{:t :list :ordered true}` needs no
+special case — except four keys that read something not sitting at the top of the node:
+
+| key      | reads                                                                    |
+| -------- | -------------------------------------------------------------------------- |
+| `:id`    | `(get-in node [:attr :id])`                                              |
+| `:class` | membership in `(get-in node [:attr :classes])`                           |
+| `:prop`  | a `{k v}` map, every entry matched against `(get-in node [:attr :props])`|
+| `:text`  | the node's own flattened plain text — every `:str`/code/math leaf reachable from it, markup stripped |
+
+Every value, under any key, is matched the same way regardless of which key it sits under:
+a set means membership, a regex means `re-find` against the string form of the actual value
+(so `{:t #"^section$"}` matches the keyword `:section`), a function is applied to the actual
+value, and anything else — a string, a number, a keyword, `nil` — is compared with `=`. That
+one rule is what gives `{:id #"^fig:"}`, `{:class #{"warn" "info"}}` and `{:level (fn [n] (>
+n 2))}` for free, with no special case written for any of them.
+
+**The return-value contract.** `:transform`'s own return value is the whole vocabulary a
+rule has for changing the tree:
+
+- a node map — replaces the node
+- `nil` — deletes it
+- a sequence of nodes — splices them in where it was
+
+`ctx` (the function's second argument, the same two-argument shape a sidecar `:emit`
+renderer already takes) carries `:path` and `:ref-kind` (`haselnuss.walk`'s own path vector
+and reference kind for the matched node) and `:meta`, the document's own front matter,
+read-only. Rules apply in file order, then declaration order within a file, each one as one
+full pass over the whole document before the next rule runs — "uppercase every heading,
+THEN drop every draft block" means exactly what it says, not first-match-wins at a single
+node, and a rule's own replacement is never re-visited by that same rule, so a rule that
+wraps its match in a fresh parent still terminates. Delete and splice are not legal
+everywhere: a position with room for exactly one node (a Figure's own content, the document
+root) refuses any other count, naming the rule and the field. A returned node that does not
+fit where it landed is refused too, with the same schema explanation `haselnuss.ast/explain`
+gives anywhere else in this tool. A rule whose selector matches nothing in the whole
+document is not silently a no-op: it is a warning naming the rule, on stderr, the same as a
+resolver diagnostic — a rule that runs and visibly does nothing is the easiest kind of
+authoring mistake to miss on your own.
+
+`--transform` runs immediately after parsing, before overlays, extensions, resolving or
+lowering — and before the `json`/`hdoc` targets' own early return, so it is the one flag
+that has an effect on *every* target, including those two. It composes with every output
+mode above exactly as any other build does: `--output PATH`, `--output -` (piped straight
+out, nothing else on stdout), and `--in-place` — which, with no explicit `--target`, is what
+turns a `--transform` file into a way to rewrite a document's own source in place, with the
+same atomicity and refusal guarantees `--in-place` above already has, unchanged here.
+
+The sidecar file runs in the identical sandbox `--extensions` uses — shared as one forked
+context per build when a run passes both flags — so the same bounds apply verbatim: no host
+interop, no file reads, no process execution, no `require` reaching this machine's
+classpath, a wall-clock timeout, and captured, size-capped output. `--trusted-extensions`
+grants a `--transform` rule nothing at all: a rule's return value is plain AST data only — a
+node, `nil`, or a sequence of nodes — never `haselnuss.ext/raw`'s verbatim escape hatch, so
+there is nothing here for that flag to gate. **What this does and does not protect against**
+is the same as above, restated for a rule rather than a directive renderer: this sandbox is
+for an author running their own file: it is built to catch a mistake — a typo that tries to
+read a file, a copy-pasted loop that never terminates, a stray debug `println` — not to
+withstand a determined attacker. It does not run in a separate, killable process, so a
+single runaway computation inside the sandbox is stopped from hanging the *build*, but is
+not guaranteed to be reclaimed instantly. Treat `--transform` the way you would treat
+running someone else's script directly: fine for your own files, or a collaborator's; not a
+boundary for converting a document from someone you do not trust.
+
+Three limitations worth knowing before reaching for this, each at the point a document
+actually meets it:
+
+- **Includes are not expanded.** `--transform` sits before `resolve`, and expanding an
+  `!include` line into the file it names is `resolve`'s own job (see "Multi-file
+  documents" above) — so a rule's selector only ever sees the including file's own
+  top-level content, never reaches into a file it `!include`s, no matter how broad its
+  `:select` is. When the document still holds one or more unexpanded `!include`s at that
+  point, the build says so: a `:transform-partial-document` warning, naming every skipped
+  path concretely (`--transform ran before 2 !includes were expanded, so these rules never
+  saw: chapters/intro.hdoc, chapters/methods.hdoc`), fires once per build whenever
+  `--transform` runs at all — whether or not any rule went on to match something in the
+  including file itself. A document with no `!include` at all produces none of this.
+- **`--in-place` still re-spells canonically.** `--target hdoc`, and therefore `--in-place`
+  (which implies it), always writes back one emphasis delimiter, ATX headings and
+  normalized wrapping — the same note under "Usage" above — so running a `--transform` file
+  whose every rule matches nothing at all still rewrites the document: the diff is the
+  formatter's own canonical re-spelling, not evidence a rule silently changed something.
+- **Four `Inline` variants have no `.hdoc` spelling of their own.** `:strike`, `:small-caps`,
+  `:sub` and `:sup` are schema-valid and both emitters render them, but nothing in `.hdoc`'s
+  own surface syntax ever parses into one — the one way to meet this is a rule's own
+  `:transform` constructing one directly (wrapping matched text in `{:t :strike ...}` to
+  mark it deprecated, say). Write that back out through `--target hdoc`/`--in-place` and it
+  comes back as a generic `[text]{.strike}`-shaped role span; re-parsing THAT always yields a
+  `:span`, not the tag the rule built. `haselnuss.emit.hdoc/lossy-role-span-diagnostics` can
+  report every occurrence a document carries, but nothing on the command line calls it
+  today, so this is silent unless you know to look for it.
+
+`examples/publish.clj` and `examples/draft.hdoc` are a worked example: three rules
+stripping the drafting scaffolding a real page might actually carry before it goes out — an
+internal-only editorial directive deleted outright, a paragraph of reviewer `TODO:` items
+spliced into several separate, numbered admonitions, and a heading's leftover `[DRAFT]`
+marker tidied by regex — exercising all three return shapes in one file. `examples/
+publish.clj`'s own header comment has the exact commands, building into `examples/out/` as
+ever.
 
 ## Example
 

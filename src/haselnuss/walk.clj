@@ -111,7 +111,31 @@
   `:visit`, read back out once the top-level call returns -- ordinary
   Clojure for a pure tree transform with a side channel, and simpler than
   making either primitive generically monadic for a need only one kind of
-  future caller has."
+  future caller has.
+
+  `rewrite-post` (TASK-94, doc-7 decision 2) is `rewrite`'s post-order
+  sibling: it recurses into every child-bearing field of `node` FIRST,
+  then calls `((:rewrite-fn walker) path ref-kind node')` on the
+  already-rewritten `node'`, and returns whatever that call produces
+  UNCHANGED -- a callback's own return value is never walked again within
+  the same call. `rewrite`'s pre-order/re-walk-the-substitution behavior is
+  exactly what author-supplied code must not get: a rule that wraps every
+  `:para` in a `:block-quote` meets its own output on the very next step
+  under `rewrite` and wraps forever, for a rule that is not itself wrong --
+  the traversal order is. `rewrite-post`'s callback takes `[path ref-kind
+  node]`, `fold`'s own visit shape rather than `rewrite`'s 2-arity
+  `rewrite-fn`, so a caller can report WHERE a rule matched using the exact
+  path vector `fold`/`id-locations-in-block` already produce (AC #2). The
+  0/1/many contract at a `:many`/`:many-of-many` position and
+  `expect-count-one!`'s refusal of any other count at a `:one` position
+  (AC #3) carry over unchanged, and both primitives share the same
+  arity/scope-filtering logic (`descend-into-position`) rather than each
+  hand-rolling its own copy (AC #5) -- exactly the traversal-drift doc-5
+  lists as its top pitfall and doc-6 measures as hand-written dispatch's
+  own cost, this time one layer up at 'pre-order vs. post-order' rather
+  than 'which fields does this node type have'. `rewrite` itself -- its
+  signature, its pre-order behavior, every existing caller -- is
+  unchanged (AC #6)."
   (:require [haselnuss.ast :as ast]))
 
 ;; --- Deriving the table from the raw schema -------------------------------
@@ -379,16 +403,29 @@
                :replacements replacements})))))
 
 (declare rewrite)
+(declare rewrite-post)
 
-(defn- rewrite-position
-  "`parent-node` with one child-bearing field (`field`, `[arity ref-kind]`
-  spec) rewritten: `:many`/`:many-of-many` `mapcat` `rewrite` over each
-  element, so an element can vanish, stay one node or fan out to several
-  (AC #3, `lower-blocks`' own `mapcat`); `:one` requires `rewrite` to come
-  back with exactly one node (`expect-count-one!`, AC #4). Left alone --
-  same as `fold-position` -- when `ref-kind` is out of `(:scope walker)`,
-  or the field is altogether absent from `parent-node`."
-  [walker parent-node parent-ref-kind field [arity ref-kind]]
+(defn- descend-into-position
+  "The arity/scope logic `rewrite-position` and `rewrite-post-position`
+  (TASK-94) share rather than each hand-rolling its own copy (AC #5, this
+  namespace's own docstring): `parent-node` with one child-bearing field
+  (`field`, `[arity ref-kind]` spec) rewritten by calling `(recurse
+  ref-kind child child-path)` -- `child-path` `(conj parent-path field)`,
+  plus that child's own index/indices at a `:many`/`:many-of-many`
+  position, `fold`'s own path convention -- for each child reachable
+  through it. `:many`/`:many-of-many` `mapcat` `recurse` over each element,
+  so an element can vanish, stay one node or fan out to several (AC #3,
+  `lower-blocks`' own `mapcat`); `:one` requires `recurse` to come back
+  with exactly one node (`expect-count-one!`, AC #4). Left alone -- same as
+  `fold-position` -- when `ref-kind` is out of `(:scope walker)`, or the
+  field is altogether absent from `parent-node`.
+
+  `recurse` is the one thing `rewrite-position` and `rewrite-post-position`
+  each supply differently: whether it re-walks a returned node's own
+  children (`rewrite`, ignoring `child-path`) or has already done so before
+  being called (`rewrite-post`) is entirely their own concern, invisible
+  here."
+  [walker parent-node parent-ref-kind parent-path field [arity ref-kind] recurse]
   (if-not (contains? (:scope walker) ref-kind)
     parent-node
     (case arity
@@ -396,21 +433,33 @@
       (if-let [child (get parent-node field)]
         (assoc parent-node field
                (expect-count-one! walker parent-ref-kind parent-node field
-                                  (rewrite walker ref-kind child)))
+                                  (recurse ref-kind child (conj parent-path field))))
         parent-node)
 
       :many
       (if-let [kids (get parent-node field)]
         (assoc parent-node field
-               (into [] (mapcat (partial rewrite walker ref-kind)) kids))
+               (into [] (mapcat (fn [[i child]] (recurse ref-kind child (conj parent-path field i))))
+                     (map-indexed vector kids)))
         parent-node)
 
       :many-of-many
       (if-let [groups (get parent-node field)]
         (assoc parent-node field
-               (mapv (fn [group] (into [] (mapcat (partial rewrite walker ref-kind)) group))
-                     groups))
+               (mapv (fn [[i group]]
+                       (into [] (mapcat (fn [[j child]] (recurse ref-kind child (conj parent-path field i j))))
+                             (map-indexed vector group)))
+                     (map-indexed vector groups)))
         parent-node))))
+
+(defn- rewrite-position
+  "`parent-node` with one child-bearing field (`field`, `[arity ref-kind]`
+  spec) rewritten by recursing into `rewrite` (AC #3/#4, `descend-into-
+  position`'s own docstring) -- `rewrite`'s own path-blind `recurse`, so
+  the path `descend-into-position` threads through is simply discarded."
+  [walker parent-node parent-ref-kind field spec]
+  (descend-into-position walker parent-node parent-ref-kind [] field spec
+                         (fn [ref-kind child _child-path] (rewrite walker ref-kind child))))
 
 (defn rewrite
   "Rewrites `node` (of reference kind `ref-kind`) by calling `((:rewrite-fn
@@ -444,3 +493,56 @@
                       replacement
                       (get children type-key []))))
           (rewrite-fn ref-kind node))))
+
+;; --- rewrite-post: children first, then the node, never re-walked (TASK-94,
+;; doc-7 decision 2) ---------------------------------------------------------
+
+(defn- rewrite-post-position
+  "`parent-node` with one child-bearing field (`field`, `[arity ref-kind]`
+  spec) rewritten by recursing into `rewrite-post` FIRST (`descend-into-
+  position`'s own docstring, AC #3) -- `child-path`, `descend-into-
+  position`'s own threaded path, becomes the path `rewrite-post`'s callback
+  sees for that child (AC #2)."
+  [walker parent-node parent-ref-kind parent-path field spec]
+  (descend-into-position walker parent-node parent-ref-kind parent-path field spec
+                         (fn [ref-kind child child-path] (rewrite-post walker ref-kind child child-path))))
+
+(defn rewrite-post
+  "`rewrite`'s post-order sibling (TASK-94, doc-7 decision 2): rewrites
+  every child-bearing field of `node` (of reference kind `ref-kind`) FIRST
+  -- descending only through a field whose own `:ref-kind` is in `(:scope
+  walker)` (AC #4, shared with `rewrite` via `descend-into-position`) --
+  THEN calls `((:rewrite-fn walker) path ref-kind node')` on the
+  already-rewritten `node'`, and returns whatever that call produces
+  UNCHANGED: a callback's own return value is never walked again within
+  this call (AC #1). This is the opposite order from `rewrite`, and
+  deliberately so -- see this namespace's own docstring for why a
+  pre-order rewrite is a trap for a rule that wraps its own match in a new
+  parent, and `rewrite-post` is not.
+
+  `path` (the 3-arity default is `[]`, a true root, mirroring `fold`) is
+  the path to `node` itself, extended the same way `fold`'s own is (AC
+  #2): by the field keyword the walk is currently inside plus, at a
+  `:many`/`:many-of-many` position, that child's own index/indices, e.g. a
+  Table's third row's second cell's first Block is `[:rows 2 :cells 1
+  :blocks 0]`.
+
+  `walker` is `{:table {:children :discriminators} :scope #{ref-kind...}
+  :rewrite-fn (fn [path ref-kind node] -> [node...])}` -- `fold`'s own
+  visit shape, not `rewrite`'s 2-arity `rewrite-fn`, so a caller can report
+  WHERE a rule matched. Called at a `:many`/`:many-of-many` position
+  (`rewrite-post-position`), each already-rewritten element independently
+  expands to 0, 1 or several nodes; called at a `:one` position,
+  the callback is required to come back with exactly one node, raising
+  `::arity-error` otherwise (AC #3) -- this function itself doesn't know or
+  care which kind of position invoked it, exactly like `rewrite`."
+  ([walker ref-kind node] (rewrite-post walker ref-kind node []))
+  ([walker ref-kind node path]
+   (let [{:keys [children discriminators]} (:table walker)
+         rewrite-fn (:rewrite-fn walker)
+         type-key (node-type discriminators ref-kind node)
+         node' (reduce (fn [node' [field spec]]
+                         (rewrite-post-position walker node' ref-kind path field spec))
+                       node
+                       (get children type-key []))]
+     (rewrite-fn path ref-kind node'))))
