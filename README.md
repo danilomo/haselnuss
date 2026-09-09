@@ -1346,6 +1346,37 @@ lein run -- paper.hdoc --target latex
 See [Usage](#usage) above for the packaged jar, which is how the tool is
 meant to be distributed and run.
 
+## Native binary (optional)
+
+The jar pays a JVM and Clojure cold start on every invocation -- around 1.5
+seconds before it has read a byte of your document. That is the dominant cost
+of a single `haselnuss paper.hdoc`, and it matters when the tool is called
+repeatedly from a shell loop, an editor integration, or an LLM pipeline.
+
+`bin/native` compiles a GraalVM native image, which removes it:
+
+```sh
+sdk install java 21.0.2-graalce   # or set GRAALVM_HOME to an existing GraalVM
+./bin/native
+./dist/haselnuss paper.hdoc --target latex
+```
+
+| | jar (JDK 17) | native binary |
+|---|---|---|
+| `--help` | 1.31s | 0.11s |
+| `examples/hazelnuts.hdoc` to HTML | 1.45s | 0.16s |
+
+This is **optional and not part of the build or the test gate.** GraalVM is not
+in the requirements above, `lein test` never needs it, and nothing about the
+distributed jar changes. The binary is also platform-specific -- unlike the jar,
+one build does not run everywhere -- and it is 101MB.
+
+Verify a binary you have built with `lein test haselnuss.native-test`, which
+compares its output against the jar's and skips when no binary is present.
+`doc-4` records why each flag in `bin/native` is there -- every one of them is
+load-bearing -- and `doc-9` is the story of how the binary came about, including
+what the investigation got wrong on the way.
+
 ## Test
 
 ```sh

@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Builds the GraalVM native binary (TASK-126). Not part of the mandatory gate:
+# native-image is opt-in, is not in the README's requirements, and a build takes
+# minutes. See doc-4 for why each flag below is here -- every one of them was
+# arrived at by a build failing without it, and removing any one reintroduces a
+# specific, documented failure.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+# GraalVM is looked up rather than assumed to be the default JDK, deliberately:
+# the project's own `lein test`/`lein uberjar` should keep running on whatever
+# JDK the developer normally uses. Override with GRAALVM_HOME.
+GRAALVM_HOME="${GRAALVM_HOME:-$HOME/.sdkman/candidates/java/21.0.2-graalce}"
+if [ ! -x "$GRAALVM_HOME/bin/native-image" ]; then
+  echo "bin/native: no native-image at $GRAALVM_HOME/bin/native-image" >&2
+  echo "  install one with:  sdk install java 21.0.2-graalce" >&2
+  echo "  or point GRAALVM_HOME at an existing GraalVM/Mandrel." >&2
+  exit 1
+fi
+export JAVA_HOME="$GRAALVM_HOME"
+export PATH="$JAVA_HOME/bin:$PATH"
+
+# Output goes to dist/, NOT under target/ (TASK-127). Leiningen's :auto-clean
+# deletes the whole target/ tree before every jar/uberjar build, so a binary
+# kept there did not survive `lein test` -- haselnuss.uberjar-test shells out
+# to `lein uberjar` on every run. dist/ is gitignored and Leiningen never
+# touches it.
+out=dist/haselnuss
+staged=dist/haselnuss-staged.jar
+
+mkdir -p dist
+
+echo "== uberjar =="
+# Built under GraalVM itself, so the class files native-image consumes come
+# from the same JDK that reads them.
+lein uberjar || exit 1
+
+echo
+echo "== staging jar (stripping Clojure sources) =="
+# This is the step that makes the binary actually run, and it is not optional.
+#
+# `:aot :all` puts BOTH `foo/bar.clj` and `foo/bar__init.class` in the uberjar.
+# clojure.lang.RT.load picks between them by comparing resource timestamps, and
+# on the JVM the newer .class wins. Inside a native image that comparison does
+# not survive, RT falls back to the .clj, and loading source means invoking the
+# Clojure *compiler*, which needs DynamicClassLoader.defineClass -- something a
+# closed world cannot provide. The binary dies at startup with:
+#
+#   Syntax error macroexpanding clojure.core/ns at (haselnuss/cli.clj:1:1)
+#   Caused by: UnsupportedFeatureError: No classes have been predefined during
+#   the image build to load from bytecodes at runtime.
+#
+# Removing the sources leaves RT no fallback to get wrong. Done to a staged
+# copy rather than via :uberjar-exclusions so the *shipped* jar keeps its
+# sources; nothing about the published artifact changes for JVM users.
+cp target/uberjar/haselnuss.jar "$staged" || exit 1
+zip -q -d "$staged" '*.clj' '*.cljc' '*.cljs' || exit 1
+
+echo
+echo "== native-image =="
+# --features: graal-build-time registers the Clojure packages that must be
+#   initialized at build time. Without it the binary dies in
+#   clojure.lang.Namespace's static initializer before reaching -main.
+#
+# --initialize-at-run-time: the counterweight. GraalVM runs class initializers
+#   on a ForkJoinPool, so the thread binding clojure.lang.RT pushes for
+#   *warn-on-reflection* is not visible to the thread initializing some other
+#   namespace -- and every library whose source opens with
+#   `(set! *warn-on-reflection* true)` therefore throws
+#   "Can't change/establish root binding" at build time. These are the packages
+#   and classes that do it.
+#
+#   The exact class names matter: Clojure's AOT naming puts `clojure.math__init`
+#   in package `clojure`, NOT in a package called `clojure.math`, so a
+#   package-level deferral silently fails to match it.
+native-image -jar "$staged" --no-fallback \
+  --features=clj_easy.graal_build_time.InitClojureClasses \
+  --initialize-at-run-time=haselnuss,sci,clj_yaml,edamame,flatland,malli,fipp,borkdude,com.vladsch.flexmark,org.yaml.snakeyaml,clojure.data.json__init,clojure.math__init,clojure.pprint__init,clojure.pprint.dispatch__init,flatland.ordered.map__init \
+  -o "$out"
+status=$?
+
+rm -f "$staged"
+
+if [ "$status" -eq 0 ]; then
+  echo
+  echo "built $out ($(du -h "$out" | cut -f1))"
+  echo "verify it with: lein test haselnuss.native-test"
+fi
+exit "$status"

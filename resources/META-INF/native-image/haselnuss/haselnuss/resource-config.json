@@ -1,0 +1,593 @@
+{
+  "resources":{
+  "includes":[{
+    "pattern":"\\QMETA-INF/maven/haselnuss/haselnuss/pom.properties\\E"
+  }, {
+    "pattern":"\\QMETA-INF/services/java.lang.System$LoggerFinder\\E"
+  }, {
+    "pattern":"\\QMETA-INF/services/java.time.zone.ZoneRulesProvider\\E"
+  }, {
+    "pattern":"\\Qborkdude/dynaload.clj\\E"
+  }, {
+    "pattern":"\\Qborkdude/dynaload.cljc\\E"
+  }, {
+    "pattern":"\\Qborkdude/dynaload__init.class\\E"
+  }, {
+    "pattern":"\\Qborkdude/graal/locking.clj\\E"
+  }, {
+    "pattern":"\\Qborkdude/graal/locking__init.class\\E"
+  }, {
+    "pattern":"\\Qclj_yaml/core.clj\\E"
+  }, {
+    "pattern":"\\Qclj_yaml/core__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/core.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/core/protocols.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/core/protocols__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/core/server.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/core/server__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/core__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/core_deftype.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/core_deftype__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/core_print.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/core_print__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/core_proxy.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/core_proxy__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/data/json.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/data/json__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/edn.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/edn__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/genclass.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/genclass__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/gvec.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/gvec__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/instant.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/instant__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/java/io.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/java/io__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/main.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/main__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/math.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/math__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/cl_format.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/cl_format__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/column_writer.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/column_writer__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/dispatch.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/dispatch__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/pprint_base.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/pprint_base__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/pretty_writer.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/pretty_writer__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/print_table.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/print_table__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/utilities.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint/utilities__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/pprint__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/set.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/set__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/spec/alpha.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/spec/alpha__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/spec/gen/alpha.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/spec/gen/alpha__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/string.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/string__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/default_data_readers.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/default_data_readers__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/edn.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/edn__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/impl/commons.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/impl/commons__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/impl/errors.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/impl/errors__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/impl/inspect.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/impl/inspect__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/impl/utils.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/impl/utils__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/reader_types.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader/reader_types__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/tools/reader__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/uuid.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/uuid__init.class\\E"
+  }, {
+    "pattern":"\\Qclojure/version.properties\\E"
+  }, {
+    "pattern":"\\Qclojure/walk.clj\\E"
+  }, {
+    "pattern":"\\Qclojure/walk__init.class\\E"
+  }, {
+    "pattern":"\\Qdata_readers.clj\\E"
+  }, {
+    "pattern":"\\Qdata_readers.cljc\\E"
+  }, {
+    "pattern":"\\Qedamame/core.clj\\E"
+  }, {
+    "pattern":"\\Qedamame/core.cljc\\E"
+  }, {
+    "pattern":"\\Qedamame/core__init.class\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/macros.clj\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/macros.cljc\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/macros__init.class\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/ns_parser.clj\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/ns_parser.cljc\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/ns_parser__init.class\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/parser.clj\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/parser.cljc\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/parser__init.class\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/read_fn.clj\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/read_fn.cljc\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/read_fn__init.class\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/syntax_quote.clj\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/syntax_quote.cljc\\E"
+  }, {
+    "pattern":"\\Qedamame/impl/syntax_quote__init.class\\E"
+  }, {
+    "pattern":"\\Qflatland/ordered/common.clj\\E"
+  }, {
+    "pattern":"\\Qflatland/ordered/common__init.class\\E"
+  }, {
+    "pattern":"\\Qflatland/ordered/map.clj\\E"
+  }, {
+    "pattern":"\\Qflatland/ordered/map__init.class\\E"
+  }, {
+    "pattern":"\\Qflatland/ordered/set.clj\\E"
+  }, {
+    "pattern":"\\Qflatland/ordered/set__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/anchor.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/anchor__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/ast.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/ast__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/cli.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/cli__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/emit/hdoc.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/emit/hdoc__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/emit/html.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/emit/html__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/emit/latex.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/emit/latex__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/ext.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/ext__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/collapsable.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/collapsable__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/derived_lists.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/derived_lists__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/front_matter.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/front_matter__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/rules.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/rules__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/sidecar.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/sidecar__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/small_collapsable.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/extensions/small_collapsable__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/json.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/json__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/lower.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/lower__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/parser.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/parser__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/registry.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/registry__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/resolver.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/resolver__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/sandbox.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/sandbox__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/select.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/select__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/transform.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/transform__init.class\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/walk.clj\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/walk__init.class\\E"
+  }, {
+    "pattern":"\\Qmalli/core.clj\\E"
+  }, {
+    "pattern":"\\Qmalli/core.cljc\\E"
+  }, {
+    "pattern":"\\Qmalli/core__init.class\\E"
+  }, {
+    "pattern":"\\Qmalli/error.clj\\E"
+  }, {
+    "pattern":"\\Qmalli/error.cljc\\E"
+  }, {
+    "pattern":"\\Qmalli/error__init.class\\E"
+  }, {
+    "pattern":"\\Qmalli/impl/regex.clj\\E"
+  }, {
+    "pattern":"\\Qmalli/impl/regex.cljc\\E"
+  }, {
+    "pattern":"\\Qmalli/impl/regex__init.class\\E"
+  }, {
+    "pattern":"\\Qmalli/impl/util.clj\\E"
+  }, {
+    "pattern":"\\Qmalli/impl/util.cljc\\E"
+  }, {
+    "pattern":"\\Qmalli/impl/util__init.class\\E"
+  }, {
+    "pattern":"\\Qmalli/json_schema.clj\\E"
+  }, {
+    "pattern":"\\Qmalli/json_schema.cljc\\E"
+  }, {
+    "pattern":"\\Qmalli/json_schema__init.class\\E"
+  }, {
+    "pattern":"\\Qmalli/registry.clj\\E"
+  }, {
+    "pattern":"\\Qmalli/registry.cljc\\E"
+  }, {
+    "pattern":"\\Qmalli/registry__init.class\\E"
+  }, {
+    "pattern":"\\Qmalli/sci.clj\\E"
+  }, {
+    "pattern":"\\Qmalli/sci.cljc\\E"
+  }, {
+    "pattern":"\\Qmalli/sci__init.class\\E"
+  }, {
+    "pattern":"\\Qmalli/transform.clj\\E"
+  }, {
+    "pattern":"\\Qmalli/transform.cljc\\E"
+  }, {
+    "pattern":"\\Qmalli/transform__init.class\\E"
+  }, {
+    "pattern":"\\Qmalli/util.clj\\E"
+  }, {
+    "pattern":"\\Qmalli/util.cljc\\E"
+  }, {
+    "pattern":"\\Qmalli/util__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/core.clj\\E"
+  }, {
+    "pattern":"\\Qsci/core.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/core__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/ctx_store.clj\\E"
+  }, {
+    "pattern":"\\Qsci/ctx_store.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/ctx_store__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/analyzer.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/analyzer.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/analyzer__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/async_macro.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/async_macro.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/async_macro__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/callstack.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/callstack.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/callstack__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/cljs.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/cljs.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/cljs__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/copy_vars.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/copy_vars.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/copy_vars__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/core_protocols.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/core_protocols.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/core_protocols__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/deftype.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/deftype.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/deftype__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/destructure.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/destructure.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/destructure__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/doseq_macro.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/doseq_macro.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/doseq_macro__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/evaluator.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/evaluator.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/evaluator__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/faster.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/faster.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/faster__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/fns.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/fns.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/fns__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/for_macro.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/for_macro.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/for_macro__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/hierarchies.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/hierarchies.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/hierarchies__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/interop.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/interop.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/interop__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/interpreter.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/interpreter.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/interpreter__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/io.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/io.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/io__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/load.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/load.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/load__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/macroexpand.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/macroexpand.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/macroexpand__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/macros.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/macros.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/macros__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/multimethods.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/multimethods.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/multimethods__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/namespaces.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/namespaces.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/namespaces__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/opts.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/opts.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/opts__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/parser.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/parser.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/parser__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/protocols.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/protocols.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/protocols__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/proxy.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/proxy__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/read.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/read.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/read__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/records.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/records.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/records__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/reflector.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/reflector.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/reflector__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/reify.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/reify.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/reify__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/resolve.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/resolve.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/resolve__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/types.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/types.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/types__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/unrestrict.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/unrestrict.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/unrestrict__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/utils.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/utils.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/utils__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/impl/vars.clj\\E"
+  }, {
+    "pattern":"\\Qsci/impl/vars.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/impl/vars__init.class\\E"
+  }, {
+    "pattern":"\\Qsci/lang.clj\\E"
+  }, {
+    "pattern":"\\Qsci/lang.cljc\\E"
+  }, {
+    "pattern":"\\Qsci/lang__init.class\\E"
+  }, {
+    "pattern":"\\Quser.clj\\E"
+  }]},
+  "bundles":[]
+}

@@ -195,8 +195,13 @@
   `{:error throwable}` on an exception -- never left running with anything
   blocking the caller once the promise is delivered. `:daemon true` is what
   keeps a thread this function abandons on timeout (see `bounded-eval!`)
-  from being able to outlive the JVM process itself."
-  [thunk describe p]
+  from being able to outlive the JVM process itself.
+
+  The `^Thread` return hint is what keeps `bounded-eval!`'s own `.start`
+  and `.interrupt` off reflective dispatch (TASK-125); hinting it here
+  rather than at each call site means a third caller cannot reintroduce
+  the reflection by forgetting to."
+  ^Thread [thunk describe p]
   (doto (Thread. ^Runnable
          (fn []
            (try

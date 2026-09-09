@@ -1,4 +1,12 @@
 /target
+# Where bin/native puts the GraalVM binary (TASK-127). Deliberately NOT under
+# target/: Leiningen's :auto-clean deletes that whole tree before every
+# jar/uberjar build, so a binary living there was destroyed by any later
+# `lein test` (haselnuss.uberjar-test shells out to `lein uberjar`). Listed
+# here before anything could write to it -- a 101MB artifact is the worst
+# possible thing to sweep into a commit, which TASK-50.5 records happening
+# twice already.
+/dist
 /.lein-*
 /.nrepl-port
 *.jar

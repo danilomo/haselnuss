@@ -18,8 +18,37 @@
                  ;; version TASK-89's own review used to verify the
                  ;; `sci.lang.Var` behavior `haselnuss.registry/renderer-v2`
                  ;; now accounts for -- see that function's docstring).
-                 [org.babashka/sci "0.12.51"]]
+                 [org.babashka/sci "0.12.51"]
+                 ;; TASK-126: not called from anywhere in `src/`, and that is
+                 ;; the point. GraalVM's closed-world analysis has to decide,
+                 ;; per class, whether to run its static initializer at image
+                 ;; build time or defer it to run time, and Clojure's runtime
+                 ;; (`clojure.lang.RT`, var/namespace init) only works if that
+                 ;; split is drawn correctly. This library draws it, by
+                 ;; shipping a `META-INF/native-image/**/native-image.properties`
+                 ;; that names the packages to initialize at build time.
+                 ;;
+                 ;; It therefore has to be INSIDE the uberjar rather than on a
+                 ;; build-only classpath, since `native-image -jar` reads that
+                 ;; properties file from the jar it is given. The cost to
+                 ;; someone who only ever runs `java -jar` is a few KB of
+                 ;; never-loaded classes; the alternative is hand-maintaining
+                 ;; the `--initialize-at-build-time` package list on the
+                 ;; command line, which is the thing this library exists to
+                 ;; stop people getting wrong.
+                 [com.github.clj-easy/graal-build-time "1.0.5"]]
   :plugins [[lein-cljfmt "0.9.2"]]
+  ;; Reflective interop is a silent cost twice over (TASK-125): it is slower on
+  ;; the JVM, and it is precisely what a closed-world GraalVM build cannot see
+  ;; ahead of time, so every un-hinted call site would have to be rediscovered
+  ;; by a tracing agent and written into a reflect-config. Turning the warning
+  ;; on globally keeps new ones from landing unnoticed.
+  ;;
+  ;; Scope, so this is not read as more than it is: this flags only reflection
+  ;; the *Clojure compiler* emits for un-hinted interop in this project's own
+  ;; code. It says nothing about reflection a dependency performs inside its
+  ;; own already-compiled Java.
+  :global-vars {*warn-on-reflection* true}
   :main ^:skip-aot haselnuss.cli
   :target-path "target/%s"
   ;; A stable, version-free name (TASK-26): the artifact `lein uberjar`
