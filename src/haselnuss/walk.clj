@@ -296,6 +296,32 @@
     (keyword (get node field))
     (keyword (name ref-kind))))
 
+(defn fields-holding
+  "The fields of `node` (a value of reference kind `ref-kind`) that hold a
+  VECTOR of `child-kind` children -- `(:children table)`'s own `[:many
+  child-kind]` entries for whatever node type `node` is, in schema
+  declaration order.
+
+  The point of this, and the reason it is public rather than a detail of
+  `fold`/`rewrite`, is the hand-written traversals that predate this
+  namespace and cannot simply be ported onto its primitives -- passes
+  that rebuild rather than walk, or that collect a different shape
+  (`haselnuss.resolver`'s `inline-blocks`/`expand-inlines`/`splice-
+  overlay-inlines`, `haselnuss.emit.html`'s `plain-text-inline`). Each of
+  those still needs its own control flow, but none of them needs to know
+  WHICH Inline variants carry nested Inlines or Blocks: asking here
+  instead of listing `(:emph :strong :strike :small-caps :sub :sup :span
+  :link)` by hand is what stops the next node type added to
+  `haselnuss.ast/registry` from being silently skipped by whichever pass
+  forgot it, which is exactly what happened to all four of those when
+  TASK-116 added `:highlight` and `:sticky-note`."
+  [ref-kind node child-kind]
+  (let [{:keys [children discriminators]} table]
+    (into []
+          (keep (fn [[field [arity kind]]]
+                  (when (and (= :many arity) (= child-kind kind)) field)))
+          (get children (node-type discriminators ref-kind node) []))))
+
 (def every-ref-kind
   "Every reference kind `table` uses anywhere -- the union of every
   `ref-kind` named in `(:children table)` -- for a caller (or a test) that

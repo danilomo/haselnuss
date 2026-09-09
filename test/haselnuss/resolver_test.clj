@@ -1810,8 +1810,8 @@
       (is (= [{:type :overlay-unexpected-content :directive "prepnd" :target "ch:intro"}]
              (mapv #(select-keys % [:type :directive :target]) warnings)))
       (is (= (str "unexpected top-level directive \"prepnd\" (target=ch:intro) in an"
-                  " overlay file (only prepend/append/describe directives are"
-                  " recognized there); it was dropped")
+                  " overlay file (only append/describe/highlight/prepend/sticky-note"
+                  " directives are recognized there); it was dropped")
              (:message (first warnings))))))
   (testing "TASK-112: the same unrecognized directive with no target=
             names it but omits the parenthetical -- there is nothing
@@ -1820,16 +1820,17 @@
           {:keys [warnings]}
           (resolver/apply-overlays doc [[(overlay-directive "prepnd" nil [])]])]
       (is (= (str "unexpected top-level directive \"prepnd\" in an overlay file"
-                  " (only prepend/append/describe directives are recognized there);"
-                  " it was dropped")
+                  " (only append/describe/highlight/prepend/sticky-note directives are"
+                  " recognized there); it was dropped")
              (:message (first warnings))))))
   (testing "TASK-112: AC #3 -- the stray-paragraph case, which has no
             name to add, is unchanged"
     (let [doc {:meta {} :blocks [(section "ch:intro" [])]}
           {:keys [warnings]}
           (resolver/apply-overlays doc [[(para {:t :str :text "stray"})]])]
-      (is (= (str "unexpected top-level para in an overlay file (only prepend/append/"
-                  "describe directives are recognized there); it was dropped")
+      (is (= (str "unexpected top-level para in an overlay file (only append/describe/"
+                  "highlight/prepend/sticky-note directives are recognized there);"
+                  " it was dropped")
              (:message (first warnings))))))
   (testing "pitfall 5 (doc-5): an id collision INTRODUCED by overlay
             content needs no bespoke check here -- apply-overlays runs
@@ -2671,3 +2672,605 @@
           [resolved] (resolved-cross-refs {:document document})]
       (is (= "??" (:text resolved)))
       (is (= [:dangling-cross-ref] (map :type diagnostics))))))
+
+;; --- Inline containers, derived rather than enumerated (TASK-122) ---------
+
+(def ^:private block-bearing-inlines
+  "Every Inline variant that carries a vector of Blocks, derived from
+  `haselnuss.ast/registry` rather than listed: today `:note` (a footnote)
+  and `:sticky-note`, each mapped to a function wrapping one Block in it.
+
+  This namespace's four inline traversals -- numbering
+  (`inline-blocks`), `!include` expansion (`expand-inlines`), overlay
+  splicing (`splice-overlay-inlines`) and duplicate-id collection
+  (`id-locations-inline-visit`) -- each used to name the container
+  variants in a hand-written `case`, and all four were silently wrong the
+  day TASK-116 added a node type none of them mentioned. A Figure inside
+  a footnote inside a `:highlight` got no number and no diagnostic; the
+  identical document written with `*emph*` numbered fine. They now ask
+  `haselnuss.walk/fields-holding` instead, and this set is derived the
+  same way so the tests below cannot fall behind the schema either."
+  (let [tags (->> (get ast/registry ::ast/inline)
+                  (drop 2)
+                  (keep (fn [[tag [_map & field-specs]]]
+                          (when (some (fn [spec]
+                                        (let [field-type (last spec)]
+                                          (= [:vector [:ref ::ast/block]] field-type)))
+                                      field-specs)
+                            tag))))]
+    (into {} (map (fn [tag]
+                    [tag (fn [block]
+                           (cond-> {:t tag :blocks [block]}
+                             (not= :note tag) (assoc :attr attr)))]))
+          tags)))
+
+(def ^:private inline-wrappers
+  "One wrapper per Inline variant that carries nested INLINES, likewise
+  derived -- the outer layer a `block-bearing-inlines` wrapper is put
+  inside, so each test below exercises \"Block inside a Block-bearing
+  Inline inside an Inline container\", which is the shape that broke."
+  (let [tags (->> (get ast/registry ::ast/inline)
+                  (drop 2)
+                  (keep (fn [[tag [_map & field-specs]]]
+                          (when (some (fn [spec] (= [:vector [:ref ::ast/inline]] (last spec)))
+                                      field-specs)
+                            tag))))]
+    (into {} (map (fn [tag]
+                    [tag (fn [inline]
+                           (cond-> {:t tag :inlines [inline]}
+                             (contains? #{:link :span :highlight} tag)
+                             (assoc :attr attr)
+                             (= :link tag) (assoc :target "u")))]))
+          tags)))
+
+(deftest inline-container-coverage-is-derived-test
+  (testing "the two derived sets are non-empty and actually contain the
+            node types TASK-116 added -- a derivation that quietly
+            matched nothing would make every test below vacuous"
+    (is (contains? block-bearing-inlines :note))
+    (is (contains? block-bearing-inlines :sticky-note))
+    (is (contains? inline-wrappers :emph))
+    (is (contains? inline-wrappers :highlight))))
+
+(deftest numbering-reaches-blocks-inside-every-inline-container-test
+  (testing "a labelled Figure inside a Block-bearing Inline, itself
+            inside any Inline container, still numbers -- sec9 step 1's
+            'every labeled node', which is what the hand-written variant
+            list quietly stopped delivering"
+    (doseq [[block-tag wrap-block] block-bearing-inlines
+            [inline-tag wrap-inline] inline-wrappers]
+      (testing (str block-tag " inside " inline-tag)
+        (let [doc {:meta {}
+                   :blocks [(para (wrap-inline (wrap-block (figure "fig:x"))))
+                            (para (cross-ref "fig:x"))]}
+              {:keys [labels]} (resolver/resolve-document doc)]
+          (is (= "1" (:number (get labels "fig:x")))))))))
+
+(deftest overlay-splicing-reaches-every-inline-container-test
+  (testing "an overlay targeting a Section inside a Block-bearing Inline,
+            itself inside any Inline container, is spliced rather than
+            reported as a dangling target"
+    (let [appended (para {:t :str :text "Z"})
+          overlay [(overlay-directive "append" "ch:x" [appended])]]
+      (doseq [[block-tag wrap-block] block-bearing-inlines
+              [inline-tag wrap-inline] inline-wrappers]
+        (testing (str block-tag " inside " inline-tag)
+          (let [doc {:meta {}
+                     :blocks [(para (wrap-inline (wrap-block (section "ch:x" []))))]}
+                {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
+            (is (= [] (mapv :type warnings)))
+            (is (= [appended]
+                   (get-in document [:blocks 0 :inlines 0 :inlines 0 :blocks 0 :blocks])))))))))
+
+(deftest include-expansion-reaches-every-inline-container-test
+  (testing "an :include inside a Block-bearing Inline, itself inside any
+            Inline container, is expanded rather than surviving to an
+            emitter"
+    (let [expanded (para {:t :str :text "included"})]
+      (doseq [[block-tag wrap-block] block-bearing-inlines
+              [inline-tag wrap-inline] inline-wrappers]
+        (testing (str block-tag " inside " inline-tag)
+          (let [doc {:meta {}
+                     :blocks [(para (wrap-inline (wrap-block {:t :include :src "x.hdoc"})))]}
+                loader (stub-loader {"x.hdoc" {:meta {} :blocks [expanded]}})
+                {:keys [document warnings]} (resolver/expand-includes
+                                             doc {:load loader :base-dir "/x"})]
+            (is (= [] (mapv :type warnings)))
+            (is (= [expanded]
+                   (get-in document [:blocks 0 :inlines 0 :inlines 0 :blocks])))))))))
+
+(deftest duplicate-ids-are-found-inside-every-inline-container-test
+  (testing "a duplicate attr.id inside a Block-bearing Inline, itself
+            inside any Inline container, is still reported -- it was not,
+            for :sticky-note, until the collection walk stopped naming
+            :note by hand"
+    (doseq [[block-tag wrap-block] block-bearing-inlines
+            [inline-tag wrap-inline] inline-wrappers]
+      (testing (str block-tag " inside " inline-tag)
+        (let [doc {:meta {}
+                   :blocks [(figure "fig:dup")
+                            (para (wrap-inline (wrap-block (figure "fig:dup"))))]}
+              diagnostics (resolver/structural-diagnostics doc)]
+          (is (some #(= :duplicate-id (:type %)) diagnostics)
+              (pr-str (mapv :type diagnostics))))))))
+
+;; --- Annotation overlay directives (TASK-119, doc-8 sec4) -----------------
+
+(defn- annotation-str
+  "A `:str` Inline, this namespace's own fixtures otherwise building
+  inlines inline."
+  [text]
+  {:t :str :text text})
+
+(defn- annotation-directive
+  "A `highlight`/`sticky-note` overlay directive Block, in the shape
+  `haselnuss.parser` produces one: every prop a string, the body its own
+  nested Blocks."
+  [directive-name props blocks]
+  {:t :directive :name directive-name
+   :attr {:classes [] :props props}
+   :blocks (vec blocks)})
+
+(def ^:private annotated-base
+  "The base document every annotation fixture below targets: one Section
+  with one paragraph, whose wording the quotes are written against."
+  {:meta {}
+   :blocks [{:t :section :level 1 :heading [(annotation-str "Intro")]
+             :attr (id-attr "sec:intro")
+             :blocks [(para (annotation-str "Hazelnuts ripen in early autumn and drop soon after."))]}]})
+
+(defn- annotate!
+  "`apply-overlays` over `annotated-base` with `overlays` (a seq of
+  overlay files, each a vector of Blocks), returning
+  `[target-paragraph-inlines diagnostic-types]`."
+  [& overlays]
+  (let [{:keys [document warnings]} (resolver/apply-overlays annotated-base (vec overlays))]
+    [(get-in document [:blocks 0 :blocks 0 :inlines]) (mapv :type warnings)]))
+
+(defn- highlight-nodes
+  [inlines]
+  (filter #(= :highlight (:t %)) (tree-seq coll? seq inlines)))
+
+(defn- sticky-note-nodes
+  [inlines]
+  (filter #(= :sticky-note (:t %)) (tree-seq coll? seq inlines)))
+
+(deftest annotation-overlay-highlight-test
+  (testing "AC #1: a one-line !highlight{target= text=} wraps the quoted
+            run of the named section in a :highlight, with the base
+            document otherwise unchanged"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive "highlight"
+                                            {"target" "sec:intro"
+                                             "text" "ripen in early autumn"} [])])]
+      (is (= [] diagnostics))
+      (is (= [(annotation-str "Hazelnuts ")
+              {:t :highlight :inlines [(annotation-str "ripen in early autumn")]
+               :attr {:classes [] :props {}}}
+              (annotation-str " and drop soon after.")]
+             inlines))))
+  (testing "color= and author= reach the node's own Attr, and the props
+            that are instructions to this pass -- target=, text=, the
+            disambiguators -- do not"
+    (let [[inlines _] (annotate! [(annotation-directive
+                                   "highlight"
+                                   {"target" "sec:intro" "text" "ripen"
+                                    "color" "green" "author" "DM" "nth" "1"} [])])]
+      (is (= {:classes [] :props {"color" "green" "author" "DM"}}
+             (:attr (first (highlight-nodes inlines))))))))
+
+(deftest annotation-overlay-sticky-note-test
+  (testing "AC #2: a :::{sticky-note ...} with a body inserts a
+            :sticky-note carrying that body at the anchored edge"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive "sticky-note"
+                                            {"target" "sec:intro" "text" "early autumn"
+                                             "at" "end" "author" "DM"}
+                                            [(para (annotation-str "Check the lab notebook."))])])
+          note (first (sticky-note-nodes inlines))]
+      (is (= [] diagnostics))
+      (is (= [(para (annotation-str "Check the lab notebook."))] (:blocks note)))
+      (is (= {"author" "DM"} (:props (:attr note))))
+      (is (= [(annotation-str "Hazelnuts ripen in early autumn") note
+              (annotation-str " and drop soon after.")]
+             inlines)
+          "at=end puts it immediately after the matched run")))
+  (testing "AC #2: at=start puts it immediately before"
+    (let [[inlines _] (annotate! [(annotation-directive
+                                   "sticky-note"
+                                   {"target" "sec:intro" "text" "early autumn" "at" "start"}
+                                   [(para (annotation-str "Check."))])])]
+      (is (= (annotation-str "Hazelnuts ripen in ") (first inlines)))
+      (is (= :sticky-note (:t (second inlines)))))))
+
+(deftest annotation-overlay-highlight-with-body-test
+  (testing "AC #3: a :::{highlight ...} WITH a body produces a :highlight
+            immediately followed by a :sticky-note carrying that body --
+            the Acrobat 'highlight with a comment' shape, built from the
+            two node types rather than from a third"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive "highlight"
+                                            {"target" "sec:intro" "text" "early autumn"
+                                             "color" "blue"}
+                                            [(para (annotation-str "And this is the comment."))])])]
+      (is (= [] diagnostics))
+      (is (= [(annotation-str "Hazelnuts ripen in ")
+              {:t :highlight :inlines [(annotation-str "early autumn")]
+               :attr {:classes [] :props {"color" "blue"}}}
+              {:t :sticky-note :blocks [(para (annotation-str "And this is the comment."))]
+               :attr {:classes [] :props {"color" "blue"}}}
+              (annotation-str " and drop soon after.")]
+             inlines)))))
+
+(deftest annotation-overlay-diagnostics-test
+  (testing "AC #4: a sticky-note with no body is diagnosed and dropped --
+            an empty balloon says nothing"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive "sticky-note"
+                                            {"target" "sec:intro" "text" "ripen"} [])])]
+      (is (= [:annotation-empty-sticky-note] diagnostics))
+      (is (empty? (sticky-note-nodes inlines)))))
+  (testing "AC #5: color= outside the recognised set is diagnosed BY NAME
+            and the annotation dropped"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive "highlight"
+                                            {"target" "sec:intro" "text" "ripen"
+                                             "color" "purple"} [])])
+          {:keys [warnings]} (resolver/apply-overlays
+                              annotated-base
+                              [[(annotation-directive "highlight"
+                                                      {"target" "sec:intro" "text" "ripen"
+                                                       "color" "purple"} [])]])]
+      (is (= [:annotation-unknown-color] diagnostics))
+      (is (empty? (highlight-nodes inlines)) "and nothing was applied")
+      (is (str/includes? (:message (first warnings)) "purple"))
+      (is (str/includes? (:message (first warnings)) "yellow") "naming what IS recognised")))
+  (testing "AC #5: at= outside start|end likewise"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive "sticky-note"
+                                            {"target" "sec:intro" "text" "ripen" "at" "middle"}
+                                            [(para (annotation-str "x"))])])]
+      (is (= [:annotation-unknown-edge] diagnostics))
+      (is (empty? (sticky-note-nodes inlines)))))
+  (testing "a missing or blank text= is diagnosed -- there is nothing to
+            anchor to"
+    (doseq [props [{"target" "sec:intro"} {"target" "sec:intro" "text" "  "}]]
+      (let [[inlines diagnostics] (annotate! [(annotation-directive "highlight" props [])])]
+        (is (= [:annotation-missing-text] diagnostics))
+        (is (empty? (highlight-nodes inlines))))))
+  (testing "an nth= that is not a whole number is diagnosed rather than
+            silently ignored"
+    (let [[_ diagnostics] (annotate! [(annotation-directive
+                                       "highlight"
+                                       {"target" "sec:intro" "text" "ripen" "nth" "first"} [])])]
+      (is (= [:annotation-invalid-nth] diagnostics)))))
+
+(deftest annotation-numbering-invariant-test
+  (testing "AC #6: a numbered block inside a sticky note body is
+            diagnosed and dropped -- it would take a number out of the
+            base document's own sequence and push everything after it
+            along, the same bug TASK-54 fixed for front matter"
+    (doseq [numbered [(figure "fig:inner")
+                      (table "tbl:inner")
+                      (math-block "eq:inner")
+                      (section "sec:inner" [])]]
+      (testing (str (:t numbered))
+        (let [[inlines diagnostics]
+              (annotate! [(annotation-directive "sticky-note"
+                                                {"target" "sec:intro" "text" "ripen"}
+                                                [(para (annotation-str "kept")) numbered])])
+              note (first (sticky-note-nodes inlines))]
+          (is (= [:annotation-body-unsupported-block] diagnostics))
+          (is (= [(para (annotation-str "kept"))] (:blocks note))
+              "the numbered block is dropped and the rest of the body kept")))))
+  (testing "AC #6: and the base document's own numbering is byte-identical
+            to the same build with no overlay at all"
+    (let [overlay [(annotation-directive "highlight"
+                                         {"target" "sec:intro" "text" "ripen in early autumn"} [])
+                   (annotation-directive "sticky-note"
+                                         {"target" "sec:intro" "text" "early autumn"}
+                                         [(para (annotation-str "A note."))])]
+          document (assoc-in annotated-base [:blocks 0 :blocks]
+                             [(para (annotation-str "Hazelnuts ripen in early autumn."))
+                              (figure "fig:a")
+                              (math-block "eq:a")
+                              (table "tbl:a")])
+          bare (resolver/resolve-document document)
+          annotated (resolver/resolve-document
+                     (:document (resolver/apply-overlays document [overlay])))]
+      (is (= (:labels bare) (:labels annotated))
+          "every number the document assigns is unchanged by annotating it"))))
+
+(deftest annotation-anchor-diagnostics-are-non-fatal-test
+  (testing "AC #7: every haselnuss.anchor diagnostic reaches the build as
+            a WARNING naming the quote and the target, and nothing about
+            it is fatal -- doc-8's whole argument for quoting over
+            counting is that a stale anchor says so instead of silently
+            recalculating onto the wrong words"
+    (doseq [[label props expected]
+            [["a quote that is gone" {"text" "ripen in late spring"} :dangling-annotation-anchor]
+             ;; "o" occurs three times in the fixture paragraph (drop,
+             ;; soon twice), which is the point: a short quote that
+             ;; matches more than once is the case doc-8 refuses to guess
+             ;; at rather than an artificial one.
+             ["an ambiguous quote" {"text" "o"} :ambiguous-annotation-anchor]
+             ["nth beyond the count" {"text" "o" "nth" "9"} :annotation-anchor-out-of-range]]]
+      (testing label
+        (let [{:keys [document warnings]}
+              (resolver/apply-overlays
+               annotated-base
+               [[(annotation-directive "highlight" (assoc props "target" "sec:intro") [])]])
+              warning (first (filter #(= expected (:type %)) warnings))]
+          (is (some? warning) (pr-str (mapv :type warnings)))
+          (is (= (get props "text") (:quote warning)) "naming the quote")
+          (is (= "sec:intro" (:target warning)) "and the target")
+          (is (= annotated-base document) "and the document is untouched")
+          (is (not (some #(= :dangling-overlay-target (:type %)) warnings))
+              "the TARGET resolved; only the anchor did not, and naming
+               the same mistake twice in two vocabularies would be noise"))))))
+
+(deftest annotation-overlay-shares-prepend-diagnostics-test
+  (testing "AC #8: a missing or blank target=, a target that resolves to
+            nothing, and a directive carrying its own id are diagnosed
+            exactly as prepend/append/describe already are"
+    (let [missing (resolver/apply-overlays
+                   annotated-base
+                   [[(annotation-directive "highlight" {"text" "ripen"} [])]])
+          dangling (resolver/apply-overlays
+                    annotated-base
+                    [[(annotation-directive "highlight"
+                                            {"target" "sec:nowhere" "text" "ripen"} [])]])
+          own-id (resolver/apply-overlays
+                  annotated-base
+                  [[(assoc-in (annotation-directive "highlight"
+                                                    {"target" "sec:intro" "text" "ripen"} [])
+                              [:attr :id] "hl:mine")]])]
+      (is (= [:overlay-missing-target] (mapv :type (:warnings missing))))
+      (is (= [:dangling-overlay-target] (mapv :type (:warnings dangling))))
+      (is (= [:overlay-directive-id-ignored] (mapv :type (:warnings own-id))))
+      (is (seq (highlight-nodes (get-in (:document own-id) [:blocks 0 :blocks 0 :inlines])))
+          "an ignored own-id is non-fatal: the annotation is still applied"))))
+
+(deftest annotation-overlay-accumulation-test
+  (testing "AC #10: two overlay files annotating the same target
+            accumulate in --overlay order then in-file order"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive "highlight" {"target" "sec:intro" "text" "ripen"} [])
+                      (annotation-directive "highlight" {"target" "sec:intro" "text" "autumn"} [])]
+                     [(annotation-directive "highlight" {"target" "sec:intro" "text" "drop"} [])])]
+      (is (= [] diagnostics))
+      (is (= ["ripen" "autumn" "drop"]
+             (mapv #(get-in % [:inlines 0 :text]) (highlight-nodes inlines)))
+          "all three applied, and each found its own words in document order"))))
+
+(deftest annotation-overlay-reaches-included-content-test
+  (testing "AC #9: an annotation overlay targeting a section that exists
+            only after the base document's own !include expansion is
+            applied -- annotations join apply-overlays, which runs AFTER
+            expand-includes (doc-8 sec6)"
+    (let [loader (stub-loader
+                  {"ch.hdoc" {:meta {}
+                              :blocks [{:t :section :level 1 :heading [(annotation-str "Chapter")]
+                                        :attr (id-attr "ch:one")
+                                        :blocks [(para (annotation-str "Hazelnuts ripen here."))]}]}})
+          document {:meta {} :blocks [(include-block "ch.hdoc")]}
+          expanded (:document (resolver/expand-includes document {:load loader :base-dir "/x"}))
+          {:keys [document warnings]}
+          (resolver/apply-overlays
+           expanded
+           [[(annotation-directive "highlight" {"target" "ch:one" "text" "ripen"} [])]])]
+      (is (= [] (mapv :type warnings)))
+      (is (seq (highlight-nodes (get-in document [:blocks 0 :blocks 0 :inlines])))))))
+
+(deftest annotation-overlay-is-a-no-op-without-overlays-test
+  (testing "AC #12: omitting --overlay builds the base document
+            byte-for-byte identically whether or not an annotation
+            overlay exists on disk"
+    (is (= {:document annotated-base :warnings []}
+           (resolver/apply-overlays annotated-base [])))
+    (is (= {:document annotated-base :warnings []}
+           (resolver/apply-overlays annotated-base nil)))))
+
+(deftest annotation-numbering-invariant-is-subtree-deep-test
+  (testing "TASK-119 review: the numbering invariant was escapable FIVE
+            ways, all silent. `annotation-body` filtered only the TOP
+            level of the body and only on four node types, so a numbered
+            block nested anywhere inside it took a number and shifted the
+            base document -- `fig:a` 1.1 became 1.2 -- with no warning at
+            all. It is a property of a body block's whole SUBTREE now"
+    (doseq [[label body-block]
+            [["a figure inside a block quote"
+              {:t :block-quote :blocks [(figure "fig:inner")]}]
+             ["a figure inside a list item"
+              {:t :list :ordered false :tight true :items [[(figure "fig:inner")]] :attr attr}]
+             ["a figure inside a nested directive body"
+              {:t :directive :name "theorem" :attr attr :blocks [(figure "fig:inner")]}]
+             ["a footnote in the body, which takes a footnote number"
+              (para (annotation-str "see") {:t :note :blocks [(para (annotation-str "n"))]})]
+             ["a numbered directive at the top level, which numbers by ID
+               PREFIX rather than by :t -- the escape route no list of
+               node types could have closed"
+              {:t :directive :name "theorem" :attr (id-attr "thm:inner") :blocks []}]]]
+      (testing label
+        (let [document {:meta {}
+                        :blocks [{:t :section :level 1 :heading [(annotation-str "Intro")]
+                                  :attr (id-attr "sec:intro")
+                                  :blocks [(para (annotation-str "Hazelnuts ripen here."))
+                                           (figure "fig:a")]}]}
+              overlay [(annotation-directive "sticky-note"
+                                             {"target" "sec:intro" "text" "ripen"}
+                                             [(para (annotation-str "kept")) body-block])]
+              {:keys [document warnings]} (resolver/apply-overlays document [overlay])
+              bare {:meta {}
+                    :blocks [{:t :section :level 1 :heading [(annotation-str "Intro")]
+                              :attr (id-attr "sec:intro")
+                              :blocks [(para (annotation-str "Hazelnuts ripen here."))
+                                       (figure "fig:a")]}]}]
+          (is (some #(= :annotation-body-unsupported-block (:type %)) warnings)
+              (str "the offending block must be diagnosed: " (pr-str (mapv :type warnings))))
+          (is (= (:labels (resolver/resolve-document bare))
+                 (:labels (resolver/resolve-document document)))
+              "and every number the base document assigns must be unchanged")))))
+  (testing "a body of ordinary prose, a list and a block quote carrying
+            nothing numbered is kept whole -- the check has to be narrow
+            enough to leave a real comment alone"
+    (let [body [(para (annotation-str "One."))
+                {:t :list :ordered false :tight true
+                 :items [[(para (annotation-str "a"))]] :attr attr}
+                {:t :block-quote :blocks [(para (annotation-str "quoted"))]}
+                {:t :code-block :text "(+ 1 2)" :attr attr}]
+          [inlines diagnostics]
+          (annotate! [(annotation-directive "sticky-note"
+                                            {"target" "sec:intro" "text" "ripen"} body)])]
+      (is (= [] diagnostics))
+      (is (= body (:blocks (first (sticky-note-nodes inlines))))))))
+
+(deftest co-located-annotations-accumulate-in-order-test
+  (testing "TASK-119 review: two annotations at the SAME anchor came out
+            reversed -- each re-resolved to the same position, so every
+            later one landed nearer the anchor than the one before it.
+            The test that should have caught it used three quotes at
+            three distinct positions, so it asserted document order and
+            could not fail on accumulation order"
+    (doseq [at ["end" "start"]]
+      (testing (str "at=" at)
+        (let [[inlines diagnostics]
+              (annotate! [(annotation-directive "sticky-note"
+                                                {"target" "sec:intro" "text" "early autumn"
+                                                 "at" at}
+                                                [(para (annotation-str "FIRST"))])
+                          (annotation-directive "sticky-note"
+                                                {"target" "sec:intro" "text" "early autumn"
+                                                 "at" at}
+                                                [(para (annotation-str "SECOND"))])])]
+          (is (= [] diagnostics))
+          (is (= ["FIRST" "SECOND"]
+                 (mapv #(-> % :blocks first :inlines first :text) (sticky-note-nodes inlines)))
+              "in-file order, not reversed")))))
+  (testing "and across two --overlay files, which is the same property
+            one level up"
+    (let [[inlines _]
+          (annotate! [(annotation-directive "sticky-note"
+                                            {"target" "sec:intro" "text" "early autumn"}
+                                            [(para (annotation-str "FROM A"))])]
+                     [(annotation-directive "sticky-note"
+                                            {"target" "sec:intro" "text" "early autumn"}
+                                            [(para (annotation-str "FROM B"))])])]
+      (is (= ["FROM A" "FROM B"]
+             (mapv #(-> % :blocks first :inlines first :text) (sticky-note-nodes inlines)))))))
+
+(deftest annotation-does-not-silence-a-dangling-sibling-test
+  (testing "TASK-119 review: `matched!` fires per ASPECT, but the dangling
+            check was per ID -- so an annotation, which matches on ANY
+            node carrying the id, silenced a genuinely dangling prepend on
+            the same id. A prepend naming a Figure resolves to nothing and
+            must say so whether or not a highlight also names it"
+    (let [document {:meta {} :blocks [(figure "fig:a")]}
+          prepend-only (resolver/apply-overlays
+                        document [[(overlay-directive "prepend" "fig:a"
+                                                      [(para (annotation-str "x"))])]])
+          with-annotation (resolver/apply-overlays
+                           document
+                           [[(overlay-directive "prepend" "fig:a" [(para (annotation-str "x"))])
+                             ;; A quote that really does match, so the
+                             ;; annotation is applied and the test is
+                             ;; about the prepend beside it rather than
+                             ;; about two failures at once.
+                             (annotation-directive "highlight"
+                                                   {"target" "fig:a" "text" "x"} [])]])]
+      (is (= [:dangling-overlay-target] (mapv :type (:warnings prepend-only))))
+      (is (some #(= :dangling-overlay-target (:type %)) (:warnings with-annotation))
+          (str "still dangling with an annotation beside it: "
+               (pr-str (mapv :type (:warnings with-annotation))))))))
+
+(deftest annotation-prop-validation-test
+  (testing "TASK-119 review: an unrecognised prop did exactly nothing and
+            said nothing, so a misspelled colour looked like an unstyled
+            annotation with no reason for it"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive "highlight"
+                                            {"target" "sec:intro" "text" "ripen"
+                                             "colour" "green"} [])])]
+      (is (= [:annotation-unknown-prop] diagnostics))
+      (is (empty? (highlight-nodes inlines)))))
+  (testing "at= and style= belong to a sticky note: one says which edge a
+            BALLOON sits at and the other which shape it takes, and a
+            highlight is neither. Accepted on a highlight, at= silently
+            inverted 'a highlight is immediately FOLLOWED by its note'"
+    (doseq [prop ["at" "style"]]
+      (testing prop
+        (let [[inlines diagnostics]
+              (annotate! [(annotation-directive "highlight"
+                                                {"target" "sec:intro" "text" "ripen"
+                                                 prop (if (= "at" prop) "start" "footnote")}
+                                                [])])]
+          (is (= [:annotation-prop-not-applicable] diagnostics))
+          (is (empty? (highlight-nodes inlines)))))))
+  (testing "style= is validated against its own closed set too"
+    (let [[_ diagnostics]
+          (annotate! [(annotation-directive "sticky-note"
+                                            {"target" "sec:intro" "text" "ripen"
+                                             "style" "balloon"}
+                                            [(para (annotation-str "x"))])])]
+      (is (= [:annotation-unknown-style] diagnostics))))
+  (testing "and every recognised prop is accepted, so the check cannot
+            have been made by refusing everything"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive
+                       "sticky-note"
+                       {"target" "sec:intro" "text" "early autumn" "before" "in"
+                        "after" "and" "nth" "1" "at" "end" "color" "blue"
+                        "author" "DM" "style" "footnote"}
+                       [(para (annotation-str "x"))])])]
+      (is (= [] diagnostics))
+      (is (= 1 (count (sticky-note-nodes inlines)))))))
+
+(deftest context-props-that-exclude-everything-say-so-test
+  (testing "TASK-119 review: a before=/after= that rejected every
+            occurrence reported the quote as missing and told the author
+            to update it -- when the quote matched and the context prop
+            is what rejected it. A different mistake with a different fix"
+    (let [{:keys [warnings]}
+          (resolver/apply-overlays
+           annotated-base
+           [[(annotation-directive "highlight"
+                                   {"target" "sec:intro" "text" "ripen"
+                                    "before" "greenhouse"} [])]])
+          message (:message (first warnings))]
+      (is (= [:dangling-annotation-anchor] (mapv :type warnings)))
+      (is (str/includes? message "was found in") "the quote WAS found")
+      (is (str/includes? message "before=\"greenhouse\"") "and the prop that rejected it is named")
+      (is (not (str/includes? message "update the quote"))
+          "so the advice is about the context props, not the quote")))
+  (testing "and a quote that really is gone still says exactly that"
+    (let [{:keys [warnings]}
+          (resolver/apply-overlays
+           annotated-base
+           [[(annotation-directive "highlight"
+                                   {"target" "sec:intro" "text" "not in the document"} [])]])]
+      (is (str/includes? (:message (first warnings)) "update the quote")))))
+
+(deftest a-highlight-body-emptied-by-the-numbering-rule-is-dropped-test
+  (testing "TASK-124 review: a highlight WITH a body is a highlight plus
+            a sticky note, and when the numbering rule emptied that body
+            the highlight was applied ALONE -- the author's comment
+            vanished while the warning said 'the rest of the body was
+            kept'. The empty-after-drop guard covered only sticky notes"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive "highlight"
+                                            {"target" "sec:intro" "text" "ripen"}
+                                            [(figure "fig:inner")])])]
+      (is (= [:annotation-empty-sticky-note] diagnostics)
+          "one message, naming what emptied the body -- the per-block warning would
+           have said 'the rest of the body was kept', which is not what happened")
+      (is (empty? (highlight-nodes inlines)) "no bare mark with the comment silently gone")
+      (is (empty? (sticky-note-nodes inlines)))))
+  (testing "and a highlight with a body that survives the rule still
+            places both, so the guard is not simply refusing bodies"
+    (let [[inlines diagnostics]
+          (annotate! [(annotation-directive "highlight"
+                                            {"target" "sec:intro" "text" "ripen"}
+                                            [(para (annotation-str "kept")) (figure "fig:inner")])])]
+      (is (= [:annotation-body-unsupported-block] diagnostics))
+      (is (= 1 (count (highlight-nodes inlines))))
+      (is (= 1 (count (sticky-note-nodes inlines)))))))

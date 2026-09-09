@@ -169,10 +169,25 @@
             rather than being silently skipped downstream"
     (let [tags (mapcat #(schema-variant-tags (get ast/registry %))
                        [::ast/block ::ast/inline ::ast/fallback])]
-      (is (= 33 (count tags)) "11 Block + 18 Inline + 4 Fallback variants")
+      (is (= 35 (count tags)) "11 Block + 20 Inline + 4 Fallback variants")
       (doseq [tag tags]
         (testing (str tag)
           (is (contains? (:children walk/table) tag)))))))
+
+(deftest annotation-nodes-derive-their-own-table-entries-test
+  (testing "TASK-116 AC #3: the two annotation Inline types (doc-8 sec2)
+            reach the table with the right child fields and arities purely
+            by being in haselnuss.ast/registry -- this namespace was not
+            edited for them, so this pins the derivation rather than a
+            hand-maintained list"
+    (is (= [[:inlines [:many ::ast/inline]]
+            [:attr [:one ::ast/attr]]]
+           (get-in walk/table [:children :highlight]))
+        ":highlight is span-shaped")
+    (is (= [[:blocks [:many ::ast/block]]
+            [:attr [:one ::ast/attr]]]
+           (get-in walk/table [:children :sticky-note]))
+        ":sticky-note is note-shaped, plus the Attr :note never had")))
 
 ;; --- schema declaration order (AC #2) --------------------------------------
 

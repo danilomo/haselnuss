@@ -16,7 +16,8 @@
   `cross-ref-rendering-test`), and the generated bibliography section
   plus in-text-citation linking (AC #4, `cite-and-bibliography-rendering-
   test`)."
-  (:require [clojure.string :as str]
+  (:require [clojure.set]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [haselnuss.emit.html :as html]
             [haselnuss.extensions.collapsable :as collapsable]
@@ -691,7 +692,29 @@
                  {:t :cite :items [] :text [(str-inline "[1]")]}]
           out (html/emit-document {:meta {:title title} :blocks []})]
       (is (well-formed? out))
-      (is (re-find #"<title>See Figure 1 \(x\^2\) \[1\]</title>" out)))))
+      (is (re-find #"<title>See Figure 1 \(x\^2\) \[1\]</title>" out))))
+  (testing "TASK-122: a :highlight in meta.title contributes its own
+            words to <title> rather than nothing. The fallback used to
+            name the container Inline types by hand, so a highlight --
+            the moment `==...==` made one writable -- flattened to the
+            empty string in the one place a document's own name is set"
+    (let [title [(str-inline "A ")
+                 {:t :highlight :inlines [(str-inline "marked")] :attr empty-attr}
+                 (str-inline " title")]
+          ;; A `:highlight` has no built-in renderer yet (that is
+          ;; TASK-120), and `emit-document` renders meta.title into the
+          ;; page's own title block as well as into <title>. Supplying
+          ;; one through the documented `:inline-handlers` opt keeps this
+          ;; test about the <title> FALLBACK -- which is what regressed
+          ;; -- rather than about rendering.
+          out (html/emit-document
+               {:meta {:title title} :blocks []}
+               {:inline-handlers
+                {:highlight (fn [_ctx inline footnotes]
+                              [(str "<mark>" (:text (first (:inlines inline))) "</mark>")
+                               footnotes])}})]
+      (is (well-formed? out))
+      (is (re-find #"<title>A marked title</title>" out)))))
 
 (deftest title-block-test
   (testing "TASK-68 AC #1: a document declaring title, authors and date
@@ -1026,3 +1049,266 @@
           "a later call with no :block-handlers opt must not see the earlier call's addition")
       (is (= ::html/unsupported-block (:type (ex-data thrown))))
       (is (str/includes? (ex-message thrown) ":callout")))))
+
+;; --- Annotations: :highlight and :sticky-note (TASK-120, doc-8 sec5) -------
+
+(defn- annotation-attr
+  "An Attr with an optional id and the annotation props doc-8 sec2
+  recognises."
+  [& {:keys [id color author classes]}]
+  (cond-> {:classes (vec classes)
+           :props (cond-> {} color (assoc "color" color) author (assoc "author" author))}
+    id (assoc :id id)))
+
+(defn- highlight
+  [attr & inlines]
+  {:t :highlight :inlines (vec inlines) :attr attr})
+
+(defn- sticky-note
+  [attr & blocks]
+  {:t :sticky-note :blocks (vec blocks) :attr attr})
+
+(defn- emit-body
+  [& blocks]
+  (body-of (html/emit-document {:meta {} :blocks (vec blocks)})))
+
+(deftest highlight-renders-as-mark-test
+  (testing "AC #1: a :highlight renders as a <mark> carrying its marked
+            inlines. <mark> is the element for exactly this, and it is
+            legible with no stylesheet at all -- which is this emitter's
+            own self-contained-single-file contract, and the reason a
+            highlight is not a <span> with a class"
+    (let [body (emit-body (para (str-inline "Hazelnuts ")
+                                (highlight (annotation-attr) (str-inline "ripen"))
+                                (str-inline " here.")))]
+      (is (re-find #"<mark class=\"highlight highlight-yellow\">ripen</mark>" body))))
+  (testing "AC #1: nested markup inside a highlight renders normally"
+    (let [body (emit-body
+                (para (highlight (annotation-attr)
+                                 {:t :emph :inlines [(str-inline "emph")]}
+                                 {:t :strong :inlines [(str-inline "strong")]}
+                                 {:t :link :target "https://example.com"
+                                  :inlines [(str-inline "link")] :attr empty-attr}
+                                 {:t :code :text "code"}
+                                 {:t :math-inline :tex "x^2"})))]
+      (is (re-find #"<em>emph</em>" body))
+      (is (re-find #"<strong>strong</strong>" body))
+      (is (re-find #"<a href=\"https://example.com\">link</a>" body))
+      (is (re-find #"<code>code</code>" body))
+      (is (re-find #"<span class=\"math inline\">" body))
+      (is (re-find #"<mark[^>]*>.*</mark>" body)))))
+
+(def ^:private phrasing-content-elements
+  "The HTML elements a `:sticky-note` is allowed to emit.
+
+  Every one of them is PHRASING content, and that is the whole
+  constraint: a sticky note is an inline node, so everything it emits
+  lands inside a `<p>`, and a `<p>` may contain nothing else. An HTML
+  parser does not nest a `<p>`, `<ul>`, `<pre>` or `<details>` there --
+  it CLOSES the paragraph and makes the element a sibling, which puts
+  the marker on a line of its own and orphans the rest of the sentence.
+
+  Asserted as a name set rather than by re-parsing with an HTML5 tree
+  builder: this encodes the rule that was actually broken, needs no new
+  dependency, and fails on the offending element by name."
+  #{"span" "input" "label" "code" "em" "strong" "s" "sub" "sup" "a" "mark" "br" "img"})
+
+(defn- element-names
+  "Every element name appearing in `html`, as a set."
+  [html]
+  (into #{} (map second) (re-seq #"</?([a-zA-Z][a-zA-Z0-9]*)" html)))
+
+(deftest sticky-note-renders-as-phrasing-content-test
+  (testing "AC #2: a :sticky-note renders as an inline disclosure whose
+            body holds the rendered blocks, opening and closing on click
+            with no script at all.
+
+            NOT the <details>/<summary> AC #2 and doc-8 sec5 name, and
+            that is a measured correction rather than a shortcut:
+            <details> is flow content, so an HTML parser closes the
+            enclosing <p> when it meets one and the balloon ends up a
+            SIBLING of the paragraph it was meant to sit inside. A hidden
+            checkbox plus its own <label> is phrasing content, so it is
+            legal where a sticky note actually occurs -- and it is still
+            click-to-open, click-to-dismiss, with no JavaScript"
+    (let [body (emit-body (para (str-inline "text")
+                                (sticky-note (annotation-attr)
+                                             (para (str-inline "A comment."))
+                                             (para (str-inline "And another.")))))]
+      (is (re-find #"<span class=\"sticky-note sticky-note-yellow\">" body))
+      (is (re-find #"<input class=\"sticky-note-toggle\" type=\"checkbox\" id=\"[^\"]+\"/>" body))
+      (is (re-find #"<label class=\"sticky-note-marker\" for=\"[^\"]+\">note</label>" body))
+      (is (re-find #"<span class=\"sticky-note-body\"><span>A comment.</span><span>And another.</span></span>"
+                   body))
+      (is (not (re-find #"<script" body)) "no JavaScript is emitted")
+      (is (not (re-find #"<details" body))
+          "and no <details>, which is what broke the paragraph")))
+  (testing "AC #3, the half that MEASUREMENT settles rather than CSS: a
+            sticky note in the middle of a paragraph emits only phrasing
+            content, so the paragraph survives it. This is the assertion
+            the XML-well-formedness proxy is structurally blind to -- a
+            <p> inside a <p> is perfectly well-formed XML and a broken
+            HTML document"
+    (doseq [[label blocks]
+            [["paragraphs" [(para (str-inline "one")) (para (str-inline "two"))]]
+             ["a list" [{:t :list :ordered false :tight true
+                         :items [[(para (str-inline "item"))]] :attr empty-attr}]]
+             ["a code block" [{:t :code-block :text "(+ 1 2)" :attr empty-attr}]]
+             ["a block quote" [{:t :block-quote :blocks [(para (str-inline "quoted"))]}]]
+             ["markup inside" [(para (str-inline "with ")
+                                     {:t :emph :inlines [(str-inline "emphasis")]}
+                                     {:t :code :text "code"})]]
+             ["a block with no phrasing rendering at all"
+              [{:t :figure :content (para (str-inline "x"))
+                :caption [(str-inline "a caption")] :attr empty-attr}]]]]
+      (testing label
+        (let [body (emit-body (para (str-inline "before ")
+                                    (apply sticky-note (annotation-attr) blocks)
+                                    (str-inline " after")))]
+          (is (empty? (clojure.set/difference (element-names body)
+                                              (conj phrasing-content-elements "p")))
+              (str "only phrasing content inside the paragraph, saw "
+                   (pr-str (element-names body))))
+          (is (= 1 (count (re-seq #"<p>" body)))
+              "and exactly one paragraph, not one split into several")))))
+  (testing "AC #3, the half CSS settles: the body is positioned OVER the
+            text rather than pushing it, and has no box at all while
+            closed, so nothing can split the inline box"
+    (is (re-find #"span\.sticky-note\{position:relative\}" html/default-stylesheet)
+        "the positioning context the body is placed against")
+    (is (re-find #"span\.sticky-note-body\{display:none\}" html/default-stylesheet)
+        "no box at all while closed")
+    (is (re-find #"input\.sticky-note-toggle:checked ~ span\.sticky-note-body\{display:block;position:absolute;"
+                 html/default-stylesheet)
+        "absolutely positioned when open, so it floats over the text")
+    (is (re-find #"background:Canvas" html/default-stylesheet)
+        "opaque, since it sits on top of the text it is about"))
+  (testing "the toggle is hidden without being removed from the keyboard's
+            reach -- display:none would make the disclosure mouse-only"
+    (is (re-find #"input\.sticky-note-toggle\{position:absolute;width:1px;height:1px;opacity:0\}"
+                 html/default-stylesheet))
+    (is (not (re-find #"input\.sticky-note-toggle\{display:none" html/default-stylesheet))))
+  (testing "the checkbox's own id is NOT the annotation's id, so a
+            cross-reference to the annotation lands on the note rather
+            than on its toggle"
+    (let [body (emit-body (para (sticky-note (annotation-attr :id "note:1")
+                                             (para (str-inline "x")))))]
+      (is (re-find #"<span id=\"note:1\"" body))
+      (is (not (re-find #"<input[^>]* id=\"note:1\"" body))))))
+
+(deftest annotation-colors-test
+  (testing "AC #4: each recognised color= produces a distinct class, and
+            each class has a rule in default-stylesheet"
+    (doseq [color html/annotation-colors]
+      (testing color
+        (let [body (emit-body (para (highlight (annotation-attr :color color)
+                                               (str-inline "x"))
+                                    (sticky-note (annotation-attr :color color)
+                                                 (para (str-inline "y")))))]
+          (is (re-find (re-pattern (str "class=\"highlight highlight-" color "\"")) body))
+          (is (re-find (re-pattern (str "class=\"sticky-note sticky-note-" color "\"")) body))
+          (is (re-find (re-pattern (str "mark\\.highlight-" color "\\{background:"))
+                       html/default-stylesheet))
+          (is (re-find (re-pattern (str "span\\.sticky-note-" color " label\\{background:"))
+                       html/default-stylesheet))))))
+  (testing "AC #4: four distinct colours, so no two annotations are
+            indistinguishable"
+    (is (= 4 (count html/annotation-colors)))
+    (is (= html/annotation-colors #{"yellow" "green" "blue" "pink"})))
+  (testing "AC #4: no color= at all defaults to yellow"
+    (is (re-find #"class=\"highlight highlight-yellow\""
+                 (emit-body (para (highlight (annotation-attr) (str-inline "x")))))))
+  (testing "a color= outside the recognised set falls back to yellow
+            rather than to a class no stylesheet defines -- an authored
+            one is diagnosed on the directive that wrote it (TASK-119),
+            and by the time a Document reaches an emitter it may equally
+            have come from JSON or a transform rule"
+    (let [body (emit-body (para (highlight (annotation-attr :color "purple") (str-inline "x"))))]
+      (is (re-find #"class=\"highlight highlight-yellow\"" body))
+      (is (not (re-find #"purple" body)) "and the unrecognised value is not written as markup"))))
+
+(deftest annotation-author-is-a-data-attribute-test
+  (testing "AC #5: author= appears as a data attribute and NEVER as
+            visible page text -- it is what makes an overlay usable as a
+            review pass, not something a reader has to read past"
+    (let [body (emit-body (para (highlight (annotation-attr :author "DM") (str-inline "marked"))
+                                (sticky-note (annotation-attr :author "DM")
+                                             (para (str-inline "A comment.")))))]
+      (is (re-find #"<mark[^>]* data-author=\"DM\"" body))
+      (is (re-find #"<span[^>]* data-author=\"DM\"" body))
+      (is (not (re-find #">[^<]*DM[^<]*<" body))
+          "DM occurs only inside a tag, never as text between two of them")
+      (is (not (re-find #" author=\"" body))
+          "and never as a bare author= attribute, which is not an HTML one")))
+  (testing "style= is moved out of :props too, and it is the one that
+            would have hurt most: the resolver deliberately keeps it on
+            the node for the LaTeX target, and `style` IS a real HTML
+            attribute -- so left in :props it emitted style=\"footnote\",
+            colliding with an authored CSS style prop into a duplicate"
+    (let [body (emit-body (para (sticky-note
+                                 {:classes [] :props {"style" "footnote" "color" "blue"}}
+                                 (para (str-inline "x")))))]
+      (is (not (re-find #"style=\"footnote\"" body)))
+      (is (re-find #"class=\"sticky-note sticky-note-blue\"" body)))))
+
+(deftest annotation-id-is-the-element-id-test
+  (testing "AC #6: an id on either node becomes the element id, so an
+            in-page link to it resolves"
+    (let [document {:meta {}
+                    :blocks [(para (highlight (annotation-attr :id "hl:a") (str-inline "marked"))
+                                   (sticky-note (annotation-attr :id "note:1")
+                                                (para (str-inline "A comment."))))
+                             (para {:t :cross-ref :label "hl:a" :target "hl:a"
+                                    :text "the highlight"})]}
+          out (html/emit-document document)
+          body (body-of out)]
+      (is (well-formed? out))
+      (is (re-find #"<mark id=\"hl:a\"" body))
+      (is (re-find #"<span id=\"note:1\" class=\"sticky-note" body))
+      (is (re-find #"<a href=\"#hl:a\">the highlight</a>" body)
+          "a resolved cross-reference lands on the element the id names")))
+  (testing "authored classes survive alongside the two the emitter adds"
+    (is (re-find #"class=\"highlight highlight-blue important\""
+                 (emit-body (para (highlight (annotation-attr :color "blue" :classes ["important"])
+                                             (str-inline "x"))))))))
+
+(deftest annotated-document-still-parses-as-xml-test
+  (testing "AC #7: the emitted document still parses as XML, with both
+            node types in it"
+    (let [out (html/emit-document
+               {:meta {:title [(str-inline "Annotated")]}
+                :blocks [(para (str-inline "Hazelnuts ")
+                               (highlight (annotation-attr :id "hl:a" :color "green"
+                                                           :author "DM")
+                                          (str-inline "ripen ")
+                                          {:t :emph :inlines [(str-inline "early")]})
+                               (str-inline " and drop.")
+                               (sticky-note (annotation-attr :id "note:1" :author "DM")
+                                            (para (str-inline "Was this the rerun trial?"))))]})]
+      (is (well-formed? out))))
+  (testing "AC #7: default-stylesheet still contains no > combinator --
+            this namespace's tests parse the output as XML, and an
+            unescaped > inside <style> is valid HTML but not valid XML"
+    (is (not (re-find #">" html/default-stylesheet)))))
+
+(deftest every-sticky-note-gets-its-own-toggle-test
+  (testing "TASK-120 review: the checkbox id was derived from the
+            FOOTNOTE count, which sticky notes do not contribute to -- so
+            every note in a document got the same id, every <label>
+            pointed at the first checkbox, and clicking any balloon
+            opened that one. It shipped in this project's own worked
+            example, where three notes shared one id, and it falsifies
+            the very thing the markup exists to do"
+    (let [body (emit-body (para (sticky-note (annotation-attr) (para (str-inline "one")))
+                                (sticky-note (annotation-attr) (para (str-inline "two"))))
+                          (para (sticky-note (annotation-attr) (para (str-inline "three")))))
+          ids (mapv second (re-seq #"<input[^>]* id=\"([^\"]+)\"" body))
+          fors (mapv second (re-seq #"<label[^>]* for=\"([^\"]+)\"" body))]
+      (is (= 3 (count ids)))
+      (is (= ids (distinct ids)) (str "every toggle id distinct: " (pr-str ids)))
+      (is (= ids fors) "and each label points at its own checkbox, in order")))
+  (testing "and the counter is per DOCUMENT, so a second emit-document
+            call starts again from one rather than carrying state over"
+    (let [once (emit-body (para (sticky-note (annotation-attr) (para (str-inline "x")))))
+          twice (emit-body (para (sticky-note (annotation-attr) (para (str-inline "x")))))]
+      (is (= once twice) "two identical documents emit identically"))))

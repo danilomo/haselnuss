@@ -235,6 +235,17 @@
              [:t [:= :span]]
              [:inlines [:vector [:ref ::inline]]]
              [:attr [:ref ::attr]]]]
+     ;; TASK-116/doc-8 sec2: an annotation laid over a run of words, the
+     ;; coloured wash a PDF reader draws. Structurally a `:span` -- a
+     ;; wrapping inline that marks a run and changes nothing about it --
+     ;; and deliberately NOT a `:span` carrying a class: classes select
+     ;; directive/role *behaviour* (sec4.1), and an emitter branching on a
+     ;; string inside `attr.classes` would be the first place in this
+     ;; codebase that happens.
+     [:highlight [:map
+                  [:t [:= :highlight]]
+                  [:inlines [:vector [:ref ::inline]]]
+                  [:attr [:ref ::attr]]]]
      [:cross-ref [:map
                   [:t [:= :cross-ref]]
                   [:label :string]
@@ -244,7 +255,17 @@
              [:items [:vector [:ref ::cite-item]]]]]
      [:note [:map
              [:t [:= :note]]
-             [:blocks [:vector [:ref ::block]]]]]]}))
+             [:blocks [:vector [:ref ::block]]]]]
+     ;; TASK-116/doc-8 sec2: the balloon wedged between two words, opened
+     ;; on click and dismissed again. Structurally a `:note` -- a footnote
+     ;; is already "an inline marker whose content lives elsewhere and is
+     ;; revealed on demand", which is a sticky note with different
+     ;; presentation -- plus the `:attr` `:note` has never had, so an
+     ;; annotation can be given an id and cross-referenced.
+     [:sticky-note [:map
+                    [:t [:= :sticky-note]]
+                    [:blocks [:vector [:ref ::block]]]
+                    [:attr [:ref ::attr]]]]]}))
 
 (def Attr
   "Attr (sec4.1): id/classes/props carried by every referenceable/styleable node."

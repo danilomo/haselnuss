@@ -16,7 +16,7 @@
 
 (def every-inline
   "One example of every Inline variant (sec4.4), all in one vector, so a
-  single Para below exercises all 18 in one place."
+  single Para below exercises all 20 in one place."
   [{:t :str :text "hi"}
    {:t :space}
    {:t :soft-break}
@@ -37,11 +37,14 @@
                      {:key "doe2021" :mode :author
                       :prefix [{:t :str :text "see"}]
                       :suffix [{:t :str :text "p. 3"}]}]}
-   {:t :note :blocks [{:t :para :inlines [{:t :str :text "footnote"}]}]}])
+   {:t :note :blocks [{:t :para :inlines [{:t :str :text "footnote"}]}]}
+   {:t :highlight :inlines [{:t :str :text "marked"}] :attr attr}
+   {:t :sticky-note :blocks [{:t :para :inlines [{:t :str :text "balloon"}]}]
+    :attr attr}])
 
 (def document
   "A whole Document exercising every one of the 11 Block variants (sec4.3)
-  and, via `every-inline`, every one of the 18 Inline variants (sec4.4),
+  and, via `every-inline`, every one of the 20 Inline variants (sec4.4),
   nested realistically rather than as a flat list."
   ;; `:top-level-division` is a keyword-valued enum, unlike every other
   ;; Meta field (TASK-53), so it is in the fixture rather than only in
@@ -82,7 +85,8 @@
 (def all-inline-tags
   "Every Inline variant tag (sec4.4)."
   #{:str :space :soft-break :line-break :emph :strong :strike :small-caps
-    :sub :sup :code :math-inline :link :image :span :cross-ref :cite :note})
+    :sub :sup :code :math-inline :link :image :span :cross-ref :cite :note
+    :highlight :sticky-note})
 
 (defn- used-tags
   "Every `:t` value reachable anywhere inside `data`, found by walking the
@@ -96,7 +100,7 @@
 (deftest document-round-trip-test
   (testing "the fixture Document is itself valid, exercising every Block/Inline variant"
     (is (= 11 (count all-block-tags)))
-    (is (= 18 (count all-inline-tags)))
+    (is (= 20 (count all-inline-tags)))
     (is (set/subset? all-block-tags (used-tags document))
         "document should exercise every Block variant")
     (is (set/subset? all-inline-tags (used-tags document))
@@ -143,7 +147,7 @@
       (is (contains? (:definitions schema) "haselnuss.ast/inline"))
       (is (= 11 (-> schema :definitions (get "haselnuss.ast/block") :oneOf count))
           "one oneOf branch per Block variant")
-      (is (= 18 (-> schema :definitions (get "haselnuss.ast/inline") :oneOf count))
+      (is (= 20 (-> schema :definitions (get "haselnuss.ast/inline") :oneOf count))
           "one oneOf branch per Inline variant")))
   (testing "the generated schema is itself well-formed, serializable JSON"
     (let [text (data-json/write-str json/document-json-schema)

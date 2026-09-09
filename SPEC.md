@@ -225,7 +225,9 @@ type Inline =
   | { t: "Span";      inlines: Inline[]; attr: Attr }            // inline role carrier
   | { t: "CrossRef";  label: string; suppressPrefix?: boolean }  // → "Figure 3" (resolved)
   | { t: "Cite";      items: CiteItem[] }
-  | { t: "Note";      blocks: Block[] };                         // footnote
+  | { t: "Note";      blocks: Block[] }                          // footnote
+  | { t: "Highlight"; inlines: Inline[]; attr: Attr }            // annotation: marked run
+  | { t: "StickyNote";blocks: Block[]; attr: Attr };             // annotation: balloon
 
 type CiteItem = {
   key: string;
@@ -237,6 +239,25 @@ type CiteItem = {
 
 The lossy `FontType` (which lumped `em`/`it`/`strong`) from the current model is replaced by
 distinct `Emph`/`Strong`/`Sub`/`Sup`/… nodes.
+
+**`Highlight` / `StickyNote`** are the two annotation nodes — what a PDF reader lays over
+someone else's document without editing it. `Highlight` is structurally a `Span`: a wrapping
+inline that marks a run of text and changes nothing about it. `StickyNote` is structurally a
+`Note` — a footnote is already "an inline marker whose content lives elsewhere and is revealed
+on demand", which is a sticky note with different presentation — **plus the `Attr` that `Note`
+has never had**, so an annotation can be given an id and cross-referenced. Neither is a `Span`
+carrying a class: classes select directive/role *behaviour* (§4.1), and `Note` has nothing to
+hang a class on. A `Highlight` is written `==marked text==` (§5.6); a `StickyNote` has no
+surface syntax and is created by an overlay or a transform rule.
+
+Recognised `attr.props` on both: `color` (`yellow|green|blue|pink`, default `yellow`) and
+`author`. `StickyNote` additionally takes `style` (`annotation|footnote`), read by the LaTeX
+target alone. `at=` is **not** a node prop: it tells the overlay directive which edge of the
+annotated run to place the node at (§5.5), and is consumed there. Both node types
+render on every target: `<mark>` and an inline disclosure in HTML, real PDF annotation
+objects in LaTeX, and `==…==` plus a footnote in `.hdoc`. A `StickyNote` whose body a PDF
+annotation string cannot hold degrades to a `\footnote` with a diagnostic naming why — §4.5's
+own philosophy applied to a node rather than a directive.
 
 ### 4.5 Fallback
 
@@ -327,6 +348,36 @@ Do not feed hazelnuts to squirrels you intend to keep.
 ::::
 ```
 
+A directive with **no body at all** — everything it carries is in its header — is written on
+one line instead, `!name{…}`, with no closing fence:
+
+```markdown
+!toc
+!list-of-figures
+
+!reveal{question="Why does a lone hazel set no nuts?" answer="It is self-incompatible."}
+```
+
+This is a second *spelling* of the same mechanism, not a fourth extension mechanism (§2): it
+produces the identical `Directive` node with an empty `blocks`, and nothing downstream — the
+resolver, the registry, the `lower` pass, the emitters, the JSON interchange — can tell which
+spelling was written. Three rules define it:
+
+- The attribute group is optional, so `!toc` is complete. When present it is the plain §5.3
+  group (`#id`, `.class`, `key=val`) — the name is already given outside the braces, so a bare
+  word inside them is an error rather than a second name.
+- The line carries no body, and what follows the name decides whether it is a directive at
+  all. Trailing text that never opens a group leaves the line as prose (`!toc extra words`),
+  matching `!include`'s own tolerance. But a `{` commits the line: from there the rest of it
+  must be exactly one group, so both `!toc{unclosed` and `!toc{a=1} trailing` are build
+  errors rather than silently prose.
+- `include` is **reserved**: `!include` is §4.3's include line, and a bare `!include` with no
+  path stays the ordinary paragraph it already is.
+
+`!` puts this beside `!include` — the format's other whole-line block construct — rather than
+opening a second family with a shorter colon run. Which spelling to write is decided by whether
+the directive has a body, never by taste.
+
 The directive `name` (or first class) selects behavior via the extension registry (§8). This is
 the mechanism by which "all of LaTeX's environments" are expressible without new syntax.
 
@@ -340,11 +391,39 @@ The built-in directive names, and what each is:
 | `listing` | a captioned, numbered code float, `caption` on the fence line |
 | `algorithm` | the same mechanism for pseudocode; its body stays verbatim in both targets |
 | `figure`, `subfigure` | §5.8 |
-| `toc`, `list-of-figures`, `list-of-tables` | empty placeholders that print the resolver's derived lists where the author writes them |
+| `toc`, `list-of-figures`, `list-of-tables` | empty placeholders that print the resolver's derived lists where the author writes them; having no body, each can take the one-line form (`!toc`) |
 | `collapsable`, `small-collapsable` | the reference extensions (§8.4) |
 
 A directive name that is not registered stops the build and names it, rather than being
 dropped or passed through.
+
+#### Overlay directive conventions
+
+Five directive names are recognised **only inside a file named by `--overlay`**, never in a
+base document, where each is an ordinary unregistered directive and stops the build like any
+other. Every one is addressed by `target=`, an `attr.id` in the base document, and every one
+is dropped with a named, non-fatal diagnostic rather than being applied to a guess.
+
+| name | what it does |
+| ---- | ------------ |
+| `prepend`, `append` | inject the directive's own body at the start or end of the Section `target=` names |
+| `describe` | merge every prop but `target=` into that node's own `attr.props`; body-less, so written in the one-line form |
+| `highlight` | wrap the run of words `text=` quotes inside `target=` in a `Highlight` (§4.4). With a body, also places a `StickyNote` immediately after it |
+| `sticky-note` | place a `StickyNote` carrying the directive's body at one edge of that run |
+
+`highlight` and `sticky-note` address a **run of words**, not a node, and say which run by
+quoting it: `text=` is the quote, and `before=`/`after=`/`nth=` disambiguate one that occurs
+more than once inside the target. Quoting rather than counting is what makes an annotation
+survive the base document being edited elsewhere — and what makes it fail *loudly*, by name,
+when the quoted words themselves change, rather than silently reanchoring onto the wrong
+text. Both also take `color` and `author`; `sticky-note` additionally takes `at` and, on the
+LaTeX target, `style` (§4.4).
+
+An annotation must not renumber the document it annotates, so a Block whose own subtree holds
+anything that would take a number — a Figure, Table, MathBlock or Section, a footnote, or any
+Block carrying an `attr.id` — is diagnosed and dropped from a `sticky-note` body. A body left
+empty by that rule drops the whole annotation rather than leaving a mark with no comment on
+it.
 
 ### 5.6 Roles / spans — inline environments
 
@@ -353,6 +432,30 @@ dropped or passed through.
 ```markdown
 Consider the [free monoid]{.term #def:free-monoid}.
 ```
+
+`==marked text==` produces a `Highlight` (§4.4) — an annotation over a run of words:
+
+```markdown
+Hazelnuts ==ripen in early autumn== and drop soon after.
+```
+
+An attribute group after the closing `==` attaches to the `Highlight` itself, exactly as one
+after a `Link` or an `Image` does:
+
+```markdown
+Hazelnuts ==ripen in early autumn=={#hl:autumn .important}.
+```
+
+This is a primitive like `**strong**`, not a fourth extension mechanism: §2's "exactly three"
+is about *extension* mechanisms. Djot's own `{=highlighted=}` was considered and rejected,
+because `{` already opens an attribute group in this surface and `{=` would have to be
+disambiguated from one.
+
+`StickyNote`, the other annotation node, deliberately has **no** inline surface syntax.
+Nothing in this grammar carries `Block`s inline except a footnote reference and its
+definition, and inventing a second such construct to write something whose entire purpose is
+to be authored from a separate file is the wrong trade. A sticky note is created by an
+overlay or by a transform rule.
 
 ### 5.7 Math
 
@@ -617,6 +720,14 @@ Surface syntax reuses the directive form:
 :::{chart #fig:sales exports=both}
 { "type": "bar", "data": [ ["Q1", 3], ["Q2", 5] ] }
 :::
+```
+
+A custom element whose configuration is *entirely* in `props` — no spec, no source, nothing in
+`blocks` — takes §5.5's one-line spelling instead, which is the common shape for a small
+author-defined directive:
+
+```markdown
+!flashcard{front="Corylus avellana" back="Common hazel"}
 ```
 
 ### 8.5 Execution & trust model (settles D6)

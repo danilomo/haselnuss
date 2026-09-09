@@ -49,6 +49,7 @@
   purposes: its children inherit its own unchanged enclosing path."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
+            [haselnuss.anchor :as anchor]
             [haselnuss.ast :as ast]
             [haselnuss.walk :as walk]))
 
@@ -206,25 +207,73 @@
   [table]
   (mapcat :cells (cons (:head table) (:rows table))))
 
+(defn- cite-item-inlines
+  "Every Inline held by `item`, a CiteItem -- its `:prefix` and `:suffix`,
+  read off `haselnuss.walk/table` rather than named, so this stays right
+  if the schema gives a CiteItem a third such field."
+  [item]
+  (mapcat #(get item %) (walk/fields-holding ::ast/cite-item item ::ast/inline)))
+
+(defn- rebuild-inline-children
+  "`inline` with every one of its nested-content fields rewritten:
+  `blocks-fn` over each `[:many ::ast/block]` field (a footnote `:note`'s
+  or a `:sticky-note`'s own `:blocks`), `inlines-fn` over each `[:many
+  ::ast/inline]` one (`:emph`, `:span`, `:link`, `:highlight`, ...), and
+  `inlines-fn` again over each CiteItem's own `:prefix`/`:suffix` behind
+  a `[:many ::ast/cite-item]` field.
+
+  The shared body of this file's two rebuild-in-place inline walks
+  (`expand-inlines`, `splice-overlay-inlines`), which were separate
+  hand-written `case`s over the same eight variant names -- kept
+  deliberately \"in step with each other\" by their own docstrings, and
+  both silently incomplete the day TASK-116 added a node type neither
+  named. Asking `haselnuss.walk/fields-holding` instead means there is
+  nothing left to keep in step.
+
+  An absent optional field (a CiteItem with no `:prefix`) is left absent
+  rather than created empty, matching what these walks did before."
+  [inline {:keys [blocks-fn inlines-fn]}]
+  (as-> inline node
+    (reduce (fn [n field] (cond-> n (get n field) (update field blocks-fn)))
+            node (walk/fields-holding ::ast/inline node ::ast/block))
+    (reduce (fn [n field] (cond-> n (get n field) (update field inlines-fn)))
+            node (walk/fields-holding ::ast/inline node ::ast/inline))
+    (reduce (fn [n field]
+              (cond-> n
+                (get n field)
+                (update field
+                        (partial mapv
+                                 (fn [item]
+                                   (reduce (fn [i f] (cond-> i (get i f) (update f inlines-fn)))
+                                           item
+                                           (walk/fields-holding ::ast/cite-item item
+                                                                ::ast/inline)))))))
+            node (walk/fields-holding ::ast/inline node ::ast/cite-item))))
+
 (defn- inline-blocks
-  "Every Block reachable from `inlines` via a footnote (`:note`), recursing
-  into every Inline variant that itself carries nested Inlines
-  (`:emph`/`:strong`/`:strike`/`:small-caps`/`:sub`/`:sup`/`:span`/`:link`)
-  or a Cite's per-item `:prefix`/`:suffix` Inlines, so a labeled Figure/
-  Table/etc. tucked inside a footnote still numbers (sec9 step 1: \"every
-  labeled node\")."
+  "Every Block reachable from `inlines` through an Inline that carries
+  them -- a footnote `:note`, and since TASK-116 a `:sticky-note` --
+  recursing first into every Inline that carries nested Inlines
+  (`:emph`, `:strong`, `:span`, `:link`, `:highlight`, ...) and into a
+  Cite's own per-item `:prefix`/`:suffix`, so a labeled Figure/Table/etc.
+  tucked inside a footnote still numbers (sec9 step 1: \"every labeled
+  node\").
+
+  WHICH Inlines those are is asked of `haselnuss.walk/fields-holding`,
+  not listed here. It used to be a hand-written `case` naming eight
+  variants, and the day TASK-116 added `:highlight` and `:sticky-note`
+  that list was silently wrong: a Figure inside a footnote inside a
+  highlight got no number at all, and no diagnostic, while the identical
+  document written with `*emph*` numbered fine."
   [inlines]
   (mapcat
    (fn [inline]
-     (case (:t inline)
-       :note (:blocks inline)
-       (:emph :strong :strike :small-caps :sub :sup :span :link)
-       (inline-blocks (:inlines inline))
-       :cite (mapcat (fn [item]
-                       (concat (inline-blocks (:prefix item))
-                               (inline-blocks (:suffix item))))
-                     (:items inline))
-       []))
+     (concat
+      (mapcat #(get inline %) (walk/fields-holding ::ast/inline inline ::ast/block))
+      (mapcat #(inline-blocks (get inline %))
+              (walk/fields-holding ::ast/inline inline ::ast/inline))
+      (mapcat (fn [field] (mapcat #(inline-blocks (cite-item-inlines %)) (get inline field)))
+              (walk/fields-holding ::ast/inline inline ::ast/cite-item))))
    inlines))
 
 (defn- block-children
@@ -304,19 +353,12 @@
   `haselnuss.json/json->ast` can, and an emitter reached that way would
   raise `::unresolved-include` from inside a note."
   [inlines expand-one]
-  (mapv
-   (fn [inline]
-     (case (:t inline)
-       :note (update inline :blocks expand-blocks expand-one)
-       (:emph :strong :strike :small-caps :sub :sup :span :link)
-       (update inline :inlines expand-inlines expand-one)
-       :cite (update inline :items
-                     (partial mapv (fn [item]
-                                     (cond-> item
-                                       (:prefix item) (update :prefix expand-inlines expand-one)
-                                       (:suffix item) (update :suffix expand-inlines expand-one)))))
-       inline))
-   inlines))
+  (mapv (fn [inline]
+          (rebuild-inline-children
+           inline
+           {:blocks-fn #(expand-blocks % expand-one)
+            :inlines-fn #(expand-inlines % expand-one)}))
+        inlines))
 
 (defn- expand-blocks
   "`blocks` with every `:include` replaced by `(expand-one include)`'s own
@@ -564,15 +606,269 @@
 ;; stays free of file I/O and of any dependency on `haselnuss.parser` --
 ;; the plain Block vectors it reads here already sat through that pass.
 
+(def ^:private annotation-directive-names
+  "The two overlay directive names that place an annotation (TASK-119,
+  doc-8 sec4), as opposed to injecting content or metadata."
+  #{"highlight" "sticky-note"})
+
+(def ^:private overlay-directive-names
+  "Every top-level directive name an overlay file may use."
+  (into #{"prepend" "append" "describe"} annotation-directive-names))
+
+(def ^:private recognized-overlay-names
+  "`overlay-directive-names` as one readable list, for the diagnostic
+  TASK-112 built to tell an author who misspelled one which names DO
+  work. Derived rather than written out, since the list it used to
+  hard-code stopped being true the moment TASK-119 added two names -- in
+  the one message whose whole job is to be accurate about it."
+  (str/join "/" (sort overlay-directive-names)))
+
+(def annotation-colors
+  "The `color=` values an annotation recognizes (doc-8 sec2). A CLOSED
+  set, and one outside it is diagnosed HERE, where the author wrote it,
+  rather than in an emitter -- which is why both emitters may safely fall
+  back to yellow for a value that reaches them some other way.
+
+  Public because it is one vocabulary that three namespaces have to
+  agree on -- this one diagnoses it, and both emitters style it -- and
+  `haselnuss.cross-format-test` pins that agreement rather than leaving
+  three copies to drift apart."
+  #{"yellow" "green" "blue" "pink"})
+
+(def ^:private annotation-edges
+  "The `at=` values a sticky note recognizes: which edge of the matched
+  run the balloon sits at."
+  #{"start" "end"})
+
+(def ^:private annotation-body-numbered-types
+  "The node types that TAKE A NUMBER, and which a sticky note's body may
+  therefore not contain anywhere in its subtree (doc-8 sec2's numbering
+  invariant).
+
+  An annotation must not renumber the document it annotates. Anything
+  here inside a sticky note's body would take a number out of the base
+  document's own sequence and push everything after it along -- exactly
+  the bug TASK-54 fixed for front matter.
+
+  `:note` is in the set because a footnote number is a number like any
+  other. The four Block types are not the whole story on their own,
+  though, which is why `numbered-in-body?` also looks for an `attr.id`:
+  `number-block` numbers by ID PREFIX on ANY Block, never by `:t` -- a
+  `:::{theorem #thm:inner}` or a `:::{listing #lst:x}` in a body numbers
+  and shifts the document just as a Figure does, and neither is a type
+  this set could name without naming every registered directive."
+  #{:figure :table :math-block :section :note})
+
+(defn- numbered-in-body?
+  "Whether `block` would take a number, or contains anything that would,
+  anywhere in its own subtree.
+
+  The SUBTREE is what matters, and checking only the top level is how
+  this was wrong: a Figure inside a block quote, inside a list item,
+  inside a nested directive body, or a footnote anywhere in the body each
+  numbered and shifted the base document with no diagnostic at all
+  (found by review). `tree-seq` rather than a walker, because this is a
+  read-only scan for ANY node of a shape, so it needs none of the
+  walker's per-position knowledge and cannot fall behind the schema."
+  [block]
+  (boolean (some (fn [node]
+                   (and (map? node)
+                        (or (contains? annotation-body-numbered-types (:t node))
+                            (some? (get-in node [:attr :id])))))
+                 (tree-seq coll? seq block))))
+
 (defn- overlay-directive-block?
   "True when `block` is a top-level overlay directive this pass recognizes
   -- `prepend`/`append` (sec9 step 0.5's content-injection convention,
-  TASK-83.1) or `describe` (TASK-83.2's flat-metadata convention).
-  Anything else -- a paragraph, a section, an unrelated or misspelled
-  directive name -- is unrecognized top-level overlay content (see
-  `overlay-plan`)."
+  TASK-83.1), `describe` (TASK-83.2's flat-metadata convention), or
+  `highlight`/`sticky-note` (TASK-119's annotation convention, doc-8
+  sec4). Anything else -- a paragraph, a section, an unrelated or
+  misspelled directive name -- is unrecognized top-level overlay content
+  (see `overlay-plan`)."
   [block]
-  (and (= :directive (:t block)) (contains? #{"prepend" "append" "describe"} (:name block))))
+  (and (= :directive (:t block)) (contains? overlay-directive-names (:name block))))
+
+(defn- annotation-nth
+  "The `nth=` prop parsed to a 1-based integer, `:missing` when absent,
+  or nil when present but not a number -- three outcomes rather than two,
+  so `annotation-entry` can tell \"the author did not disambiguate\" from
+  \"the author tried to and wrote something that is not an index\"."
+  [props]
+  (let [raw (get props "nth")]
+    (cond
+      (str/blank? raw) :missing
+      (re-matches #"-?\d+" raw) (parse-long raw)
+      :else nil)))
+
+(def ^:private annotation-anchor-props
+  "The props that say WHERE an annotation goes, as opposed to what it is
+  (`annotation-attr`)."
+  #{"target" "text" "before" "after" "nth"})
+
+(defn- recognised-annotation-props
+  "Every prop name a `highlight`/`sticky-note` directive of kind `kind`
+  recognises. `at=` and `style=` are the sticky note's alone -- one says
+  which edge a balloon sits at and the other which shape it takes, and a
+  highlight is not a balloon."
+  [kind]
+  (cond-> (into annotation-anchor-props ["color" "author"])
+    (= :sticky-note kind) (into ["at" "style"])))
+
+(defn- unrecognised-annotation-props
+  "The prop names on this directive that no annotation recognises, sorted.
+
+  Diagnosed rather than ignored, for the same reason a misspelled
+  DIRECTIVE name is (TASK-112): `colour=green` did exactly nothing and
+  said nothing, so an author saw an unstyled annotation and no reason for
+  it. This is the one place that mistake is visible."
+  [kind props]
+  (sort (remove (recognised-annotation-props kind) (keys props))))
+
+(defn- annotation-attr
+  "The `Attr` the annotation NODE carries into the document: the
+  directive's own recognised annotation props (`color=`, `author=`,
+  and `style=` for a sticky note, which `haselnuss.emit.latex` reads),
+  and nothing else.
+
+  Deliberately not the directive's own `attr` wholesale: `target=`,
+  `text=`, `before=`, `after=`, `nth=` and `at=` are instructions to THIS
+  pass about where the annotation goes, not properties of the annotation,
+  and an emitter that wrote them out as HTML attributes would be
+  publishing the overlay's own bookkeeping into the document. The
+  directive's own id is discarded and diagnosed by `overlay-plan`, like
+  every other overlay directive's."
+  [props]
+  {:classes []
+   :props (select-keys props ["color" "author" "style"])})
+
+(defn- annotation-body
+  "`[kept dropped]` for a sticky note's own `blocks`: the Blocks a PDF
+  or HTML balloon may carry, and the ones dropped to keep doc-8's
+  numbering invariant (`numbered-in-body?`) -- which is a property of a
+  block's whole SUBTREE, not of its own type."
+  [blocks]
+  [(into [] (remove numbered-in-body?) blocks)
+   (into [] (filter numbered-in-body?) blocks)])
+
+(defn- annotation-entry
+  "The plan entry for one `highlight`/`sticky-note` overlay directive, or
+  nil when `warn!` was called instead and the annotation dropped.
+
+  Every refusal here is doc-8's own rule that an annotation applied
+  wrongly is a wrong document: a quote that names nothing, a colour or an
+  edge outside the recognised set, an empty balloon, an `nth=` that is
+  not an index. Each is diagnosed BY NAME and drops only this one
+  annotation, exactly as `prepend`'s own diagnostics drop only their own
+  directive."
+  [kind block target warn!]
+  (let [props (get-in block [:attr :props])
+        text (get props "text")
+        color (get props "color")
+        at (get props "at")
+        parsed-nth (annotation-nth props)
+        [kept dropped] (annotation-body (:blocks block))
+        drop! (fn [diagnostic-type message]
+                (warn! {:type diagnostic-type
+                        :directive (name kind)
+                        :target target
+                        :quote text
+                        :message message})
+                nil)]
+    (cond
+      (str/blank? text)
+      (drop! :annotation-missing-text
+             (str "a \"" (name kind) "\" directive for \"" target "\" has no text= (or it is"
+                  " blank); there is nothing to anchor it to, so it was dropped"))
+
+      (and (some? color) (not (contains? annotation-colors color)))
+      (drop! :annotation-unknown-color
+             (str "color=" color " is not one of "
+                  (str/join ", " (sort annotation-colors))
+                  "; the annotation for \"" text "\" was dropped"))
+
+      (and (some? at) (not (contains? annotation-edges at)))
+      (drop! :annotation-unknown-edge
+             (str "at=" at " is not one of " (str/join ", " (sort annotation-edges))
+                  "; the annotation for \"" text "\" was dropped"))
+
+      (and (some? at) (= :highlight kind))
+      (drop! :annotation-prop-not-applicable
+             (str "at= says which edge of the matched run a BALLOON sits at, and a"
+                  " \"highlight\" marks a run rather than sitting at an edge of it -- a"
+                  " highlight with a body always places its note immediately after the"
+                  " marked run; the annotation for \"" text "\" was dropped"))
+
+      (and (some? (get props "style")) (= :highlight kind))
+      (drop! :annotation-prop-not-applicable
+             (str "style= chooses between a PDF annotation and a footnote for a BALLOON, and"
+                  " a \"highlight\" is neither; the annotation for \"" text "\" was dropped"))
+
+      (and (some? (get props "style"))
+           (not (contains? #{"annotation" "footnote"} (get props "style"))))
+      (drop! :annotation-unknown-style
+             (str "style=" (get props "style") " is not one of annotation, footnote; the"
+                  " annotation for \"" text "\" was dropped"))
+
+      (seq (unrecognised-annotation-props kind props))
+      (drop! :annotation-unknown-prop
+             (str "this \"" (name kind) "\" directive carries "
+                  (str/join ", " (map #(str % "=") (unrecognised-annotation-props kind props)))
+                  ", which " (if (= 1 (count (unrecognised-annotation-props kind props)))
+                               "is not a prop" "are not props")
+                  " an annotation recognises (a misspelled color= or author= would otherwise"
+                  " be silently ignored); the annotation for \"" text "\" was dropped"))
+
+      (nil? parsed-nth)
+      (drop! :annotation-invalid-nth
+             (str "nth=" (get props "nth") " is not a whole number; the annotation for \""
+                  text "\" was dropped"))
+
+      (and (= :sticky-note kind) (empty? (:blocks block)))
+      (drop! :annotation-empty-sticky-note
+             (str "a \"sticky-note\" directive for \"" text "\" has no body; an empty balloon"
+                  " says nothing, so it was dropped"))
+
+      ;; Both kinds, not just `:sticky-note`. A `highlight` WITH a body
+      ;; is a highlight plus a note, and when the numbering rule empties
+      ;; that body the note has nothing to say -- so the highlight was
+      ;; applied alone and the author's comment vanished, while the
+      ;; warning said "the rest of the body was kept" (found by review).
+      ;; Dropping the whole directive is the right answer for both: an
+      ;; author who wrote a comment and got a bare mark has lost the
+      ;; thing they were actually trying to say.
+      (and (seq (:blocks block)) (empty? kept))
+      ;; One message rather than two: the per-block warnings below would
+      ;; each say a block was dropped "and the rest of the body kept",
+      ;; which is not what happens when there IS no rest. So this names
+      ;; what emptied it itself.
+      (drop! :annotation-empty-sticky-note
+             (str "a \"" (name kind) "\" directive for \"" text "\" has nothing left in its"
+                  " body once its "
+                  (str/join ", " (distinct (map (comp name :t) dropped)))
+                  " -- which would have renumbered the document -- was dropped; the whole"
+                  " annotation was dropped rather than leaving a"
+                  (if (= :highlight kind) " mark with no comment on it" "n empty balloon")))
+
+      :else
+      (do
+        (doseq [block' dropped]
+          (warn! {:type :annotation-body-unsupported-block
+                  :node-type (:t block')
+                  :target target
+                  :quote text
+                  :message (str "this annotation's body holds a " (name (:t block'))
+                                " that would take a number out of the document's own sequence"
+                                " and push everything after it along -- an annotation must not"
+                                " renumber the document it annotates -- so that block was"
+                                " dropped; the rest of the body was kept")}))
+        {:kind kind
+         :anchor (cond-> {:text text :target target}
+                   (get props "before") (assoc :before (get props "before"))
+                   (get props "after") (assoc :after (get props "after"))
+                   (int? parsed-nth) (assoc :nth parsed-nth))
+         :attr (annotation-attr props)
+         :blocks kept
+         :at (if (= "start" at) :start :end)}))))
 
 (defn- overlay-plan
   "Walks every overlay source's own top-level Blocks ONLY (never
@@ -667,6 +963,9 @@
             (case kind
               (:prepend :append)
               (vswap! plan update-in [target kind] (fnil into []) (:blocks block))
+              (:highlight :sticky-note)
+              (when-let [entry (annotation-entry kind block target warn!)]
+                (vswap! plan update-in [target :annotations] (fnil conj []) entry))
               :describe
               (let [extra-props (dissoc (get-in block [:attr :props]) "target")]
                 (when (seq extra-props)
@@ -689,13 +988,13 @@
                     :target target
                     :message (str "unexpected top-level directive \"" (:name block) "\""
                                   (when-not (str/blank? target) (str " (target=" target ")"))
-                                  " in an overlay file (only prepend/append/describe"
+                                  " in an overlay file (only " recognized-overlay-names
                                   " directives are recognized there); it was dropped")}))
           (warn! {:type :overlay-unexpected-content
                   :node-type (:t block)
                   :message (str "unexpected top-level " (name (:t block)) " in an overlay file"
-                                " (only prepend/append/describe directives are recognized there);"
-                                " it was dropped")}))))
+                                " (only " recognized-overlay-names " directives are recognized"
+                                " there); it was dropped")}))))
     {:plan @plan :warnings @warnings}))
 
 (def ^:private describable-block-types
@@ -744,23 +1043,59 @@
 
 (defn- splice-overlay-inlines
   "`splice-overlay-block` applied wherever an Inline can hold a Block --
-  mirrors `expand-inlines`'s own traversal exactly, for the same reason:
-  a Section tucked inside a footnote is still a Section an overlay might
-  target."
+  the same traversal `expand-inlines` runs, and now literally the same
+  code (`rebuild-inline-children`), for the same reason: a Section tucked
+  inside a footnote is still a Section an overlay might target."
   [inlines ctx]
-  (mapv
-   (fn [inline]
-     (case (:t inline)
-       :note (update inline :blocks splice-overlay-blocks ctx)
-       (:emph :strong :strike :small-caps :sub :sup :span :link)
-       (update inline :inlines splice-overlay-inlines ctx)
-       :cite (update inline :items
-                     (partial mapv (fn [item]
-                                     (cond-> item
-                                       (:prefix item) (update :prefix splice-overlay-inlines ctx)
-                                       (:suffix item) (update :suffix splice-overlay-inlines ctx)))))
-       inline))
-   inlines))
+  (mapv (fn [inline]
+          (rebuild-inline-children
+           inline
+           {:blocks-fn #(splice-overlay-blocks % ctx)
+            :inlines-fn #(splice-overlay-inlines % ctx)}))
+        inlines))
+
+(defn- annotation-nodes
+  "The `{:highlight :sticky-note :at}` map `haselnuss.anchor/apply-
+  annotation` takes, built from one plan entry.
+
+  A `highlight` WITH a body is a highlight PLUS a sticky note -- doc-8's
+  Acrobat \"highlight with a comment\" shape, built from the two node
+  types rather than from a third -- so both keys are filled and the note
+  lands immediately after the wrapping node. A `highlight` with no body
+  places only the highlight; a `sticky-note` places only the note."
+  [{:keys [kind attr blocks at]}]
+  (cond-> {:at at}
+    (= :highlight kind) (assoc :highlight {:t :highlight :inlines [] :attr attr})
+    (or (= :sticky-note kind) (and (= :highlight kind) (seq blocks)))
+    (assoc :sticky-note {:t :sticky-note :blocks blocks :attr attr})))
+
+(defn- apply-annotations
+  "Every annotation planned for `block`'s own id applied to it in turn,
+  in `--overlay` order then in-file order (`overlay-plan`'s own
+  accumulation), each anchored by its quote inside `block` itself --
+  which is what `target=` is for, and what lets a quote stay short.
+
+  Applied AFTER this block's own `prepend`/`append`/`describe`, so an
+  annotation sees the section as the overlays leave it rather than a
+  half-built one. Every `haselnuss.anchor` diagnostic, at resolve time or
+  at apply time, is passed straight through to `ctx`'s own `warn!` -- so
+  a stale quote is a non-fatal build warning naming the quote and the
+  target, and the build still exits 0 (doc-8 sec1: an annotation layer
+  that goes stale and says so is a layer you can fix; one that goes stale
+  silently is worse than none)."
+  [block annotations ctx]
+  (reduce (fn [block' annotation]
+            (let [{matched :range diagnostics :diagnostics}
+                  (anchor/resolve-anchor block' (:anchor annotation))]
+              (run! (:warn! ctx) diagnostics)
+              (if matched
+                (let [applied (anchor/apply-annotation block' matched
+                                                       (annotation-nodes annotation))]
+                  (run! (:warn! ctx) (:diagnostics applied))
+                  (:document applied))
+                block')))
+          block
+          annotations))
 
 (defn- splice-overlay-block
   "One Block of the BASE document, recursed into first (so a nested
@@ -823,13 +1158,25 @@
                              (or (seq (:prepend entry)) (seq (:append entry))))
         describe? (and entry (contains? describable-block-types (:t block)) (seq (:props entry)))
         block (if prepend-append?
-                (do ((:matched! ctx) id)
+                (do ((:matched! ctx) id :prepend-append)
                     (update block :blocks
                             (fn [own] (into (vec (:prepend entry)) (into own (:append entry))))))
                 block)
         block (if describe?
-                (do ((:matched! ctx) id)
+                (do ((:matched! ctx) id :describe)
                     (merge-overlay-props block id (:props entry) ctx))
+                block)
+        ;; Unlike prepend/append (Section-only) and describe
+        ;; (`describable-block-types`), an annotation is accepted on ANY
+        ;; node carrying the id: `target=` scopes the quote search rather
+        ;; than naming what is patched, so anything with a subtree to
+        ;; search in is a legitimate target. `matched!` fires whether or
+        ;; not the quote resolved -- the TARGET did, and reporting it as
+        ;; a dangling target as well as a dangling anchor would name the
+        ;; same mistake twice in two different vocabularies.
+        block (if (and entry (seq (:annotations entry)))
+                (do ((:matched! ctx) id :annotations)
+                    (apply-annotations block (:annotations entry) ctx))
                 block)]
     block))
 
@@ -878,19 +1225,49 @@
           collected (volatile! (vec warnings))
           matched (volatile! #{})
           ctx {:plan plan
-               :matched! (fn [id] (vswap! matched conj id))
+               :matched! (fn [id aspect] (vswap! matched conj [id aspect]))
                :warn! (fn [w] (vswap! collected conj w))}
           spliced (splice-overlay-blocks (:blocks document) ctx)
+          ;; PER ASPECT, not per id. `matched!` has always fired per
+          ;; aspect actually applied -- `splice-overlay-block`'s own
+          ;; docstring says so -- but the check here was per id, so one
+          ;; aspect that matched silenced another on the same id that did
+          ;; not. An annotation, which matches on ANY node carrying the
+          ;; id, made that visible: adding a highlight to `fig:a` silenced
+          ;; a genuinely dangling `prepend` there (found by review). One
+          ;; diagnostic per id still, since an id whose every aspect
+          ;; failed is one mistake however many directives named it.
+          aspects-of (fn [entry]
+                       (cond-> #{}
+                         (or (seq (:prepend entry)) (seq (:append entry)))
+                         (conj :prepend-append)
+                         (seq (:props entry)) (conj :describe)
+                         (seq (:annotations entry)) (conj :annotations)))
           dangling (into []
-                         (keep (fn [id]
-                                 (when-not (contains? @matched id)
+                         (keep (fn [[id entry]]
+                                 ;; EVERY aspect, not any: an id is only
+                                 ;; fully resolved when each directive
+                                 ;; that named it found what it needed.
+                                 (when-not (every? #(contains? @matched [id %])
+                                                   (aspects-of entry))
                                    {:type :dangling-overlay-target
                                     :id id
-                                    :message (str "overlay target \"" id "\" does not resolve"
-                                                  " to a Section, Figure, Table, MathBlock, or"
-                                                  " referenceable Directive in the base"
-                                                  " document")})))
-                         (keys plan))]
+                                    ;; The kinds named are prepend/append/
+                                    ;; describe's own, which is what this
+                                    ;; message has always been about. An
+                                    ;; annotation accepts ANY node
+                                    ;; carrying the id, so naming that
+                                    ;; list at one would have sent its
+                                    ;; author looking for the wrong
+                                    ;; mistake (found by review).
+                                    :message (str "overlay target \"" id "\" does not resolve to"
+                                                  " a node in the base document that the"
+                                                  " directives naming it can patch"
+                                                  " (prepend/append need a Section; describe"
+                                                  " needs a Section, Figure, Table, MathBlock or"
+                                                  " referenceable Directive; an annotation"
+                                                  " needs only a node carrying that id)")})))
+                         plan)]
       {:document (assoc document :blocks spliced)
        :warnings (into @collected dangling)})))
 
@@ -2681,9 +3058,10 @@
 ;;
 ;; Coverage (review fix on this task -- see TASK-15's task comments for the
 ;; original finding): every `attr.id` anywhere in the document is checked,
-;; not just Block-level ones. A Link/Image/Span Inline's own `attr.id` (the
-;; only Inline variants that carry an `Attr` at all, per `ast.clj`'s
-;; `::inline` schema, sec4.4) is in the SAME id namespace as a Block's, per
+;; not just Block-level ones. An Attr-carrying Inline's own `attr.id`
+;; (`:link`/`:image`/`:span`, plus TASK-116's `:highlight`/`:sticky-note`,
+;; per `ast.clj`'s `::inline` schema, sec4.4) is in the SAME id namespace
+;; as a Block's, per
 ;; `SPEC.md` sec4.1's own Attr definition (`id?: string; //
 ;; unique document-wide anchor`) -- there is no Block-only carve-out in the
 ;; spec, and any future HTML emitter would render two same-id nodes, Block
@@ -3059,27 +3437,34 @@
 (defn- id-locations-inline-visit
   "`id-locations-inline-walker`'s own `:visit` (TASK-87): every Inline
   this walk reaches contributes its own `attr.id` (`:link`/`:image`/
-  `:span` only -- the only Inline variants that carry an `Attr` at all,
-  sec4.4), paired with `{:node-type :path}` at `fold`'s own path,
+  `:span`, plus TASK-116's `:highlight`/`:sticky-note` -- the Inline
+  variants that carry an `Attr` at all, sec4.4), paired with `{:node-type
+  :path}` at `fold`'s own path,
   UNCHANGED (see this section's own top-of-namespace comment for why the
   Inline side needs no compaction, unlike the Block side). `fold`'s own
-  recursion already covers every other position this walk needs --
-  `:inlines` for `:emph`/`:strong`/`:strike`/`:small-caps`/`:sub`/`:sup`/
-  `:span`/`:link`, and `:items` then each item's own `:prefix`/`:suffix`
-  for `:cite`, via `id-locations-inline-walker`'s own `::cite-item` scope
-  -- EXCEPT a footnote `:note`'s own `:blocks`, `::block`-typed and
-  therefore out of this walker's `:scope`: handled here instead,
-  recursing into `id-locations-in-block` (the OTHER walker) for each of
-  `:note`'s own `:blocks`, at `path` extended by the field's own `:blocks`
-  keyword -- the one field name this side keeps for a Block-typed
-  position (see this section's own top-of-namespace comment)."
+  recursion already covers every other position this walk needs -- every
+  `[:many ::ast/inline]` field, and `:items` then each item's own
+  `:prefix`/`:suffix` for `:cite`, via `id-locations-inline-walker`'s own
+  `::cite-item` scope -- EXCEPT an Inline's own Block-typed field, which
+  is out of this walker's `:scope`: handled here instead, recursing into
+  `id-locations-in-block` (the OTHER walker) for each Block, at `path`
+  extended by that field's own keyword.
+
+  WHICH fields those are is asked of `haselnuss.walk/fields-holding`
+  rather than hardcoded to `:note`'s `:blocks`. It was hardcoded, and the
+  day TASK-116 added `:sticky-note` a duplicate `attr.id` inside one
+  stopped being reported at all -- the same document with the id inside a
+  `:note` reported `:duplicate-id` correctly."
   [acc path ref-kind node]
   (let [own (when-let [id (get-in node [:attr :id])]
               [[id {:node-type (:t node) :path path}]])
         acc (into acc own)]
-    (if (and (= ref-kind ::ast/inline) (= :note (:t node)))
-      (into acc (mapcat (fn [i block] (id-locations-in-block (conj path :blocks i) block))
-                        (range) (:blocks node)))
+    (if (= ref-kind ::ast/inline)
+      (reduce (fn [acc field]
+                (into acc (mapcat (fn [i block] (id-locations-in-block (conj path field i) block))
+                                  (range) (get node field))))
+              acc
+              (walk/fields-holding ::ast/inline node ::ast/block))
       acc)))
 
 (def ^:private id-locations-inline-walker

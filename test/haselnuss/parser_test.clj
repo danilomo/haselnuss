@@ -842,6 +842,174 @@
     (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse ":::{!!!}\nx\n:::\n")))]
       (is (= ::parser/malformed-directive (:type (ex-data e)))))))
 
+(deftest bang-directive-test
+  (testing "TASK-114 AC #1: a bare `!name` line is a complete directive --
+            sec5.5's second spelling, for a directive whose whole content
+            lives in its header, so there is no body and no closing fence"
+    (let [doc (parser/parse "!toc\n")]
+      (is (= [{:t :directive :name "toc" :attr attr :blocks []}] (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "TASK-114 AC #2: props reach the AST through the one-line form
+            exactly as they do through a fence header, spaces and all --
+            examples/reveal.clj's own question/answer shape, which is the
+            case this spelling exists for"
+    (let [doc (parser/parse "!reveal{question=\"a b\" answer=\"c d\"}\n")]
+      (is (= [{:t :directive :name "reveal"
+               :attr {:classes [] :props {"question" "a b" "answer" "c d"}}
+               :blocks []}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "TASK-114 AC #3: the group carries the plain sec5.3 three-form
+            grammar -- `#id`, `.class` and `key=val` together"
+    (let [doc (parser/parse "!fig-note{#note:a .aside k=v}\n")]
+      (is (= [{:t :directive :name "fig-note"
+               :attr {:id "note:a" :classes ["aside"] :props {"k" "v"}}
+               :blocks []}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "whitespace between the name and its group is tolerated, as it
+            is between a colon run and its own header (`fence-line` trims)"
+    (is (= [{:t :directive :name "toc" :attr {:classes [] :props {"x" "1"}} :blocks []}]
+           (:blocks (parser/parse "!toc {x=1}\n")))))
+  (testing "a `}` inside a quoted value works, because the group is
+            captured greedily to the LAST `}` on the line -- the same
+            property a `:::` header has and a display-math group does not"
+    (is (= {"a" "}"} (-> (parser/parse "!reveal{a=\"}\"}\n") :blocks first :attr :props))))
+  (testing "up to 3 leading spaces is still a directive, matching
+            `include-line-re`/`directive-fence-re`'s own CommonMark
+            leaf-block indentation tolerance; at 4 it is an indented code
+            block like any other over-indented line"
+    (is (= [{:t :directive :name "toc" :attr attr :blocks []}]
+           (:blocks (parser/parse "   !toc\n"))))
+    (is (= [{:t :code-block :text "!toc\n" :attr attr}]
+           (:blocks (parser/parse "    !toc\n")))))
+  (testing "the whole design claim, asserted directly: the two spellings
+            are the same MECHANISM, not merely similar ones -- a one-line
+            directive and the fence it replaces parse to the identical
+            node, so nothing downstream can tell them apart"
+    (doseq [[one-line fenced] [["!toc\n" ":::{toc}\n:::\n"]
+                               ["!reveal{a=\"x y\"}\n" ":::{reveal a=\"x y\"}\n:::\n"]
+                               ["!note{#n:a .aside}\n" ":::{note #n:a .aside}\n:::\n"]]]
+      (is (= (:blocks (parser/parse fenced)) (:blocks (parser/parse one-line))) one-line)))
+  (testing "TASK-114 AC #6: a one-line directive nests inside a `:::`
+            fence -- both spellings are recognized by the same raw-line
+            recursion, at any depth"
+    (let [doc (parser/parse ":::{note}\n!toc\n:::\n")]
+      (is (= [{:t :directive :name "note" :attr attr
+               :blocks [{:t :directive :name "toc" :attr attr :blocks []}]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc)))
+    (is (= [{:t :directive :name "a" :attr attr
+             :blocks [{:t :directive :name "b" :attr attr
+                       :blocks [{:t :directive :name "toc" :attr attr :blocks []}]}]}]
+           (:blocks (parser/parse "::::{a}\n:::{b}\n!toc\n:::\n::::\n")))))
+  (testing "it ends the run of text before it and starts a fresh one
+            after, exactly as a `!include` line and a directive fence do"
+    (is (= [{:t :para :inlines [(str-inline "Before.")]}
+            {:t :directive :name "toc" :attr attr :blocks []}
+            {:t :para :inlines [(str-inline "After.")]}]
+           (:blocks (parser/parse "Before.\n!toc\nAfter.\n"))))))
+
+(deftest bang-directive-non-collision-test
+  (testing "TASK-114 AC #4: `!include <path>` is still an Include -- text
+            after the name that is not a `{...}` group means this was
+            never a one-line directive"
+    (is (= [{:t :include :src "chapters/a.hdoc"}]
+           (:blocks (parser/parse "!include chapters/a.hdoc\n")))))
+  (testing "TASK-114 AC #4: a bare `!include` is still an ordinary
+            paragraph. `include` is a RESERVED name in this form
+            precisely so that it stays one: promoting it to a directive
+            named \"include\" would turn a mistyped include into a
+            plausible-looking wrong document"
+    (is (= [{:t :para :inlines [(str-inline "!include")]}]
+           (:blocks (parser/parse "!include\n")))))
+  (testing "trailing text that is not a group leaves the line as prose,
+            the same tolerance `include-line` gives a bare `!include`"
+    (is (= [{:t :para :inlines [(str-inline "!toc") space (str-inline "extra")
+                                space (str-inline "words")]}]
+           (:blocks (parser/parse "!toc extra words\n")))))
+  (testing "TASK-114 AC #8: a CommonMark image at the margin is untouched
+            -- `[` is not a name character, so `![` can never open this
+            construct"
+    (is (= [{:t :para :inlines [{:t :image :src "img.png" :alt "alt" :attr attr}]}]
+           (:blocks (parser/parse "![alt](img.png)\n")))))
+  (testing "TASK-114 AC #5: a `!name` line inside a fenced code block is
+            code content, not a directive -- the shielding
+            `parse-directive-region` already consults for a colon run
+            covers this construct for free"
+    (is (= [{:t :code-block :text "!toc\n" :attr attr}]
+           (:blocks (parser/parse "```\n!toc\n```\n")))))
+  (testing "TASK-114 AC #5: and inside a `$$` display-math block it is
+            raw TeX, for the same reason"
+    (is (= [{:t :math-block :tex "x = !toc" :attr attr}]
+           (:blocks (parser/parse "$$\nx = !toc\n$$\n")))))
+  (testing "a `\\!` at the start of the line escapes the construct back to
+            prose: the line no longer begins with `!`, so this raw-line
+            scan skips it and flexmark unescapes it as it always has --
+            the way out for a paragraph that really does start `!figure`"
+    (is (= [{:t :para :inlines [(str-inline "!figure")]}]
+           (:blocks (parser/parse "\\!figure\n"))))))
+
+(deftest bang-directive-shares-fence-consequences-test
+  (testing "the two consequences `include-line-test` pins for `:::` and
+            `!include` side by side hold for a `!name` line too, and are
+            asserted here for the same reason they are asserted there --
+            so a future change cannot quietly make the three differ.
+            First: it is block-level, so one indented into a list ends
+            that list and starts a new one after, rather than joining the
+            item"
+    (is (= [{:t :list :ordered false :tight true
+             :items [[{:t :para :inlines [(str-inline "item")]}]] :attr attr}
+            {:t :directive :name "toc" :attr attr :blocks []}
+            {:t :list :ordered false :tight true
+             :items [[{:t :para :inlines [(str-inline "two")]}]] :attr attr}]
+           (:blocks (parser/parse "- item\n  !toc\n- two\n")))))
+  (testing "second: it splits the run of text around it into separate
+            parse chunks, so a footnote definition on one side no longer
+            sees its use on the other -- the diagnostic, not silence"
+    (let [e (is (thrown? clojure.lang.ExceptionInfo
+                         (parser/parse "text[^a]\n!toc\n\n[^a]: note\n")))]
+      (is (= ::parser/undefined-footnote (:type (ex-data e)))))))
+
+(deftest malformed-bang-directive-test
+  (testing "TASK-114 AC #7: once `!name{` has committed the line to being
+            a directive, a group that never closes is a diagnostic rather
+            than something that quietly falls back to prose (this file's
+            own no-silent-drop ethos, AC #4 of TASK-5)"
+    (doseq [source ["!toc{unclosed\n" "!toc{a=\"unterminated}\n" "!toc{a=\"x\"y}\n"]]
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse source)) source)]
+        (is (= ::parser/malformed-directive (:type (ex-data e))) source))))
+  (testing "TASK-114 AC #3: a bare word inside the group is a diagnostic,
+            not a second name -- the name has already been given outside
+            the braces, so what is left is the plain sec5.3 grammar"
+    (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse "!toc{foo}\n")))]
+      (is (= ::parser/malformed-directive (:type (ex-data e))))))
+  (testing "a group token that is neither `#id`, `.class` nor `key=val`
+            raises the same diagnostic a `:::` header raises for it"
+    (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse "!toc{!!!}\n")))]
+      (is (= ::parser/malformed-directive (:type (ex-data e))))))
+  (testing "trailing text AFTER a closed group is an error too, not the
+            prose a never-opened group would have left. Once a `{`
+            commits the line, the whole rest of it must be one group --
+            `!toc{a=1} trailing` is a mistake worth naming, where
+            `!toc extra words` (no group at all) is just a paragraph"
+    (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse "!toc{a=1} trailing\n")))]
+      (is (= ::parser/malformed-directive (:type (ex-data e)))))
+    (is (= [{:t :para :inlines [(str-inline "!toc") space (str-inline "extra")
+                                space (str-inline "words")]}]
+           (:blocks (parser/parse "!toc extra words\n")))))
+  (testing "a RESERVED name written with a group is refused by name.
+            Without this `!include{src=\"a.hdoc\"}` reaches flexmark and
+            dies as an ::unsupported-node \"unsupported inline
+            construct\", a diagnostic naming neither !include nor the
+            rule; a bare `!include` still stays the paragraph it is"
+    (doseq [source ["!include{}\n" "!include{src=\"a.hdoc\"}\n"]]
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse source)) source)]
+        (is (= ::parser/malformed-directive (:type (ex-data e))) source)
+        (is (= "include" (:name (ex-data e))) source)))
+    (is (= [{:t :para :inlines [(str-inline "!include")]}]
+           (:blocks (parser/parse "!include\n"))))))
+
 (deftest quoted-attribute-value-test
   (let [directive-props (fn [source]
                           (-> (parser/parse source) :blocks first :attr :props))]
@@ -2124,5 +2292,242 @@
                          space (str-inline "and") space
                          {:t :link :target "http://example.com/one" :inlines [(str-inline "1")] :attr attr}
                          (str-inline ".")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc)))))
+
+;; --- Highlights: `==marked text==` (TASK-122, doc-8 section 3, sec5.6) -----
+
+(defn- highlight
+  "A `:highlight` Inline (sec4.4) wrapping `inlines`, with the default
+  Attr every one this parser produces without an attribute group carries."
+  [& inlines]
+  {:t :highlight :inlines (vec inlines) :attr attr})
+
+(deftest highlight-test
+  (testing "AC #1: a ==run of words== inside a paragraph parses to a
+            :highlight carrying its inlines and the default :attr"
+    (let [doc (parser/parse "Hazelnuts ==ripen in early autumn== and drop.\n")]
+      (is (= [{:t :para
+               :inlines [(str-inline "Hazelnuts") space
+                         (highlight (str-inline "ripen") space (str-inline "in") space
+                                    (str-inline "early") space (str-inline "autumn"))
+                         space (str-inline "and") space (str-inline "drop.")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "two highlights in one paragraph are two separate nodes, not
+            one spanning run"
+    (let [doc (parser/parse "a ==b== c ==d== e\n")]
+      (is (= [{:t :para :inlines [(str-inline "a") space (highlight (str-inline "b"))
+                                  space (str-inline "c") space (highlight (str-inline "d"))
+                                  space (str-inline "e")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc)))))
+
+(deftest highlight-nested-markup-test
+  (testing "AC #2: emphasis, a link, inline code, inline math, a
+            cross-reference and a citation all survive inside a highlight.
+            This is the requirement that settles the parsing mechanism: a
+            highlight's content is ordinary markup, so it is a flexmark
+            DelimiterProcessor (what `*emph*` itself is built on) rather
+            than an InlineParserExtension reading an opaque span"
+    (let [doc (parser/parse "A ==run *emph*, [l](u), `c`, $x^2$, @fig:t, @knuth== here.\n")]
+      (is (= [{:t :para
+               :inlines [(str-inline "A") space
+                         (highlight (str-inline "run") space
+                                    {:t :emph :inlines [(str-inline "emph")]}
+                                    (str-inline ",") space
+                                    {:t :link :target "u" :inlines [(str-inline "l")] :attr attr}
+                                    (str-inline ",") space
+                                    {:t :code :text "c"}
+                                    (str-inline ",") space
+                                    {:t :math-inline :tex "x^2"}
+                                    (str-inline ",") space
+                                    {:t :cross-ref :label "fig:t"}
+                                    (str-inline ",") space
+                                    {:t :cite :items [{:key "knuth" :mode :author}]})
+                         space (str-inline "here.")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "a highlight nests inside emphasis, and inside a link"
+    (let [doc (parser/parse "*emph with ==mark== in it* and [==marked==](u).\n")]
+      (is (= [{:t :para
+               :inlines [{:t :emph :inlines [(str-inline "emph") space (str-inline "with") space
+                                             (highlight (str-inline "mark")) space
+                                             (str-inline "in") space (str-inline "it")]}
+                         space (str-inline "and") space
+                         {:t :link :target "u" :inlines [(highlight (str-inline "marked"))]
+                          :attr attr}
+                         (str-inline ".")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "a highlight in image alt text contributes its words to the
+            flattened `:alt` string rather than vanishing"
+    (let [doc (parser/parse "![a ==marked== alt](i.png)\n")]
+      (is (= "a marked alt" (get-in (:blocks doc) [0 :inlines 0 :alt])))
+      (is (ast/valid? ast/Document doc)))))
+
+(deftest highlight-in-every-container-test
+  (testing "AC #3: a highlight parses in a heading, a figure caption, a
+            table cell and a list item, not only in a plain paragraph"
+    (let [heading (parser/parse "# A ==marked== heading\n")
+          figure (parser/parse "![A ==marked== caption](i.png){#fig:a}\n")
+          table (parser/parse "| a | b |\n|---|---|\n| ==c== | d |\n")
+          a-list (parser/parse "- item with ==mark==\n")]
+      (is (= [(str-inline "A") space (highlight (str-inline "marked")) space
+              (str-inline "heading")]
+             (get-in (:blocks heading) [0 :heading])))
+      (is (= [(str-inline "A") space (highlight (str-inline "marked")) space
+              (str-inline "caption")]
+             (get-in (:blocks figure) [0 :caption])))
+      (is (= [{:t :para :inlines [(highlight (str-inline "c"))]}]
+             (get-in (:blocks table) [0 :rows 0 :cells 0 :blocks]))
+          "a highlight in a table cell -- the case that crashed flexmark's
+           own table pre-processor until the synthetic node was given a
+           real source span")
+      (is (= [{:t :para :inlines [(str-inline "item") space (str-inline "with") space
+                                  (highlight (str-inline "mark"))]}]
+             (get-in (:blocks a-list) [0 :items 0])))
+      (doseq [doc [heading figure table a-list]]
+        (is (ast/valid? ast/Document doc))))))
+
+(deftest highlight-attribute-group-test
+  (testing "AC #4: an attribute group after the closing == attaches its
+            id, classes and props to the :highlight itself -- no wrapping
+            Span, since unlike a Code span a :highlight carries an :attr
+            of its own (sec4.4)"
+    (let [doc (parser/parse "Tagged ==text=={#hl:a .important note=check} here.\n")]
+      (is (= [{:t :para
+               :inlines [(str-inline "Tagged") space
+                         {:t :highlight :inlines [(str-inline "text")]
+                          :attr {:id "hl:a" :classes ["important"] :props {"note" "check"}}}
+                         space (str-inline "here.")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc)))))
+
+(deftest highlight-does-not-disturb-existing-equals-syntax-test
+  (testing "AC #5, hazard 1 of 2 (doc-8 pitfall 2): a setext heading
+            underline is still a setext heading, at every length. It is a
+            BLOCK-level construct, settled before inline parsing runs at
+            all, which is why the delimiter processor cannot reach it --
+            asserted rather than assumed, in the same way TASK-7's `$`
+            math had to be shown not to eat `$5`"
+    (doseq [underline ["=" "==" "===" "===================="]]
+      (let [doc (parser/parse (str "Heading\n" underline "\n\nBody.\n"))]
+        (testing (str "underline of length " (count underline))
+          (is (= [{:t :section :level 1 :heading [(str-inline "Heading")]
+                   :blocks [{:t :para :inlines [(str-inline "Body.")]}]
+                   :attr attr}]
+                 (:blocks doc)))
+          (is (ast/valid? ast/Document doc))))))
+  (testing "AC #5, hazard 2 of 2: key=val inside an attribute group is
+            unchanged, and so is a quoted value that itself contains =="
+    (let [doc (parser/parse "[t]{#p key=val other=\"a==b\"} tail.\n")]
+      (is (= [{:t :para
+               :inlines [{:t :span :inlines [(str-inline "t")]
+                          :attr {:id "p" :classes [] :props {"key" "val" "other" "a==b"}}}
+                         space (str-inline "tail.")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "a lone = and a lone == in running prose stay literal text --
+            neither is a delimiter run that opens anything"
+    (let [doc (parser/parse "x = y and z == w here\n")]
+      (is (= [{:t :para :inlines [(str-inline "x") space (str-inline "=") space
+                                  (str-inline "y") space (str-inline "and") space
+                                  (str-inline "z") space (str-inline "==") space
+                                  (str-inline "w") space (str-inline "here")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc)))))
+
+(deftest highlight-unclosed-and-escaped-test
+  (testing "AC #6: an unclosed == stays literal text rather than
+            swallowing the rest of the paragraph"
+    (let [doc (parser/parse "An unclosed ==thing keeps going.\n")]
+      (is (= [{:t :para :inlines [(str-inline "An") space (str-inline "unclosed") space
+                                  (str-inline "==thing") space (str-inline "keeps") space
+                                  (str-inline "going.")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "AC #6: \\== escapes the construct -- an ordinary CommonMark
+            backslash escape, since = is already escapable punctuation, so
+            the surviving single = never reaches the two-character minimum"
+    (let [doc (parser/parse "Escaped \\==not a highlight== here.\n")]
+      (is (= [{:t :para :inlines [(str-inline "Escaped") space (str-inline "==not") space
+                                  (str-inline "a") space (str-inline "highlight==") space
+                                  (str-inline "here.")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc)))))
+
+(deftest highlight-is-shielded-inside-verbatim-constructs-test
+  (testing "AC #7: == inside inline code is content"
+    (let [doc (parser/parse "Code `a == b` here.\n")]
+      (is (= [{:t :para :inlines [(str-inline "Code") space {:t :code :text "a == b"}
+                                  space (str-inline "here.")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "AC #7: == inside a fenced code block is content"
+    (let [doc (parser/parse "```\nx ==y== z\n```\n")]
+      (is (= [{:t :code-block :text "x ==y== z\n" :attr attr}] (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "AC #7: == inside display math is content"
+    (let [doc (parser/parse "$$\na ==b== c\n$$\n")]
+      (is (= [{:t :math-block :tex "a ==b== c" :attr attr}] (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "AC #7: == inside INLINE math is raw TeX, not a highlight"
+    (let [doc (parser/parse "Let $a ==b$ hold.\n")]
+      (is (= [{:t :para :inlines [(str-inline "Let") space {:t :math-inline :tex "a ==b"}
+                                  space (str-inline "hold.")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc)))))
+
+(deftest highlight-delimiter-run-semantics-test
+  (testing "TASK-122 review: the delimiter-run behaviour this construct
+            defines, pinned rather than left to whatever flexmark
+            happens to do. A run longer than two opens with two of its
+            characters and leaves the rest as literal text -- deliberately
+            NOT emphasis's rule-of-three, which has no meaning for a
+            construct with exactly one length"
+    (let [doc (parser/parse "===three===\n")]
+      (is (= [{:t :para :inlines [(str-inline "=")
+                                  (highlight (str-inline "three"))
+                                  (str-inline "=")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "an opener flanked by whitespace on its inner side opens
+            nothing -- CommonMark's own left-flanking rule, the same one
+            that stops `* not emph *`"
+    (let [doc (parser/parse "a == b == c\n")]
+      (is (= [{:t :para :inlines [(str-inline "a") space (str-inline "==") space
+                                  (str-inline "b") space (str-inline "==") space
+                                  (str-inline "c")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "an unclosed == earlier in a paragraph does not consume a
+            properly closed pair later in it"
+    (let [doc (parser/parse "stray == then ==marked== after\n")]
+      (is (= [{:t :para :inlines [(str-inline "stray") space (str-inline "==") space
+                                  (str-inline "then") space
+                                  (highlight (str-inline "marked")) space
+                                  (str-inline "after")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "a highlight spanning a soft line break keeps the break inside
+            it, so the anchor resolver's own whitespace normalisation
+            sees exactly the words the author wrote"
+    (let [doc (parser/parse "A ==run across\ntwo lines== here.\n")]
+      (is (= [{:t :para :inlines [(str-inline "A") space
+                                  (highlight (str-inline "run") space (str-inline "across")
+                                             {:t :soft-break}
+                                             (str-inline "two") space (str-inline "lines"))
+                                  space (str-inline "here.")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "a highlight nested directly inside another is one node, not
+            two -- the inner pair closes the outer opener"
+    (let [doc (parser/parse "x ==a ==b== c== y\n")]
+      (is (= :highlight (get-in (:blocks doc) [0 :inlines 2 :t])))
+      (is (ast/valid? ast/Document doc))))
+  (testing "== at the very start and the very end of a paragraph"
+    (let [doc (parser/parse "==whole line==\n")]
+      (is (= [{:t :para :inlines [(highlight (str-inline "whole") space (str-inline "line"))]}]
              (:blocks doc)))
       (is (ast/valid? ast/Document doc)))))

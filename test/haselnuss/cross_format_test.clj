@@ -24,7 +24,10 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [haselnuss.cli :as cli])
+            [haselnuss.cli :as cli]
+            [haselnuss.emit.html :as html]
+            [haselnuss.emit.latex :as latex]
+            [haselnuss.resolver :as resolver])
   (:import (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)))
 
@@ -478,3 +481,60 @@
           ;; map above already says, so it needs no assertion of its own
           ;; (found by review).
           )))))
+
+;; --- Annotations across the targets (TASK-120 AC #8, doc-8 sec8) ---------
+
+(deftest annotation-colors-agree-across-targets-test
+  (testing "TASK-120/121: `color=` is one closed vocabulary that three
+            namespaces have to agree on -- the resolver diagnoses a value
+            outside it, and both emitters style each value inside it. It
+            was written out three times with nothing holding the copies
+            together, which is exactly the kind of drift this namespace
+            exists to catch"
+    (is (= #{"yellow" "green" "blue" "pink"} resolver/annotation-colors))
+    (is (= resolver/annotation-colors html/annotation-colors))
+    (is (= resolver/annotation-colors latex/annotation-colors))))
+
+(deftest annotations-render-on-every-target-test
+  (testing "TASK-120 AC #8: an annotated document goes through the real
+            CLI to both targets, alongside the existing node types.
+
+            Built through `cli/build` like every other fixture here, and
+            annotated the way an author actually would -- `==...==` in the
+            source for the highlight, an `--overlay` file for the sticky
+            note, which has no surface syntax by design. What is compared
+            is the ONE thing both targets must agree on: the annotated
+            words survive, and the document's own numbering is untouched
+            by annotating it (doc-8 sec2's numbering invariant)"
+    (let [dir (str (Files/createTempDirectory "haselnuss-annot" (make-array FileAttribute 0)))
+          input (str (io/file dir "annotated.hdoc"))
+          overlay (str (io/file dir "review.hdoc"))
+          source (str "# Intro {#sec:intro}\n\n"
+                      "Hazelnuts ==ripen in early autumn== and drop soon after.\n\n"
+                      "$$\nE = mc^2\n$$ {#eq:mass}\n\n"
+                      "See @eq:mass.\n")
+          bare-source (str/replace source "==ripen in early autumn==" "ripen in early autumn")]
+      (spit input source)
+      (spit overlay (str ":::{sticky-note target=sec:intro text=\"early autumn\" author=\"DM\"}\n"
+                         "Was this the rerun trial?\n:::\n"))
+      (doseq [target ["html" "latex"]]
+        (testing target
+          (let [annotated (slurp (:output-path (cli/build {:input input :target target
+                                                           :overlay [overlay]
+                                                           :computed-numbers true})))]
+            (is (str/includes? annotated "ripen in early autumn")
+                "the marked words survive, which is the one thing an annotation must never cost")
+            (is (str/includes? annotated "Was this the rerun trial?")
+                "and so does the note's own body"))))
+      ;; The numbering invariant, compared rather than asserted twice:
+      ;; the number the equation prints, and the number the reference to
+      ;; it prints, must be what the same document produces with no
+      ;; annotation in it at all.
+      (spit input bare-source)
+      (let [bare-html (slurp (:output-path (cli/build {:input input :target "html"})))]
+        (spit input source)
+        (let [annotated-html (slurp (:output-path (cli/build {:input input :target "html"
+                                                              :overlay [overlay]})))]
+          (is (= (html-reference-numbers (body-only bare-html))
+                 (html-reference-numbers (body-only annotated-html)))
+              "every number a reference prints is unchanged by annotating the document"))))))

@@ -8,8 +8,10 @@
   test here would fail the same way a real caller's build would."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [haselnuss.ast :as ast]
             [haselnuss.emit.hdoc :as hdoc]
-            [haselnuss.parser :as parser]))
+            [haselnuss.parser :as parser]
+            [haselnuss.select :as select]))
 
 (defn- fixed-point?
   "True if `(parse (emit (parse src))) = (parse src)` -- the AST fixed
@@ -110,20 +112,29 @@
       (is (str/starts-with? out "---\n---\n\n"))
       (is (= document (parser/parse out))))))
 
+(defn- registry-variant-tags
+  "Every variant tag of a `[:multi {:dispatch fn} & variants]` registry
+  entry, by the simplest independent read of the raw schema data."
+  [ref-kind]
+  (set (map first (drop 2 (get ast/registry ref-kind)))))
+
 (def ^:private all-block-tags
-  "Every Block variant `haselnuss.ast/registry` defines (sec4.3), pinned
-  here rather than derived from the schema -- the same shape
-  `haselnuss.json-test`'s own `all-block-tags` uses, per TASK-97's own
-  instruction to prove coverage \"the way haselnuss.json-test already
-  proves its own\" (AC #1)."
-  #{:section :para :list :code-block :math-block :figure :table
-    :block-quote :directive :include :thematic-break})
+  "Every Block variant `haselnuss.ast/registry` defines (sec4.3), DERIVED
+  from the registry -- see `every-inline-tag` for why the hand-pinned set
+  this replaces was a canary that could not fire."
+  (registry-variant-tags ::ast/block))
 
 (def ^:private every-inline-tag
-  "Every Inline variant `haselnuss.ast/registry` defines (sec4.4), pinned
-  here rather than derived from the schema (TASK-95's own job, AC #4)."
-  #{:str :space :soft-break :line-break :emph :strong :strike :small-caps
-    :sub :sup :code :math-inline :link :image :span :cross-ref :cite :note})
+  "Every Inline variant `haselnuss.ast/registry` defines (sec4.4),
+  DERIVED from the registry rather than pinned.
+
+  It used to be a hand-written set, compared with `=` against the handler
+  map and never against the schema -- so it stayed green with eighteen
+  stale tags the whole time `:highlight` and `:sticky-note` existed
+  unhandled here, which is precisely the failure it advertises itself as
+  catching (found by the TASK-116 review, fixed with TASK-123 since this
+  is the task that had to add both handlers anyway)."
+  (registry-variant-tags ::ast/inline))
 
 (deftest block-and-inline-coverage-test
   (testing "TASK-97 AC #1: every Block variant haselnuss.ast/registry
@@ -131,9 +142,10 @@
             schema's own pinned tag set rather than by inspection -- a
             variant added to the registry later and left unhandled here
             fails this assertion instead of being silently unwritable"
-    (is (= 11 (count all-block-tags)))
+    (is (= 11 (count all-block-tags)) "the derivation found the schema's own Block variants")
     (is (= all-block-tags (set (keys hdoc/built-in-block-handlers)))))
   (testing "TASK-95 AC #4: every Inline variant has a handler"
+    (is (= 20 (count every-inline-tag)) "the derivation found the schema's own Inline variants")
     (is (= every-inline-tag (set (keys hdoc/built-in-inline-handlers)))))
   (testing "a document combining every Block variant and every ordinary
             Inline (a chaptered Section, a Para holding every ordinary
@@ -235,7 +247,15 @@
             thematic-break attempt at the point they occur, which is
             exactly the risk this AC is about protecting a TRANSFORM-
             or JSON-produced :str from"
-    (doseq [text ["*" "_" "[" "]" "`" "$" "@" "!" "#" ":" ":::" "---" "!important"]]
+    (doseq [text ["*" "_" "[" "]" "`" "$" "@" "!" "#" ":" ":::" "---" "!important"
+                  ;; TASK-122: `==` opens a highlight now, so a literal
+                  ;; one in a :str has to be escaped or the round trip
+                  ;; INVENTS a :highlight nobody wrote. A lone `=` is
+                  ;; deliberately still unescaped -- see
+                  ;; `escapes-as-highlight-marker?` -- so both forms are
+                  ;; here, and so is the run of three that would break
+                  ;; if only the first `=` of a run were escaped.
+                  "=" "==" "===" "====" "==marked=="]]
       (let [document {:meta {} :blocks [{:t :para :inlines [(str-inline text)]}]}]
         (is (= document (parser/parse (hdoc/emit-document document))) (pr-str text)))))
   (testing "the same literal text, immediately followed by ! before a
@@ -599,6 +619,74 @@
             indentation (this namespace's own docstring)"
     (is (fixed-point? ":::{note}\n!include other.hdoc\n:::\n"))))
 
+(deftest one-line-directive-round-trip-test
+  (testing "TASK-115 AC #1: a body-less named directive is written in
+            sec5.5's one-line spelling, with NO group at all when it
+            carries no attributes -- `!toc`, never `!toc{}`"
+    (is (= "!toc\n" (hdoc/emit-document (parser/parse "!toc\n"))))
+    (is (fixed-point? "!toc\n")))
+  (testing "TASK-115 AC #1: attributes ride along in the same sorted-key
+            order and with the same quoting the fence header already
+            uses -- `attr-tokens` is shared between the two spellings"
+    (is (= "!reveal{answer=\"c d\" question=\"a b\"}\n"
+           (hdoc/emit-document (parser/parse "!reveal{question=\"a b\" answer=\"c d\"}\n"))))
+    (is (fixed-point? "!reveal{question=\"a b\" answer=\"c d\"}\n"))
+    (is (fixed-point? "!fig-note{#note:a .aside k=v}\n")))
+  (testing "TASK-115 AC #2: this emitter is the format's canonical
+            formatter and the AST records no trace of which spelling its
+            author wrote, so a body-less directive written as a fence
+            comes back as the one-line form -- a normalization, and still
+            an AST fixed point"
+    (is (= "!toc\n" (hdoc/emit-document (parser/parse ":::{toc}\n:::\n"))))
+    (is (fixed-point? ":::{toc}\n:::\n"))
+    (is (= "!list-of-figures\n" (hdoc/emit-document (parser/parse ":::{list-of-figures}\n:::\n")))))
+  (testing "TASK-115 AC #3: a directive WITH a body keeps the fence --
+            the one-line form has no body to put it in"
+    (is (= ":::{note}\nBody.\n:::\n" (hdoc/emit-document (parser/parse ":::{note}\nBody.\n:::\n"))))
+    (is (fixed-point? ":::{note}\nBody.\n:::\n")))
+  (testing "TASK-115 AC #3: a NAMELESS body-less directive keeps the
+            fence too. `!{}` is not the grammar, so there is nothing to
+            write; both source spellings still canonicalize to `:::{}`"
+    (is (= ":::{}\n:::\n" (hdoc/emit-document (parser/parse ":::{}\n:::\n"))))
+    (is (= ":::{}\n:::\n" (hdoc/emit-document (parser/parse ":::\n:::\n"))))
+    (is (fixed-point? ":::{}\n:::\n")))
+  (testing "TASK-115 AC #3: a directive actually NAMED \"include\" keeps
+            the fence, because `include` is reserved in the one-line
+            spelling -- emitting `!include` would come back as an
+            ordinary paragraph, losing the directive entirely"
+    (is (= ":::{include}\n:::\n" (hdoc/emit-document (parser/parse ":::{include}\n:::\n"))))
+    (is (fixed-point? ":::{include}\n:::\n")))
+  (testing "TASK-115 AC #3: and a :name that is not shaped like a
+            directive name keeps the fence. `haselnuss.parser` can only
+            ever produce a legal one, but `haselnuss.transform`'s rules
+            build Directives directly and `haselnuss.ast` types `:name`
+            as a plain `:string`, so this emitter cannot assume it"
+    (doseq [dname ["my directive" "2fast" "a.b" "-lead" "" "include"]]
+      (let [document {:meta {} :blocks [{:t :directive :name dname
+                                         :attr empty-attr :blocks []}]}]
+        (is (str/starts-with? (hdoc/emit-document document) ":::{") dname))))
+  (testing "the fence those names fall back to is a FALLBACK, not a
+            promise of representability: a name the fence header's own
+            grammar cannot spell either has no .hdoc spelling at all and
+            does not survive a re-parse. That hole predates this emitter
+            (the fence header has always used the same name production);
+            it is pinned here so the fallback is not mistaken for a
+            round trip it never was"
+    (doseq [dname ["" "include"]]
+      (let [document {:meta {} :blocks [{:t :directive :name dname
+                                         :attr empty-attr :blocks []}]}]
+        (is (= document (parser/parse (hdoc/emit-document document))) dname)))
+    (doseq [dname ["my directive" "2fast"]]
+      (let [document {:meta {} :blocks [{:t :directive :name dname
+                                         :attr empty-attr :blocks []}]}]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (parser/parse (hdoc/emit-document document)))
+            dname))))
+  (testing "a one-line directive nested inside a fence round-trips, and
+            the enclosing fence is unaffected by the inner spelling"
+    (is (= ":::{outer}\n!toc\n:::\n" (hdoc/emit-document (parser/parse ":::{outer}\n!toc\n:::\n"))))
+    (is (fixed-point? ":::{outer}\n!toc\n:::\n"))))
+
 (deftest include-round-trip-test
   (testing "TASK-97 AC #7: an !include line round-trips"
     (is (fixed-point? "!include chapters/a.hdoc\n")))
@@ -635,3 +723,216 @@
             deferred to this task, no longer throwing
             ::unsupported-block"
     (is (fixed-point? "See.[^1]\n\n[^1]: - a\n\n    - b\n"))))
+
+;; --- Annotations back to .hdoc source (TASK-123, doc-8 sec3) --------------
+
+(defn- round-trips-from-source?
+  "Whether `src` survives parse -> emit -> parse with an identical AST --
+  the property that makes `--target hdoc` a formatter rather than a
+  lossy dump. Returns the re-parsed blocks on failure so a message can
+  show what changed."
+  [src]
+  (let [document (parser/parse src)
+        back (parser/parse (hdoc/emit-document document))]
+    (if (= (:blocks document) (:blocks back)) true (:blocks back))))
+
+(deftest highlight-round-trips-exactly-test
+  (testing "AC #1: a :highlight emits ==...== and re-parses to an
+            identical node -- an EXACT round trip, unlike the four role
+            spans, because a highlight has a surface spelling of its own"
+    (doseq [src ["Hazelnuts ==ripen in early autumn== and drop.\n"
+                 "==A whole paragraph is marked.==\n"
+                 "a ==b== c ==d== e\n"
+                 "*emph with ==mark== inside it*\n"
+                 "A ==run with *emph*, `code` and $x^2$ in it== here.\n"]]
+      (testing (pr-str src)
+        (is (true? (round-trips-from-source? src))))))
+  (testing "AC #2: a :highlight carrying an id, classes or props emits
+            the attribute group AFTER the closer and re-parses
+            identically"
+    (doseq [src ["==x=={#hl:a}\n"
+                 "==x=={.important}\n"
+                 "==x=={note=check}\n"
+                 "==x=={#hl:a .important .urgent note=check}\n"]]
+      (testing (pr-str src)
+        (is (true? (round-trips-from-source? src)))))
+    (is (str/includes? (hdoc/emit-document
+                        (parser/parse "==x=={#hl:a .important}\n"))
+                       "==x=={#hl:a .important}")
+        "the group is written after the closing ==, which is where it parses from"))
+  (testing "AC #3: a :highlight whose marked text itself contains an = or
+            a == emits an escaped form that re-parses identically -- an
+            unescaped one would close the highlight early, or open a
+            second one inside it"
+    (doseq [text ["a = b" "a == b" "===" "====" "=" "a=b" "a==b==c" "=a=" "==a=="
+                  ;; The `\=` family, which is where the first fix was
+                  ;; wrong by one case: a trailing `\=` in the escaped
+                  ;; text is just as often an escaped BACKSLASH followed
+                  ;; by a bare `=`, and treating it as already-escaped
+                  ;; let the `=` escape out of the node -- the highlight
+                  ;; silently moved its own edge.
+                  "a\\=" "\\=" "\\" "a\\" "\\\\=" "=\\=" "a\\=b"]]
+      (testing (pr-str text)
+        (let [document {:meta {} :blocks [{:t :para
+                                           :inlines [{:t :highlight
+                                                      :inlines [(str-inline text)]
+                                                      :attr {:classes [] :props {}}}]}]}
+              emitted (hdoc/emit-document document)
+              back (parser/parse emitted)
+              highlights (filter #(= :highlight (:t %)) (tree-seq coll? seq (:blocks back)))]
+          (is (= 1 (count highlights))
+              (str "exactly one highlight should survive: " (pr-str emitted)))
+          ;; Asserted on the HIGHLIGHT, not on the paragraph. The
+          ;; paragraph's own flattened text is unchanged when a character
+          ;; merely moves from inside the highlight to a sibling :str, so
+          ;; the paragraph-level assertion this replaces passed with the
+          ;; bug in place (found by review).
+          (is (= text (select/flatten-text (first highlights)))
+              (str "and the MARKED text unchanged: " (pr-str emitted)))
+          (is (= 1 (count (:inlines (first (:blocks back)))))
+              (str "with nothing left outside it: " (pr-str emitted))))))))
+
+(deftest nested-highlight-degrades-to-a-role-span-test
+  (testing "TASK-123 review: `==...==` cannot spell one highlight inside
+            another -- the inner `==` closes the outer opener, so
+            `==a ==b== c==` parses as ONE highlight over `a ==b`. Written
+            naively it emitted four `=` characters that were never in the
+            document and left the tail unmarked. Two overlapping
+            annotations produce exactly this shape, so it is not
+            hypothetical"
+    (let [attr {:classes [] :props {}}
+          document {:meta {}
+                    :blocks [{:t :para
+                              :inlines [(str-inline "Hazelnuts ")
+                                        {:t :highlight :attr attr
+                                         :inlines [(str-inline "ripen ")
+                                                   {:t :highlight :attr attr
+                                                    :inlines [(str-inline "in early")]}
+                                                   (str-inline " autumn")]}
+                                        (str-inline " and drop.")]}]}
+          emitted (hdoc/emit-document document)
+          back (parser/parse emitted)]
+      (is (= "Hazelnuts ripen in early autumn and drop."
+             (select/flatten-text (first (:blocks back))))
+          (str "not one character invented or lost: " (pr-str emitted)))
+      (is (= 1 (count (filter #(= :highlight (:t %)) (tree-seq coll? seq (:blocks back)))))
+          "the outer highlight survives as a highlight")
+      (is (= 1 (count (filter #(and (= :span (:t %))
+                                    (contains? (set (:classes (:attr %))) "highlight"))
+                              (tree-seq coll? seq (:blocks back)))))
+          "and the inner one as a role span, content-preserving and kind-lossy")
+      (is (= [:haselnuss.emit.hdoc/lossy-nested-highlight]
+             (mapv :type (hdoc/lossy-role-span-diagnostics document)))
+          "reported the same way every other kind-lossy round trip is")))
+  (testing "a highlight with no highlight inside it is NOT diagnosed --
+            it is an exact round trip, and a warning would be noise"
+    (is (= [] (hdoc/lossy-role-span-diagnostics
+               {:meta {} :blocks [{:t :para
+                                   :inlines [{:t :highlight
+                                              :inlines [(str-inline "x")]
+                                              :attr {:classes [] :props {}}}]}]})))))
+
+(deftest sticky-note-attr-loss-is-named-test
+  (testing "TASK-123 review: sec4.3 gives :note no :attr at all, so the
+            footnote a sticky note degrades to has nowhere to carry one
+            -- its id, color= and author= are simply gone. The diagnostic
+            used to name only the footnote number, which would let an
+            author believe an id survived that did not"
+    (let [document {:meta {}
+                    :blocks [{:t :para
+                              :inlines [{:t :sticky-note
+                                         :blocks [(para (str-inline "A comment."))]
+                                         :attr {:id "sn:1" :classes []
+                                                :props {"color" "green" "author" "DM"}}}]}]}
+          emitted (hdoc/emit-document document)
+          [diagnostic] (hdoc/lossy-role-span-diagnostics document)]
+      (is (not (str/includes? emitted "sn:1")) "the id really is gone")
+      (is (not (str/includes? emitted "green")))
+      (is (str/includes? (:message diagnostic) "no Attr"))
+      (is (str/includes? (:message diagnostic) "id"))
+      (is (str/includes? (:message diagnostic) "author=")))))
+
+(deftest sticky-note-degrades-to-a-footnote-test
+  (testing "AC #4: a :sticky-note emits a footnote marker plus its
+            definition, preserving every block of its body. It has no
+            inline surface syntax by design (doc-8 sec3), so this is
+            content-preserving and kind-lossy -- exactly the contract
+            :strike/:small-caps/:sub/:sup already round-trip under"
+    (let [document {:meta {}
+                    :blocks [{:t :para
+                              :inlines [(str-inline "text")
+                                        {:t :sticky-note
+                                         :blocks [(para (str-inline "First block."))
+                                                  (para (str-inline "Second block."))]
+                                         :attr {:classes [] :props {}}}]}]}
+          emitted (hdoc/emit-document document)
+          back (parser/parse emitted)
+          note (first (filter #(= :note (:t %)) (tree-seq coll? seq (:blocks back))))]
+      (is (str/includes? emitted "[^1]"))
+      (is (some? note) "it comes back as a footnote")
+      (is (= 2 (count (:blocks note))) "with every block of the body preserved")
+      (is (str/includes? emitted "First block."))
+      (is (str/includes? emitted "Second block."))))
+  (testing "AC #5: a :sticky-note produces a ::lossy-sticky-note
+            diagnostic through the SAME path as the existing lossy role
+            spans, rather than a second reporting shape"
+    (let [document {:meta {}
+                    :blocks [{:t :para
+                              :inlines [{:t :sticky-note :blocks [(para (str-inline "x"))]
+                                         :attr {:classes [] :props {}}}
+                                        {:t :strike :inlines [(str-inline "y")]}]}]}
+          diagnostics (hdoc/lossy-role-span-diagnostics document)]
+      (is (= [:haselnuss.emit.hdoc/lossy-sticky-note :haselnuss.emit.hdoc/lossy-role-span]
+             (mapv :type diagnostics))
+          "both kinds of loss, in document order, from the one function")
+      (is (= :sticky-note (:t (first diagnostics))))
+      (is (str/includes? (:message (first diagnostics)) "footnote number")
+          "and it states the cost, which is the one thing a footnote adds")))
+  (testing "AC #6: a document mixing real footnotes with degraded sticky
+            notes emits both with distinct, correctly ordered markers and
+            definitions. The degradation goes through render-note itself
+            rather than a copy of it, so the two share one numbering and
+            one deferral mechanism and cannot collide (doc-8 pitfall 5)"
+    (let [document {:meta {}
+                    :blocks [{:t :para
+                              :inlines [(str-inline "a")
+                                        {:t :note :blocks [(para (str-inline "real one"))]}
+                                        (str-inline " b")
+                                        {:t :sticky-note :blocks [(para (str-inline "sticky"))]
+                                         :attr {:classes [] :props {}}}
+                                        (str-inline " c")
+                                        {:t :note :blocks [(para (str-inline "real two"))]}]}]}
+          emitted (hdoc/emit-document document)
+          back (parser/parse emitted)
+          notes (filter #(= :note (:t %)) (tree-seq coll? seq (:blocks back)))]
+      (is (= "a[^1] b[^2] c[^3]\n\n[^1]: real one\n\n[^2]: sticky\n\n[^3]: real two\n" emitted)
+          "three distinct markers in position order, three definitions in the same order")
+      (is (= 3 (count notes)))
+      (is (= ["real one" "sticky" "real two"]
+             (mapv (fn [note] (select/flatten-text (first (:blocks note)))) notes))
+          "and each definition came back attached to its own marker"))))
+
+(deftest annotated-document-round-trips-test
+  (testing "AC #7: a document containing each new node type survives the
+            round trip -- the highlight exactly, the sticky note as a
+            footnote carrying all of its content"
+    (let [document {:meta {}
+                    :blocks [{:t :para
+                              :inlines [(str-inline "Hazelnuts ")
+                                        {:t :highlight :inlines [(str-inline "ripen")]
+                                         :attr {:id "hl:a" :classes [] :props {}}}
+                                        (str-inline " and drop.")
+                                        {:t :sticky-note
+                                         :blocks [(para (str-inline "Check the notebook."))]
+                                         :attr {:classes [] :props {}}}]}]}
+          emitted (hdoc/emit-document document)
+          back (parser/parse emitted)
+          again (hdoc/emit-document back)]
+      (is (= emitted again)
+          "emit is stable: a second pass over the re-parsed document is byte-identical")
+      (is (some #(= :highlight (:t %)) (tree-seq coll? seq (:blocks back))))
+      (is (= "hl:a" (->> (tree-seq coll? seq (:blocks back))
+                         (filter #(= :highlight (:t %)))
+                         first :attr :id))
+          "the highlight keeps its id through the round trip")
+      (is (some #(= :note (:t %)) (tree-seq coll? seq (:blocks back)))))))

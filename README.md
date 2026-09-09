@@ -698,20 +698,20 @@ HTML `width` attribute since long before this, and a browser reads that as a pix
 
 ### Table of contents, list of figures, list of tables
 
-Each is an empty block directive written exactly where the list belongs — a thesis puts the
+Each is a body-less directive written exactly where the list belongs — a thesis puts the
 lists between the abstract and the contents, a report puts the contents first and no lists at
-all, and neither position is fixed here:
+all, and neither position is fixed here. Having no body, each takes the one-line form:
 
 ```
-:::{toc}
-:::
+!toc
 
-:::{list-of-figures}
-:::
+!list-of-figures
 
-:::{list-of-tables}
-:::
+!list-of-tables
 ```
+
+The fence spelling (`:::{toc}` and a closing `:::`) parses to exactly the same thing and
+keeps working. It is only longer, and `--in-place` rewrites it to the line above.
 
 The entries come from the resolver's own derivations, which have existed since the numbering
 pass was written and until now had no consumer. A document that asks for none of the three is
@@ -855,9 +855,12 @@ a Figure, Table, MathBlock, or a referenceable Directive too — addressed the s
 by `attr.id`:
 
 ```
-:::{describe target=fig:tree alt="A hazelnut tree in early spring bloom, seen from the orchard path."}
-:::
+!describe{target=fig:tree alt="A hazelnut tree in early spring bloom, seen from the orchard path."}
 ```
+
+`describe` carries everything in its header and nothing in a body, so it is written in the
+one-line form — which is what makes an alt-text overlay one line per figure rather than two.
+The fence spelling parses identically and still works.
 
 Every prop other than `target` merges into the target node's own `attr.props`. This needs
 no schema change (`props` already exists on every node's `Attr`) and is invisible to both
@@ -883,6 +886,182 @@ Not in scope: a multi-paragraph or richly-marked-up description. `attr.props` is
 `string -> string` map, so `describe` only fits a caption-length string per key — a richer
 description (its own cross-references, math, multiple paragraphs) would need an actual
 AST addition, and is left for a future extension.
+
+### Annotations
+
+A PDF reader lets you lay two things over someone else's document without editing it: a
+**highlight**, a coloured wash over a run of text, and a **sticky note**, a balloon wedged
+between two words that opens on click. Two more overlay directives do exactly that, and
+because they are overlay directives the base document never references them — the review
+lives in its own file and the document stays as its author wrote it.
+
+```
+!highlight{target=sec:why text="wind-pollinated and self-incompatible"}
+
+:::{highlight target=sec:why text="four or five years" color=green author="DM"}
+Worth saying which cultivars this holds for.
+:::
+
+:::{sticky-note target=sec:spacing text="three metres is the usual compromise" at=end author="DM"}
+Is this the spacing the table models, or the one you actually planted?
+:::
+```
+
+A worked example ships in `examples/review.hdoc`, a review pass over `examples/hazelnuts.hdoc`:
+
+```sh
+lein uberjar
+cd examples && mkdir -p out && cp catkins.png out/
+java -jar ../target/uberjar/haselnuss.jar hazelnuts.hdoc --overlay review.hdoc \
+  --output out/reviewed.html
+java -jar ../target/uberjar/haselnuss.jar hazelnuts.hdoc --overlay review.hdoc \
+  --target latex --computed-numbers --output out/reviewed.tex
+pdflatex -output-directory=out out/reviewed.tex   # twice: the annotation quads settle
+pdflatex -output-directory=out out/reviewed.tex   # on the second pass
+```
+
+That is the "Example" section's own recipe with `--overlay review.hdoc` added, writing to
+`reviewed.*` so the annotated build sits beside the plain one rather than overwriting the
+thing you would compare it against. `mkdir -p out` is not optional: the converter writes the
+file you name and does not create directories for it. Nor is the second `pdflatex` pass, the
+way it nearly is for cross-references alone — a PDF annotation's `/QuadPoints`, the boxes
+that make a highlight follow the line wrap, are written from positions recorded on the
+previous run, so one pass produces a PDF with no highlight objects in it at all.
+
+#### How an annotation says where it goes
+
+An annotation is not addressed to a *node*. It is addressed to **a run of words inside
+one**, and it says which run by **quoting it**:
+
+- `target=` is required and names an `attr.id`, as every overlay directive's does. It scopes
+  the search, which is what lets the quote stay short. Unlike `prepend`/`append` (which need
+  a Section) and `describe` (which needs a referenceable node), an annotation accepts any
+  node carrying the id — it is searching inside it, not patching it.
+- `text=` is required: the words to mark.
+- `before=` / `after=` / `nth=` disambiguate a quote that occurs more than once inside the
+  target, in that order of desperation. `before=`/`after=` name the text immediately
+  either side; `nth=` is a 1-based index among what survives them.
+
+Quoting rather than counting is the whole design. A node index would address a *parse*
+detail — whether `foo bar` is one text node or two is flexmark's business, not the
+document's — and would drift silently the moment a sentence was inserted above it: the
+build would still succeed and the highlight would still render, over the wrong words. A
+quote spans emphasis, links and line breaks indifferently, because it is matched against
+the flattened text; whitespace is normalised on both sides, so reflowing a paragraph does
+not break it; and it is legible in a diff and greppable in the base document.
+
+#### Props both directives take
+
+| prop | meaning |
+| --- | --- |
+| `color` | `yellow` (default), `green`, `blue` or `pink`. A closed set: the value has to map to both a CSS colour and a PDF annotation colour, so an unrecognised one is a diagnostic rather than a silently unstyled annotation. |
+| `author` | who made the annotation. A `data-author` attribute in HTML, and the annotation's own author and subject in the PDF. Present in the markup, never visible page text. |
+| `at` | `start` or `end` (default `end`), **`sticky-note` only**: which edge of the matched run the balloon sits at. "Between two words" is the quote of the word before, with the default. |
+| `style` | `annotation` or `footnote`, **`sticky-note` only**, and **LaTeX only**: see the degradation below. |
+
+That table is the whole vocabulary — an annotation recognises exactly those props plus the
+addressing ones (`target`, `text`, `before`, `after`, `nth`), and **anything else is a
+warning and drops the annotation**. A misspelled `colour=green` used to be silently ignored,
+which looked like an annotation that simply came out unstyled, so it says so now:
+
+```
+haselnuss: warning: this "highlight" directive carries colour=, which is not a prop an
+annotation recognises (a misspelled color= or author= would otherwise be silently ignored);
+the annotation for "four or five years" was dropped
+```
+
+Everything the directive itself can get wrong is diagnosed the same way, and each drops only
+its own annotation: a missing or blank `text=`, a `color=` or `at=` outside its set, an
+`nth=` that is not a whole number, `at=` or `style=` written on a `highlight` (both belong to
+a balloon), a `style=` outside `annotation|footnote`, and a `sticky-note` with no body — an
+empty balloon says nothing. The overlay diagnostics `prepend`/`append`/`describe` already
+have apply too: a missing or blank `target=`, a `target=` that resolves to nothing, and a
+directive carrying its own id, which is discarded.
+
+A `highlight` **with a body** is a highlight plus a sticky note — the reader's "highlight
+with a comment" — built from the two nodes rather than a third.
+
+An annotation never renumbers the document it annotates. Anything in a sticky note's body
+that would take a number — a Figure, Table, display equation or Section, a footnote, or any
+block carrying an `attr.id` at all, since numbering keys on an id's prefix rather than on a
+node's type — would take that number out of the base document's own sequence and push
+everything after it along. So the block carrying it is diagnosed and dropped and the rest of
+the body is kept; if that leaves nothing, the whole annotation is dropped rather than a mark
+with no comment on it. The check looks at a block's whole subtree, not just its own type: a
+figure nested inside a block quote inside a list item shifts the document exactly as much as
+one written at the top of the body.
+
+#### What each target does with them
+
+**HTML.** A highlight is a `<mark>`; a sticky note is an inline disclosure whose balloon
+floats over the text — click to open, click to dismiss, no JavaScript. `color=` becomes a
+class rather than an inline style, so anyone bringing their own CSS (`--no-stylesheet`, or
+the emitter's `:stylesheet` option) can restate it; an inline style could not be overridden.
+
+The balloon is a hidden checkbox and its `<label>`, not a `<details>`, and the reason is
+worth knowing if you are styling it: everything a sticky note emits sits inside a `<p>`, and
+`<details>` is flow content, so an HTML parser *closes the paragraph* when it meets one. The
+markup a sticky note emits is phrasing content throughout, which is what keeps the sentence
+around it intact.
+
+**LaTeX.** Both become **real PDF annotations** — objects in the page's own `/Annots` that
+Foxit or Acrobat shows as a clickable highlight and a dismissible balloon, not ink drawn on
+the page. This needs two `pdflatex` passes for the annotation geometry to settle — the
+`/QuadPoints` that make a highlight follow the line wrap are written from positions recorded
+on the previous run, so one pass produces a PDF with no highlight objects in it at all. The
+recipe above runs it twice for exactly that reason.
+
+A PDF annotation's body is a plain string, so a sticky note whose body is more than flat
+prose — math, a citation, emphasis, more than one paragraph — is emitted as an ordinary
+`\footnote` instead, with a warning naming what forced it. Nothing is lost and the note
+stays attached at the right point; the cost is a footnote number, and the warning says so.
+`style=footnote` forces that form; `style=annotation` cannot force the reverse, because the
+constraint is PDF's rather than this program's, and says so when asked.
+
+#### When an anchor goes stale
+
+This is the failure mode you will actually meet, and it is the reason the design quotes
+rather than counts. Edit the base document so the quoted words are gone, and the build
+tells you by name and drops that one annotation:
+
+```
+haselnuss: warning: no text matching "wind-pollinated and self-incompatible" was found in
+"sec:why" -- the annotation was dropped. If the base document was edited, update the quote
+to match its current wording.
+```
+
+The other outcomes are diagnosed the same way, and each names the annotation it is about:
+
+| what happened | warning |
+| --- | --- |
+| the quote is not in the target | `no text matching "…" was found in "…" -- the annotation was dropped. If the base document was edited, update the quote to match its current wording.` |
+| it occurs more than once and nothing disambiguates it | `"…" occurs 2 times in "…" -- the annotation was dropped rather than applied to a guess. Add before=, after= or nth= to say which one is meant.` |
+| `nth=` is past the end | `nth=9 is out of range: "…" has 2 matches in "…" -- the annotation was dropped.` |
+| `before=`/`after=` rejected every occurrence — a different mistake, with a different fix | `"…" was found in "…", but no occurrence of it has before="…" immediately before it -- the annotation was dropped. Check the context props against the document's current wording.` |
+| a boundary falls inside something that cannot be split — inline code, math, an image | `the quoted run "…" in "…" ends inside a code, which has nothing to split -- the annotation was widened to cover it whole` |
+| a sticky note's `at=` edge falls inside one | `the sticky note anchored at "…" in "…" has its end edge inside a code, which is not a position between two inlines -- it was moved to the end of that node` |
+
+The last two are the only entries here that still apply the annotation: the quote plainly
+meant to cover what it landed inside, and a slightly wider highlight — or a balloon at the
+nearest real seam — is a better failure than a missing one, but it is never silent. Every
+other row drops the annotation it names, and only that one.
+
+None of these is fatal. The build finishes, exits 0, and produces the document with the
+annotations that still hold. **The fix is to update the quote in the overlay file** to
+match the document's current wording.
+
+**Re-anchoring is not implemented**, and that is a deliberate boundary rather than an
+oversight. When a quote goes stale, something has to update the overlay file, and today
+that is a person with `grep` — which is workable precisely because a quote is legible and
+greppable. A `--reanchor` mode that fuzzy-matched a stale quote against the current
+document and rewrote the overlay would need a similarity metric, a confidence threshold,
+and a policy for writing to a file you did not name as an output; the last of those is the
+real obstacle, and none of the three has an obvious answer. What this milestone owes such a
+mode is the diagnostic that makes staleness visible, which is the table above.
+
+Writing `highlight` or `sticky-note` directly in the *base* document is not a way to use
+this feature, exactly as with `prepend`/`append`/`describe`: it is an ordinary unregistered
+directive there, and fails the build.
 
 ### Author-defined extensions
 
@@ -1071,15 +1250,20 @@ actually meets it:
   normalized wrapping — the same note under "Usage" above — so running a `--transform` file
   whose every rule matches nothing at all still rewrites the document: the diff is the
   formatter's own canonical re-spelling, not evidence a rule silently changed something.
-- **Four `Inline` variants have no `.hdoc` spelling of their own.** `:strike`, `:small-caps`,
-  `:sub` and `:sup` are schema-valid and both emitters render them, but nothing in `.hdoc`'s
-  own surface syntax ever parses into one — the one way to meet this is a rule's own
-  `:transform` constructing one directly (wrapping matched text in `{:t :strike ...}` to
-  mark it deprecated, say). Write that back out through `--target hdoc`/`--in-place` and it
-  comes back as a generic `[text]{.strike}`-shaped role span; re-parsing THAT always yields a
-  `:span`, not the tag the rule built. `haselnuss.emit.hdoc/lossy-role-span-diagnostics` can
-  report every occurrence a document carries, but nothing on the command line calls it
-  today, so this is silent unless you know to look for it.
+- **Five `Inline` variants have no `.hdoc` spelling of their own.** `:strike`,
+  `:small-caps`, `:sub`, `:sup` and `:sticky-note` are schema-valid and every emitter renders
+  them, but nothing in `.hdoc`'s own surface syntax ever parses into one — the one way to
+  meet this is a rule's own `:transform` constructing one directly (wrapping matched text in
+  `{:t :strike ...}` to mark it deprecated, say), or, for a sticky note, an `--overlay`
+  annotation. Write that back out through `--target hdoc`/`--in-place` and the first four
+  come back as a generic `[text]{.strike}`-shaped role span, which re-parses as a `:span`
+  rather than the tag the rule built; a sticky note comes back as a footnote, which preserves
+  every block of its body but not its `Attr`, since a footnote has none.
+  `haselnuss.emit.hdoc/lossy-role-span-diagnostics` can report every occurrence a document
+  carries, but nothing on the command line calls it today, so this is silent unless you know
+  to look for it. `:highlight` is the exception: `==…==` is its own spelling, so it is an
+  exact round trip — except one nested inside another, which that spelling cannot express and
+  which comes back as a `[text]{.highlight}` role span.
 
 `examples/publish.clj` and `examples/draft.hdoc` are a worked example: three rules
 stripping the drafting scaffolding a real page might actually carry before it goes out — an
@@ -1170,9 +1354,12 @@ lein test haselnuss.parser-test                         # one namespace
 lein test :only haselnuss.parser-test/inline-math-test  # one test
 ```
 
-Requires `pdflatex`, `bibtex` and `pdftotext` on `PATH`: several namespaces compile real
-LaTeX and read the resulting PDF back rather than asserting on emitted strings, and they
-fail rather than skip without a toolchain. Three of them are most of the wall time, for
+Requires `pdflatex`, `bibtex`, `pdftotext`, `pdfinfo` and `qpdf` on `PATH`: several
+namespaces compile real LaTeX and read the resulting PDF back rather than asserting on
+emitted strings, and they fail rather than skip without a toolchain. `qpdf` is what
+TASK-121's annotation tests read the PDF's own `/Annots` with -- the claim there is that a
+reader opening the file sees a real annotation, so the test has to look at the PDF and not
+at the `.tex`. Three of them are most of the wall time, for
 that same deliberate reason:
 
 | namespace | ~time | why |

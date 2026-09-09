@@ -149,13 +149,19 @@
     ;; Inline (sec4.4).
     :str (:text node)
     (:space :soft-break :line-break) " "
-    (:emph :strong :strike :small-caps :sub :sup :span :link) (inlines->text (:inlines node))
+    (:emph :strong :strike :small-caps :sub :sup :span :link :highlight)
+    (inlines->text (:inlines node))
     :code (:text node)
     :math-inline (:tex node)
     :image (:alt node)
     :cross-ref (or (:text node) "")
     :cite (apply join-parts (map cite-item-text (:items node)))
-    :note (blocks->text (:blocks node))
+    ;; A sticky note's body is prose about the document rather than prose
+    ;; in it, but it is prose all the same: `:text` selects on what a node
+    ;; says, and a `--transform` rule looking for a phrase should find it
+    ;; wherever it was written. Grouped with `:note` for the same reason
+    ;; the two share a shape (sec4.4, doc-8 section 2).
+    (:note :sticky-note) (blocks->text (:blocks node))
 
     ;; Block (sec4.3).
     :section (join-parts (inlines->text (:heading node)) (blocks->text (:blocks node)))

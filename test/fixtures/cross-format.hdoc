@@ -6,18 +6,15 @@ lang: en
 bibliography: cross-format.json
 ---
 
-:::{toc}
-:::
+!toc
 
-:::{list-of-figures}
-:::
+!list-of-figures
 
-:::{list-of-tables}
-:::
+!list-of-tables
 
 # Background {#sec:background}
 
-The mass-energy equivalence is stated in @eq:mass, and the tree in
+The ==mass-energy equivalence== is stated in @eq:mass, and the tree in
 @fig:tree illustrates the structure it applies to. Both are discussed
 by [@knuth1984]. @sec:results carries this further.
 

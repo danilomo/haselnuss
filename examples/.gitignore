@@ -1,7 +1,8 @@
-# This directory holds sources only: the .hdoc documents, the CSL-JSON
-# bibliography they name, the figure they include, and (TASK-92) a sidecar
-# .clj file an .hdoc document loads via --extensions. Anything else here is
-# something a build produced.
+# This directory holds sources only: the .hdoc documents (including
+# `review.hdoc`, TASK-124's annotation overlay, which is a source like any
+# other), the CSL-JSON bibliography they name, the figure they include, and
+# (TASK-92) a sidecar .clj file an .hdoc document loads via --extensions.
+# Anything else here is something a build produced.
 #
 # So: a whitelist, not a list of artifact extensions (TASK-50.5). The
 # extension-list version had to be patched reactively twice -- once for the

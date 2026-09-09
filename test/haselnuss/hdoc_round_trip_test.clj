@@ -188,11 +188,20 @@
             directories fails loudly here rather than passing
             `hdoc-round-trip-test` vacuously on an empty `doseq`.
             `draft.hdoc` (TASK-104, examples/publish.clj's own worked
-            example) is the 6th name here, added the way this namespace's
-            own docstring says a newly committed .hdoc should be: by
-            nothing more than existing on disk under examples/, with this
-            literal set updated alongside it as the canary AC #3 asks for"
+            example) and `review.hdoc` (TASK-124, the annotation overlay
+            over hazelnuts.hdoc) are the 6th and 7th names here, each
+            added the way this namespace's own docstring says a newly
+            committed .hdoc should be: by nothing more than existing on
+            disk under examples/, with this literal set updated alongside
+            it as the canary AC #3 asks for.
+
+            An overlay file is a .hdoc like any other and holds the same
+            property: `review.hdoc` is nothing but directives, and the
+            emitter has to write each one back so it re-parses to the
+            same directive -- including the one-line `!highlight{...}`
+            form, which TASK-115 made the emitter choose for a body-less
+            directive"
     (let [names (into #{} (map (fn [^File f] (.getName f))) (committed-hdoc-files))]
-      (is (= #{"catecismo-heidelberg.hdoc" "draft.hdoc" "hazelnuts.hdoc" "reveal-demo.hdoc"
-               "thesis.hdoc" "cross-format.hdoc"}
+      (is (= #{"catecismo-heidelberg.hdoc" "draft.hdoc" "hazelnuts.hdoc" "review.hdoc"
+               "reveal-demo.hdoc" "thesis.hdoc" "cross-format.hdoc"}
              names)))))

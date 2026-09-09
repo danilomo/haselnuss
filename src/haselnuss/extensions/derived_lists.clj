@@ -12,14 +12,15 @@
   WHERE a list goes is the author's decision, not a fixed position: a
   thesis puts the lists between the abstract and the table of contents,
   a report puts the contents first and no lists at all. So the surface
-  is an empty block directive written exactly where the list belongs,
-  which needed no parser change at all:
+  is a body-less directive written exactly where the list belongs, which
+  needed no parser change of its own -- the `:::{toc}` + `:::` fence it
+  was built on already existed. sec5.5 later grew a one-line spelling
+  for exactly the body-less case (TASK-114), which is what these three
+  are now written in; the fence still parses to the identical node:
 
-      :::{toc}
-      :::
+      !toc
 
-      :::{list-of-figures}
-      :::
+      !list-of-figures
 
   This namespace owns the *data* -- which names are list placeholders,
   which derivation each prints, which LaTeX command builds it natively,

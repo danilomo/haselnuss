@@ -264,3 +264,33 @@
           block-quote {:t :block-quote :blocks [(para (str-inline "quoted"))]}
           document (doc figure block-quote)]
       (is (= document (lower/lower document :html {}))))))
+
+(deftest annotation-nodes-pass-through-untouched-test
+  (testing "TASK-116 AC #5: this pass lowers `:directive` Blocks and
+            nothing else, so the two annotation Inline types (doc-8 sec2)
+            survive it byte-for-byte on every target -- asserted rather
+            than assumed, since `lower` reaches them through the same
+            schema-derived walk everything else travels"
+    (let [highlight {:t :highlight
+                     :inlines [(str-inline "ripen in early autumn")]
+                     :attr (id-attr "hl:autumn")}
+          sticky {:t :sticky-note
+                  :blocks [(para (str-inline "Check the lab notebook."))]
+                  :attr (id-attr "note:trial")}
+          document (doc (para (str-inline "Hazelnuts ") highlight sticky))]
+      (is (ast/valid? ast/Document document)
+          (pr-str (ast/explain ast/Document document)))
+      (doseq [target [:html :latex :json :hdoc]]
+        (testing (str target)
+          (is (= document (lower/lower document target {})))))))
+  (testing "a :directive nested inside either annotation node is still
+            reached and lowered -- passing the node through untouched is
+            not the same as refusing to descend into it"
+    (let [d (directive "mystery" "x:1" [] {:kind :drop})
+          sticky {:t :sticky-note :blocks [d] :attr attr}
+          highlight {:t :highlight
+                     :inlines [{:t :note :blocks [d]}]
+                     :attr attr}
+          lowered (lower/lower (doc (para highlight sticky)) :latex {})]
+      (is (= [] (get-in lowered [:blocks 0 :inlines 0 :inlines 0 :blocks])))
+      (is (= [] (get-in lowered [:blocks 0 :inlines 1 :blocks]))))))

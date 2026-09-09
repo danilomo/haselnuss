@@ -1499,6 +1499,75 @@
           (is (= 0 status) (str target ": " err))
           (is (str/includes? (slurp (io/file dir extension)) "Included prose.") target))))))
 
+(deftest annotation-overlay-test
+  (testing "TASK-119 AC #1/#2/#3 end to end through the real CLI: a
+            one-line !highlight, a :::{sticky-note} with a body, and a
+            :::{highlight} with a body all reach both rendering targets"
+    (let [dir (fixture-dir!)
+          overlay (str (io/file dir "review.hdoc"))]
+      (spit overlay (str "!highlight{target=sec:intro text=\"Introduction\"}\n\n"
+                         ":::{sticky-note target=sec:intro text=\"Introduction\" author=\"DM\"}\n"
+                         "Was this the rerun trial?\n"
+                         ":::\n"))
+      (doseq [target ["html" "latex"]]
+        (let [{:keys [output diagnostics]} (build! dir {:target target :overlay [overlay]})]
+          (is (empty? diagnostics) (str target ": " (pr-str diagnostics)))
+          (if (= "html" target)
+            (do (is (str/includes? output "<mark") target)
+                (is (str/includes? output "sticky-note") target)
+                (is (str/includes? output "Was this the rerun trial?") target))
+            (do (is (str/includes? output "\\pdfmarkupcomment") target)
+                (is (str/includes? output "\\pdfcomment") target)))))))
+  (testing "AC #7: every haselnuss.anchor diagnostic reaches the build as
+            a NON-FATAL warning naming the quote and the target, and the
+            build still exits 0 with the base document intact. This is
+            the feature's real failure mode -- the base document was
+            edited, the quote no longer matches -- and it is the whole
+            argument for quoting over counting that it says so"
+    (let [dir (fixture-dir!)
+          overlay (str (io/file dir "stale.hdoc"))]
+      (spit overlay "!highlight{target=sec:intro text=\"words that are not there\"}\n")
+      (let [{:keys [status err]} (main-run "--overlay" overlay (str (io/file dir "doc.hdoc")))]
+        (is (= 0 status) err)
+        (is (str/includes? err "words that are not there") "naming the quote")
+        (is (str/includes? err "sec:intro") "and the target")
+        (is (str/includes? err "update the quote") "and what to do about it")
+        (is (.exists (io/file dir "doc.html")))
+        (is (str/includes? (slurp (io/file dir "doc.html")) "Introduction")
+            "with the base document intact"))))
+  (testing "AC #5: a colour or an edge outside the recognised set is
+            diagnosed by name, the annotation dropped, and the build
+            still exits 0"
+    (let [dir (fixture-dir!)
+          overlay (str (io/file dir "bad.hdoc"))]
+      (spit overlay (str "!highlight{target=sec:intro text=\"Introduction\" color=purple}\n\n"
+                         ":::{sticky-note target=sec:intro text=\"Introduction\" at=middle}\n"
+                         "body\n:::\n"))
+      (let [{:keys [status err]} (main-run "--overlay" overlay (str (io/file dir "doc.hdoc")))]
+        (is (= 0 status) err)
+        (is (str/includes? err "color=purple"))
+        (is (str/includes? err "at=middle"))
+        (is (not (str/includes? (slurp (io/file dir "doc.html")) "<mark"))))))
+  (testing "AC #11: writing highlight or sticky-note directly in the BASE
+            document fails the build as an unregistered directive, like
+            prepend does -- these are overlay conventions, not document
+            syntax"
+    (doseq [directive-name ["highlight" "sticky-note" "prepend"]]
+      (testing directive-name
+        (let [dir (fixture-dir! (str "# Intro {#sec:intro}\n\n"
+                                     ":::{" directive-name " target=sec:intro text=\"x\"}\n"
+                                     "body\n:::\n"))
+              {:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))]
+          (is (= 1 status))
+          (is (str/includes? err directive-name))))))
+  (testing "AC #12: an annotation overlay sitting on disk changes nothing
+            about a build that never names it"
+    (let [dir (fixture-dir!)
+          without (:output (build! dir {}))]
+      (spit (io/file dir "unused-review.hdoc")
+            "!highlight{target=sec:intro text=\"Introduction\"}\n")
+      (is (= without (:output (build! dir {})))))))
+
 (deftest overlay-test
   (testing "AC #1: an unused --overlay file existing on disk changes
             nothing about a build that never names it -- byte-for-byte
@@ -1547,7 +1616,7 @@
         (is (= 0 status) err)
         (is (str/includes? err "unexpected top-level para"))
         (is (str/includes? err "no target="))
-        (is (str/includes? err "does not resolve to a Section, Figure, Table, MathBlock"))
+        (is (str/includes? err "does not resolve to a node in the base document"))
         (is (.exists (io/file dir "doc.html")))
         (is (str/includes? (slurp (io/file dir "doc.html")) "Introduction")))))
   (testing "TASK-112: a misspelled directive name in an overlay file --
@@ -1635,7 +1704,21 @@
         (is (str/includes? err "credit"))
         (is (str/includes? err "was not applied"))
         (is (str/includes? html "credit=\"original\""))
-        (is (not (str/includes? html "credit=\"overlay\"")))))))
+        (is (not (str/includes? html "credit=\"overlay\""))))))
+  (testing "TASK-115: the same overlay written in sec5.5's one-line
+            spelling behaves identically. `describe` carries everything
+            in its header and nothing in a body, so this is the form an
+            alt-text overlay file is actually written in -- one line per
+            figure rather than two -- and it must reach the target node
+            with no diagnostics, exactly as the fence above does"
+    (let [dir (fixture-dir!)
+          overlay (str (io/file dir "describe.hdoc"))]
+      (spit overlay "!describe{target=fig:tree alt=\"A hazel tree in early spring.\"}\n")
+      (let [{:keys [status err]} (main-run "--overlay" overlay (str (io/file dir "doc.hdoc")))
+            html (slurp (io/file dir "doc.html"))]
+        (is (= 0 status) err)
+        (is (str/includes? html "alt=\"A hazel tree in early spring.\""))
+        (is (not (str/includes? html ">A hazel tree in early spring.<")))))))
 
 (deftest describe-overlay-overwritten-by-later-describe-test
   (testing "TASK-110 AC #1/#2: two SEPARATE --overlay files each
@@ -1888,6 +1971,23 @@
   (str "{:select :section\n"
        " :transform (fn [node ctx]\n"
        "              (update node :heading haselnuss.ext/map-text clojure.string/upper-case))}"))
+
+(defn- sticky-note-rule
+  "A `--transform` sidecar file source used by `default-stylesheet-test`:
+  every `:highlight` is followed by a `:sticky-note` in the same colour,
+  so the emitted document exercises the sticky-note stylesheet rules.
+
+  A rule producing an annotation node is not a contrivance for this test
+  -- doc-8 sec6 names it as the way a programmatic annotation pass works,
+  and it is the only route a `:sticky-note` has into a document parsed
+  from `.hdoc`, which by design gives it no surface syntax of its own."
+  []
+  (str "{:select :highlight\n"
+       " :transform (fn [node ctx]\n"
+       "              [node {:t :sticky-note\n"
+       "                     :attr {:classes [] :props (select-keys (:props (:attr node))\n"
+       "                                                            [\"color\"])}\n"
+       "                     :blocks [{:t :para :inlines [{:t :str :text \"A note.\"}]}]}])}"))
 
 (deftest transform-flag-test
   (testing "AC #1/#2: --transform loads rules from a sidecar file and
@@ -2257,9 +2357,23 @@
                     ":::{proof #prf:p}\nTrivial.\n:::\n\n"
                     ":::{collapsable summary=\"More\"}\nHidden.\n:::\n\n"
                     ":::{small-collapsable summary=\"Ref\" label=\"(1)\"}\nVerse.\n:::\n\n"
+                    ;; TASK-120: one highlight per recognised colour, so
+                    ;; every `mark.highlight-*` rule is exercised by
+                    ;; markup this document really emits, for the same
+                    ;; reason every other construct above is here.
+                    "==yellow=={color=yellow} ==green=={color=green}"
+                    " ==blue=={color=blue} ==pink=={color=pink}\n\n"
                     "---\n")
         dir (fixture-dir! source)
-        {:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))
+        ;; The sticky-note rules need a `:sticky-note` in the output, and
+        ;; a sticky note has NO inline surface syntax by design (doc-8
+        ;; sec3) -- it is created by an overlay or by a transform rule.
+        ;; This is the transform-rule route, which is also the honest
+        ;; demonstration that a programmatic annotation pass works:
+        ;; every :highlight gains a same-coloured sticky note after it.
+        transform (write-file! dir "annotate.clj" (sticky-note-rule))
+        {:keys [status err]} (main-run "--transform" transform
+                                       (str (io/file dir "doc.hdoc")))
         html (slurp (io/file dir "doc.html"))
         style (second (re-find #"(?s)<style>(.*?)</style>" html))
         body (second (re-find #"(?s)<body>(.*)</body>" html))]

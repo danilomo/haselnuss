@@ -157,6 +157,29 @@
   (is (select/matches? [:emph :strong] (emph [])))
   (is (select/matches? (fn [node] (= :space (:t node))) (space))))
 
+(deftest flatten-text-reads-the-annotation-nodes-test
+  (testing "TASK-117: `flatten-text`'s docstring claims it is defined for
+            EVERY Block and Inline variant, so TASK-116's two annotation
+            nodes have to read as prose too rather than silently
+            flattening to \"\" -- a `--transform` rule looking for a
+            phrase should find it wherever it was written"
+    (let [annotation-attr {:classes [] :props {}}]
+      (is (= "marked text"
+             (select/flatten-text {:t :highlight
+                                   :inlines [(str-inline "marked") (space) (str-inline "text")]
+                                   :attr annotation-attr}))
+          "a :highlight is transparent, exactly as the :span it is shaped like")
+      (is (= "check this"
+             (select/flatten-text {:t :sticky-note
+                                   :blocks [(para [(str-inline "check this")])]
+                                   :attr annotation-attr}))
+          "a :sticky-note reads its body, exactly as the :note it is shaped like")
+      (is (= "Hazelnuts ripen"
+             (select/flatten-text
+              (para [(str-inline "Hazelnuts") (space)
+                     {:t :highlight :inlines [(str-inline "ripen")] :attr annotation-attr}])))
+          "and a highlight nested in prose contributes its words in place"))))
+
 ;; --- AC #6: a malformed selector is refused, never silently false ---------
 
 (deftest malformed-selector-test

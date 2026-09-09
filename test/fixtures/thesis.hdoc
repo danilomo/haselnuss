@@ -39,14 +39,11 @@ Thanks to everyone who read a draft, and to the orchard that let us
 count its nuts.
 :::
 
-:::{toc}
-:::
+!toc
 
-:::{list-of-figures}
-:::
+!list-of-figures
 
-:::{list-of-tables}
-:::
+!list-of-tables
 
 # Introduction {#ch:intro}
 

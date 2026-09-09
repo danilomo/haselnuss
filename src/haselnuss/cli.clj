@@ -491,8 +491,9 @@
     "      --bibliography PATH CSL-JSON bibliography (overrides the document's own"
     "                          meta.bibliography)"
     "      --overlay PATH      a .hdoc overlay file patching the base document via"
-    "                          prepend/append/describe directives (repeatable; see"
-    "                          README \"Overlays\"). No effect on --target json or hdoc."
+    "                          prepend/append/describe/highlight/sticky-note directives"
+    "                          (repeatable; see README \"Overlays\" and \"Annotations\")."
+    "                          No effect on --target json or hdoc."
     "      --extensions PATH   a sidecar .clj file defining author directives, evaluated"
     "                          in a sandbox with no host interop, file, process or"
     "                          classpath access (repeatable; see README \"Author-defined"
@@ -1522,8 +1523,17 @@
                                         e))))
             diagnostics (cond-> diagnostics
                           (= :latex emit-target)
-                          (into (latex/unanchored-reference-diagnostics
-                                 lowered {:computed-numbers (boolean computed-numbers)})))
+                          (-> (into (latex/unanchored-reference-diagnostics
+                                     lowered {:computed-numbers (boolean computed-numbers)}))
+                              ;; TASK-121: a sticky note whose body a PDF
+                              ;; annotation string cannot hold is emitted
+                              ;; as a footnote instead, and an annotation
+                              ;; nested inside a highlight degrades too.
+                              ;; Both are the emitter's own knowledge and
+                              ;; neither may be silent -- the whole point
+                              ;; of a defined degradation is the
+                              ;; diagnostic at its boundary (SPEC sec4.5).
+                              (into (latex/annotation-diagnostics lowered))))
         ;; TASK-89 review comments #16/#17 (finalizer's own call, after a
         ;; blocking false-negative -- Finding A -- and a blocking
         ;; regression -- Finding B -- were both found in the AST+text

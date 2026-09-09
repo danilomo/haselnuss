@@ -61,7 +61,9 @@
                            {:key "doe2021" :mode :author
                             :prefix [{:t :str :text "see"}]
                             :suffix [{:t :str :text "p. 3"}]}]}
-   :note {:t :note :blocks [{:t :para :inlines []}]}})
+   :note {:t :note :blocks [{:t :para :inlines []}]}
+   :highlight {:t :highlight :inlines [{:t :str :text "x"}] :attr attr}
+   :sticky-note {:t :sticky-note :blocks [{:t :para :inlines []}] :attr attr}})
 
 (def fallbacks-by-kind
   "One valid example of every Fallback variant (sec4.5), keyed by :kind."
@@ -80,7 +82,7 @@
 
 (deftest inline-variants-test
   (testing "every Inline variant from sec4.4 is constructible and valid"
-    (is (= 18 (count inlines-by-tag)))
+    (is (= 20 (count inlines-by-tag)))
     (doseq [[tag node] inlines-by-tag]
       (testing (str tag)
         (is (ast/valid? ast/Inline node) (pr-str (ast/explain ast/Inline node)))))))
@@ -115,11 +117,30 @@
         (is (contains? node :attr) (str tag " should carry :attr"))
         (is (not (ast/valid? ast/Block (dissoc node :attr)))
             (str tag " without :attr should be invalid"))))
-    (doseq [tag [:link :image :span]]
+    (doseq [tag [:link :image :span :highlight :sticky-note]]
       (let [node (get inlines-by-tag tag)]
         (is (contains? node :attr) (str tag " should carry :attr"))
         (is (not (ast/valid? ast/Inline (dissoc node :attr)))
             (str tag " without :attr should be invalid"))))))
+
+(deftest annotation-node-shapes-test
+  (testing "TASK-116 AC #2: each is rejected when it carries the other's
+            child field -- a :highlight holds Inlines, never Blocks, and a
+            :sticky-note holds Blocks, never Inlines"
+    (is (not (ast/valid? ast/Inline {:t :highlight
+                                     :blocks [{:t :para :inlines []}]
+                                     :attr attr})))
+    (is (not (ast/valid? ast/Inline {:t :sticky-note
+                                     :inlines [{:t :str :text "x"}]
+                                     :attr attr})))
+    (is (not (ast/valid? ast/Inline {:t :highlight
+                                     :inlines [{:t :para :inlines []}]
+                                     :attr attr}))
+        ":highlight's children are Inlines, so a Block among them is invalid")
+    (is (not (ast/valid? ast/Inline {:t :sticky-note
+                                     :blocks [{:t :str :text "x"}]
+                                     :attr attr}))
+        ":sticky-note's children are Blocks, so an Inline among them is invalid")))
 
 (deftest invalid-nodes-rejected-test
   (testing "malli schemas reject malformed nodes"

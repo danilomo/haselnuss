@@ -40,7 +40,11 @@
   `fenced-lang`'s docstring for TASK-5's own precedent). TASK-38's
   `!include` line is recognized in the same scan and splits the same
   way, so it inherits that consequence exactly -- see the \"Include
-  lines\" section for the two behaviors this shares with a fence.
+  lines\" section for the two behaviors this shares with a fence. So does
+  TASK-114's one-line `!name{...}` directive, sec5.5's second spelling for
+  a directive with no body at all -- see the \"One-line directives\"
+  section for why the body-less case earned its own spelling and why `!`
+  rather than a shorter colon run.
   Because this
   raw-line scan runs *before* flexmark, it independently tracks backtick/
   tilde code-fence state itself (`annotate-code-fences`) so a colon run
@@ -129,7 +133,23 @@
   suffix) always starts this set back at `#{}`, exactly as it starts a
   fresh per-chunk `[ref]: url` resolution scope -- only a genuine
   Footnote-expansion recursive call extends the set an existing caller
-  already holds."
+  already holds.
+
+  ## Highlights (TASK-122, sec5.6)
+
+  `==marked text==` is a `:highlight` Inline (sec4.4), and it is the one
+  construct here recognized by a flexmark `DelimiterProcessor` rather
+  than an `InlineParserExtension`. The reason is a requirement none of
+  the four constructs above has: a highlight's content is ORDINARY
+  MARKUP, which has to be parsed as such, and `LightInlineParser` -- all
+  an `InlineParserExtension` is handed -- offers no way to parse a span
+  of input back into inline nodes. Every extension above reads its
+  matched span as an opaque string precisely because its content IS
+  opaque. A `DelimiterProcessor` is what `*emph*` and `**strong**`
+  themselves are built on, so this is the older and more ordinary of the
+  two mechanisms rather than a new one, and it supplies left/right
+  flanking, nesting and unmatched-delimiter fallback for free. See
+  `highlight-delimiter-processor` and the section comment above it."
   (:require [clj-yaml.core :as yaml]
             [clojure.string :as str]
             [haselnuss.ast :as ast])
@@ -149,6 +169,8 @@
            (com.vladsch.flexmark.parser InlineParserExtension
                                         InlineParserExtensionFactory
                                         LightInlineParser Parser)
+           (com.vladsch.flexmark.parser.core.delimiter Delimiter)
+           (com.vladsch.flexmark.parser.delimiter DelimiterProcessor)
            (com.vladsch.flexmark.util.ast Block Document Node)
            (com.vladsch.flexmark.util.data MutableDataSet)
            (com.vladsch.flexmark.util.sequence BasedSequence)
@@ -774,6 +796,158 @@
         (finalizeBlock [_ _])
         (parse [_ p] (parse-cite-bracket! p))))))
 
+;; --- Highlights (TASK-122, doc-8 section 3, sec5.6) ------------------------
+;;
+;; `==marked text==` is a `:highlight` Inline (sec4.4). Unlike TASK-7's `$`
+;; math and TASK-9's `@` cross-references/citations, this construct is NOT an
+;; `InlineParserExtension`, and the reason is a requirement none of those
+;; three have: a highlight's content is ORDINARY MARKUP -- emphasis, a link,
+;; inline code, inline math, a cross-reference, a citation -- which has to be
+;; parsed as such (AC #2). `LightInlineParser`, the only thing an
+;; `InlineParserExtension` is handed, offers no way to recursively parse a
+;; span of input back into inline nodes; every existing extension here reads
+;; its matched span as an opaque string precisely because its content IS
+;; opaque (raw TeX, a bare label, a citation key).
+;;
+;; `DelimiterProcessor` is flexmark's own mechanism for exactly this shape,
+;; and it is the one `**strong**` and `*emph*` themselves are built on
+;; (`EmphasisDelimiterProcessor`) -- so this is not a new mechanism, it is
+;; the older and more ordinary of the two. It also gets the hard parts
+;; right for free: delimiter runs are matched by CommonMark's own
+;; left/right-flanking rules, the content between a matched pair is parsed
+;; as inlines before this code ever sees it, and an UNMATCHED `==` stays
+;; literal text (AC #6) rather than swallowing the rest of the paragraph.
+;;
+;; The two risks doc-8 pitfall 2 names are handled by that same machinery
+;; rather than by anything here, which is why they are tested rather than
+;; guarded:
+;;
+;; - A setext heading underline is a BLOCK-level construct, settled by the
+;;   document parser before inline parsing runs at all, so no delimiter
+;;   processor can reach one however long the run of `=`.
+;; - `key=val` inside an attribute group is untouched, because a lone `=`
+;;   is never a delimiter run: `getMinLength` is 2, enforced by flexmark
+;;   before a `Delimiter` object exists at all. `key==val` is a separate
+;;   matter and NOT this construct's doing -- flexmark's own attribute
+;;   grammar rejects a bare `=` inside an unquoted value, `key=va=l`
+;;   identically, with or without this processor registered (verified
+;;   against a bare parser). Write `key="a==b"` for a value containing
+;;   one, which works and is tested.
+;;
+;; `\==` is an ordinary CommonMark backslash escape (`=` is already in
+;; `escapable-punctuation`), so the escaped `=` becomes literal text and the
+;; single `=` left over never reaches `getMinLength` 2. The `.hdoc` emitter
+;; escapes a literal `==` back out for the same reason (see
+;; `haselnuss.emit.hdoc/escapes-as-highlight-marker?`).
+;;
+;; ONE THING THIS DOES COST, stated rather than discovered: a malformed
+;; attribute group whose contents happen to contain a `==` run no longer
+;; reaches `check-no-attribute-attempt!`. `a {key==val==} b` used to raise
+;; `::malformed-attribute-group`; it now parses as prose with a highlight
+;; in it. The diagnostic fires on a `{`-led run that flexmark left as
+;; text, and a highlight consuming part of that run means there is no
+;; longer a single text node with the whole `{...}` in it to notice.
+
+(definterface ^:private HighlightNodeTag)
+
+(defn- highlight-node
+  "A fresh synthetic Node for one `==marked text==` construct, built the
+  same way as `math-inline-node`/`cross-ref-node` -- a `proxy` over
+  `DelimitedNodeImpl` plus this file's own zero-method marker interface,
+  so `highlight-node?` can recognize one by exact class identity (see
+  `math-inline-class`'s own docstring for why `instance?` would not do).
+
+  Unlike those two, this node's CHILDREN carry its content: flexmark's
+  own delimiter machinery moves the already-parsed inline nodes between
+  the matched `==` pair into it (`process` below), so `.getText` is never
+  read and `convert-inline` recurses through `convert-inlines` instead.
+
+  `open-marker`/`close-marker` are the two matched `==` runs, and setting
+  them is NOT optional bookkeeping: `moveNodesBetweenDelimitersTo`
+  derives the node's own `chars` span from them, and a node left with an
+  empty span crashes any later pass that reads its source offsets -- a
+  highlight inside a table cell raised `StringIndexOutOfBoundsException`
+  from flexmark's own table parser before this was set. Mirrors
+  flexmark's `EmphasisDelimiterProcessor`, which builds its Emphasis/
+  StrongEmphasis from `getTailChars`/`getLeadChars` the same way."
+  ^DelimitedNodeImpl [^BasedSequence open-marker ^BasedSequence close-marker]
+  (let [node (proxy [DelimitedNodeImpl HighlightNodeTag] [])]
+    (.setOpeningMarker node open-marker)
+    (.setClosingMarker node close-marker)
+    node))
+
+(def ^:private highlight-class
+  "The exact runtime class every `highlight-node` instance shares -- see
+  `math-inline-class`'s own docstring."
+  (class (highlight-node BasedSequence/NULL BasedSequence/NULL)))
+
+(defn- highlight-node? [node]
+  (identical? highlight-class (class node)))
+
+(def ^:private highlight-delimiter-length
+  "How many `=` characters open and close a highlight. Two, not one: a
+  single `=` is ordinary punctuation (`x = y`), and a setext heading
+  underline is a whole line of them."
+  2)
+
+(defn- highlight-delimiter-processor
+  "The `DelimiterProcessor` registered on `cm-parser` for `==` (see this
+  section's own comment for why a delimiter processor rather than an
+  `InlineParserExtension`).
+
+  `canBeOpener`/`canBeCloser` defer to CommonMark's own left/right-
+  flanking analysis, which flexmark has already computed and passes in --
+  the same rule `*emph*` uses, so `a == b` (flanked by spaces on both
+  sides) opens nothing while `==marked==` does. `getDelimiterUse` returns
+  2 only when both runs are long enough, and 0 otherwise, which is how a
+  delimiter processor declines a pair without consuming it.
+
+  `process` builds the node and hands it to `moveNodesBetweenDelimitersTo`,
+  flexmark's own splice: every already-parsed inline node between the two
+  markers becomes a child of it. That is the whole reason nested markup
+  works here with no code of its own.
+
+  Built with `reify` rather than `proxy` (unlike this file's
+  `InlineParserExtensionFactory`s, which need `proxy` for a covariant
+  `apply`): `DelimiterProcessor` declares no overloaded or covariantly
+  typed method, so `reify` is enough and costs no reflective dispatch."
+  []
+  (reify DelimiterProcessor
+    (getOpeningCharacter [_] \=)
+    (getClosingCharacter [_] \=)
+    (getMinLength [_] highlight-delimiter-length)
+    (getDelimiterUse [_ opener closer]
+      (if (and (>= (.length opener) highlight-delimiter-length)
+               (>= (.length closer) highlight-delimiter-length))
+        highlight-delimiter-length
+        0))
+    (unmatchedDelimiterNode [_ _inline-parser _delimiter-run] nil)
+    (canBeOpener [_ _before _after left-flanking _right-flanking
+                  _before-is-punctuation _after-is-punctuation
+                  _before-is-whitespace _after-is-whitespace]
+      left-flanking)
+    (canBeCloser [_ _before _after _left-flanking right-flanking
+                  _before-is-punctuation _after-is-punctuation
+                  _before-is-whitespace _after-is-whitespace]
+      right-flanking)
+    (skipNonOpenerCloser [_] false)
+    (process [_ opener closer delimiters-used]
+      (let [^BasedSequence open-marker (.getTailChars ^Delimiter opener delimiters-used)
+            ^BasedSequence close-marker (.getLeadChars ^Delimiter closer delimiters-used)
+            node (highlight-node open-marker close-marker)]
+        (.moveNodesBetweenDelimitersTo ^Delimiter opener node ^Delimiter closer)
+        ;; Set LAST, and set explicitly: `moveNodesBetweenDelimitersTo`
+        ;; fills in the node's `text` but leaves its own `chars` the
+        ;; empty sequence it was constructed with, and any later pass
+        ;; that reads this node's source span off `chars` then fails on
+        ;; a zero-length base -- flexmark's own table pre-processor
+        ;; calls `getChildChars` and raised
+        ;; `StringIndexOutOfBoundsException` for a highlight in a table
+        ;; cell before this line existed.
+        (.setChars ^Node node (.baseSubSequence open-marker
+                                                (.getStartOffset open-marker)
+                                                (.getEndOffset close-marker)))))))
+
 (def ^:private ^Parser cm-parser
   "A single, reusable flexmark Parser for CommonMark's core constructs plus
   TASK-5's attribute-group syntax (`{#id .class key=val}`, sec5.3), TASK-7's
@@ -785,7 +959,12 @@
   `cite-bracket-extension-factory`, sec5.10/5.11), and TASK-10's
   `[^label]`/`[^label]: ...` footnote syntax (`FootnoteExtension`, sec5.12
   -- see this namespace's own docstring for why this one, unlike TASK-7
-  through TASK-9, needs no hand-rolled recognition of its own): the
+  through TASK-9, needs no hand-rolled recognition of its own), and
+  TASK-122's `==marked text==` highlights (sec5.6), the one construct
+  here registered as a `DelimiterProcessor` rather than an
+  `InlineParserExtension` -- see `highlight-delimiter-processor` and the
+  section comment above it for why its content being ORDINARY MARKUP is
+  what settles that: the
   `AttributesExtension` is confirmed (via javap/REPL
   against the actual flexmark-ext-attributes 0.64.8 jar) to attach an
   `AttributesNode` as the immediate next sibling after a Heading's text, an
@@ -807,17 +986,19 @@
   whenever it does appear. Parser instances are immutable and safe to reuse
   (flexmark's own documented usage pattern). Hinted `^Parser` so `parse`'s
   `(.parse cm-parser ...)` call resolves without reflection."
-  (.build (.customInlineParserExtensionFactory
+  (.build (.customDelimiterProcessor
            (.customInlineParserExtensionFactory
             (.customInlineParserExtensionFactory
-             (Parser/builder (doto (MutableDataSet.)
-                               (.set Parser/EXTENSIONS
-                                     (java.util.List/of (AttributesExtension/create)
-                                                        (TablesExtension/create)
-                                                        (FootnoteExtension/create)))))
-             inline-math-extension-factory)
-            cross-ref-cite-extension-factory)
-           cite-bracket-extension-factory)))
+             (.customInlineParserExtensionFactory
+              (Parser/builder (doto (MutableDataSet.)
+                                (.set Parser/EXTENSIONS
+                                      (java.util.List/of (AttributesExtension/create)
+                                                         (TablesExtension/create)
+                                                         (FootnoteExtension/create)))))
+              inline-math-extension-factory)
+             cross-ref-cite-extension-factory)
+            cite-bracket-extension-factory)
+           (highlight-delimiter-processor))))
 
 (def ^:private escapable-punctuation
   "ASCII punctuation characters a CommonMark backslash escape (sec2.4) may
@@ -901,7 +1082,8 @@
           (case (:t inline)
             :str (:text inline)
             (:space :soft-break :line-break) " "
-            (:emph :strong :strike :small-caps :sub :sup :span :link) (alt-text (:inlines inline))
+            (:emph :strong :strike :small-caps :sub :sup :span :link :highlight)
+            (alt-text (:inlines inline))
             :code (:text inline)
             :image (:alt inline)
             :math-inline (:tex inline)
@@ -1175,6 +1357,11 @@
       `haselnuss.ast`/SPEC.md sec4.4) -> wraps it in a Span whose sole
       Inline is that Code node and whose Attr is the parsed group (AC #2,
       code-span case).
+  A `==highlight=={...}` (TASK-122) merges the group directly into the
+  `:highlight`'s own `:attr`, the same way an Image's or a Link's does
+  and for the same reason: sec4.4 gives it an `Attr` of its own, so it
+  needs no wrapping Span.
+
   Anything else immediately followed by an AttributesNode (e.g.
   `**bold**{.x}`) is deliberately left alone here, falling through to
   `convert-inline`'s existing default `::unsupported-node` error on the
@@ -1201,7 +1388,12 @@
             (recur (+ i 2)
                    (into acc (attach-link-ref-attr document active-footnotes child (parse-attr-group attrs-node))))
 
-            (and attrs-node (or (instance? Image child) (instance? Link child)))
+            ;; A `:highlight` carries an `:attr` of its own (sec4.4), so
+            ;; `==text=={.important #hl:a}` merges directly into it, the
+            ;; same way an Image's or a Link's group does -- no wrapping
+            ;; Span, unlike a Code span or a bracket-only LinkRef.
+            (and attrs-node (or (instance? Image child) (instance? Link child)
+                                (highlight-node? child)))
             (recur (+ i 2)
                    (conj acc (assoc (first (convert-inline document active-footnotes child))
                                     :attr (parse-attr-group attrs-node))))
@@ -1513,6 +1705,15 @@
     (cite-author-node? node)
     [{:t :cite :items [{:key (.toString (.getText ^DelimitedNodeImpl node)) :mode :author}]}]
     (cite-bracket-node? node) [(cite-bracket-node->cite node)]
+    ;; TASK-122: `==marked text==`. Unlike the three synthetic nodes
+    ;; above, this one's content is ordinary markup that flexmark has
+    ;; already parsed into its CHILDREN (see
+    ;; `highlight-delimiter-processor`), so it recurses like an
+    ;; `Emphasis`/`StrongEmphasis` rather than reading `.getText`.
+    (highlight-node? node)
+    [{:t :highlight
+      :inlines (convert-inlines document active-footnotes node)
+      :attr default-attr}]
     (instance? Footnote node)
     (let [label (.toString (.getText ^Footnote node))
           footnote-block (.getReferenceNode ^Footnote node document)]
@@ -2316,6 +2517,43 @@
     (throw (ex-info "malformed directive header: expected a single {...} group"
                     {:type ::malformed-directive :text header}))))
 
+(defn- attr-group-attr
+  "The Attr for a `{...}` attribute group's own text `group-text` (its
+  braces included), or `default-attr` when `group-text` is nil/blank (no
+  group at all). Reuses `directive-header-token`'s tokenizer rather than
+  duplicating it, but rejects that function's `:name` token kind: this is
+  the plain three-form sec5.3 grammar (`#id`/`.class`/`key=val`), never a
+  directive header's own bare-name fourth form, so a bare word here throws
+  `ex-info` exactly like `attribute-token` does for an ordinary attribute
+  group -- this file's no-silent-drop ethos (AC #4 of TASK-5) applied to
+  every construct carrying one of these groups. A non-blank `group-text`
+  that is not a single brace-delimited group at all throws for the same
+  reason, rather than quietly yielding `default-attr` as if no group had
+  been written.
+
+  `error-type` is the caller's own diagnostic keyword -- sec5.7's display
+  math group passes `::malformed-attributes` (see `math-attr-group`), a
+  sec5.5 `!name{...}` line passes `::malformed-directive` (see
+  `bang-directive-line`) -- so an author gets the diagnostic naming the
+  construct they actually wrote, not the one this helper happens to be
+  shared with."
+  [group-text error-type]
+  (if (str/blank? group-text)
+    default-attr
+    (if-let [inner (second (re-matches #"\{(.*)\}" group-text))]
+      (reduce (fn [attr tok]
+                (let [[kind a b] (directive-header-token tok)]
+                  (case kind
+                    :id (assoc attr :id a)
+                    :class (update attr :classes conj a)
+                    :prop (update attr :props assoc a b)
+                    :name (throw (ex-info "malformed attribute group: token is not #id, .class, or key=val"
+                                          {:type error-type :token tok})))))
+              default-attr
+              (split-attr-tokens inner error-type group-text))
+      (throw (ex-info "malformed attribute group: expected a single {...} group"
+                      {:type error-type :text group-text})))))
+
 ;; --- Include lines (TASK-38, sec4.3) ---------------------------------------
 ;;
 ;; SPEC.md defines the Include *node* and marks multi-file a later phase; the
@@ -2386,6 +2624,133 @@
         path)
       raw)))
 
+;; --- One-line directives (TASK-114, sec5.5) --------------------------------
+;;
+;; A directive whose whole content lives in its header props still paid for
+;; a closing `:::` line. That shape is not a corner case here: sec5.5's own
+;; `toc`/`list-of-figures`/`list-of-tables` are "empty placeholders", every
+;; `describe` overlay directive is one (so an alt-text overlay file paid a
+;; closing fence once per figure), and a sidecar directive can put all of
+;; its content in props too (`examples/reveal.clj`'s `question`/`answer`).
+;; So sec5.5 gains a second SPELLING -- not a second mechanism -- for
+;; exactly that case: a whole line
+;;
+;;     !toc
+;;     !reveal{question="Why does a lone hazel set no nuts?" answer="..."}
+;;
+;; which is a Directive with an empty `:blocks` and no closing fence. The
+;; AST is untouched, so nothing in the resolver, registry, lower pass, JSON
+;; interchange or the HTML/LaTeX emitters knows this form exists.
+;;
+;; `!` rather than a shorter colon run (`::{name}`), a self-closing
+;; `:::{name}:::`, or the name outside a `::name{...}`: `!include` above
+;; already established a whole-line `!` block construct recognized in this
+;; same raw-line scan, so this joins an existing family instead of opening
+;; a second one. Two costs, recorded rather than papered over:
+;;
+;; - `:::` and `!` now both introduce a directive. The mitigation is that
+;;   `!` introduces ONLY the body-less form, so which one to write is
+;;   decided by whether there is a body, never by taste.
+;; - The name sits OUTSIDE the braces here and inside them on a fence.
+;;   Contained by making the group after `!name` the ordinary sec5.3
+;;   attribute group (`attr-group-attr`, shared with sec5.7's math group)
+;;   rather than a second directive-header grammar: a bare word inside it
+;;   is an error, because the name has already been given.
+;; - A line that is nothing but `!word` now means a directive rather than
+;;   prose. For an unregistered name that is loud (the build stops and
+;;   names it), but for a REGISTERED one -- a lone `!figure` written as a
+;;   sentence fragment -- it silently becomes an empty directive instead
+;;   of text. Accepted because the line must be exactly `!word` with
+;;   nothing else on it, which prose almost never is, and because `\!word`
+;;   escapes it (the backslash means the line no longer starts with `!`,
+;;   so this scan skips it and flexmark unescapes it as usual).
+;;
+;; `include` is RESERVED here. Without that, a bare `!include` -- today an
+;; ordinary paragraph, since `include-line-re` requires a path -- would
+;; silently become a directive named "include", which is a typo turned
+;; into a plausible-looking wrong document, the thing this file refuses
+;; everywhere else.
+;;
+;; Both consequences the `!include` comment above lists apply unchanged: a
+;; `!name` line is block-level (indent one into a list and the list ends,
+;; exactly as a `:::` fence there does), and it splits the run of text
+;; around it into separate chunks before flexmark sees them.
+;;
+;; One known gap, shared with `!include` and left alone deliberately so
+;; that the two cannot diverge: `block-marker-line-re` -- which bounds an
+;; unterminated `$$` opener's search for a closer -- lists `:::` but
+;; neither bang form, so a `!name` line sitting between a stray `$$` and a
+;; later `$$`-shaped line is swallowed into that bogus MathBlock, where a
+;; heading in the same position would have bounded the scan. Closing it
+;; means closing it for `!include` too, which is a change to a construct
+;; this section does not own.
+
+(def ^:private bang-directive-line-re
+  "A one-line directive: up to 3 leading spaces (matching
+  `include-line-re`/`directive-fence-re`'s own CommonMark leaf-block
+  indentation tolerance), a `!`, the directive's name (group 1), then the
+  rest of the line (group 2) -- its `{...}` attribute group if it has one,
+  or nothing but whitespace if it does not. The name production is
+  deliberately `directive-header-token`'s own, so a directive name cannot
+  come to mean two different things depending on which spelling it is
+  written in."
+  #"^ {0,3}!([A-Za-z_][\w-]*)(.*)$")
+
+(def ^:private bang-directive-reserved-names
+  "Directive names this form does not spell. `include` is the only one,
+  and note where it actually bites: `parse-directive-region` tries
+  `include-line` first, so a real `!include <path>` never reaches
+  `bang-directive-line` at all. What is left for this set to catch is the
+  PATHLESS remainder -- a bare `!include`, an ordinary paragraph today
+  which stays one, and `!include{...}`, refused by name (see
+  `bang-directive-line`) rather than left to fail later as something
+  else. Quietly promoting either to a directive named \"include\" would
+  turn a mistyped include into a plausible-looking wrong document, which
+  this file refuses everywhere else.
+
+  ADDING A NAME HERE means adding it to
+  `haselnuss.emit.hdoc/bang-directive-reserved-names` too. That namespace
+  keeps its own copy on purpose (no emitter requires this one), and it
+  decides which directives it may write in this spelling -- so a name
+  reserved here but not there would be emitted as `!thatname` and read
+  back as something else."
+  #{"include"})
+
+(defn- bang-directive-line
+  "`[name attr]` if `line` is a one-line body-less directive (see this
+  section's own comment), nil if it is not one at all.
+
+  What follows the name decides, in exactly three cases:
+
+  - nothing, or only whitespace: a directive with no attributes (`!toc`);
+  - a `{`: the line is COMMITTED to being a directive, and the whole rest
+    of it must then be exactly one `{...}` group. Both `!toc{unclosed`
+    and `!toc{a=1} trailing` are therefore errors (`attr-group-attr` with
+    `::malformed-directive` -- the same diagnostic the same mistake earns
+    on a `:::` header), never a quiet fall back to prose;
+  - anything else -- a path (`!include chapters/a.hdoc`), or any other
+    trailing text (`!toc extra words`): this was never a one-line
+    directive and stays prose, matching `include-line`'s own \"a bare
+    `!include` is just a paragraph\" tolerance at the other end.
+
+  A reserved name (`bang-directive-reserved-names`) never yields a
+  directive, but is not simply ignored either: written WITH a group it
+  throws, naming the rule. `!include{src=\"a.hdoc\"}` is a plausible
+  thing to try, and without this it reaches flexmark and fails as an
+  `::unsupported-node` \"unsupported inline construct\" -- a diagnostic
+  naming neither `!include` nor the reason."
+  [line]
+  (when-let [[_ dname tail] (re-matches bang-directive-line-re line)]
+    (let [group (str/trim tail)
+          reserved? (contains? bang-directive-reserved-names dname)]
+      (cond
+        (str/blank? group) (when-not reserved? [dname default-attr])
+        (not (str/starts-with? group "{")) nil
+        reserved? (throw (ex-info (str "\"" dname "\" is not a one-line directive name: "
+                                       "an include is written `!include <path>` (sec4.3)")
+                                  {:type ::malformed-directive :name dname :line line}))
+        :else [dname (attr-group-attr group ::malformed-directive)]))))
+
 (defn- parse-directive-region
   "Recursive-descent scan of `lines` (the whole document body's lines,
   paired one-for-one with a shielded flag by `annotate-fences` and shared
@@ -2400,7 +2765,11 @@
   `{:type :include :src ..}` (TASK-38) entries in source
   order, and `next-i` is the index of the line right after this level's own
   closing fence (irrelevant at the top level, where there is none to
-  consume).
+  consume). A `:directive` entry comes from either of sec5.5's two
+  spellings: a `:::` fence, whose own `:segments` are this function
+  recurring over the lines up to its closing fence, or a one-line
+  `!name{...}` (`bang-directive-line`, TASK-114), whose `:segments` is
+  empty by construction.
 
   A line flagged shielded (inside an open backtick/tilde code fence, or
   inside an open multi-line `$$` display-math fence -- see
@@ -2462,7 +2831,16 @@
               ;; `!include` written mid-paragraph splits that paragraph
               ;; in two rather than disappearing into it.
               (recur (inc i) (conj (flush-text segments) {:type :include :src src}) [])
-              (recur (inc i) segments (conj text-buf line)))))))))
+              (if-let [[dname attr] (and (not shielded?) (bang-directive-line line))]
+                ;; TASK-114: a one-line body-less directive. Its
+                ;; `:segments` is empty by construction (this form has no
+                ;; body and consumes no further lines), so it needs no
+                ;; recursion and cannot be left unterminated.
+                (recur (inc i)
+                       (conj (flush-text segments)
+                             {:type :directive :name dname :attr attr :segments []})
+                       [])
+                (recur (inc i) segments (conj text-buf line))))))))))
 
 ;; --- Display math (TASK-7, sec5.7) ------------------------------------------
 ;;
@@ -2509,28 +2887,16 @@
   text `group-text` (including its own braces, as captured by
   `math-single-line-re`/`math-fence-line-re`'s own attribute-group group),
   or `default-attr` if `group-text` is nil/blank (no group at all).
-  Reuses `directive-header-token`'s tokenizer rather than duplicating it,
-  but rejects that function's `:name` token kind: sec5.7's math attribute
-  group is the plain three-form sec5.3 grammar (`#id`/`.class`/`key=val`),
-  never a directive's own bare-name fourth form, so a bare word here
-  throws `ex-info` (`:type ::malformed-attributes`) exactly like
-  `attribute-token` does for an ordinary attribute group (AC #4's no-
-  silent-drop philosophy applied to this construct too)."
+  `attr-group-attr` (which this is now a thin naming wrapper over, sharing
+  it with sec5.5's `!name{...}` line) does the work: sec5.7's math
+  attribute group is the plain three-form sec5.3 grammar
+  (`#id`/`.class`/`key=val`), never a directive's own bare-name fourth
+  form, so a bare word here throws `ex-info`
+  (`:type ::malformed-attributes`) exactly like `attribute-token` does for
+  an ordinary attribute group (AC #4's no-silent-drop philosophy applied
+  to this construct too)."
   [group-text]
-  (if (str/blank? group-text)
-    default-attr
-    (let [inner (second (re-matches #"\{(.*)\}" group-text))
-          tokens (split-attr-tokens inner ::malformed-attributes group-text)]
-      (reduce (fn [attr tok]
-                (let [[kind a b] (directive-header-token tok)]
-                  (case kind
-                    :id (assoc attr :id a)
-                    :class (update attr :classes conj a)
-                    :prop (update attr :props assoc a b)
-                    :name (throw (ex-info "malformed attribute group: token is not #id, .class, or key=val"
-                                          {:type ::malformed-attributes :token tok})))))
-              default-attr
-              tokens))))
+  (attr-group-attr group-text ::malformed-attributes))
 
 (def ^:private block-marker-line-re
   "A line that opens a new CommonMark block with a marker of its own: an

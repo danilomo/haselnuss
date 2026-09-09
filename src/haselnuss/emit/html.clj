@@ -144,9 +144,12 @@
   higher number than its enclosing one, matching encounter order, instead
   of corrupting the outer entry's own position."
   (:require [clojure.string :as str]
+            [haselnuss.ast :as ast]
             [haselnuss.extensions.derived-lists :as derived-lists]
             [haselnuss.extensions.front-matter :as front-matter]
-            [haselnuss.registry :as registry]))
+            [haselnuss.registry :as registry]
+            [haselnuss.select :as select]
+            [haselnuss.walk :as walk]))
 
 (defn- escape-html
   "Escapes `&`, `<`, `>`, and `\"` in `s` so plain text is always safe to
@@ -298,6 +301,67 @@
                       (str/join "; " (cond-> (vec styled) authored (conj authored)))))))
       attr)))
 
+;; --- Annotations: :highlight and :sticky-note (TASK-120, doc-8 sec5) -------
+
+(def annotation-colors
+  "The `color=` values an annotation recognizes (doc-8 sec2). A CLOSED
+  set, not free hex: the value has to map to both a CSS colour and a PDF
+  annotation colour, and each one here has its own rule in
+  `default-stylesheet`."
+  #{"yellow" "green" "blue" "pink"})
+
+(def ^:private default-annotation-color
+  "The colour an annotation with no `color=` prop is rendered in, and the
+  fallback for one carrying a value outside `annotation-colors` (AC #4).
+
+  Falling back rather than raising, deliberately: an authored value
+  outside the set is diagnosed where an author writes it -- on the
+  overlay directive (TASK-119) -- and by the time a Document reaches an
+  emitter it may equally have come through `--target json` or a
+  transform rule. Rendering it in the default colour keeps the annotation
+  visible, which is the whole point of one, rather than losing it to a
+  class no stylesheet defines."
+  "yellow")
+
+(defn- annotation-color
+  "`attr`'s own `color=` prop when it names one of `annotation-colors`,
+  else `default-annotation-color`."
+  [attr]
+  (let [authored (get-in attr [:props "color"])]
+    (if (contains? annotation-colors authored) authored default-annotation-color)))
+
+(defn- annotation-attr
+  "`attr` rewritten for an annotation element of kind `kind` (`\"highlight\"`
+  or `\"sticky-note\"`): `color=` becomes a CLASS rather than a literal
+  attribute, and `author=` becomes `data-author`.
+
+  Both moves are the point rather than housekeeping. A class is what lets
+  a caller substituting their own `:stylesheet` restate the colour, where
+  an inline style could not be overridden; and `color=\"yellow\"` is not
+  an HTML attribute at all, so left in `:props` it would reach
+  `prop-attrs` and be written as one (the same reasoning
+  `image-attr` already applies to `scale`/`height`). `author=` becomes a
+  data attribute because it belongs in the markup -- it is what makes an
+  overlay usable as a review pass -- but must never become visible page
+  text (AC #5).
+
+  The kind class comes first and the colour class second (`class=\"highlight
+  highlight-yellow\"`), with any authored classes after both, so a
+  stylesheet can key on either the kind alone or the exact colour."
+  [attr kind]
+  (let [author (get-in attr [:props "author"])]
+    (-> attr
+        (assoc :classes (into [kind (str kind "-" (annotation-color attr))]
+                              (:classes attr)))
+        ;; `style` goes too, and it is the one that would have hurt most:
+        ;; doc-8 sec2 defines it, `haselnuss.resolver` deliberately keeps
+        ;; it on the node for the LaTeX target to read, and `style` IS a
+        ;; real HTML attribute -- so left in `:props` it reached
+        ;; `prop-attrs` and emitted `style="footnote"`, colliding with an
+        ;; authored CSS `style` prop into a duplicate attribute.
+        (update :props dissoc "color" "author" "style")
+        (cond-> author (assoc-in [:props "data-author"] author)))))
+
 (declare render-inlines)
 
 (defn- render-wrapped
@@ -328,6 +392,91 @@
         filled (mapv (fn [entry] (if (= n (:number entry)) (assoc entry :html content-html) entry))
                      footnotes')]
     [marker filled]))
+
+(defn- balloon-blocks
+  "A `:sticky-note` body's own Blocks rendered as PHRASING content: each
+  Block becomes a `<span>` (given `display:block` by the stylesheet),
+  with its own inline content rendered normally inside.
+
+  This is not decoration, it is what makes the balloon legal. A sticky
+  note is an INLINE node, so everything it emits sits inside a `<p>`, and
+  a `<p>` may contain only phrasing content -- a `<p>`, `<ul>` or `<pre>`
+  in there is not nested by an HTML parser, it CLOSES the enclosing
+  paragraph and becomes its sibling. Measured, not assumed: two
+  independent HTML5 tree builders re-parse a `<p>` containing a `<p>` into
+  three siblings, which puts the balloon's marker on a line of its own at
+  the left margin and orphans the rest of the sentence -- the exact
+  opposite of what a sticky note is for.
+
+  A Block this has no phrasing rendering for -- a Figure or Table, which
+  the overlay directive already drops for the numbering invariant, but
+  which `--target json` or a transform rule could still put here -- falls
+  back to its flattened text rather than to markup that would break the
+  paragraph. Lossy, and deliberately: the words survive and the document
+  around them stays intact, which is the better of the two failures."
+  [ctx blocks footnotes]
+  (reduce (fn [[html footnotes'] block]
+            (let [[inner footnotes'']
+                  (case (:t block)
+                    :para (render-inlines ctx (:inlines block) footnotes')
+                    :block-quote (balloon-blocks ctx (:blocks block) footnotes')
+                    :list (balloon-blocks ctx (apply concat (:items block)) footnotes')
+                    :code-block [(str "<code>" (escape-html (:text block)) "</code>") footnotes']
+                    [(escape-html (select/flatten-text block)) footnotes'])]
+              [(str html "<span>" inner "</span>") footnotes'']))
+          ["" footnotes]
+          blocks))
+
+(defn- render-sticky-note
+  "Renders a `:sticky-note` (sec4.4) as an inline disclosure whose body is
+  an absolutely-positioned box: click the marker to open it, click again
+  to dismiss, with no JavaScript at all (doc-8 sec5).
+
+  NOT a `<details>`, which is what doc-8 sec5 and this task's own AC #2
+  specify -- and the deviation is the whole point of this docstring.
+  `<details>` is flow content, not phrasing, so an HTML parser closes the
+  enclosing `<p>` when it meets one; a sticky note is an inline node, so
+  its `<details>` became a SIBLING of the paragraph it was supposed to sit
+  inside. Measured with two independent HTML5 tree builders and confirmed
+  in a real browser's layout boxes: the marker landed on a new line at
+  the left margin and the rest of the sentence was orphaned after it.
+  `display:inline` cannot repair that -- by the time CSS runs, the
+  document tree is already wrong.
+
+  The `small-collapsable` precedent does not carry over, and that is why
+  it looked safe: that extension is a BLOCK directive, so its `<details>`
+  is a sibling of `<p>` to begin with and only its LAYOUT is inline. A
+  `:sticky-note` is the first inline node in this emitter that has to
+  carry flow-shaped content.
+
+  So the disclosure is a hidden checkbox plus its `<label>` -- `<input>`,
+  `<label>` and `<span>` are all phrasing content, so the whole thing is
+  legal inside a paragraph -- and the stylesheet opens the body on
+  `:checked`. Still no script, still click-to-open and click-to-dismiss.
+
+  The `<label>` marker is deliberately a word rather than a symbol: this
+  emitter's contract is one self-contained file legible with no
+  stylesheet at all (`--no-stylesheet` is a supported mode), and an empty
+  label is a click target a reader cannot see. `author=` is NOT in it --
+  that is a data attribute and never visible page text (AC #5)."
+  [ctx sticky-note footnotes]
+  (let [[body-html footnotes'] (balloon-blocks ctx (:blocks sticky-note) footnotes)
+        attr (annotation-attr (:attr sticky-note) "sticky-note")
+        ;; The checkbox needs an id for its own <label> to point at, and
+        ;; it must not be the annotation's own id -- that belongs to the
+        ;; annotation, so a cross-reference to it lands on the note
+        ;; rather than on its toggle. `emit-document` supplies a counter
+        ;; per document; a caller who assembled a ctx without one (this
+        ;; namespace's own tests do) still gets a usable, if unnumbered,
+        ;; id rather than an exception.
+        toggle-id (str "sticky-note-toggle-"
+                       (if-let [counter (:sticky-note-counter ctx)] (swap! counter inc) 1))]
+    [(str "<span" (attr-attrs attr) ">"
+          "<input class=\"sticky-note-toggle\" type=\"checkbox\" id=\"" toggle-id "\"/>"
+          "<label class=\"sticky-note-marker\" for=\"" toggle-id "\">note</label>"
+          "<span class=\"sticky-note-body\">" body-html "</span>"
+          "</span>")
+     footnotes']))
 
 (defn- render-math-inline
   "Renders MathInline `inline` (sec4.4: `:tex`) as `<span class=\"math
@@ -420,6 +569,17 @@
            (render-wrapped ctx inline footnotes
                            (str "<span" (attr-attrs (:attr inline)) ">") "</span>"))
    :note render-note
+   ;; TASK-120 (doc-8 sec5). `<mark>` is the element for exactly this,
+   ;; and it is legible with no stylesheet at all -- which is this
+   ;; emitter's own self-contained-single-file contract, and the reason
+   ;; a highlight is NOT a `<span class="highlight">`.
+   :highlight (fn [ctx inline footnotes]
+                (render-wrapped ctx inline footnotes
+                                (str "<mark"
+                                     (attr-attrs (annotation-attr (:attr inline) "highlight"))
+                                     ">")
+                                "</mark>"))
+   :sticky-note render-sticky-note
    :math-inline (fn [_ctx inline footnotes] [(render-math-inline inline) footnotes])
    :cross-ref (fn [_ctx inline footnotes] [(render-cross-ref inline) footnotes])
    :cite render-cite})
@@ -1424,13 +1584,22 @@
     :space " "
     :soft-break " "
     :line-break " "
-    (:emph :strong :strike :small-caps :sub :sup :span :link) (plain-text (:inlines inline))
     :code (:text inline)
     :image (:alt inline)
     :math-inline (:tex inline)
     :cross-ref (or (:text inline) "")
     :cite (plain-text (:text inline))
-    ""))
+    ;; Every remaining Inline that carries nested Inlines -- `:emph`,
+    ;; `:strong`, `:span`, `:link` and, since TASK-116, `:highlight` --
+    ;; contributes its children's text. Asked of `haselnuss.walk/fields-
+    ;; holding` rather than listed by name: this was a hardcoded list of
+    ;; eight variants, and a `:highlight` in a document's own title
+    ;; silently contributed nothing to `<title>` the moment one could be
+    ;; written. A variant with no such field (`:space` and the two break
+    ;; types are handled above; `:note`'s Blocks are not Inlines) has no
+    ;; fields to fold over and still contributes "".
+    (apply str (map (fn [field] (plain-text (get inline field)))
+                    (walk/fields-holding ::ast/inline inline ::ast/inline)))))
 
 (defn- plain-text
   "`plain-text-inline` mapped and concatenated over every Inline in
@@ -1730,7 +1899,56 @@
     "section.bibliography{margin-top:2.5rem;padding-top:1rem;"
     "border-top:1px solid rgba(128,128,128,.4);font-size:.92em}"
     "hr{border:none;border-top:1px solid rgba(128,128,128,.4);margin:2rem 0}"
-    "img{max-width:100%}"]))
+    "img{max-width:100%}"
+    ;; TASK-120 (doc-8 sec5), annotations. `<mark>` already has a UA
+    ;; background, so these rules only replace it per colour; a highlight
+    ;; is legible with this whole sheet removed, which is why it is a
+    ;; `<mark>` in the first place. The colours are translucent so they
+    ;; read over either canvas without a prefers-color-scheme block, the
+    ;; same rule every other colour here lives under.
+    ;; `<mark>` already has a UA background, so these rules only replace
+    ;; it per colour; a highlight is legible with this whole sheet
+    ;; removed, which is why it is a `<mark>` in the first place. The
+    ;; alphas are the lowest that keep every colour above WCAG AA against
+    ;; BOTH canvases -- measured on each, since the sheet has no
+    ;; prefers-color-scheme block by design and one set of values has to
+    ;; serve both.
+    "mark.highlight{padding:0 .1em;border-radius:2px;color:inherit}"
+    "mark.highlight-yellow{background:rgba(255,225,90,.55)}"
+    "mark.highlight-green{background:rgba(130,220,130,.55)}"
+    "mark.highlight-blue{background:rgba(130,190,255,.55)}"
+    "mark.highlight-pink{background:rgba(255,150,195,.55)}"
+    ;; The balloon. A hidden checkbox plus its own <label> rather than a
+    ;; <details>, because everything a sticky note emits sits inside a
+    ;; <p> and <details> is flow content, not phrasing -- see
+    ;; `render-sticky-note`, where that is measured rather than argued.
+    ;; `position:relative` on the wrapper is what the body is positioned
+    ;; against.
+    "span.sticky-note{position:relative}"
+    ;; Hidden without display:none, which would take it out of the
+    ;; keyboard's reach: the label is still clickable, and the checkbox
+    ;; itself is still focusable and toggles with the space bar.
+    "input.sticky-note-toggle{position:absolute;width:1px;height:1px;opacity:0}"
+    "label.sticky-note-marker{cursor:pointer;font-size:.75em;vertical-align:super;"
+    "padding:0 .3em;border:1px solid rgba(128,128,128,.6);border-radius:3px}"
+    "span.sticky-note-yellow label{background:rgba(255,225,90,.55)}"
+    "span.sticky-note-green label{background:rgba(130,220,130,.55)}"
+    "span.sticky-note-blue label{background:rgba(130,190,255,.55)}"
+    "span.sticky-note-pink label{background:rgba(255,150,195,.55)}"
+    "span.sticky-note-body{display:none}"
+    ;; `background:Canvas` rather than a fixed colour: the sheet declares
+    ;; `color-scheme:light dark`, so the system canvas colour is already
+    ;; the right ground under either preference, and an opaque balloon is
+    ;; required -- it sits ON TOP of the text it is about.
+    "input.sticky-note-toggle:checked ~ span.sticky-note-body{display:block;position:absolute;"
+    "left:0;top:1.6em;z-index:10;width:22rem;max-width:80vw;"
+    "padding:.5rem .75rem;font-size:.92em;background:Canvas;color:CanvasText;"
+    "border:1px solid rgba(128,128,128,.5);border-radius:4px;"
+    "box-shadow:0 2px 8px rgba(0,0,0,.25)}"
+    ;; Each Block of the body is a bare <span> (phrasing content, so the
+    ;; enclosing paragraph survives); this is what makes them read as the
+    ;; blocks they are.
+    "span.sticky-note-body span{display:block;margin:.4em 0}"]))
 
 (defn- stylesheet-tag
   "The `<style>` element `emit-document` puts in `<head>` for the
@@ -1840,6 +2058,17 @@
               ;; themselves -- see emit-document's own docstring.
               :block-handlers (merge built-in-block-handlers (:block-handlers opts))
               :inline-handlers (merge built-in-inline-handlers (:inline-handlers opts))
+              ;; TASK-120: one counter per DOCUMENT, so every sticky
+              ;; note's own checkbox gets an id no other one in the same
+              ;; page shares. Derived from the footnote count before
+              ;; this, which sticky notes do not contribute to -- so
+              ;; every note in a document got the SAME id, every <label>
+              ;; pointed at the first checkbox, and clicking any balloon
+              ;; opened that one instead (found by review, in this
+              ;; project's own shipped example). Built here rather than
+              ;; held in a var: this is per-call state, and nothing in
+              ;; this namespace is process-global.
+              :sticky-note-counter (atom 0)
               ;; TASK-54: the document's own language, so a front-matter
               ;; block with no `lang` of its own still prints its heading
               ;; word in the language the document is written in.

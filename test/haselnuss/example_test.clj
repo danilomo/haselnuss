@@ -110,3 +110,110 @@
                 (is (pos? h) (str item " must actually appear in the HTML"))
                 (is (= h (occurrences pdf item))
                     (str item " must appear the same number of times in both outputs"))))))))))
+
+;; --- The worked annotation overlay (TASK-124, doc-8) ----------------------
+
+(defn- build-annotated!
+  "The committed example built AGAIN with `examples/review.hdoc` layered
+  over it, to both targets. Returns `{:dir :html :latex :diagnostics
+  :bare-html :bare-latex}` -- the unannotated builds alongside, since
+  the property that matters most about an overlay is what it does NOT
+  change."
+  []
+  (let [dir (str (Files/createTempDirectory "haselnuss-review" (make-array FileAttribute 0)))
+        input (str (io/file dir "hazelnuts.hdoc"))
+        overlay (str (io/file dir "review.hdoc"))]
+    (doseq [f ["hazelnuts.hdoc" "hazelnuts.json" "review.hdoc"]]
+      (io/copy (io/reader (io/resource f)) (io/file dir f)))
+    (io/copy (io/input-stream (io/resource "catkins.png")) (io/file dir "catkins.png"))
+    (let [bare-html (cli/build {:input input :target "html"
+                                :output (str (io/file dir "bare.html"))})
+          bare-latex (cli/build {:input input :target "latex" :computed-numbers true
+                                 :output (str (io/file dir "bare.tex"))})
+          html (cli/build {:input input :target "html" :overlay [overlay]
+                           :output (str (io/file dir "annotated.html"))})
+          latex (cli/build {:input input :target "latex" :computed-numbers true
+                            :overlay [overlay] :output (str (io/file dir "annotated.tex"))})]
+      {:dir dir
+       :html (slurp (:output-path html))
+       :latex (slurp (:output-path latex))
+       :bare-html (slurp (:output-path bare-html))
+       :bare-latex (slurp (:output-path bare-latex))
+       :diagnostics (into (vec (:diagnostics html)) (:diagnostics latex))})))
+
+(deftest annotation-overlay-example-test
+  (let [{:keys [dir html latex bare-html bare-latex diagnostics]} (build-annotated!)]
+    (testing "AC #3: the committed annotation overlay builds over the
+              committed example to both targets, with no diagnostics at
+              all -- an example shipped by the project should not be
+              teaching an author to ignore warnings, and every quote in
+              it must therefore still match the prose it names"
+      (is (= [] diagnostics) (pr-str diagnostics)))
+
+    (testing "AC #4: the example covers a plain highlight, a highlight
+              with an attached comment, a standalone sticky note, a
+              non-default colour and an author -- checked in the output
+              rather than by reading the overlay, so an annotation that
+              silently failed to anchor cannot pass"
+      (testing "html"
+        (is (re-find #"<mark class=\"highlight highlight-yellow\">" html)
+            "a plain highlight, in the default colour")
+        (is (re-find #"<mark class=\"highlight highlight-green\" data-author=\"DM\">" html)
+            "a highlight with a non-default colour and an author")
+        (is (re-find #"<mark class=\"highlight highlight-pink\">" html)
+            "and a third colour")
+        (is (= 3 (count (re-seq #"<span class=\"sticky-note sticky-note-" html)))
+            "three balloons: one attached to a highlight, two standalone")
+        (is (re-find #"class=\"sticky-note sticky-note-blue\" data-author=\"AL\"" html)
+            "a second reviewer, which is what author= is for")
+        (is (re-find #"Cosford bears noticeably" html)
+            "the comment attached to a highlight")
+        (is (re-find #"the spacing the table models" html)
+            "and a standalone note's own body"))
+      (testing "latex"
+        (is (= 3 (count (re-seq #"\\pdfmarkupcomment\[markup=Highlight" latex))))
+        (is (= 3 (count (re-seq #"\\pdfcomment\[icon=Note" latex))))
+        (is (re-find #"color=green,author=\{DM\},subject=\{DM\}" latex))
+        (is (re-find #"color=pink" latex))
+        (is (re-find #"color=blue,author=\{AL\},subject=\{AL\}" latex))))
+
+    (testing "AC #3, and doc-8's headline invariant: an annotation adds
+              nothing numbered, so every number the document assigns is
+              the same as in the build with no overlay at all. Compared
+              rather than asserted, because a number that moved would
+              still look plausible on its own"
+      (let [occurrences (fn [text item]
+                          (count (re-seq (re-pattern (java.util.regex.Pattern/quote item)) text)))]
+        (doseq [item ["Figure 1.1" "Table 2.1" "Eq. (2.1)" "Section 1" "Section 2" "Note 1"]]
+          (is (pos? (occurrences bare-html item)) (str item " must appear in the bare build"))
+          (is (= (occurrences bare-html item) (occurrences html item))
+              (str item " must appear the same number of times with and without the overlay")))
+        (is (= (count (re-seq #"<section id=" bare-html)) (count (re-seq #"<section id=" html)))
+            "and the same number of sections")
+        (is (= (count (re-seq #"footnote" bare-latex)) (count (re-seq #"footnote" latex)))
+            "and no footnote was added: every sticky note here is a real
+             PDF annotation, not a degraded one")))
+
+    (testing "AC #3: and the annotated .tex still compiles, with the
+              annotations reaching the PDF as real annotation objects --
+              which is the whole claim, so it is read off the PDF"
+      (spit (io/file dir "annotated.tex") latex)
+      (dotimes [_ 2]
+        (shell/sh "pdflatex" "-interaction=nonstopmode" "-halt-on-error" "annotated.tex" :dir dir))
+      (let [{:keys [exit out]} (shell/sh "pdflatex" "-interaction=nonstopmode" "-halt-on-error"
+                                         "annotated.tex" :dir dir)]
+        (is (zero? exit) (str "the annotated example must compile, pdflatex output:\n" out))
+        (let [expanded (io/file dir "expanded.pdf")
+              qpdf (shell/sh "qpdf" "--qdf" "--decode-level=all"
+                             (str (io/file dir "annotated.pdf")) (str expanded))]
+          ;; ASSERTED, not skipped: a `when` here would let this whole
+          ;; block -- the only place the worked example's own PDF is
+          ;; read, which is the claim it exists to make -- report green
+          ;; having checked nothing at all (found by review).
+          (is (zero? (:exit qpdf)) (str "qpdf must expand the PDF: " (:err qpdf)))
+          (when (zero? (:exit qpdf))
+            (let [subtypes (frequencies (map second (re-seq #"/Subtype\s*/(\w+)" (slurp expanded))))]
+              (is (<= 3 (get subtypes "Highlight" 0))
+                  (str "three highlights, at least one quad each: " (pr-str subtypes)))
+              (is (= 3 (get subtypes "Text" 0))
+                  (str "and three balloons: " (pr-str subtypes))))))))))

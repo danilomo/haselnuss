@@ -28,8 +28,9 @@
   enough to survive an internal backtick run), `:math-block` (`$$ ... $$`,
   optionally attributed), `:table` (a pipe table with alignment, column
   widths and a trailing caption line), `:figure` (the standalone-image
-  shorthand ONLY -- see below), `:directive` (the generic `:::` fence,
-  nested to arbitrary depth) and `:include` (back to its `!include` line,
+  shorthand ONLY -- see below), `:directive` (the generic `:::` fence
+  nested to arbitrary depth, or sec5.5's one-line `!name{...}` when it
+  has no body -- see below) and `:include` (back to its `!include` line,
   UNEXPANDED -- see below). `haselnuss.ast/registry` now has no Block
   variant left unhandled (`block-and-inline-coverage-test` proves this by
   a subset check against the schema's own tag set, not by inspection).
@@ -53,7 +54,11 @@
      (sec5.5's own generic `:::` syntax, e.g. `:::{figure #fig:x}`) is
      still a plain `:directive` here, not a `:figure`: `render-directive`
      handles it exactly like any other named directive, name and
-     attributes round-tripping through its own generic fence syntax. Only
+     attributes round-tripping through whichever generic directive
+     spelling fits it -- so a `{figure}` carrying actual content keeps
+     the fence, while a body-less `:::{figure #fig:x}` comes back as
+     `!figure{#fig:x}`, the same normalization every other body-less
+     directive gets. Only
      `haselnuss.parser`'s standalone-image shorthand
      (`![alt](src){#fig:id}`, sec5.8, `standalone-figure-image`) ever
      produces an actual `:figure` Block AT PARSE TIME -- `render-figure`
@@ -207,8 +212,23 @@
   copy -- `convert-block`'s own docstring explains why the two Attrs
   hold what they do), reconstructing the single group an author wrote.
 
-  DIRECTIVES (TASK-97 AC #5). Every directive fence this namespace
-  writes -- opening AND nested opening alike -- carries a `{...}` header,
+  DIRECTIVES (TASK-97 AC #5, TASK-115). A directive with NO BODY is
+  written in sec5.5's one-line spelling, `!name{...}` -- `!toc`, with no
+  group at all when it has no attributes. The AST records no trace of
+  which spelling its author wrote, so the choice is made from the
+  document model alone: a directive is one-line iff the form can
+  represent it losslessly (`bang-spellable?` -- empty `:blocks`, a name
+  the parser would accept back, and not the reserved `include`), and
+  keeps the fence otherwise. \"Otherwise\" is a fallback, not a promise
+  that the fence can spell every remaining name -- see
+  `bang-spellable?`'s own docstring for the pre-existing hole it does
+  not close. One
+  visible consequence, and the intended one: this emitter is the format's
+  canonical formatter, so `--in-place` rewrites an author's existing
+  `:::{toc}` / `:::` pair to `!toc`.
+
+  Every directive FENCE this namespace writes -- opening AND nested
+  opening alike -- carries a `{...}` header,
   even an EMPTY one (`{}`) for a nameless, attributeless directive: a
   non-blank header always opens a new level regardless of its own
   colon-run length relative to any enclosing one (`parse-directive-region`
@@ -297,14 +317,20 @@
   in the first place) and is left unescaped here rather than worked
   around; not in scope, not tested.
 
-  FOUR INLINES WITH NO `.hdoc` SURFACE SYNTAX AT ALL (AC #7, doc-7 \"What
-  this does not do\"): `:strike`, `:small-caps`, `:sub` and `:sup` are
-  schema-valid (`haselnuss.ast/registry`) and both existing emitters
-  render them, but `haselnuss.parser` produces none of them --
-  confirmed at `parser.clj:904`. Written here as the role span an author
-  would reach for (`[text]{.strike}`, the same `[text]{...}` construct
-  that already produces a `:span`), since re-parsing that spelling yields
-  a `:span`, not the original tag. `lossy-role-span-diagnostics` is the
+  FIVE INLINES WITH NO `.hdoc` SURFACE SYNTAX AT ALL (AC #7, doc-7 \"What
+  this does not do\"): `:strike`, `:small-caps`, `:sub`, `:sup` and --
+  since TASK-123 -- `:sticky-note` are schema-valid
+  (`haselnuss.ast/registry`) and both existing emitters render them, but
+  `haselnuss.parser` produces none of them. The first four are written
+  here as the role span an author would reach for (`[text]{.strike}`, the
+  same `[text]{...}` construct that already produces a `:span`), since
+  re-parsing that spelling yields a `:span`, not the original tag; a
+  `:sticky-note` carries Blocks rather than Inlines, so it is written as
+  a footnote instead -- the one construct in this grammar that does carry
+  Blocks from an inline position. `:highlight` is NOT in this list: it
+  has a surface spelling of its own (`==...==`, sec5.6) and is an exact
+  round trip, except nested inside another highlight, which that spelling
+  cannot express (`render-highlight`). `lossy-role-span-diagnostics` is the
   separate, pure function a caller runs over `document` BEFORE emitting
   it to get one diagnostic per occurrence naming the node and its path
   (mirroring `haselnuss.emit.latex/unanchored-reference-diagnostics`'s
@@ -390,15 +416,43 @@
   rare enough in ordinary prose not to cost much readability."
   (set "\\`*_[]$@!#:>"))
 
+(defn- escapes-as-highlight-marker?
+  "True when the character at `i` in `s` is an `=` immediately followed by
+  another one -- the opening or closing marker of a `==highlight==`
+  (TASK-122, sec5.6).
+
+  `=` is deliberately NOT in `always-escaped-chars`: a lone `=` is
+  ordinary punctuation, common in prose (`x = y`) and in an attribute
+  group (`key=val`), and escaping every one of them would be unreadable
+  for no gain. Only a RUN of two or more is a delimiter, and escaping
+  each `=` that has another after it is exactly enough to break every
+  such run -- `==` becomes `\\==`, which re-parses as a literal `=` then
+  a lone `=`, never a delimiter of the minimum length two.
+
+  Without this a literal `==` written in the source came back out
+  unescaped and re-parsed as a `:highlight` nobody wrote: the round trip
+  invented a node."
+  [^String s i]
+  (and (= \= (.charAt s i))
+       (< (inc i) (.length s))
+       (= \= (.charAt s (inc i)))))
+
 (defn- escape-text
   "Backslash-escapes every character in `always-escaped-chars` found in
-  `s`, leaving everything else untouched. The inverse of
-  `haselnuss.parser/unescape-backslashes` for exactly this character set:
-  re-parsing the result always resolves each escape back to the bare
-  character (CommonMark sec2.4), regardless of what precedes or follows
-  it."
+  `s`, plus every `=` that opens a `==` run
+  (`escapes-as-highlight-marker?`), leaving everything else untouched.
+  The inverse of `haselnuss.parser/unescape-backslashes` for exactly
+  this character set: re-parsing the result always resolves each escape
+  back to the bare character (CommonMark sec2.4), regardless of what
+  precedes or follows it."
   [s]
-  (apply str (map (fn [c] (if (contains? always-escaped-chars c) (str \\ c) c)) s)))
+  (apply str
+         (map-indexed (fn [i c]
+                        (if (or (contains? always-escaped-chars c)
+                                (escapes-as-highlight-marker? s i))
+                          (str \\ c)
+                          c))
+                      s)))
 
 (def ^:private hazard-line-re
   "Matches a physical line composed ENTIRELY of `-`/`=`/whitespace, with
@@ -851,7 +905,8 @@
   (when (contains? unrepresentable-nested-block-types (:t block))
     (throw (ex-info
             (str "hdoc emitter cannot represent a " (pr-str (:t block)) " nested inside " context
-                 ": haselnuss.parser recognizes ::: directive fences and !include lines via a raw, "
+                 ": haselnuss.parser recognizes ::: directive fences, !name lines and !include "
+                 "lines via a raw, "
                  "container-oblivious line scan, so no indentation makes this reachable from real parsing")
             {:type ::unrepresentable-nested-block :t (:t block) :context context}))))
 
@@ -908,6 +963,57 @@
                      footnotes')]
     [marker filled]))
 
+(defn- escape-highlight-boundary
+  "`text` (a highlight's own already-escaped rendered content) with a
+  leading or trailing `=` backslash-escaped.
+
+  `escape-text` cannot see this one: it escapes an `=` that has another
+  `=` AFTER IT IN THE SAME STRING, and a highlight's boundary `=` has
+  the emitter's own `==` delimiter next to it instead, in a string that
+  does not exist yet. Left alone, a highlight of the single character
+  `=` emitted `=====`, which re-parses as no highlight at all -- the
+  round trip lost the node (found by test)."
+  [text]
+  ;; The one string whose leading and trailing `=` are the SAME character.
+  ;; Tested before anything is prefixed, and by equality rather than by a
+  ;; suffix: a `\=` at the end of the already-escaped text is just as
+  ;; often an escaped BACKSLASH followed by a bare `=` (`escape-text`
+  ;; writes `\\` for a literal backslash), and treating that as
+  ;; "already escaped" let the `=` escape out of the node -- the
+  ;; highlight silently moved its own edge (found by review, fuzzing
+  ;; every string over {= \ a} up to length four).
+  (let [single-equals? (= "=" text)
+        text (cond-> text (str/starts-with? text "=") (->> (str "\\")))]
+    (cond-> text
+      (and (not single-equals?) (str/ends-with? text "="))
+      (as-> escaped (str (subs escaped 0 (dec (count escaped))) "\\=")))))
+
+(defn- render-highlight
+  "Renders a `:highlight` (sec4.4) as `==marked text==`, plus its own
+  attribute group when it carries one (TASK-123 AC #1/#2). An EXACT
+  round trip, unlike the four role spans: a highlight has a surface
+  spelling of its own (sec5.6), so the node this writes re-parses to the
+  same node.
+
+  EXCEPT when one highlight is nested inside another, which two
+  overlapping annotations produce and which `==...==` cannot spell at
+  all: the inner `==` closes the outer opener, so `==a ==b== c==` parses
+  as ONE highlight over `a ==b`. Written naively it emitted four `=`
+  characters that were never in the document and left the tail unmarked
+  (found by review). The inner one is written as a role span instead --
+  `[text]{.highlight}`, which re-parses as a `:span` -- which is
+  content-preserving and kind-lossy, exactly the contract `:strike`/
+  `:small-caps`/`:sub`/`:sup` already round-trip under, and is reported
+  the same way."
+  [ctx inline footnotes]
+  (let [[text footnotes'] (render-inlines (assoc ctx :in-highlight? true)
+                                          (:inlines inline) footnotes)]
+    [(if (:in-highlight? ctx)
+       (str "[" text "]" (attr-group (update (:attr inline) :classes
+                                             (fnil conj []) "highlight")))
+       (str "==" (escape-highlight-boundary text) "==" (attr-group (:attr inline))))
+     footnotes']))
+
 (def built-in-inline-handlers
   "The built-in `:t -> (fn [ctx inline footnotes] -> [rendered
   footnotes'])` table `render-inline` dispatches through (TASK-88): every
@@ -938,7 +1044,21 @@
    ;; (letter/digit/_/-/:), which needs no escaping of its own.
    :cross-ref (fn [_ctx inline footnotes] [(str "@" (:label inline)) footnotes])
    :cite (fn [ctx inline footnotes] [(render-cite ctx inline) footnotes])
-   :note render-note})
+   :note render-note
+   ;; TASK-123 (doc-8 sec3). A `:highlight` has a surface spelling of its
+   ;; own, so this is an EXACT round trip -- `render-wrapped` plus the
+   ;; attribute group `==text=={.important #hl:a}` re-parses into the
+   ;; same node.
+   :highlight render-highlight
+   ;; A `:sticky-note` has NO inline surface syntax, by design (doc-8
+   ;; sec3), so it writes back as a footnote: the marker at its position
+   ;; and its own Blocks as the definition. Content-preserving and
+   ;; kind-lossy, exactly the contract :strike/:small-caps/:sub/:sup
+   ;; already round-trip under -- and it goes through `render-note`
+   ;; itself rather than a copy of it, so a degraded note shares the one
+   ;; numbering and deferral mechanism and cannot collide with a real
+   ;; footnote's number (doc-8 pitfall 5).
+   :sticky-note render-note})
 
 (defn- unsupported-inline!
   "The declared default `render-inline` dispatches an unrecognized Inline
@@ -1102,6 +1222,70 @@
 
 (def ^:private directive-fence "3-colon fence text, fixed at every nesting depth -- this namespace's own docstring explains why." ":::")
 
+(def ^:private bang-directive-marker
+  "The `!` opening sec5.5's one-line directive spelling (TASK-114), the
+  form this namespace writes for a directive with no body at all."
+  "!")
+
+(def ^:private bang-directive-name-re
+  "A directive `:name` the one-line spelling can actually write:
+  `haselnuss.parser/bang-directive-line-re`'s own name production,
+  restated here because a `:name` reaching this emitter has not
+  necessarily come from that parser (see `bang-spellable?`). Anchored,
+  used with `re-matches`."
+  #"[A-Za-z_][\w-]*")
+
+(def ^:private bang-directive-reserved-names
+  "Directive names the one-line spelling refuses, mirroring
+  `haselnuss.parser/bang-directive-reserved-names`. Emitting `!include`
+  for a directive named \"include\" would not round-trip: the parser
+  reserves that name, so the line would come back as an ordinary
+  paragraph (or, with a group, as a diagnostic) rather than the directive
+  that was written.
+
+  Kept as a copy rather than read from the parser because no emitter
+  requires `haselnuss.parser` -- the two are pointed at each other in
+  both docstrings instead, and
+  `one-line-directive-round-trip-test` pins the round trip for every name
+  in this set, so a name reserved on one side and not the other fails
+  there rather than silently."
+  #{"include"})
+
+(defn- bang-spellable?
+  "True if Directive `block` can be written in sec5.5's one-line
+  `!name{...}` spelling rather than a `:::` fence -- the AST records no
+  trace of which form its author wrote (TASK-114 deliberately added
+  none), so this emitter picks from the document model alone, and the
+  test is simply whether the one-line form can represent this node
+  losslessly.
+
+  Three things disqualify a directive, each because re-parsing the
+  one-line output would NOT give the same node back:
+
+  - a non-empty `:blocks`, since the one-line form has no body at all;
+  - a `:name` that is blank, or that is not shaped like a directive name
+    (`bang-directive-name-re`) -- `haselnuss.parser` can only ever
+    produce a legal one, but `haselnuss.transform`'s rules build
+    Directives directly and `haselnuss.ast` types `:name` as a plain
+    `:string`, so `\"\"` (the nameless `:::{}` an author can also write)
+    and `\"my directive\"` both reach here;
+  - a reserved `:name` (`bang-directive-reserved-names`).
+
+  Everything else keeps the fence. That is the right fallback, but it is
+  NOT a claim that the fence can always represent what is left: a `:name`
+  the fence header's own grammar cannot spell either -- `\"my directive\"`
+  (two name tokens on re-parse), `\"2fast\"`, `\"a.b\"` -- has no `.hdoc`
+  spelling in either form, and emits a `:::{my directive}` fence that
+  will not re-parse. That hole predates this predicate, since the fence
+  header has always used the same name production, and is left where it
+  is rather than quietly absorbed here."
+  [block]
+  (let [dname (:name block)]
+    (boolean (and (empty? (:blocks block))
+                  (string? dname)
+                  (re-matches bang-directive-name-re dname)
+                  (not (contains? bang-directive-reserved-names dname))))))
+
 (defn- directive-header-text
   "A directive's own `{name #id .class key=val}` header (sec5.5),
   ALWAYS written -- even `{}`, empty, for a nameless attributeless
@@ -1130,9 +1314,11 @@
   `haselnuss.registry`'s own directive rules do, post-resolve, outside
   THE CONTRACT this emitter runs under)."
   [ctx block footnotes]
-  (let [header (directive-header-text (:name block) (:attr block))
-        [body footnotes'] (render-blocks ctx (:blocks block) footnotes)]
-    [(str directive-fence header (when (seq body) (str "\n" body)) "\n" directive-fence) footnotes']))
+  (if (bang-spellable? block)
+    [(str bang-directive-marker (:name block) (attr-group (:attr block))) footnotes]
+    (let [header (directive-header-text (:name block) (:attr block))
+          [body footnotes'] (render-blocks ctx (:blocks block) footnotes)]
+      [(str directive-fence header (when (seq body) (str "\n" body)) "\n" directive-fence) footnotes'])))
 
 (defn- quote-include-path
   "`src` (an Include's own `:src`, sec4.3/TASK-38) quoted (matching
@@ -1525,23 +1711,59 @@
   "`haselnuss.walk/fold`'s own `:visit` for `lossy-role-span-diagnostics`:
   appends one `{:type ::lossy-role-span :t :node-path}` diagnostic per
   node whose `:t` is in `lossy-role-span-types`, naming the node's own
-  type and its `haselnuss.walk/fold`-computed path."
+  type and its `haselnuss.walk/fold`-computed path, and one `{:type
+  ::lossy-sticky-note ...}` per `:sticky-note` (TASK-123).
+
+  A `:sticky-note` is the same KIND of loss for the same reason -- it has
+  no `.hdoc` surface syntax, so it comes back as something else that
+  carries all of its content -- so it is reported through this one path
+  rather than a second reporting shape. Its own type, though, because
+  what it degrades to is a footnote rather than a `:span`, and the two
+  need different things said about them: a footnote takes a number."
   [acc path _ref-kind node]
-  (if (contains? lossy-role-span-types (:t node))
+  (cond
+    (contains? lossy-role-span-types (:t node))
     (conj acc {:type ::lossy-role-span :t (:t node) :path path})
-    acc))
+
+    ;; A `:highlight` is an EXACT round trip except nested inside another
+    ;; one, which `==...==` cannot spell -- see `render-highlight`. Only
+    ;; the inner one is lossy, so this fires on a highlight that has one
+    ;; inside it rather than on every highlight.
+    (and (= :highlight (:t node))
+         (some #(= :highlight (:t %)) (rest (tree-seq coll? seq node))))
+    (conj acc {:type ::lossy-nested-highlight :t :highlight :path path
+               :message (str "one highlight nested inside another has no `==...==` spelling --"
+                             " the inner `==` would close the outer one -- so the inner"
+                             " highlight was written as a `[text]{.highlight}` role span,"
+                             " which re-parses as a span")})
+
+    (= :sticky-note (:t node))
+    (conj acc {:type ::lossy-sticky-note :t :sticky-note :path path
+               ;; The Attr loss is named, not just the footnote number.
+               ;; sec4.3 gives `:note` no `:attr` at all, so a footnote
+               ;; has nowhere to carry one -- and a diagnostic that
+               ;; listed only the number would let an author believe an
+               ;; id survived that did not (found by review).
+               :message (str "a sticky note has no .hdoc syntax of its own, so it was written"
+                             " back as a footnote: every block of its body is preserved, but a"
+                             " footnote carries no Attr, so its id, color= and author= are"
+                             " lost, and it takes a footnote number")})
+
+    :else acc))
 
 (def ^:private lossy-role-span-walker
   "The `haselnuss.walk/fold` walker for `lossy-role-span-diagnostics`:
   every reference kind the schema has (`walk/every-ref-kind`), since a
-  `:strike`/`:small-caps`/`:sub`/`:sup` node could in principle be
-  reached from anywhere an Inline can occur."
+  `:strike`/`:small-caps`/`:sub`/`:sup`/`:sticky-note` node could in
+  principle be reached from anywhere an Inline can occur."
   {:table walk/table :scope walk/every-ref-kind :visit lossy-role-span-visit})
 
 (defn lossy-role-span-diagnostics
-  "Every `:strike`/`:small-caps`/`:sub`/`:sup` node in `document`,
-  reported as `{:type ::lossy-role-span :t node-type :path path}` (AC
-  #7), in document order -- run this BEFORE `emit-document` writes
+  "Every node in `document` this emitter can only write back as
+  something of a different kind, in document order (AC #7; TASK-123):
+  `:strike`/`:small-caps`/`:sub`/`:sup` as `{:type ::lossy-role-span :t
+  node-type :path path}`, and `:sticky-note` as `{:type
+  ::lossy-sticky-note ...}` -- run this BEFORE `emit-document` writes
   `document` out, mirroring `haselnuss.emit.latex/unanchored-reference-
   diagnostics`'s own shape: a separate, pure diagnostics function a
   caller runs alongside emission, not folded into `emit-document`'s own

@@ -3304,3 +3304,449 @@
           "a later call with no :block-handlers opt must not see the earlier call's addition")
       (is (= ::latex/unsupported-block (:type (ex-data thrown))))
       (is (str/includes? (ex-message thrown) ":callout")))))
+
+;; --- Annotations: real PDF annotations (TASK-121, doc-8 sec5) -------------
+
+(defn- annotation-attr
+  [& {:keys [id color author style]}]
+  (cond-> {:classes []
+           :props (cond-> {}
+                    color (assoc "color" color)
+                    author (assoc "author" author)
+                    style (assoc "style" style))}
+    id (assoc :id id)))
+
+(defn- highlight
+  [attr & inlines]
+  {:t :highlight :inlines (vec inlines) :attr attr})
+
+(defn- sticky-note
+  [attr & blocks]
+  {:t :sticky-note :blocks (vec blocks) :attr attr})
+
+(defn- annotated-tex
+  "The emitted `.tex` for a document whose single paragraph is `inlines`."
+  [& inlines]
+  (latex/emit-document {:meta {} :blocks [(apply para inlines)]} {:computed-numbers true}))
+
+(defn- compile-pdf-twice!
+  "Compiles `tex` with TWO pdflatex passes and returns the produced
+  `doc.pdf`, or nil on a failed compile.
+
+  Two passes, not one, and that is the whole reason this helper exists
+  beside `compile-pdf!`: a PDF annotation's `/QuadPoints` -- the boxes
+  that make a highlight follow the line wrap -- are written from
+  positions recorded on the previous run, so a single pass produces a
+  PDF with the annotation objects but not yet the right geometry. The
+  README's own build recipe already runs pdflatex twice (three times
+  with bibtex), so this costs a real build nothing."
+  [tex]
+  (let [dir (Files/createTempDirectory "haselnuss-latex-annot" (make-array FileAttribute 0))
+        tex-file (io/file (str dir) "doc.tex")]
+    (write-test-image! (io/file (str dir) "pic.png"))
+    (spit tex-file tex)
+    (let [run (fn [] (shell/sh "pdflatex" "-interaction=nonstopmode" "-halt-on-error" "doc.tex"
+                               :dir (str dir)))
+          ;; BOTH passes are asserted, not just the first. A first-pass
+          ;; success followed by a silent second-pass failure used to
+          ;; return nil, and both callers guard with `when-let` -- so the
+          ;; only two tests in this suite that read a PDF, which is this
+          ;; task's central claim, would have reported green having
+          ;; asserted nothing at all (found by review).
+          results [(run) (run)]]
+      (doseq [[pass result] (map-indexed vector results)]
+        (is (zero? (:exit result))
+            (str "expected the annotated document to compile on pass " (inc pass)
+                 ", pdflatex output:\n" (:out result) (:err result))))
+      (when (every? (comp zero? :exit) results)
+        (io/file (str dir) "doc.pdf")))))
+
+(defn- pdf-annotation-subtypes
+  "Every `/Subtype` named inside `pdf-file`'s own annotation objects, as
+  a frequency map -- read from the PDF ITSELF rather than from the
+  `.tex`, via `qpdf --qdf --decode-level=all`, which rewrites the file
+  with its object streams expanded and its content uncompressed so the
+  dictionaries are plain text.
+
+  That is the point of this whole test section. The claim TASK-121 makes
+  is that a reader opening the PDF sees a REAL annotation -- an object in
+  the page's own /Annots, clickable, with a popup -- and a `.tex` file
+  containing the right command is not evidence of that."
+  [pdf-file]
+  (let [expanded (io/file (.getParentFile ^java.io.File pdf-file) "expanded.pdf")
+        {:keys [exit]} (shell/sh "qpdf" "--qdf" "--decode-level=all"
+                                 (str pdf-file) (str expanded))]
+    (when (zero? exit)
+      (frequencies (map second (re-seq #"/Subtype\s*/(\w+)" (slurp expanded)))))))
+
+(deftest annotation-preamble-test
+  (testing "AC #1: the preamble gains pdfcomment BEFORE hyperref, plus
+            soul and xcolor. The order is measured, not stylistic:
+            after hyperref it also works but emits `Option 'pdftex' has
+            already been used`; before, the build is warning-clean"
+    (let [preamble (latex/emit-preamble {:meta {} :blocks []})]
+      (doseq [package ["xcolor" "soul" "pdfcomment"]]
+        (is (str/includes? preamble (str "\\usepackage{" package "}")) package))
+      (is (< (str/index-of preamble "\\usepackage{pdfcomment}")
+             (str/index-of preamble "\\usepackage{hyperref}"))
+          "pdfcomment before hyperref")
+      (is (< (str/index-of preamble "\\usepackage{hyperref}")
+             (str/index-of preamble "\\usepackage{cleveref}"))
+          "and hyperref still before cleveref")))
+  (testing "AC #1: a document with no annotation in it still compiles
+            with NO NEW WARNINGS -- the reason the load order is what it
+            is, and the one thing `assert-compiles!` on its own cannot
+            tell you, since pdflatex exits 0 with warnings"
+    (let [[ok? result] (compiles? (latex/emit-document
+                                   {:meta {} :blocks [(para (str-inline "Ordinary prose."))]}
+                                   {:computed-numbers true}))]
+      (is ok? (:out result))
+      (doseq [package ["pdfcomment" "soul" "xcolor"]]
+        (is (not (re-find (re-pattern (str "(?i)warning[^\n]*" package)) (:out result)))
+            (str "no warning mentioning " package)))
+      (is (not (re-find #"Option .pdftex. has already been used" (:out result)))
+          "the exact warning loading pdfcomment AFTER hyperref produces"))))
+
+(deftest highlight-emits-pdfmarkupcomment-test
+  (testing "AC #2: a :highlight emits \\pdfmarkupcomment with
+            markup=Highlight, and -- carrying no note of its own -- an
+            EMPTY comment argument. A highlight with a comment is doc-8's
+            Acrobat shape, a :highlight followed by a :sticky-note, not a
+            comment field on this node"
+    (let [tex (annotated-tex (highlight (annotation-attr) (str-inline "marked")))]
+      (is (str/includes? tex "\\pdfmarkupcomment[markup=Highlight,color=yellow]{marked}{}"))))
+  (testing "AC #10: each recognised color= reaches the command, and an
+            absent one defaults to yellow"
+    (doseq [color ["yellow" "green" "blue" "pink"]]
+      (is (str/includes? (annotated-tex (highlight (annotation-attr :color color)
+                                                   (str-inline "m")))
+                         (str "color=" color)) color))
+    (is (str/includes? (annotated-tex (highlight (annotation-attr) (str-inline "m")))
+                       "color=yellow"))))
+
+(deftest sticky-note-emits-pdfcomment-test
+  (testing "AC #3: a :sticky-note whose body is flat prose emits
+            \\pdfcomment, and author= reaches the annotation"
+    (let [tex (annotated-tex (sticky-note (annotation-attr :author "DM")
+                                          (para (str-inline "A plain comment."))))]
+      (is (str/includes? tex "\\pdfcomment[icon=Note,color=yellow"))
+      (is (str/includes? tex "subject={DM}") "the /Subj a viewer prints as the popup title")
+      (is (str/includes? tex "author={DM}") "and the /T, which is who made it")
+      (is (str/includes? tex "{A plain comment.}"))))
+  (testing "AC #10: colour reaches \\pdfcomment too, defaulting to yellow"
+    (is (str/includes? (annotated-tex (sticky-note (annotation-attr :color "pink")
+                                                   (para (str-inline "x"))))
+                       "color=pink"))))
+
+(deftest annotations-are-real-pdf-objects-test
+  (testing "AC #4: compiling a fixture with pdflatex TWICE produces a PDF
+            whose page carries /Annots with a /Subtype /Highlight and a
+            /Subtype /Text -- asserted against the PDF, not the .tex,
+            because the claim is what a reader opening it sees"
+    (let [tex (latex/emit-document
+               {:meta {}
+                :blocks [(para (str-inline "Hazelnuts ")
+                               (highlight (annotation-attr :color "green" :author "DM")
+                                          (str-inline "ripen in early autumn"))
+                               (str-inline " and drop.")
+                               (sticky-note (annotation-attr :author "DM")
+                                            (para (str-inline "Was this the rerun trial?"))))]}
+               {:computed-numbers true})]
+      (when-let [pdf (compile-pdf-twice! tex)]
+        (let [subtypes (pdf-annotation-subtypes pdf)]
+          (is (some? subtypes) "qpdf should expand the PDF")
+          (is (pos? (get subtypes "Highlight" 0))
+              (str "expected a /Highlight annotation, saw " (pr-str subtypes)))
+          (is (pos? (get subtypes "Text" 0))
+              (str "expected a /Text annotation (the balloon), saw " (pr-str subtypes))))))))
+
+(deftest highlight-protects-fragile-inlines-test
+  (testing "AC #5: a cross-reference, a link and a citation inside a
+            highlight each compile, each wrapped in \\mbox. All three are
+            regression tests, because all three were a FATAL build error
+            without the box -- soul, which \\pdfmarkupcomment marks text
+            with, dies on `Argument of \\@cref has an extra }`"
+    (let [tex (latex/emit-document
+               {:meta {}
+                :blocks [{:t :section :level 1 :heading [(str-inline "Intro")]
+                          :attr {:id "sec:i" :classes [] :props {}}
+                          :blocks [(para (highlight (annotation-attr)
+                                                    (str-inline "see ")
+                                                    {:t :cross-ref :label "sec:i" :target "sec:i"
+                                                     :text "Section 1"}
+                                                    (str-inline " and ")
+                                                    {:t :link :target "http://example.com"
+                                                     :inlines [(str-inline "a link")]
+                                                     :attr empty-attr}
+                                                    (str-inline " and ")
+                                                    {:t :cite :items [{:key "knuth" :mode :normal}]
+                                                     :text [(str-inline "[1]")]}))]}]}
+               {:computed-numbers true})]
+      (is (str/includes? tex "\\mbox{\\hyperref[sec:i]{Section 1}}"))
+      (is (str/includes? tex "\\mbox{\\href{http://example.com}{a link}}"))
+      (is (str/includes? tex "\\mbox{[1]}"))
+      (assert-compiles! tex)))
+  (testing "AC #5: and the same three OUTSIDE a highlight are not boxed
+            -- an \\mbox is unbreakable, so a needless one costs the line
+            breaking around it"
+    (let [tex (latex/emit-document
+               {:meta {}
+                :blocks [{:t :section :level 1 :heading [(str-inline "Intro")]
+                          :attr {:id "sec:i" :classes [] :props {}}
+                          :blocks [(para {:t :cross-ref :label "sec:i" :target "sec:i"
+                                          :text "Section 1"}
+                                         {:t :link :target "http://example.com"
+                                          :inlines [(str-inline "a link")] :attr empty-attr})]}]}
+               {:computed-numbers true})]
+      (is (not (str/includes? tex "\\mbox{")))))
+  (testing "AC #6: a footnote inside a highlight compiles WITHOUT \\mbox
+            and is not wrapped -- measured, so the protection stays as
+            narrow as the hazard"
+    (let [tex (annotated-tex (highlight (annotation-attr)
+                                        (str-inline "marked")
+                                        {:t :note :blocks [(para (str-inline "inner"))]}))]
+      (is (str/includes? tex "\\footnote{inner}"))
+      (is (not (str/includes? tex "\\mbox{\\footnote")))
+      (assert-compiles! tex)))
+  (testing "AC #6, CORRECTED BY MEASUREMENT: inline math inside a
+            highlight IS wrapped, contrary to doc-8 sec5. That spike
+            measured `$x^2$`, which compiles bare; this emitter writes
+            `\\(x^2\\)`, and `\\(` inside soul dies with `Extra }, or
+            forgotten $`. Compiled both ways against this repository's
+            own emitter output before changing it"
+    (let [tex (annotated-tex (highlight (annotation-attr)
+                                        (str-inline "marked ")
+                                        {:t :math-inline :tex "x^2"}))]
+      (is (str/includes? tex "\\mbox{\\(x^2"))
+      (assert-compiles! tex)))
+  (testing "AC #7: a highlight long enough to wrap across a line break
+            still compiles, and still produces the annotation -- with one
+            /Highlight object per line segment, which is what
+            /QuadPoints following the wrap means"
+    (let [long-run (str "a deliberately long marked run of ordinary words that must certainly "
+                        "wrap across at least one line break in an article class at ten point "
+                        "with default margins, with a cross-reference ")
+          tex (latex/emit-document
+               {:meta {}
+                :blocks [{:t :section :level 1 :heading [(str-inline "Intro")]
+                          :attr {:id "sec:i" :classes [] :props {}}
+                          :blocks [(para (highlight (annotation-attr)
+                                                    (str-inline long-run)
+                                                    {:t :cross-ref :label "sec:i" :target "sec:i"
+                                                     :text "Section 1"}
+                                                    (str-inline (str " sitting in the middle of it"
+                                                                     " and a good many more words"
+                                                                     " after that to force the"
+                                                                     " wrap"))))]}]}
+               {:computed-numbers true})]
+      (when-let [pdf (compile-pdf-twice! tex)]
+        (let [subtypes (pdf-annotation-subtypes pdf)]
+          (is (< 1 (get subtypes "Highlight" 0))
+              (str "a wrapped highlight should produce one /Highlight quad per line segment,"
+                   " saw " (pr-str subtypes))))))))
+
+(deftest sticky-note-degrades-to-footnote-test
+  (testing "AC #8: a sticky note whose body carries math, a citation,
+            emphasis or more than one block is emitted as \\footnote and
+            diagnosed, naming what forced it. A PDF annotation body is a
+            plain string -- \\pdfcomment with markup in it produces
+            `Token not allowed in a PDF string`"
+    (doseq [[label blocks expected]
+            [["emphasis" [(para (str-inline "with ")
+                                {:t :emph :inlines [(str-inline "markup")]})] "emph"]
+             ["math" [(para (str-inline "with ") {:t :math-inline :tex "x"})] "math-inline"]
+             ["a citation" [(para {:t :cite :items [{:key "k" :mode :normal}]
+                                   :text [(str-inline "[1]")]})] "cite"]
+             ["two blocks" [(para (str-inline "one")) (para (str-inline "two"))] "2 blocks"]]]
+      (testing label
+        (let [document {:meta {} :blocks [(para (apply sticky-note (annotation-attr) blocks))]}
+              tex (latex/emit-document document {:computed-numbers true})
+              [diagnostic] (latex/annotation-diagnostics document)]
+          (is (str/includes? tex "\\footnote{"))
+          (is (not (str/includes? tex "\\pdfcomment")))
+          (is (= :sticky-note-degraded-to-footnote (:type diagnostic)))
+          (is (str/includes? (:reason diagnostic) expected)
+              (str "the diagnostic should name what forced it: " (pr-str diagnostic)))
+          (is (str/includes? (:message diagnostic) "footnote number")
+              "and state the cost")))))
+  (testing "AC #8: a flat-prose body is NOT diagnosed -- it becomes a
+            real annotation, which is the whole point"
+    (let [document {:meta {} :blocks [(para (sticky-note (annotation-attr)
+                                                         (para (str-inline "Flat prose."))))]}]
+      (is (= [] (latex/annotation-diagnostics document)))))
+  (testing "AC #9: style=footnote forces the footnote form for a body
+            that WOULD have qualified, and is not diagnosed -- that is
+            the author getting exactly what they asked for"
+    (let [document {:meta {}
+                    :blocks [(para (sticky-note (annotation-attr :style "footnote")
+                                                (para (str-inline "Flat prose."))))]}
+          tex (latex/emit-document document {:computed-numbers true})]
+      (is (str/includes? tex "\\footnote{"))
+      (is (not (str/includes? tex "\\pdfcomment")))
+      (is (= [] (latex/annotation-diagnostics document)))))
+  (testing "AC #9: style=annotation on a body that CANNOT be one is
+            diagnosed rather than silently degraded -- the constraint is
+            PDF's and not this emitter's, so it still degrades, but the
+            message says the requested style could not be honoured"
+    (let [document {:meta {}
+                    :blocks [(para (sticky-note (annotation-attr :style "annotation")
+                                                (para (str-inline "one"))
+                                                (para (str-inline "two"))))]}
+          [diagnostic] (latex/annotation-diagnostics document)]
+      (is (= :sticky-note-degraded-to-footnote (:type diagnostic)))
+      (is (= :annotation (:style diagnostic)))
+      (is (str/includes? (:message diagnostic) "asks for style=annotation"))))
+  (testing "a degraded sticky note still compiles"
+    (assert-compiles!
+     (annotated-tex (sticky-note (annotation-attr)
+                                 (para (str-inline "with ")
+                                       {:t :emph :inlines [(str-inline "markup")]}))))))
+
+(deftest every-fragile-inline-is-protected-test
+  (testing "TASK-121 review: the \\mbox set was derived from doc-8's three
+            spiked constructs rather than from this namespace's own
+            inline table, and four more were fatal and unprotected. Each
+            is compiled here individually, which is how they were found:
+            a highlight containing an image, a strikethrough or a
+            subscript wrote a .tex pdflatex refuses, with no diagnostic"
+    (doseq [[label inline]
+            [[":image" {:t :image :src "pic.png" :alt "" :attr empty-attr}]
+             [":strike" {:t :strike :inlines [(str-inline "gone")]}]
+             [":sub" {:t :sub :inlines [(str-inline "n")]}]
+             [":sup" {:t :sup :inlines [(str-inline "n")]}]
+             [":math-inline" {:t :math-inline :tex "x^2"}]
+             [":code" {:t :code :text "f(x)"}]
+             [":small-caps" {:t :small-caps :inlines [(str-inline "sc")]}]
+             [":emph" {:t :emph :inlines [(str-inline "em")]}]
+             [":note" {:t :note :blocks [(para (str-inline "inner"))]}]]]
+      (testing label
+        (assert-compiles!
+         (annotated-tex (highlight (annotation-attr) (str-inline "marked ") inline))))))
+  (testing "and the protection stays as narrow as the hazard: the two
+            that were measured SAFE bare are not boxed"
+    (let [tex (annotated-tex (highlight (annotation-attr)
+                                        {:t :note :blocks [(para (str-inline "inner"))]}
+                                        {:t :small-caps :inlines [(str-inline "sc")]}))]
+      (is (not (str/includes? tex "\\mbox{\\footnote")))
+      (is (not (str/includes? tex "\\mbox{\\textsc")))))
+  (testing "a footnote's own body is typeset outside the marked run
+            entirely, so nothing in it is boxed -- every needless \\mbox
+            is an unbreakable box, measured at three Overfull \\hbox
+            warnings for one long link"
+    (let [tex (annotated-tex (highlight (annotation-attr)
+                                        (str-inline "marked")
+                                        {:t :note
+                                         :blocks [(para {:t :link :target "http://example.com"
+                                                         :inlines [(str-inline "a link")]
+                                                         :attr empty-attr})]}))]
+      (is (str/includes? tex "\\footnote{"))
+      (is (not (str/includes? tex "\\mbox{\\href"))
+          "the link is inside the footnote, not inside the marked run"))))
+
+(deftest annotations-nested-in-a-highlight-degrade-test
+  (testing "TASK-121 review: a :highlight inside a :highlight is soul
+            inside soul -- `Package soul Error: Reconstruction failed`, a
+            dead build that \\mbox does NOT rescue. Reachable from this
+            milestone's own flagship workflow: a base document containing
+            ==ripen== plus an overlay highlight covering a longer run
+            that includes it. The inner one is emitted as its marked text
+            alone, and said so"
+    (let [document {:meta {}
+                    :blocks [(para (highlight (annotation-attr)
+                                              (str-inline "outer ")
+                                              (highlight (annotation-attr :color "green")
+                                                         (str-inline "inner"))
+                                              (str-inline " tail")))]}
+          tex (latex/emit-document document {:computed-numbers true})]
+      (is (= 1 (count (re-seq #"\\pdfmarkupcomment" tex)))
+          "exactly one marked run, not one nested inside another")
+      (is (str/includes? tex "inner") "and the inner text survives")
+      (is (= [:nested-highlight-flattened]
+             (mapv :type (latex/annotation-diagnostics document))))
+      (assert-compiles! tex)))
+  (testing "TASK-121 review: a :sticky-note inside a :highlight compiles
+            but its annotation object never reaches the page's own
+            /Annots -- the balloon silently VANISHES, which is the one
+            failure worse than degrading. It becomes a footnote instead"
+    (let [document {:meta {}
+                    :blocks [(para (highlight (annotation-attr)
+                                              (str-inline "marked ")
+                                              (sticky-note (annotation-attr)
+                                                           (para (str-inline "Flat prose.")))))]}
+          tex (latex/emit-document document {:computed-numbers true})
+          [diagnostic] (latex/annotation-diagnostics document)]
+      (is (str/includes? tex "\\footnote{"))
+      (is (not (str/includes? tex "\\pdfcomment")))
+      (is (= :sticky-note-degraded-to-footnote (:type diagnostic)))
+      (is (str/includes? (:message diagnostic) "inside a highlight"))
+      (assert-compiles! tex)))
+  (testing "and a sticky note OUTSIDE any highlight is still a real
+            annotation -- the degradation is scoped to the hazard"
+    (is (str/includes? (annotated-tex (sticky-note (annotation-attr)
+                                                   (para (str-inline "Flat prose."))))
+                       "\\pdfcomment"))))
+
+(deftest annotation-body-with-a-blank-line-degrades-test
+  (testing "TASK-121 review: `flat-prose-blocks` vetted node TYPES, not
+            text -- and a :str containing a blank line is fatal inside
+            \\pdfcomment (`Paragraph ended before
+            \\HyPsd@@ProtectSpacesFi was complete`). Nothing in the parser
+            produces one, but JSON and a transform rule both can"
+    (let [document {:meta {}
+                    :blocks [(para (sticky-note (annotation-attr)
+                                                (para (str-inline "line one\n\nline two"))))]}
+          tex (latex/emit-document document {:computed-numbers true})
+          [diagnostic] (latex/annotation-diagnostics document)]
+      (is (str/includes? tex "\\footnote{"))
+      (is (not (str/includes? tex "\\pdfcomment")))
+      (is (str/includes? (:reason diagnostic) "blank line"))
+      (assert-compiles! tex)))
+  (testing "and the characters that ARE safe in a PDF string stay a real
+            annotation -- TeX specials, non-ASCII and a long body were
+            each measured"
+    (doseq [[label text] [["tex specials" "100% of {a} \\ b # c & d $ e _ f ^ g ~ h"]
+                          ["non-ascii" "Haselnusse reifen im fruhen Herbst -- éção"]
+                          ["a long body" (apply str (repeat 200 "word "))]]]
+      (testing label
+        (let [document {:meta {}
+                        :blocks [(para (sticky-note (annotation-attr)
+                                                    (para (str-inline text))))]}]
+          (is (str/includes? (latex/emit-document document {:computed-numbers true})
+                             "\\pdfcomment"))
+          (is (= [] (latex/annotation-diagnostics document))))))))
+
+(deftest annotated-heading-does-not-corrupt-the-pdf-outline-test
+  (testing "TASK-119 review: hyperref reuses a sectioning argument
+            verbatim as the PDF outline entry, which is a plain STRING --
+            so an annotated heading wrote its own command options into
+            the bookmark and produced two `Token not allowed in a PDF
+            string` warnings, silently. Reachable from an ordinary
+            overlay, since target= names a Section and its heading is
+            inside the quote search scope"
+    (let [document {:meta {}
+                    :blocks [{:t :section :level 1
+                              :heading [(highlight (annotation-attr) (str-inline "Introduction"))]
+                              :attr {:id "sec:i" :classes [] :props {}}
+                              :blocks [(para (str-inline "Body."))]}]}
+          tex (latex/emit-document document {:computed-numbers true})]
+      (is (str/includes? tex "\\texorpdfstring{")
+          "hyperref's own answer: typeset one thing, bookmark another")
+      (is (str/includes? tex "}{Introduction}")
+          "and the bookmark gets the heading's plain words")
+      (is (str/includes? tex "\\pdfmarkupcomment")
+          "while the annotation still renders on the page")
+      (let [[ok? result] (compiles? tex)]
+        (is ok? (:out result))
+        (is (not (re-find #"Token not allowed in a PDF string" (:out result)))
+            "and hyperref has nothing to complain about"))))
+  (testing "a heading with no annotation is NOT wrapped -- an
+            unconditional \\texorpdfstring would be noise in every
+            document that has none"
+    (is (not (str/includes?
+              (latex/emit-document
+               {:meta {} :blocks [{:t :section :level 1
+                                   :heading [(str-inline "Introduction")]
+                                   :attr {:id "sec:i" :classes [] :props {}}
+                                   :blocks []}]}
+               {:computed-numbers true})
+              "\\texorpdfstring")))))

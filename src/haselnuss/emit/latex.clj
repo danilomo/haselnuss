@@ -485,7 +485,8 @@
   (:require [clojure.string :as str]
             [haselnuss.extensions.derived-lists :as derived-lists]
             [haselnuss.extensions.front-matter :as front-matter]
-            [haselnuss.registry :as registry]))
+            [haselnuss.registry :as registry]
+            [haselnuss.select :as select]))
 
 (def ^:private combining-cluster-re
   "A base character followed by one or more combining marks -- the only
@@ -840,6 +841,221 @@
   [ctx inline open close]
   (str open (render-inlines ctx (:inlines inline)) close))
 
+;; --- Annotations: :highlight and :sticky-note (TASK-121, doc-8 sec5) -------
+;;
+;; The claim these render is strong: a reader opening the PDF sees a REAL
+;; annotation -- an object in the page's own /Annots, clickable, with a
+;; popup that opens and dismisses -- not ink drawn on the page. That comes
+;; from `pdfcomment` (see `preamble` for the load order, which is
+;; measured), and it costs two pdflatex runs for the annotation quads to
+;; settle, which the README's own build recipe already does.
+;;
+;; TWO CONSTRAINTS, BOTH FATAL IF IGNORED, both found by spiking against
+;; this repository's own preamble and TeX Live 2023 before doc-8 was
+;; written:
+;;
+;; 1. `soul`, which `\pdfmarkupcomment` marks text with, is fragile
+;;    inside the marked run. An unprotected `\Cref`, `\href`, `\citep`
+;;    or `\(...\)` in there is a FATAL build error (`Argument of
+;;    \@cref has an extra }`; `Extra }, or forgotten $` for the math),
+;;    and an `\mbox` around each fixes all four -- including a highlight
+;;    that wraps across a line break with a cross-reference in the middle
+;;    of it. A `\footnote` needs no protection and gets none. Each of
+;;    those was compiled individually against a real pdflatex; see
+;;    `highlight-protected-types`, including where the measurement
+;;    corrects doc-8.
+;; 2. A PDF annotation body is a plain STRING. `\pdfcomment{...}` with
+;;    LaTeX markup in it produces `Token not allowed in a PDF string`. A
+;;    sticky note whose body is more than flat prose therefore cannot BE
+;;    a PDF annotation, and is emitted as an ordinary `\footnote`
+;;    instead with a `:sticky-note-degraded-to-footnote` diagnostic
+;;    naming what forced it. Nothing is lost, the note stays attached at
+;;    the right point, and the cost is a footnote number, which the
+;;    diagnostic states.
+;;
+;; That is SPEC sec4.5's own Fallback philosophy applied to a node rather
+;; than to a directive: the richest representation the target supports, a
+;; defined degradation below it, and a diagnostic at the boundary.
+
+(def annotation-colors
+  "The `color=` values an annotation recognizes (doc-8 sec2), each also a
+  colour name `xcolor` defines, so the value reaches both
+  `\\pdfmarkupcomment` and `\\pdfcomment` unchanged. Public so
+  `haselnuss.cross-format-test` can pin it equal to the resolver's own
+  and to the HTML emitter's -- one vocabulary, three namespaces."
+  #{"yellow" "green" "blue" "pink"})
+
+(def ^:private default-annotation-color
+  "The colour an annotation with no `color=` prop gets, and the fallback
+  for one outside `annotation-colors` -- mirroring
+  `haselnuss.emit.html/default-annotation-color`, and for the same
+  reason: an authored value is diagnosed where it is written (TASK-119),
+  and a Document reaching an emitter may equally have come from JSON or a
+  transform rule. A colour xcolor does not define would be a build
+  error, which is a worse answer than a yellow highlight."
+  "yellow")
+
+(defn- annotation-color
+  [attr]
+  (let [authored (get-in attr [:props "color"])]
+    (if (contains? annotation-colors authored) authored default-annotation-color)))
+
+(defn- annotation-options
+  "The bracketed option list shared by both commands: `color=`, plus --
+  when the annotation names an `author=` -- BOTH pdfcomment's own
+  `author` (the PDF `/T`, which is who made the annotation) and
+  `subject` (the `/Subj` a viewer prints as the popup's title line). Both
+  rather than one: doc-8 sec2 specifies `/T`, this task's AC #3 specifies
+  the subject, and a review annotation genuinely wants the reviewer's
+  name visible whichever field the reader's viewer chooses to show.
+
+  `extra` is prepended for the option only one command takes
+  (`markup=Highlight`, `icon=Note`)."
+  [attr extra]
+  (let [author (get-in attr [:props "author"])]
+    (str "[" extra "color=" (annotation-color attr)
+         (when-not (str/blank? author)
+           (str ",author={" (escape-tex author) "},subject={" (escape-tex author) "}"))
+         "]")))
+
+(def ^:private highlight-protected-types
+  "The Inline types that are a FATAL build error inside a
+  `\\pdfmarkupcomment`'s marked run unless wrapped in `\\mbox`, each
+  measured individually against a real pdflatex (see this section's own
+  comment). A cross-reference (`\\Cref`/`\\hyperref`), a link
+  (`\\href`) and a citation (`\\citep`) each die with `Argument of
+  ... has an extra }`.
+
+  `:math-inline` IS in this set, and that is a correction to doc-8 sec5
+  rather than an oversight. That spike measured `$x^2$`, which compiles
+  bare; this emitter does not write `$...$`, it writes `\\(x^2\\)`,
+  and `\\(` inside soul dies with `Extra }, or forgotten $`. Measured
+  both ways against this repository's own emitter output: bare
+  `\\(...\\)` fails, `\\mbox{\\(...\\)}` compiles. A fatal build
+  error is not worth preserving for the sake of a claim measured on a
+  different spelling of the same construct.
+
+  `:image`, `:strike` and `:sub` are here for the same reason and were
+  found the same way, by compiling every entry of `built-in-inline-
+  handlers` inside a marked run rather than only doc-8's three spiked
+  constructs: `Argument of \\Gin@ii`, `Argument of \\UL@on` and
+  `Argument of \\textsubscript` respectively, each fixed by `\\mbox`.
+  `:sup` was measured SAFE in the same position and is protected anyway
+  -- it is `\\textsubscript`'s own twin, one construct with one
+  implementation, and an unbreakable box around a superscript costs
+  nothing since a superscript never breaks.
+
+  `:note` is deliberately ABSENT: a `\\footnote` inside a marked run was
+  measured too, and it compiles unprotected, so wrapping it would be
+  superstition -- and an `\\mbox` is unbreakable, so every needless one
+  costs the line breaking that `pdfmarkupcomment`'s own `/QuadPoints`
+  are there to follow. `:highlight` and `:sticky-note` are absent for a
+  different reason entirely: `\\mbox` does not save either, so neither
+  is emitted inside a highlight at all -- see `render-highlight`."
+  #{:cross-ref :link :cite :math-inline :image :strike :sub :sup})
+
+(defn- highlight-protected
+  "`rendered` wrapped in `\\mbox{...}` when `ctx` is inside a
+  `:highlight` and `inline` is one of `highlight-protected-types`, else
+  `rendered` unchanged.
+
+  `soul` is what makes this necessary, and it is necessary only there --
+  the same `\\Cref` outside a highlight must NOT be boxed, since an
+  `\\mbox` is unbreakable and would stop the line breaking around it."
+  [ctx inline rendered]
+  (if (and (:in-highlight? ctx) (contains? highlight-protected-types (:t inline)))
+    (str "\\mbox{" rendered "}")
+    rendered))
+
+(defn- render-highlight
+  "Renders a `:highlight` as `\\pdfmarkupcomment[markup=Highlight,...]{marked}{}`
+  -- a genuine PDF `/Highlight` annotation, with `/QuadPoints` following
+  the line wrap and `/F 4` so it PRINTS.
+
+  The second argument is the annotation's own comment, and it is always
+  empty here: a highlight carrying a note is doc-8's Acrobat shape, a
+  `:highlight` immediately FOLLOWED BY a `:sticky-note` (which becomes
+  its own annotation), rather than a third node type with a comment field
+  on it. An empty comment argument is legal, so an uncommented highlight
+  is the same command.
+
+  `:in-highlight?` is set on `ctx` for the marked run alone, which is what
+  `highlight-protected` reads -- and what makes an annotation NESTED
+  inside this one degrade rather than break the build. A second
+  `\\pdfmarkupcomment` inside a marked run is soul inside soul, which
+  dies with `Package soul Error: Reconstruction failed` and which
+  `\\mbox` does NOT rescue, so an inner `:highlight` renders as its own
+  marked text alone; a `:sticky-note` inside one compiles but its
+  annotation object is silently dropped from the page's `/Annots`, so it
+  degrades to a `\\footnote` instead. Both are reported by
+  `annotation-diagnostics` -- neither is silent."
+  [ctx inline]
+  (if (:in-highlight? ctx)
+    (render-inlines ctx (:inlines inline))
+    (str "\\pdfmarkupcomment" (annotation-options (:attr inline) "markup=Highlight,")
+         "{" (render-inlines (assoc ctx :in-highlight? true) (:inlines inline)) "}{}")))
+
+(defn- flat-prose-blocks
+  "The single paragraph's worth of plain text `blocks` holds, or nil when
+  it holds anything else.
+
+  \"Anything else\" is the whole of constraint 2 above: a PDF annotation
+  body is a plain string, so a body is only representable as one when it
+  is exactly one `:para` whose Inlines are all text or whitespace. Two
+  paragraphs, emphasis, math, a citation, a link, a nested footnote --
+  each is markup a PDF string cannot hold, and each sends the note down
+  the `\\footnote` path instead."
+  [blocks]
+  (when (and (= 1 (count blocks)) (= :para (:t (first blocks))))
+    (let [inlines (:inlines (first blocks))]
+      (when (every? #(contains? #{:str :space :soft-break :line-break} (:t %)) inlines)
+        (let [text (str/join (map (fn [inline]
+                                    (if (= :str (:t inline)) (:text inline) " "))
+                                  inlines))]
+          ;; Vetting the TYPES is not enough: a `:str` may itself contain
+          ;; a blank line (nothing in the parser produces one, but JSON
+          ;; and a transform rule both can), and a blank line inside
+          ;; `\\pdfcomment` ends the paragraph mid-argument --
+          ;; `Paragraph ended before \\HyPsd@@ProtectSpacesFi was
+          ;; complete`, fatal. Everything else measured safe, including
+          ;; `% \\ { } # & $ _ ^ ~`, a 2 kB body and non-ASCII.
+          (when-not (re-find #"\n[ \t]*\n" text) text))))))
+
+(defn- sticky-note-style
+  "The `style=` an annotation asks for -- `:annotation`, `:footnote`, or
+  nil for neither/unrecognised, in which case the body decides."
+  [attr]
+  (case (get-in attr [:props "style"])
+    "annotation" :annotation
+    "footnote" :footnote
+    nil))
+
+(defn- render-sticky-note
+  "Renders a `:sticky-note` as `\\pdfcomment[icon=Note,...]{...}` -- a
+  genuine PDF `/Subtype /Text` annotation, the clickable balloon -- when
+  its body is flat prose, and as an ordinary `\\footnote{...}` when it is
+  not (see this section's own comment for why, and
+  `annotation-diagnostics` for the report).
+
+  `style=footnote` forces the footnote form for a body that would have
+  qualified; `style=annotation` cannot force the reverse, since the
+  constraint is PDF's and not this emitter's -- such a body still
+  degrades, and `annotation-diagnostics` says the requested style could
+  not be honoured rather than letting it look like an ordinary
+  degradation."
+  [ctx inline]
+  (let [text (flat-prose-blocks (:blocks inline))
+        forced (sticky-note-style (:attr inline))]
+    ;; Inside a highlight the annotation form is not available at all:
+    ;; `\\pdfcomment` there compiles but its annotation object never
+    ;; reaches the page's own /Annots -- the balloon simply vanishes,
+    ;; which is the one failure mode worse than degrading. A footnote in
+    ;; a marked run is measured safe, so that is what it becomes.
+    (if (and text (not= :footnote forced) (not (:in-highlight? ctx)))
+      (str "\\pdfcomment" (annotation-options (:attr inline) "icon=Note,")
+           "{" (escape-tex text) "}")
+      (str "\\footnote{" (render-blocks ctx (:blocks inline)) "}"))))
+
 (def ^:private percentage-re
   "A sizing value written as a percentage, with the number captured --
   shared by an image's own `width`/`height`/`scale` (`image-size`) and a
@@ -1190,10 +1406,13 @@
    ;; `ulem`'s `\sout` is the standard choice, mirroring
    ;; `haselnuss.emit.html`'s own `<s>` -- presentational, not `<del>`'s
    ;; "this was deleted" edit semantics).
-   :strike (fn [ctx inline] (render-wrapped ctx inline "\\sout{" "}"))
+   :strike (fn [ctx inline]
+             (highlight-protected ctx inline (render-wrapped ctx inline "\\sout{" "}")))
    :small-caps (fn [ctx inline] (render-wrapped ctx inline "\\textsc{" "}"))
-   :sub (fn [ctx inline] (render-wrapped ctx inline "\\textsubscript{" "}"))
-   :sup (fn [ctx inline] (render-wrapped ctx inline "\\textsuperscript{" "}"))
+   :sub (fn [ctx inline]
+          (highlight-protected ctx inline (render-wrapped ctx inline "\\textsubscript{" "}")))
+   :sup (fn [ctx inline]
+          (highlight-protected ctx inline (render-wrapped ctx inline "\\textsuperscript{" "}")))
    :code (fn [_ctx inline] (str "\\texttt{" (escape-tex (:text inline)) "}"))
    ;; Link :target passed through `latex-safe-url`, not `escape-tex` --
    ;; see namespace docstring for why (hyperref's own URL-argument
@@ -1201,18 +1420,28 @@
    ;; that escape-tex actively breaks it) and `latex-safe-url`'s own
    ;; docstring for the two characters it does rewrite (TASK-78).
    :link (fn [ctx inline]
-           (render-wrapped ctx inline (str "\\href{" (latex-safe-url (:target inline)) "}{") "}"))
+           (highlight-protected
+            ctx inline
+            (render-wrapped ctx inline
+                            (str "\\href{" (latex-safe-url (:target inline)) "}{") "}")))
    ;; Image :src likewise passed through verbatim -- see namespace
    ;; docstring (graphicx's own filename-argument handling already
    ;; tolerates a raw underscore etc; no AC requires rendering :alt,
    ;; which LaTeX has no visual equivalent for).
-   :image (fn [_ctx inline] (render-image inline))
+   :image (fn [ctx inline] (highlight-protected ctx inline (render-image inline)))
    :span (fn [ctx inline] (render-wrapped ctx inline "" ""))
    ;; A footnote marker is its own definition's Blocks, sec4.4 -- LaTeX's
    ;; own \footnote is self-numbering/self-placing, so (unlike
    ;; haselnuss.emit.html) no footnotes accumulator is threaded anywhere
    ;; in this namespace at all (AC #4, see namespace docstring).
-   :note (fn [ctx inline] (str "\\footnote{" (render-blocks ctx (:blocks inline)) "}"))
+   ;; `:in-highlight?` is CLEARED for the body: a footnote's content is
+   ;; typeset at the bottom of the page, outside the soul-marked run
+   ;; entirely, so nothing in it needs protecting -- and every needless
+   ;; `\\mbox` in there is an unbreakable box, measured at three
+   ;; `Overfull \\hbox` warnings for one long `\\href`.
+   :note (fn [ctx inline]
+           (str "\\footnote{"
+                (render-blocks (dissoc ctx :in-highlight?) (:blocks inline)) "}"))
    ;; Raw :tex passed through completely verbatim (AC #3) -- this is
    ;; already TeX, not authored prose, so escape-tex must never run over
    ;; it (see namespace docstring). The closing delimiter sits on its own
@@ -1220,10 +1449,18 @@
    ;; #4, this task's own fatal bug): an un-escaped, entirely plausible
    ;; `%` in :tex would otherwise TeX-comment out the emitter's own
    ;; closing "\)" along with the rest of that line.
-   :math-inline (fn [_ctx inline] (str "\\(" (:tex inline) "\n\\)"))
+   :math-inline (fn [ctx inline]
+                  (highlight-protected ctx inline (str "\\(" (:tex inline) "\n\\)")))
+   ;; TASK-121 (doc-8 sec5): real PDF annotations, not ink on the page.
+   ;; See that section's own comment for the two measured constraints.
+   :highlight render-highlight
+   :sticky-note render-sticky-note
    ;; TASK-23: both mode-dependent -- see each function's own docstring.
-   :cross-ref render-cross-ref
-   :cite render-cite})
+   ;; Both are `highlight-protected`, as `:link` above is: inside a
+   ;; `\pdfmarkupcomment`'s soul-marked run all three are a FATAL build
+   ;; error unwrapped, and an `\mbox` around each fixes all three.
+   :cross-ref (fn [ctx inline] (highlight-protected ctx inline (render-cross-ref ctx inline)))
+   :cite (fn [ctx inline] (highlight-protected ctx inline (render-cite ctx inline)))})
 
 (defn- unsupported-inline!
   "The declared default `render-inline` dispatches an unrecognized Inline
@@ -2102,6 +2339,130 @@
                                            " --computed-numbers, or use a directive with a"
                                            " mapped environment")})))))
           nodes)))
+
+(defn- sticky-note-degradation-reason
+  "Why `sticky-note`'s body cannot be a PDF annotation body, as a phrase
+  for the diagnostic, or nil when it can be one.
+
+  Names the actual obstacle rather than saying \"not flat prose\": an
+  author who gets \"it holds inline math\" knows what to change, and one
+  who gets \"more than one block\" knows to join the paragraphs."
+  [sticky-note]
+  (let [blocks (:blocks sticky-note)]
+    ;; The VERDICT is `flat-prose-blocks`, the same function
+    ;; `render-sticky-note` decides with, so the two can never disagree
+    ;; about whether a body degrades. Everything below only says WHY.
+    (when-not (flat-prose-blocks blocks)
+      (cond
+        (empty? blocks) "it has no body at all"
+        (< 1 (count blocks)) (str "its body is " (count blocks) " blocks, and a PDF"
+                                  " annotation body is one plain string")
+        (not= :para (:t (first blocks))) (str "its body is a " (name (:t (first blocks)))
+                                              " rather than a paragraph")
+        :else
+        (if-let [markup (->> (:inlines (first blocks))
+                             (remove #(contains? #{:str :space :soft-break :line-break} (:t %)))
+                             (map :t)
+                             distinct
+                             seq)]
+          (str "its body holds " (str/join ", " (map name markup))
+               ", and a PDF annotation body is a plain string")
+          "its body text contains a blank line, which ends the PDF string mid-argument")))))
+
+(defn- annotations-inside
+  "Every `:highlight`/`:sticky-note` reachable from `highlight`'s own
+  marked run -- the annotations that cannot be emitted as PDF
+  annotations because they sit inside a soul-marked one."
+  [highlight]
+  (filter #(contains? #{:highlight :sticky-note} (:t %))
+          (mapcat ast-nodes (:inlines highlight))))
+
+(defn- nested-annotation-diagnostics
+  "One diagnostic per annotation nested INSIDE a `:highlight`'s own
+  marked run (TASK-121, found by review).
+
+  Neither can be a PDF annotation there, and neither failure is one an
+  `\\mbox` rescues. A second `\\pdfmarkupcomment` is soul inside soul --
+  `Package soul Error: Reconstruction failed`, a dead build -- so an
+  inner highlight is emitted as its marked text alone. A `\\pdfcomment`
+  compiles but its annotation object never reaches the page's own
+  `/Annots`, so the balloon simply vanishes; it degrades to a
+  `\\footnote`, which is measured safe in a marked run.
+
+  Both are reachable from m-14's own flagship workflow -- a base
+  document containing `==ripen==` plus an overlay highlight covering a
+  longer run that includes it -- so neither is hypothetical, and neither
+  is silent."
+  [document]
+  (into []
+        (comp (filter #(= :highlight (:t %)))
+              (mapcat (fn [highlight]
+                        (map (fn [nested]
+                               (if (= :highlight (:t nested))
+                                 {:type :nested-highlight-flattened
+                                  :message (str "a highlight inside another highlight cannot be"
+                                                " a second PDF annotation -- LaTeX's own text"
+                                                " marking cannot nest -- so the inner one was"
+                                                " emitted as ordinary text inside the outer"
+                                                " highlight")}
+                                 {:type :sticky-note-degraded-to-footnote
+                                  :reason "it sits inside a highlight, where a PDF annotation"
+                                  :style (sticky-note-style (:attr nested))
+                                  :message (str "this sticky note sits inside a highlight, where"
+                                                " a PDF annotation object never reaches the page"
+                                                " -- it was emitted as a footnote instead, which"
+                                                " takes a footnote number")}))
+                             (annotations-inside highlight)))))
+        (ast-nodes document)))
+
+(defn annotation-diagnostics
+  "One diagnostic per `:sticky-note` in `document` (a LOWERED Document)
+  that this emitter cannot render as a real PDF annotation, in document
+  order (TASK-121).
+
+  A PDF annotation body is a plain STRING -- `\\pdfcomment{...}` with
+  LaTeX markup in it produces `Token not allowed in a PDF string` -- so a
+  sticky note whose body carries math, a citation, emphasis or more than
+  one block is emitted as an ordinary `\\footnote` instead. That is the
+  right degradation rather than a compromise: nothing is lost, the note
+  stays attached at the right point, and the cost is a footnote number.
+  But it is never silent, which is what this function is for.
+
+  Two shapes, because the author can also have asked for a form they
+  cannot have:
+
+  - the body simply is not representable, and degraded (the common case);
+  - `style=annotation` asked for the annotation form for a body that
+    cannot be one. It still degrades -- the constraint is PDF's, not this
+    emitter's -- and the message says the requested style could not be
+    honoured, so it does not read as an ordinary degradation the author
+    never asked about.
+
+  `style=footnote` forcing the footnote form for a body that WOULD have
+  qualified is not diagnosed at all: that is the author getting exactly
+  what they asked for.
+
+  Reported the same way `unanchored-reference-diagnostics` is -- a
+  separate, pure function a caller runs alongside emission, so
+  `emit-document` stays a bare string like every other emitter's."
+  [document]
+  (into (nested-annotation-diagnostics document)
+        (comp (filter #(= :sticky-note (:t %)))
+              (keep (fn [sticky-note]
+                      (when-let [reason (sticky-note-degradation-reason sticky-note)]
+                        (let [forced (sticky-note-style (:attr sticky-note))]
+                          {:type :sticky-note-degraded-to-footnote
+                           :reason reason
+                           :style forced
+                           :message
+                           (if (= :annotation forced)
+                             (str "this sticky note asks for style=annotation, but "
+                                  reason " -- it was emitted as a footnote instead,"
+                                  " which takes a footnote number")
+                             (str "this sticky note was emitted as a footnote rather than"
+                                  " a PDF annotation because " reason
+                                  " -- it takes a footnote number as a result"))})))))
+        (ast-nodes document)))
 
 (defn- image-path-hazards
   "What, if anything, `src` carries that `\\includegraphics` cannot: a
@@ -3438,6 +3799,39 @@
        " :load option -- haselnuss.cli always supplies one, so this AST did not"
        " come through it)"))
 
+(defn- annotated-heading?
+  "Whether `heading` (a Section's own Inlines) holds an annotation
+  anywhere inside it."
+  [heading]
+  (boolean (some (fn [node]
+                   (and (map? node) (contains? #{:highlight :sticky-note} (:t node))))
+                 (tree-seq coll? seq heading))))
+
+(defn- render-heading
+  "A Section's heading rendered for a sectioning command's own argument.
+
+  Ordinarily that is just `render-inlines`. A heading holding an
+  ANNOTATION is wrapped in hyperref's `\\texorpdfstring`, and the
+  difference matters: hyperref reuses a sectioning argument verbatim as
+  the PDF outline entry, which is a plain STRING, so an annotated heading
+  wrote its own command options into the bookmark --
+  `\\BOOKMARK ... {[markup=Highlight,color=yellow]Introduction}` -- plus
+  two `Token not allowed in a PDF string` warnings, silently (found by
+  review, and reachable from an ordinary overlay: `target=` names a
+  Section and its heading is inside the search scope).
+
+  `\\texorpdfstring` is hyperref's own answer to exactly this: the first
+  argument is typeset, the second becomes the PDF string. So the
+  annotation still renders on the page and the outline gets the heading's
+  plain words. Only when there IS one, since an unconditional wrapper
+  would be noise in every document that has none."
+  [ctx heading]
+  (let [rendered (render-inlines ctx heading)]
+    (if (annotated-heading? heading)
+      (str "\\texorpdfstring{" rendered "}{"
+           (escape-tex (select/flatten-text {:t :para :inlines (vec heading)})) "}")
+      rendered)))
+
 (defn- render-section
   "Renders Section `block`, or, when it is the generated bibliography
   Section in native mode, `bibliography-block` instead (AC #2)."
@@ -3464,7 +3858,7 @@
     (str "\\" (section-command ctx (:level block))
          (when (or (:computed-numbers ctx) (:unnumbered ctx)) "*")
          "{" (section-number-prefix ctx (:attr block))
-         (render-inlines ctx (:heading block)) "}"
+         (render-heading ctx (:heading block)) "}"
          (unnumbered-label ctx (:attr block)) "\n"
          (render-blocks ctx (:blocks block)))))
 
@@ -3928,6 +4322,22 @@
          "\\usepackage{caption}\n"
          "\\usepackage[" natbib-options "]{natbib}\n"
          (apply str (map (fn [p] (str "\\usepackage{" p "}\n")) packages))
+         ;; TASK-121 (doc-8 sec5). `pdfcomment` is what turns a
+         ;; `:highlight`/`:sticky-note` into a REAL PDF annotation -- an
+         ;; object in the page's own /Annots, clickable and dismissible
+         ;; in Foxit or Acrobat -- rather than ink drawn on the page.
+         ;; `soul` is what it marks text with and `xcolor` supplies the
+         ;; colour names; both are loaded explicitly rather than left to
+         ;; pdfcomment's own dependencies, so the preamble states what it
+         ;; relies on.
+         ;;
+         ;; LOAD ORDER IS MEASURED, NOT GUESSED: pdfcomment goes BEFORE
+         ;; hyperref (which stays before cleveref). After hyperref it
+         ;; also works, but emits `Option 'pdftex' has already been
+         ;; used`; before, the build is warning-clean.
+         "\\usepackage{xcolor}\n"
+         "\\usepackage{soul}\n"
+         "\\usepackage{pdfcomment}\n"
          "\\usepackage{hyperref}\n"
          "\\usepackage{cleveref}\n"
          (when (some :counter specs)
