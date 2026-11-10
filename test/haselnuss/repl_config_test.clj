@@ -1,4 +1,4 @@
-(ns haselnuss.repl-config-test
+(ns ^:parallel haselnuss.repl-config-test
   "Fixtures for the pinned agent-facing nREPL (TASK-45).
 
   This namespace exists because the code it covers lives in `project.clj`

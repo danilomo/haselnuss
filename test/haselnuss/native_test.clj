@@ -156,3 +156,68 @@
                     jvm (run-jar (str (io/file dir "no-such-file.hdoc")))]
                 (is (= (:exit jvm) (:exit native)))
                 (is (= (:err jvm) (:err native)))))))))))
+
+(defn- library-fixture-dir!
+  "A fresh temp directory holding a filesystem library `lib` (two books,
+  one with a bibliography of its own) under `lib/`, a `libraries.yaml`
+  naming it with a URL template, and a `host.hdoc` that links to and
+  quotes it (TASK-157)."
+  []
+  (let [dir (str (Files/createTempDirectory "haselnuss-native-libraries"
+                                            (make-array FileAttribute 0)))]
+    (.mkdirs (io/file dir "lib" "creeds"))
+    (spit (io/file dir "lib" "creeds" "nicene.hdoc")
+          (str "---\ntitle: Nicene Creed\nbibliography: refs.json\n---\n\n"
+               "# The Creed {#sec:creed}\n\nWe believe, as [@knuth1984] did.\n"))
+    (spit (io/file dir "lib" "creeds" "refs.json") bibliography)
+    (spit (io/file dir "lib" "apostles.hdoc") "---\ntitle: Apostles' Creed\n---\n\nI believe.\n")
+    (spit (io/file dir "libraries.yaml")
+          (str "- name: lib\n  type: filesystem\n  path: lib\n"
+               "  url: \"https://lib.example/{slug}.html#{label}\"\n"))
+    (spit (io/file dir "host.hdoc")
+          "# Host\n\nSee @{lib:nicene#sec:creed}.\n\n!quote lib:nicene#sec:creed\n")
+    dir))
+
+(deftest native-libraries-test
+  (if-not (binary-present?)
+    (testing "no native binary built -- skipping (see this namespace's docstring)"
+      (is true "native-image is opt-in; absence of a binary is not a failure"))
+    (let [dir (library-fixture-dir!)
+          yaml (str (io/file dir "libraries.yaml"))
+          host (str (io/file dir "host.hdoc"))]
+      (testing "TASK-157: --libraries reaches the library namespaces, which the
+                CLI never loaded before -- a missing reflect-config entry
+                shows up here and nowhere else"
+        (let [{:keys [exit out err]} (run-binary "--libraries" yaml host "-o" "-")]
+          (is (= 0 exit) err)
+          (is (str/includes? out "We believe") "the quote expanded")
+          (is (str/includes? out "https://lib.example/nicene.html#sec:creed") "the URL template")
+          (is (str/includes? out "Nicene Creed, Section 1") "the link text")))
+      (testing "--list-books"
+        (let [{:keys [exit out err]} (run-binary "--libraries" yaml "--list-books" "lib")]
+          (is (= 0 exit) err)
+          (is (= "lib:apostles\tApostles' Creed\nlib:creeds/nicene\tNicene Creed\n" out))))
+      (testing "a book ID as input, written into the working directory"
+        (let [{:keys [exit err]} (shell/sh (.getAbsolutePath (io/file binary-path))
+                                           "--libraries" yaml "lib:nicene" "--target" "latex"
+                                           :dir dir)]
+          (is (= 0 exit) err)
+          (is (.isFile (io/file dir "nicene.tex"))))
+        (testing "and never over a file already there unless --output names it"
+          (let [before (slurp (io/file dir "nicene.tex"))
+                {:keys [exit err]} (shell/sh (.getAbsolutePath (io/file binary-path))
+                                             "--libraries" yaml "lib:nicene" "--target" "latex"
+                                             :dir dir)]
+            (is (= 1 exit))
+            (is (str/includes? err "refusing to overwrite nicene.tex") err)
+            (is (= before (slurp (io/file dir "nicene.tex")))))))
+      (when (jar-present?)
+        (testing "and the binary agrees with the jar, byte for byte"
+          (doseq [args [["--libraries" yaml host "-o" "-"]
+                        ["--libraries" yaml "--list-books" "lib"]
+                        ["--libraries" yaml "lib:nowhere"]]]
+            (let [native (apply run-binary args)
+                  jvm (apply run-jar args)]
+              (is (= (:exit jvm) (:exit native)) (pr-str args))
+              (is (= (:out jvm) (:out native)) (pr-str args))
+              (is (= (:err jvm) (:err native)) (pr-str args)))))))))

@@ -565,7 +565,8 @@
 ;;   SPLITTABLE  `:str` -- a boundary falling inside one splits it into up
 ;;               to three.
 ;;   ATOMIC      everything else: :code, :math-inline, :image, :cross-ref,
-;;               :cite. There is nothing to split, so a boundary falling
+;;               :cite, and :book-ref despite its Inline `:text` field
+;;               (`atomic-inline-types`). There is nothing to split, so a boundary falling
 ;;               INSIDE one snaps outward to include it whole, and says so
 ;;               (`:annotation-anchor-snapped`). The quote plainly meant to
 ;;               cover it, and a slightly wider highlight is a better
@@ -575,17 +576,33 @@
 ;; placement fails, nothing is spliced and the annotation is dropped whole:
 ;; a highlight with no end is worse than no highlight.
 
+(def ^:private atomic-inline-types
+  "Inline types that are ATOMIC here even though `haselnuss.walk/table`
+  gives them an Inline field, so `container-inline-field` would otherwise
+  make them CONTAINERS.
+
+  `:book-ref` (TASK-152): its `:text` is link text the resolver computes
+  from ANOTHER book (doc-10), not prose the author wrote, so it is to an
+  annotation what a `:cross-ref`'s computed text already is -- something
+  a quote can read across (its text still counts towards the flattened
+  run, `stratum-text`) but never cut into. A highlight descending into it
+  would also be spliced into content that resolution rewrites."
+  #{:book-ref})
+
 (defn- container-inline-field
   "The single `[:many ::ast/inline]` field of Inline `node`, or nil when
-  it has none -- read off `haselnuss.walk/table`, so this is the whole of
-  what makes a node a CONTAINER here. Every current such Inline has
-  exactly one (`:inlines`); the first is taken if a later schema adds a
-  second, since a highlight has to descend into one definite position."
+  it has none or is one of the `atomic-inline-types` -- read off
+  `haselnuss.walk/table`, so this is the whole of what makes a node a
+  CONTAINER here. Every current such Inline has exactly one (`:inlines`,
+  or `:book-ref`'s `:text`, which the atomic set excludes); the first is
+  taken if a later schema adds a second, since a highlight has to descend
+  into one definite position."
   [node]
   (let [type-key (walk/node-type (:discriminators walk/table) ::ast/inline node)]
-    (first (keep (fn [[field [arity ref-kind]]]
-                   (when (and (= :many arity) (= ::ast/inline ref-kind)) field))
-                 (get-in walk/table [:children type-key] [])))))
+    (when-not (contains? atomic-inline-types type-key)
+      (first (keep (fn [[field [arity ref-kind]]]
+                     (when (and (= :many arity) (= ::ast/inline ref-kind)) field))
+                   (get-in walk/table [:children type-key] []))))))
 
 (defn- article-for
   "\"a\" or \"an\" for `word` -- so a diagnostic reads \"an image\" and

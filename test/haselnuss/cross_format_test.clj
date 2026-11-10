@@ -211,8 +211,15 @@
               vacuously on a fixture that lost a construct"
       (is (= referenced-ids (set (map first (keys html-refs)))) (pr-str html-refs))
       (is (= referenced-ids (set (map first (keys latex-refs)))) (pr-str latex-refs))
-      (is (= 8 (reduce + (vals html-refs)))
-          "eight reference occurrences, one of them a repeat, so a last-wins extraction cannot hide a drift")
+      ;; TASK-160 added the second @tbl:yields, inside an undefined
+      ;; `[...]` next to inline math, so both targets render a reference
+      ;; there too.
+      (is (= 9 (reduce + (vals html-refs)))
+          "nine reference occurrences, two of them repeats, so a last-wins extraction cannot hide a drift")
+      (is (str/includes? html "most [<span class=\"math inline\">\\(y \\approx 1.4\\)</span>")
+          "TASK-160: math inside an undefined bracket renders as math in HTML")
+      (is (re-find #"most \[\\\(y \\approx 1\.4\s*\\\), see \\hyperref\[tbl:yields\]" latex)
+          "TASK-160: and in LaTeX")
       (is (re-find #"<figure id=\"fig:tree\">" html))
       (is (re-find #"class=\"math display\"" html))
       (is (re-find #"<section id=\"sec:bibliography\"" html)))
@@ -234,7 +241,7 @@
               ["eq:energy" "Eq. (2.1)"] 1
               ["sec:background" "Section 1"] 1
               ["sec:results" "Section 2"] 1
-              ["tbl:yields" "Table 2.1"] 1}
+              ["tbl:yields" "Table 2.1"] 2}
              html-refs)))
 
     (testing "each target also agrees with ITSELF, per node: the number

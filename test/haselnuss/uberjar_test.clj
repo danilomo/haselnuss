@@ -92,10 +92,9 @@
       (is (= 0 (:exit (run-jar "--help"))))))
   (testing "AC #2: the jar prints usage instructions covering target
             selection, input/output paths and the available flags, for
-            both a help flag and no arguments at all"
+            a help flag"
     (doseq [[label result] [["--help" (run-jar "--help")]
-                            ["-h" (run-jar "-h")]
-                            ["no arguments" (run-jar)]]]
+                            ["-h" (run-jar "-h")]]]
       (let [text (str (:out result) (:err result))]
         (is (str/includes? text "Usage: haselnuss") label)
         (is (str/includes? text "--target") (str label " covers target selection"))
@@ -106,7 +105,13 @@
               and its status is success"
       (let [{:keys [exit out]} (run-jar "--help")]
         (is (= 0 exit))
-        (is (str/includes? out "Usage: haselnuss")))))
+        (is (str/includes? out "Usage: haselnuss"))))
+    (testing "TASK-138: no arguments is a usage error -- exit 2, and
+              only a one-line pointer to --help, not the usage text"
+      (let [{:keys [exit err]} (run-jar)]
+        (is (= 2 exit))
+        (is (str/includes? err "--help"))
+        (is (not (str/includes? err "Usage: haselnuss"))))))
   (testing "TASK-46: the jar reports its own version. Asserted here
             rather than only through `lein run` because the flag exists
             for a jar sitting on disk with no version in its filename --

@@ -73,7 +73,12 @@
   extension recognizes on its own -- confirmed via javap against the actual
   flexmark-ext-tables 0.64.8 jar that its `WITH_CAPTION` option only
   recognizes MultiMarkdown-style `[Caption]` bracket captions, a different,
-  unrelated syntax -- so it is hand-detected against the already-parsed
+  unrelated syntax. That option is on by default and is turned OFF in
+  `build-cm-parser` (TASK-208): it made a line wholly in `[...]` directly
+  under a table (`[@k]`, `[^1]`, `[note]`) a `TableCaption`, which this
+  namespace never converted, so the citation or note silently vanished;
+  off, the line is an ordinary paragraph, exactly as after a blank line.
+  The `: caption` line is hand-detected against the already-parsed
   tree instead (see `table-caption-paragraph?`/`table-caption-and-attr`,
   used from `block-items`), the same general approach (detect the shape
   flexmark actually produces, don't fight it) TASK-5's attribute-attachment
@@ -160,20 +165,22 @@
                                      MailLink OrderedList Paragraph Reference RefNode
                                      SoftLineBreak StrongEmphasis Text TextBase
                                      ThematicBreak)
-           (com.vladsch.flexmark.ext.attributes AttributeNode AttributesExtension
-                                                AttributesNode)
+           (com.vladsch.flexmark.ext.attributes AttributeNode AttributesNode)
+           (com.vladsch.flexmark.ext.attributes.internal AttributesInlineParserExtension$Factory
+                                                         AttributesNodePostProcessor$Factory)
            (com.vladsch.flexmark.ext.footnotes Footnote FootnoteBlock FootnoteExtension)
            (com.vladsch.flexmark.ext.tables TableBlock TableBody TableCell
                                             TableCell$Alignment TableHead
                                             TablesExtension)
-           (com.vladsch.flexmark.parser InlineParserExtension
+           (com.vladsch.flexmark.parser InlineParser InlineParserExtension
                                         InlineParserExtensionFactory
-                                        LightInlineParser Parser)
-           (com.vladsch.flexmark.parser.core.delimiter Delimiter)
+                                        LightInlineParser LinkRefProcessor
+                                        LinkRefProcessorFactory Parser)
+           (com.vladsch.flexmark.parser.core.delimiter Bracket Delimiter)
            (com.vladsch.flexmark.parser.delimiter DelimiterProcessor)
            (com.vladsch.flexmark.util.ast Block Document Node)
-           (com.vladsch.flexmark.util.data MutableDataSet)
-           (com.vladsch.flexmark.util.sequence BasedSequence)
+           (com.vladsch.flexmark.util.data MutableDataSet NullableDataKey)
+           (com.vladsch.flexmark.util.sequence BasedSequence Escaping)
            (java.time ZoneOffset)
            (java.util Date)))
 
@@ -502,6 +509,19 @@
           (recur (dec j))
           j)))))
 
+(defn bare-reference-token?
+  "True if a bare `@token` would scan `token` back whole (`ref-token-end`,
+  sec5.10/5.11): non-empty, every character `ref-token-char?`, and none of
+  `ref-token-tail-punctuation` at its end. Whether it then reads as a
+  cross-reference or an author citation is its colon's to say, and whether
+  it is one at all the vocabularies' (`reference-at?`). Public because
+  `haselnuss.emit.hdoc` must refuse a hand-built label or key the scan would
+  cut short (TASK-207): `@a.b` is the citation `a` and the text `.b`."
+  [token]
+  (boolean (and (string? token)
+                (pos? (count token))
+                (= (count token) (ref-token-end token 0 (count token))))))
+
 (defn- cross-ref-node
   "A fresh synthetic Node for sec5.10's bare `@prefix:label` cross-reference
   syntax (AC #1): `whole-span` is the matched span, `@` through the label's
@@ -582,6 +602,59 @@
   `*known-kinds*` on why nil and `#{}` differ."
   nil)
 
+(def ^:private ^:dynamic *source-file*
+  "The `:source` path of the parse in progress, or nil (TASK-143): the file a
+  node's recorded position names."
+  nil)
+
+(def ^:private ^:dynamic *body-line-offset*
+  "How many lines the front matter took off the top of the file being
+  parsed (TASK-143): a body line's number in the file is its body number
+  plus this."
+  0)
+
+(def ^:private ^:dynamic *line-base*
+  "The FILE line number (1-based) of line 0 of the flexmark document being
+  converted, or nil when its lines cannot be placed in the file (a
+  citation's own prefix/suffix, parsed on its own). A flexmark node's file
+  line is `*line-base*` plus its `.getLineNumber` (TASK-143)."
+  nil)
+
+(def ^:private ^:dynamic *line-starts*
+  "A `long-array` of the start offset of every line of the flexmark document
+  being converted, computed once per document so that locating a node is a
+  binary search rather than flexmark's `Node.getLineNumber`, which walks
+  the text up to the node on every call (TASK-143)."
+  nil)
+
+(defn- line-starts
+  "The `long-array` of line start offsets of `text`."
+  ^longs [^CharSequence text]
+  (let [n (.length text)]
+    (long-array (cons 0 (for [i (range n) :when (= \newline (.charAt text i))] (inc i))))))
+
+(defn- doc-line-starts
+  "`line-starts` of flexmark `document`'s source text."
+  ^longs [^com.vladsch.flexmark.util.ast.Document document]
+  (line-starts (.getChars document)))
+
+(defn- node-line
+  "The 0-based line of flexmark `node` within the document whose
+  `*line-starts*` is bound."
+  [^com.vladsch.flexmark.util.ast.Node node]
+  (let [starts ^longs *line-starts*
+        idx (java.util.Arrays/binarySearch starts (long (.getStartOffset node)))]
+    (if (neg? idx) (- (- idx) 2) idx)))
+
+(defn- at-node
+  "`n` (an AST node) carrying the source position of flexmark `node`
+  (TASK-143, see `haselnuss.ast/with-source`), or `n` unchanged when this
+  conversion has no `*line-base*`."
+  [^com.vladsch.flexmark.util.ast.Node node n]
+  (if *line-base*
+    (ast/with-source n *source-file* (+ *line-base* (node-line node)))
+    n))
+
 (defn- cross-ref-prefix-shape?
   "True if the portion of colon-containing ref token `token` before its
   *first* colon looks like a plausible sec5.10 kind prefix (see
@@ -611,6 +684,66 @@
   [^String token]
   (or (nil? *known-cite-keys*) (contains? *known-cite-keys* token)))
 
+;; BOOK REFERENCES (TASK-152, doc-10 "Surface syntax in .hdoc"). `@{ref}`
+;; links to a passage of another book. The braces are required precisely
+;; because a bare `@reformed:heidelberg` already means a local cross-ref
+;; (sec5.10) and must keep meaning one: `{` is not a `ref-token-char?`, so
+;; nothing above ever claimed `@{`, and recognizing it first changes no
+;; existing parse.
+;;
+;; The parser decides only that the author WROTE a book reference, not
+;; whether it is a well-formed one. The text between the braces is kept as
+;; written and never run through `haselnuss.book-ref/parse-book-ref` here:
+;; doc-10 makes a malformed reference a `malformed-book-ref` WARNING, the
+;; build continuing with a `??`, which is the resolver's to report (it is
+;; the pass that has diagnostics and the node's source position to name).
+;; A parse error would instead stop the whole build over one typo'd link,
+;; which no other reference in this format does. So the syntactic rule is
+;; deliberately loose: `@{`, then non-blank text with no line break, up to
+;; the FIRST `}`. `@{}`, `@{ }`, and an `@{` with no `}` on its line stay
+;; literal text. Unlike a bare `@token`, a preceding token character does
+;; not decline it (`x@{a:b}` is a book ref): the braces are an explicit
+;; marker, which an email address never contains.
+
+(definterface ^:private BookRefNodeTag)
+
+(defn- book-ref-end
+  "The end index (exclusive, just past the `}`) of a `@{ref}` book
+  reference whose `@` is at index `i` of `s`, or nil when there is none
+  there (see the BOOK REFERENCES comment above for the rule)."
+  [^String s i]
+  (let [n (.length s)
+        open (inc i)]
+    (when (and (< (inc open) n) (= \@ (.charAt s i)) (= \{ (.charAt s open)))
+      (let [close (.indexOf s "}" (int (inc open)))]
+        (when (pos? close)
+          (let [content (subs s (inc open) close)]
+            (when-not (or (str/blank? content) (str/includes? content "\n") (str/includes? content "\r"))
+              (inc close))))))))
+
+(defn- book-ref-node
+  "A fresh synthetic Node for a `@{ref}` book reference: `whole-span` runs
+  from the `@` through the `}`, and `.getText` is the ref between the
+  braces. Built like `cross-ref-node`."
+  ^DelimitedNodeImpl [^BasedSequence whole-span]
+  (let [node (proxy [DelimitedNodeImpl BookRefNodeTag] [])
+        n (.length whole-span)]
+    (.setChars ^Node node whole-span)
+    (.setOpeningMarker node (.subSequence whole-span 0 2))
+    (.setText node (.subSequence whole-span 2 (dec n)))
+    (.setClosingMarker node (.subSequence whole-span (dec n) n))
+    node))
+
+(def ^:private book-ref-class
+  "The exact runtime class every `book-ref-node` instance shares -- see
+  `cross-ref-class`'s own docstring."
+  (class (proxy [DelimitedNodeImpl BookRefNodeTag] [])))
+
+(defn- book-ref-node?
+  "True if `node` is one of this file's own synthetic BookRef nodes."
+  [node]
+  (identical? book-ref-class (class node)))
+
 (defn- parse-cross-ref-or-cite!
   "This file's `InlineParserExtension/parse` for the `@` trigger character
   (see the extension factory below): true if it consumed a bare CrossRef or
@@ -629,7 +762,11 @@
   for an `@`-token that is not a reference, so it is left as ordinary
   literal text instead, the same way invalid/absent math content falls
   through to plain-text handling rather than being forced into some node
-  type anyway."
+  type anyway.
+
+  A `@{ref}` book reference (TASK-152, see the BOOK REFERENCES comment
+  above) is tried first; its `{` can never start a bare token, so it takes
+  nothing from either of the other two."
   [^LightInlineParser p]
   (let [^BasedSequence input (.getInput p)
         s (.toString input)
@@ -637,16 +774,51 @@
         i (.getIndex p)
         start (inc i)
         end (ref-token-end s start n)]
-    (if (or (= end start) (and (pos? i) (ref-token-char? (.charAt s (dec i)))))
-      false
-      (let [token (subs s start end)
-            whole (.subSequence input (int i) (int end))
-            colon? (str/includes? token ":")]
-        (if-not (if colon? (cross-ref-token? token) (cite-token? token))
-          false
-          (do (.appendNode p (if colon? (cross-ref-node whole) (cite-author-node whole)))
-              (.setIndex p end)
-              true))))))
+    (if-let [book-end (book-ref-end s i)]
+      (do (.appendNode p (book-ref-node (.subSequence input (int i) (int book-end))))
+          (.setIndex p (int book-end))
+          true)
+      (if (or (= end start) (and (pos? i) (ref-token-char? (.charAt s (dec i)))))
+        false
+        (let [token (subs s start end)
+              whole (.subSequence input (int i) (int end))
+              colon? (str/includes? token ":")]
+          (if-not (if colon? (cross-ref-token? token) (cite-token? token))
+            false
+            (do (.appendNode p (if colon? (cross-ref-node whole) (cite-author-node whole)))
+                (.setIndex p end)
+                true)))))))
+
+(defn reference-at?
+  "True if the `@` at index `i` of `s` would parse as a bare cross-reference
+  or author-in-text citation -- the same decision `parse-cross-ref-or-cite!`
+  makes, over the same `ref-token-end` / preceding-character / vocabulary
+  checks, so `haselnuss.emit.hdoc` can tell an `@` that needs a backslash
+  (it would re-parse as a reference) from one that is prose (`cc @someone`
+  with no such citation key, `user@example.com`).
+
+  `opts` takes the same `:kinds` / `:cite-keys` vocabularies `parse` does
+  (nil meaning the shape heuristics, as there). `i` is taken to be at the
+  start of `s` when 0: a caller escaping one text run cannot see the
+  character before it, and treats that as not a token character.
+
+  A `@{ref}` book reference (TASK-152) is deliberately NOT covered: a
+  backslash before its `@` does not make it prose (the `{…}` left behind
+  is then read as an attribute group), so `haselnuss.emit.hdoc` escapes
+  the `{` instead."
+  [^String s i {:keys [kinds cite-keys]}]
+  (let [n (.length s)
+        start (inc i)
+        end (ref-token-end s start n)]
+    (boolean
+     (and (> end start)
+          (not (and (pos? i) (ref-token-char? (.charAt s (dec i)))))
+          (binding [*known-kinds* kinds
+                    *known-cite-keys* cite-keys]
+            (let [token (subs s start end)]
+              (if (str/includes? token ":")
+                (cross-ref-token? token)
+                (cite-token? token))))))))
 
 (def ^:private cross-ref-cite-extension-factory
   "The `InlineParserExtensionFactory` registered on `cm-parser` for the `@`
@@ -691,40 +863,122 @@
   [node]
   (identical? cite-bracket-class (class node)))
 
-(def ^:private citation-item-marker-re
-  "An *unescaped* `@key` citation-key marker (sec5.11) occurring anywhere
-  within a string -- used by `citation-bracket-content?` to decide whether
-  a bracket's raw content looks like a citation at all, not to extract the
-  key itself (see `citation-segment-re` for that). The leading
-  `(?<!\\\\)` negative lookbehind skips a backslash-escaped `\\@`
-  (CommonMark sec2.4) entirely, so it never counts as a real marker --
-  matching how the bare `@` form already honors that same escape (review
-  finding #4: `[\\@doe99]` must not be swallowed into a citation any more
-  than `\\@fig:tree` is read as a bare CrossRef)."
-  #"(?<!\\)@[\w:-]+")
+(defn- backtick-run-end
+  "The index just past the run of backticks in `s` (length `n`) that
+  starts at `i`."
+  [^String s i n]
+  (loop [k i]
+    (if (and (< k n) (= (.charAt s k) \`)) (recur (inc k)) k)))
+
+(defn- inline-span-end-index
+  "The index just past whatever inline construct opens at index `j` of `s`
+  (length `n`), for a scan that must not look inside a code span or inline
+  math (`cite-bracket-close-index`). A backtick run is a code span up to
+  the next run of the SAME length (CommonMark sec6.1), or literal on its
+  own when no such run follows; a `$` follows `parse-inline-math!`: `$$`
+  and a `$` before whitespace are literal, anything else is math up to
+  `inline-math-closing-index`, or literal when that finds no close. Any
+  other character is just itself."
+  [^String s j n]
+  (case (.charAt s j)
+    \` (let [run-end (backtick-run-end s j n)
+             len (- run-end j)]
+         (loop [k run-end]
+           (cond
+             (>= k n) run-end
+             (= (.charAt s k) \`) (let [e (backtick-run-end s k n)]
+                                    (if (= len (- e k)) e (recur e)))
+             :else (recur (inc k)))))
+    \$ (cond
+         (and (< (inc j) n) (= (.charAt s (inc j)) \$)) (+ j 2)
+         (or (>= (inc j) n) (Character/isWhitespace (.charAt s (inc j)))) (inc j)
+         :else (if-let [close (inline-math-closing-index s j n)] (inc close) (inc j)))
+    (inc j)))
+
+(defn- top-level-indices
+  "The indices of `s` whose character is not inside a code span or inline
+  math span (see `inline-span-end-index`). A bracket's `;` separators and
+  `@key` markers are only ever read at these (TASK-167), so `` `a;b` `` or
+  `$x@y$` stays the content of its span. A backslash-escaped character
+  opens no span but is still listed, as it was before spans were
+  skipped: an escaped `\\;` still splits (see
+  `haselnuss.emit.hdoc/check-no-cite-affix-semicolon!`), and
+  `cite-key-index` rejects an escaped `\\@` by the backslash before it."
+  [^String s]
+  (let [n (.length s)]
+    (loop [j 0 acc (transient [])]
+      (cond
+        (>= j n) (persistent! acc)
+        (and (= (.charAt s j) \\) (< (inc j) n)) (recur (+ j 2) (conj! acc (inc j)))
+        :else (let [e (long (inline-span-end-index s j n))]
+                (recur e (if (= e (inc j)) (conj! acc j) acc)))))))
+
+(defn cite-segments
+  "The `;`-separated segments of a citation bracket's raw inner text
+  `inner` (sec5.11), split only at a `;` in `top-level-indices` -- one
+  inside a code span or inline math belongs to that span (TASK-167).
+  Trailing empty segments are dropped, as `String/split` drops them, so
+  `@a;` is the one segment `@a`. So is a trailing segment of nothing but
+  whitespace after a `;` (TASK-207): `@a; ` is `@a` too, as it reads, rather
+  than a second segment with no key that made `[@a; ]` no citation while
+  `[@a;]` was one -- and `[@a; ](u)` a link whose text, `@a;`, no spelling
+  could write back. A whitespace-only `inner` with no `;` at all is kept as
+  its one segment (it has no key either way). Public because
+  `haselnuss.emit.hdoc` must know exactly which `;` this split would cut
+  at."
+  [^String inner]
+  (let [cuts (filterv #(= \; (.charAt inner (int %))) (top-level-indices inner))
+        starts (cons 0 (map inc cuts))
+        ends (conj cuts (count inner))
+        segments (mapv #(subs inner %1 %2) starts ends)]
+    (loop [segments segments]
+      (if (or (= "" (peek segments))
+              (and (> (count segments) 1) (str/blank? (peek segments))))
+        (recur (pop segments))
+        segments))))
+
+(defn- cite-key-index
+  "`[at key-end]` for the first `@key` citation-key marker (sec5.11) in
+  segment `seg`, or nil if it has none: `at` is the index of its `@`,
+  `key-end` the index just past its key. The `@` must be in
+  `top-level-indices` (not inside a code span or inline math, TASK-167)
+  and not directly after a backslash, so an escaped `\\@doe99` is never a
+  marker (review finding #4 on TASK-9: `[\\@doe99]` must not be swallowed
+  into a citation any more than `\\@fig:tree` is read as a bare CrossRef);
+  the key is a run of word characters, `:` and `-`."
+  [^String seg]
+  (some (fn [at]
+          (when (and (= \@ (.charAt seg (int at)))
+                     (not (and (pos? at) (= \\ (.charAt seg (int (dec at)))))))
+            (when-let [cite-key (re-find #"^[\w:-]+" (subs seg (inc at)))]
+              [at (+ (inc at) (count cite-key))])))
+        (top-level-indices seg)))
+
+(defn bracket-cite-key?
+  "True if `cite-key` is read back whole after the `@` of a bracketed
+  citation segment (sec5.11) -- a run of ASCII word characters, `:` and
+  `-`, the key `cite-key-index` scans. Public because `haselnuss.emit.hdoc`
+  must refuse a hand-built key outside it (TASK-207): `[@a.b]` reads as key
+  `a` with suffix `.b`, `[@müller]` as key `m`."
+  [cite-key]
+  (boolean (and (string? cite-key) (re-matches #"[\w:-]+" cite-key))))
 
 (defn- citation-bracket-content?
   "True if `inner` (the raw text strictly between a `[` and its candidate
   matching `]`) looks enough like sec5.11's bracketed citation syntax to
-  claim the whole bracket (AC #4): `inner` contains at least one real,
-  unescaped `@key` marker *and* every `;`-separated segment contains at
-  least one of its own (see `citation-item-marker-re`). An ordinary link/
-  text bracket with no unescaped `@` at all -- an empty bracket (`[]`),
-  one made up only of `;` characters (`[;]`/`[;;;]`), or one whose only
-  `@` is backslash-escaped (`[\\@doe99]`) -- is declined here and left for
+  claim the whole bracket (AC #4): it has at least one `;`-separated
+  segment (`cite-segments`) and every segment contains a real `@key`
+  marker of its own (`cite-key-index`). An ordinary link/text bracket
+  with no unescaped `@` at all -- an empty bracket (`[]`), one made up
+  only of `;` characters (`[;]`/`[;;;]`), or one whose only `@` is
+  backslash-escaped (`[\\@doe99]`) -- is declined here and left for
   flexmark's own default bracket/backslash-escape handling instead.
 
-  The up-front `(re-find citation-item-marker-re inner)` check exists
-  because `every?` over an *empty* collection is vacuously true: review
-  finding #3 caught that `(str/split \";\" #\";\")` (and `\";;;\"`, etc.)
-  is `[]`, not `[\"\"]`, since `String/split` drops *trailing* empty
-  tokens -- so the old code's bare `every?` wrongly accepted `[;]`/
-  `[;;;]` (zero `@` markers at all, zero segments after the split) as a
-  citation, producing a nonsensical zero-CiteItem `Cite` node. Requiring
-  at least one real marker to exist anywhere in `inner` first closes that
-  gap without changing the split's own behavior for any other input: an
-  empty bracket (`[]`, `(str/split \"\" #\";\")` => `[\"\"]`) and a
-  genuine multi-key citation are both unaffected.
+  The `seq` check exists because `every?` over an *empty* collection is
+  vacuously true: review finding #3 caught that splitting `;` (and
+  `;;;`, etc.) leaves no segments at all, since trailing empty ones are
+  dropped, and a bare `every?` wrongly accepted `[;]`/`[;;;]` as a
+  citation, producing a nonsensical zero-CiteItem `Cite` node.
 
   A known, deliberately accepted false-positive limitation (mirroring
   TASK-7's own accepted heuristic tradeoffs, e.g. its dollar-math currency
@@ -732,28 +986,97 @@
   username-style `@word` token in every semicolon-separated segment (an
   unlikely combination) is still claimed as a citation, since this check
   has no email-shape awareness of its own the way `parse-cross-ref-or-
-  cite!`'s bare-form adjacency check does."
+  cite!`'s bare-form adjacency check does. Since a citation group may
+  span lines (TASK-165), so may such a bracket: `[the list\\nat
+  foo@bar.com]` is a citation of key `bar` just as its one-line form is.
+  An `@` or `;` inside a code span or inline math is that span's content
+  (TASK-167): `` [`@x` y] `` is no citation, `` [x `a;b` @c] `` is one."
   [inner]
-  (and (re-find citation-item-marker-re inner)
-       (every? #(re-find citation-item-marker-re %) (str/split inner #";"))))
+  (let [segments (cite-segments inner)]
+    (and (seq segments) (every? cite-key-index segments))))
 
 (defn- cite-bracket-close-index
   "The absolute index within `s` (length `n`) of the `]` that closes the
-  opening `[` at `open-index`, or nil if there is none. Mirrors TASK-7's
-  own `inline-math-closing-index`: restricted to the same source line (a
-  closing `]` is never searched for past a newline), and a backslash
+  opening `[` at `open-index`, or nil if there is none. A backslash
   escapes the very next character (an escaped `\\]` does not close it).
   Deliberately does not track nested `[`/`]` pairs at all (like TASK-7's
   own heuristic, a documented, accepted scope reduction) -- no SPEC.md
-  citation example ever nests a bracket inside another."
+  citation example ever nests a bracket inside another.
+
+  The search crosses line breaks (TASK-165): a hard-wrapped citation group
+  (`[see\\n@smith2020]`, `[@a;\\n@b]`) is the same group as its one-line
+  form. TASK-9 had stopped it at a newline only to mirror
+  `inline-math-closing-index`, and since TASK-160 that silently turned a
+  wrapped group into author-in-text citations or cross-references inside
+  literal brackets. `s` is one paragraph's inline text, so the search
+  never leaves the paragraph: a blank line still ends it.
+
+  An unescaped `[` met before the `]` ends the search with nil: nesting
+  is unsupported anyway, and without this stop a stray unclosed `[` (a
+  half-open interval `[0, 1)`) would pair with the first `]` anywhere
+  later in the paragraph -- typically a link's, a `[^1]` footnote
+  marker's or a `[Fig. 2]` -- and swallow that construct into one
+  citation (TASK-165 review). It also ends each scan at the next `[`, so
+  a paragraph full of unclosed `[` is no longer quadratic in its length.
+
+  A code span or inline math span is stepped over whole (TASK-167): a `]`
+  or `[` inside `` `a[0]` `` or `$f]$` is content of that span, exactly
+  as flexmark's own left-to-right scan reads it, so it neither closes the
+  bracket nor ends the search -- see `inline-span-end-index`."
   [^String s open-index n]
   (loop [j (inc open-index)]
     (cond
       (>= j n) nil
-      (= (.charAt s j) \newline) nil
       (and (= (.charAt s j) \\) (< (inc j) n)) (recur (+ j 2))
+      (= (.charAt s j) \[) nil
       (= (.charAt s j) \]) j
-      :else (recur (inc j)))))
+      :else (recur (inline-span-end-index s j n)))))
+
+(declare attribute-group-end-index)
+
+(def ^:private ^:dynamic *caption-parse*
+  "True while `table-caption-and-attr` runs flexmark over a table caption
+  line, whose trailing attribute group is the table's -- see
+  `attributed-bracket?`."
+  false)
+
+(defn- attributed-bracket?
+  "True if the citation-shaped bracket closing at index `close` of `s` (the
+  inline input `p` is parsing) has an attribute group straight after its
+  `]` that belongs to the bracket itself (TASK-175). Such a bracket is a
+  Span (sec5.6) whatever its content, exactly as `[text]{...}` is one even
+  when `text` matches a link reference definition (see `convert-
+  children`): `parse-cite-bracket!` declines it, and flexmark's own
+  bracket handling reads it as a bracket-only LinkRef plus that group,
+  its content parsed in place -- in `[@doe]{.c}` the `@doe` is an
+  author-in-text citation. An attributed bracketed citation is written
+  with the Span around it, `[[@doe]]{.c}`.
+
+  Not a cite carrying the group, or a Span around the bracketed cite: the
+  .hdoc writer spells a Span whose content holds a citation (an undefined
+  `![@doe][s]{.c}`, say) as `[!\\[@doe\\]\\[s\\]]{.c}`, and reading that as
+  a bracketed citation would turn the document into a different one with
+  no error, with no other spelling to avoid it.
+
+  A group that ends a heading's text or a table caption line is not the
+  bracket's but that block's own (`pop-trailing-attr-group`), so `# See
+  [@doe]{#sec:x}` keeps its citation, as it always has.
+
+  Whitespace between the `]` and the `{` -- spaces, tabs, a line break --
+  still counts as straight after (TASK-184): flexmark attaches a group to
+  the inline before it across whitespace when the group ends its
+  paragraph, heading or link text, so `[s] {.c}` there is a Span, and
+  `[@doe] {.c}` is one for the same reason. Mid-text (`x [s] {.c} y`) the
+  group stays an orphan even when this is true, refused with TASK-191's
+  message (`orphan-group-message`). The heading and caption
+  exception reads the same way: `# See [@doe] {#sec:x}` keeps its
+  citation, as `# See [s] {#sec:x}` gives its group to the heading."
+  [^LightInlineParser p ^String s close]
+  (when-let [end (attribute-group-end-index
+                  s (loop [j (inc close)]
+                      (if (and (< j (count s)) (Character/isWhitespace (.charAt s j))) (recur (inc j)) j)))]
+    (not (and (or (instance? Heading (.getBlock p)) *caption-parse*)
+              (str/blank? (subs s (inc end)))))))
 
 (defn- parse-cite-bracket!
   "This file's `InlineParserExtension/parse` for the `[` trigger character
@@ -767,30 +1090,171 @@
   mechanism behind ordinary links/images/reference definitions) *after*
   every registered extension for that same character has already declined
   -- so an ordinary link/text bracket, or one flexmark ultimately can't
-  resolve at all, is untouched by this ever having run at all."
+  resolve at all, is untouched by this ever having run at all.
+
+  A bracket with an attribute group straight after its `]` is declined
+  too (TASK-175) -- see `attributed-bracket?`."
   [^LightInlineParser p]
   (let [^BasedSequence input (.getInput p)
         s (.toString input)
         n (.length input)
         i (.getIndex p)]
     (if-let [close (cite-bracket-close-index s i n)]
-      (if (citation-bracket-content? (subs s (inc i) close))
+      (if (and (citation-bracket-content? (subs s (inc i) close))
+               (not (attributed-bracket? p s close)))
         (do (.appendNode p (cite-bracket-node (.subSequence input (int i) (int (inc close)))))
             (.setIndex p (inc close))
             true)
         false)
       false)))
 
+(defn citation-bracket-at?
+  "True if the `[` at index `i` of `s` opens a bracket whose content reads
+  as a bracketed citation (sec5.11) -- the content half of
+  `parse-cite-bracket!`'s decision, over the same `cite-bracket-close-
+  index` and `citation-bracket-content?`. The other half, an attribute
+  group straight after the `]` (`attributed-bracket?`), needs the inline
+  parser's own state and is left to the caller. Public because
+  `haselnuss.emit.hdoc` must know when link text it writes would re-parse
+  as a citation instead (TASK-198)."
+  [^String s i]
+  (boolean
+   (when-let [close (cite-bracket-close-index s i (.length s))]
+     (citation-bracket-content? (subs s (inc i) close)))))
+
+;; --- Attributed brackets over a defined reference (TASK-190) ---------------
+;;
+;; `[r]{.c}` is a Span (sec5.6) even when `[r]: v` is defined -- see
+;; `convert-children` -- but flexmark has already made it a *defined*
+;; LinkRef by then, and a defined LinkRef is a link: when an outer
+;; `[a [r]{.c}](u)` closes, `InlineParserImpl.parseCloseBracket` sees a
+;; non-tentative LinkRef among the new Link's children and, since a link may
+;; not hold a link, unlinks the Link and puts its children back in the
+;; paragraph with a literal `](u)` after them (confirmed by decompiling
+;; 0.64.8). The link is lost before `regroup-attributed-brackets` (TASK-184)
+;; could see it, and with whitespace before the group (`[a [r] {.c}](u)`)
+;; the attributes post-processor then trips over the orphaned Link and
+;; throws a raw IllegalStateException.
+;;
+;; `parseCloseBracket` asks the registered `LinkRefProcessor`s before it
+;; looks a bracket up among the definitions, so `attributed-ref-processor`
+;; claims exactly that bracket -- a bracket-only, non-image `[label]` whose
+;; label is defined and which `attributed-bracket?` says has a group of its
+;; own -- and makes it an `attributed-ref-node` instead, which is not a link:
+;; an outer link forms around it, and `convert-children` makes it the Span a
+;; bracket-only LinkRef makes. An undefined label is left alone (flexmark's
+;; tentative LinkRef never cancels an outer link, and TASK-184 regroups it),
+;; and so is everything else, so no other bracket parses differently.
+;;
+;; The processor needs what `parse-cite-bracket!` gets handed -- the inline
+;; input, the index past the `]`, the block, the open bracket -- but a
+;; `LinkRefProcessor` is only given the document. Both are made per
+;; document by the same `InlineParserImpl`, so `cite-bracket-extension-
+;; factory` records that parser in the document's data under
+;; `inline-parser-key`, and the processor reads it back.
+
+(def ^:private ^NullableDataKey inline-parser-key
+  "The document data key `cite-bracket-extension-factory` records the
+  document's own `InlineParser` under, for `attributed-ref-processor`."
+  (NullableDataKey. "haselnuss.parser/inline-parser"))
+
+(definterface ^:private AttributedRefNodeTag)
+
+(defn- attributed-ref-node
+  "A fresh synthetic Node for the `bracket` (`[label]`) that
+  `attributed-ref-processor` claims -- built like `highlight-node`, a
+  `proxy` over `DelimitedNodeImpl` plus a marker interface, so
+  `attributed-ref-node?` can tell it by exact class. flexmark moves the
+  bracket's already-parsed content into it as children."
+  ^DelimitedNodeImpl [^BasedSequence bracket]
+  (let [n (.length bracket)]
+    (proxy [DelimitedNodeImpl AttributedRefNodeTag]
+           [(.subSequence bracket 0 1) (.subSequence bracket 1 (dec n)) (.subSequence bracket (dec n) n)])))
+
+(def ^:private attributed-ref-class
+  "The exact runtime class every `attributed-ref-node` shares -- see
+  `math-inline-class`'s own docstring."
+  (class (attributed-ref-node (BasedSequence/of "[x]"))))
+
+(defn- attributed-ref-node? [node]
+  (identical? attributed-ref-class (class node)))
+
+(defn- defined-reference
+  "The `Reference` the `bracket` (`[label]`, brackets included) names
+  among `document`'s definitions, or nil -- the lookup `parseCloseBracket`
+  itself makes for a bracket-only reference."
+  ^Reference [^Document document ^BasedSequence bracket]
+  (.get ^java.util.Map (.get Parser/REFERENCES document)
+        (Escaping/normalizeReferenceChars bracket true)))
+
+(defn- attributed-defined-ref?
+  "True if the `bracket` that `document`'s inline parser has just
+  closed is one `attributed-ref-processor` claims (see this section's
+  comment): its opener is a `[`, not a `![` (a defined `![x]{.c}` stays
+  the image TASK-169 makes) and has no bracket inside it (flexmark reads
+  no bracket-only reference from it then), its label is defined, and
+  `attributed-bracket?` -- TASK-175's rule for a citation-shaped bracket
+  -- says the group after its `]` is its own."
+  [^Document document ^BasedSequence bracket]
+  (let [^InlineParser ip (.get inline-parser-key document)]
+    (boolean
+     (when ip
+       (let [^Bracket opener (.getLastBracket ip)
+             ^BasedSequence input (.getInput ip)
+             close (dec (.getIndex ip))]
+         (and opener (not (.isImage opener)) (not (.isBracketAfter opener))
+              (< -1 close (.length input)) (= \] (.charAt input close))
+              (defined-reference document bracket)
+              (attributed-bracket? ip (.toString input) close)))))))
+
+(defn- trim-edge-text!
+  "Trims the leading whitespace of `node`'s first child and the trailing
+  whitespace of its last, when those are Text -- what flexmark's
+  `collapseLinkRefChildren` does to a LinkRef's children, so `[ r ]{.c}`
+  gives the same Span whether or not `r` is defined."
+  [^Node node]
+  (let [first-child (.getFirstChild node)
+        last-child (.getLastChild node)]
+    (if (identical? first-child last-child)
+      (when (instance? Text first-child)
+        (.setChars first-child (.trim (.getChars first-child))))
+      (do (when (instance? Text first-child)
+            (.setChars first-child (.trimStart (.getChars first-child))))
+          (when (instance? Text last-child)
+            (.setChars last-child (.trimEnd (.getChars last-child))))))))
+
+(def ^:private attributed-ref-processor
+  "The `LinkRefProcessorFactory` registered on `cm-parser` -- see this
+  section's comment. Bracket nesting level 0 and no `!` prefix: it only
+  ever looks at a plain `[label]`. `adjustInlineText`/`allowDelimiters`
+  keep the bracket's content and its emphasis delimiters exactly as an
+  ordinary link's."
+  (reify LinkRefProcessorFactory
+    (getWantExclamationPrefix [_ _] false)
+    (getBracketNestingLevel [_ _] 0)
+    (^LinkRefProcessor apply [_ ^Document document]
+      (reify LinkRefProcessor
+        (getWantExclamationPrefix [_] false)
+        (getBracketNestingLevel [_] 0)
+        (isMatch [_ bracket] (attributed-defined-ref? document bracket))
+        (createNode [_ bracket] (attributed-ref-node bracket))
+        (adjustInlineText [_ _ node] (.getChildChars ^Node node))
+        (allowDelimiters [_ _ _ _] true)
+        (updateNodeElements [_ _ node] (trim-edge-text! node))))))
+
 (def ^:private cite-bracket-extension-factory
   "The `InlineParserExtensionFactory` registered on `cm-parser` for the `[`
   trigger character -- see `inline-math-extension-factory`'s own docstring
-  for why `proxy` (not `reify`) is used here too."
+  for why `proxy` (not `reify`) is used here too. Applying it also records
+  the document's inline parser for `attributed-ref-processor` (TASK-190)."
   (proxy [InlineParserExtensionFactory] []
     (getCharacters [] "[")
     (getAfterDependents [] #{})
     (getBeforeDependents [] #{})
     (affectsGlobalScope [] false)
-    (apply [_lp]
+    (apply [lp]
+      (let [^LightInlineParser lp lp]
+        (.set inline-parser-key (.getDocument lp) lp))
       (reify InlineParserExtension
         (finalizeDocument [_ _])
         (finalizeBlock [_ _])
@@ -948,6 +1412,274 @@
                                                 (.getStartOffset open-marker)
                                                 (.getEndOffset close-marker)))))))
 
+;; --- Strikethrough (TASK-137, sec5.6) --------------------------------------
+;;
+;; `~~struck text~~` is a `:strike` Inline (sec4.4), GFM's own spelling. It is
+;; the same shape as a highlight -- ordinary markup inside, an unmatched run
+;; stays literal text -- so it is built exactly the same way, as a second
+;; `DelimiterProcessor` (see the Highlights section above for why). It is
+;; hand-rolled rather than flexmark's `StrikethroughExtension` because that
+;; one lives in a separate artifact (`flexmark-ext-gfm-strikethrough`) that
+;; would join the native-image reflection surface for the sake of one
+;; delimiter, and its node type would still need converting here. A single
+;; `~` is never a delimiter (`getMinLength` is 2), so `~/x` and `a ~ b`
+;; stay prose. `:strike` has no `:attr` (sec4.4), so unlike a highlight a
+;; following attribute group is not accepted.
+
+(definterface ^:private StrikeNodeTag)
+
+(defn- strike-node
+  "A fresh synthetic Node for one `~~struck text~~` construct; see
+  `highlight-node` for why the markers are set and why a `proxy` over
+  `DelimitedNodeImpl` with a marker interface."
+  ^DelimitedNodeImpl [^BasedSequence open-marker ^BasedSequence close-marker]
+  (let [node (proxy [DelimitedNodeImpl StrikeNodeTag] [])]
+    (.setOpeningMarker node open-marker)
+    (.setClosingMarker node close-marker)
+    node))
+
+(def ^:private strike-class
+  "The exact runtime class every `strike-node` shares -- see
+  `math-inline-class`'s own docstring."
+  (class (strike-node BasedSequence/NULL BasedSequence/NULL)))
+
+(defn- strike-node? [node]
+  (identical? strike-class (class node)))
+
+(def ^:private strike-delimiter-length 2)
+
+(defn- strike-delimiter-processor
+  "The `DelimiterProcessor` registered on `cm-parser` for `~~`; see
+  `highlight-delimiter-processor`, which this mirrors."
+  []
+  (reify DelimiterProcessor
+    (getOpeningCharacter [_] \~)
+    (getClosingCharacter [_] \~)
+    (getMinLength [_] strike-delimiter-length)
+    (getDelimiterUse [_ opener closer]
+      (if (and (>= (.length opener) strike-delimiter-length)
+               (>= (.length closer) strike-delimiter-length))
+        strike-delimiter-length
+        0))
+    (unmatchedDelimiterNode [_ _inline-parser _delimiter-run] nil)
+    (canBeOpener [_ _before _after left-flanking _right-flanking
+                  _before-is-punctuation _after-is-punctuation
+                  _before-is-whitespace _after-is-whitespace]
+      left-flanking)
+    (canBeCloser [_ _before _after _left-flanking right-flanking
+                  _before-is-punctuation _after-is-punctuation
+                  _before-is-whitespace _after-is-whitespace]
+      right-flanking)
+    (skipNonOpenerCloser [_] false)
+    (process [_ opener closer delimiters-used]
+      (let [^BasedSequence open-marker (.getTailChars ^Delimiter opener delimiters-used)
+            ^BasedSequence close-marker (.getLeadChars ^Delimiter closer delimiters-used)
+            node (strike-node open-marker close-marker)]
+        (.moveNodesBetweenDelimitersTo ^Delimiter opener node ^Delimiter closer)
+        (.setChars ^Node node (.baseSubSequence open-marker
+                                                (.getStartOffset open-marker)
+                                                (.getEndOffset close-marker)))))))
+
+;; --- Attribute groups at the inline parser (TASK-168) ------------------------
+;;
+;; flexmark-ext-attributes' own inline extension tries `ATTRIBUTES_TAG` (its
+;; `AttributeParsing` regex) at EVERY `{` the inline parser reaches. Java's
+;; regex engine recurses once per repetition of that pattern's token loop, so a
+;; `{x` followed by about a thousand space-separated words -- with or without a
+;; `}` somewhere after them -- overflows the stack mid-parse, and the parse
+;; died with a bare `StackOverflowError` no caller could locate or report.
+;;
+;; So this file registers the extension's `{` parser itself, in front of a
+;; decision flexmark cannot get wrong that way: `attribute-group-closes?`, the
+;; same language as `ATTRIBUTES_TAG` recognized by an iterative state set,
+;; linear and stackless. Where it says no, flexmark's regex would have failed
+;; too and its extension returned false, so this one returns false and the `{`
+;; stays prose exactly as before -- now also for an unclosed run of any length.
+;; Where it says yes, flexmark's own extension does the parsing, unchanged;
+;; only a group that genuinely closes after a thousand-odd tokens can still
+;; overflow there, and that one call -- nothing else in the parse -- is where
+;; the overflow is caught and turned into a located `::attribute-group-too-
+;; long` error. Not a bigger thread stack: that only moves the threshold.
+
+(def ^:private group-open 1)
+(def ^:private group-hash-start 2)
+(def ^:private group-hash 4)
+(def ^:private group-name 8)
+(def ^:private group-after-token 16)
+(def ^:private group-eq 32)
+(def ^:private group-eq-space 64)
+(def ^:private group-value 128)
+(def ^:private group-single 256)
+(def ^:private group-double 512)
+(def ^:private group-quoted 1024)
+(def ^:private group-sep 2048)
+
+(def ^:private group-may-close
+  "The states a `}` ends the group from: every state but the opening one
+  (a group holds at least one token), a `#`/`.` with nothing after it yet,
+  and the inside of a quoted value."
+  (bit-or group-hash group-name group-after-token group-eq group-eq-space
+          group-value group-quoted group-sep))
+
+(defn- group-ws?
+  "Java regex `\\s`, which `ATTRIBUTES_TAG` is compiled without
+  UNICODE_CHARACTER_CLASS for: ASCII whitespace only."
+  [c]
+  (case c (\space \tab \newline \u000B \formfeed \return) true false))
+
+(defn- group-value-char?
+  "`[^\"'=<>{}`\\x00-\\x20]`: a character of an unquoted value or of an
+  `#id`/`.class` token."
+  [c]
+  (and (> (int c) 0x20) (neg? (.indexOf "\"'=<>{}`" (int c)))))
+
+(defn- group-name-start? [c]
+  (or (<= (int \a) (int c) (int \z)) (<= (int \A) (int c) (int \Z)) (= c \_) (= c \:)))
+
+(defn- group-name-char? [c]
+  (or (group-name-start? c) (<= (int \0) (int c) (int \9)) (= c \.) (= c \-)))
+
+(defn- group-step
+  "The state set after reading `c` from state set `st`. Each state is a
+  point in `ATTRIBUTES_TAG`'s `{TOKEN [= VALUE] (WS TOKEN [= VALUE])* WS*}`:
+  `group-after-token` holds after a token and whitespace, which may yet be
+  the `\\s*` before an `=` or the separator before the next token, and
+  `group-eq-space` after an `=` and whitespace, where the value is optional
+  so a token may start instead -- the two places the regex backtracks."
+  ^long [^long st c]
+  (let [in? (fn [states] (not (zero? (bit-and st (long states)))))
+        ws (group-ws? c)
+        value-char (group-value-char? c)
+        token-from (bit-or group-open group-after-token group-eq-space group-sep)]
+    (cond-> 0
+      (and ws (in? group-open)) (bit-or group-open)
+      (and (or (= c \#) (= c \.)) (in? token-from)) (bit-or group-hash-start)
+      (and value-char (in? (bit-or group-hash-start group-hash))) (bit-or group-hash)
+      (and (group-name-start? c) (in? token-from)) (bit-or group-name)
+      (and (group-name-char? c) (in? group-name)) (bit-or group-name)
+      (and ws (in? (bit-or group-hash group-name group-after-token))) (bit-or group-after-token)
+      (and (= c \=) (in? (bit-or group-hash group-name group-after-token))) (bit-or group-eq)
+      (and ws (in? (bit-or group-eq group-eq-space))) (bit-or group-eq-space)
+      (and value-char (in? (bit-or group-eq group-eq-space group-value))) (bit-or group-value)
+      (and (= c \') (in? (bit-or group-eq group-eq-space))) (bit-or group-single)
+      (and (not= c \') (in? group-single)) (bit-or group-single)
+      (and (= c \") (in? (bit-or group-eq group-eq-space))) (bit-or group-double)
+      (and (not= c \") (in? group-double)) (bit-or group-double)
+      (or (and (= c \') (in? group-single)) (and (= c \") (in? group-double))) (bit-or group-quoted)
+      (and ws (in? (bit-or group-value group-quoted group-sep))) (bit-or group-sep))))
+
+(defn- attribute-group-end-index
+  "The index within `s` of the `}` that closes the attribute group opening
+  at index `i`, or nil if `ATTRIBUTES_TAG` does not match there -- see
+  `attribute-group-closes?`, the yes/no form of the same question.
+  `parse-cite-bracket!` needs the index itself, to tell a group that ends
+  its heading or caption from one with more text after it."
+  [^CharSequence s i]
+  (let [n (.length s)]
+    (when (and (< i n) (= \{ (.charAt s i)))
+      (loop [j (inc i) st (long group-open)]
+        (cond
+          (or (zero? st) (>= j n)) nil
+          (and (= \} (.charAt s j)) (not (zero? (bit-and st (long group-may-close))))) j
+          :else (recur (inc j) (group-step st (.charAt s j))))))))
+
+(defn- attribute-group-closes?
+  "True if `ATTRIBUTES_TAG` matches at index `i` of `s` -- the `{` there
+  opens what flexmark reads as an attribute group. The same answer as
+  `.lookingAt` with flexmark-ext-attributes 0.64.8's own `ATTRIBUTES_TAG`
+  from `i` (`haselnuss.parser-test` reads that field reflectively and
+  checks the two against each other, so a flexmark upgrade that changes
+  the pattern fails there), but by one
+  pass over a set of states rather than a backtracking regex, so its depth
+  does not grow with the input. Reads only as far as the group's `}`, or
+  until no state is left: in prose that is usually a few characters."
+  [^CharSequence s i]
+  (some? (attribute-group-end-index s i)))
+
+(def ^:private ^:dynamic *chunk-parse*
+  "True while `math-chunk-items` runs flexmark over a chunk's own text, so
+  an error raised inside that parse can give its position as a chunk line
+  and column. Unbound (false) for the mini-documents conversion parses
+  later (a citation's prefix, a table caption), whose lines are not the
+  chunk's."
+  false)
+
+(defn- attribute-group-too-long
+  "The located `ex-info` for a `{` at index `i` of `input` whose attribute
+  group overflowed flexmark's regex -- see this section's comment. `:text`
+  is the start of its line from the `{`, for `chunk-body-line` to find."
+  [^BasedSequence input i cause]
+  (let [base (.toString (.getBaseSequence input))
+        offset (.getStartOffset (.subSequence input (int i) (int (inc i))))
+        line-start (inc (.lastIndexOf base "\n" (int (dec offset))))
+        line-end (let [k (.indexOf base "\n" (int offset))] (if (neg? k) (.length base) k))]
+    (ex-info "attribute group too long to parse: a `{` that the attribute syntax would read up to a `}` far later (write `\\{` if it is prose)"
+             (cond-> {:type ::attribute-group-too-long
+                      :text (subs base offset (min line-end (+ offset 40)))}
+               *chunk-parse* (assoc :chunk-line (inc (count (filter #{\newline} (subs base 0 offset))))
+                                    :chunk-column (inc (.codePointCount base (int line-start) (int offset)))))
+             cause)))
+
+(def ^:private attributes-extension-factory
+  "The `InlineParserExtensionFactory` registered on `cm-parser` for `{` in
+  place of flexmark-ext-attributes' own (see this section's comment), whose
+  extension it wraps. `proxy`, not `reify`: see
+  `inline-math-extension-factory`."
+  (let [flexmark-factory (AttributesInlineParserExtension$Factory.)]
+    (proxy [InlineParserExtensionFactory] []
+      (getCharacters [] "{")
+      (getAfterDependents [] #{})
+      (getBeforeDependents [] #{})
+      (affectsGlobalScope [] false)
+      (apply [lp]
+        (let [^InlineParserExtension flexmark (.apply flexmark-factory ^LightInlineParser lp)]
+          (reify InlineParserExtension
+            (finalizeDocument [_ ip] (.finalizeDocument flexmark ip))
+            (finalizeBlock [_ ip] (.finalizeBlock flexmark ip))
+            (parse [_ p]
+              (let [^LightInlineParser p p
+                    input (.getInput p)
+                    i (.getIndex p)]
+                (and (attribute-group-closes? input i)
+                     (try (.parse flexmark p)
+                          (catch StackOverflowError e
+                            (throw (attribute-group-too-long input i e)))))))))))))
+
+(defn- build-cm-parser
+  "A flexmark Parser with every construct `cm-parser`'s docstring lists,
+  and pipe tables only when `tables?` -- see `cm-parser` and
+  `fragment-parser`, the two it builds."
+  ^Parser [tables?]
+  (.build (.customDelimiterProcessor
+           (.customDelimiterProcessor
+            (.customInlineParserExtensionFactory
+             (.customInlineParserExtensionFactory
+              (.customInlineParserExtensionFactory
+               ;; TASK-168: `AttributesExtension/extend`, by hand -- its
+               ;; post-processor, and `attributes-extension-factory` in
+               ;; place of its inline parser. Its `parserOptions` only
+               ;; adjusts fenced-code-info options this parser never sets.
+               (.customInlineParserExtensionFactory
+                (.postProcessorFactory
+                 (.linkRefProcessorFactory
+                  (Parser/builder (doto (MutableDataSet.)
+                                    ;; TASK-208: no MultiMarkdown `[caption]`
+                                    ;; line -- see this namespace's docstring.
+                                    (.set TablesExtension/WITH_CAPTION false)
+                                    (.set Parser/EXTENSIONS
+                                          (if tables?
+                                            (java.util.List/of (TablesExtension/create)
+                                                               (FootnoteExtension/create))
+                                            (java.util.List/of (FootnoteExtension/create))))))
+                  attributed-ref-processor)
+                 (AttributesNodePostProcessor$Factory.))
+                attributes-extension-factory)
+               inline-math-extension-factory)
+              cross-ref-cite-extension-factory)
+             cite-bracket-extension-factory)
+            (highlight-delimiter-processor))
+           (strike-delimiter-processor))))
+
 (def ^:private ^Parser cm-parser
   "A single, reusable flexmark Parser for CommonMark's core constructs plus
   TASK-5's attribute-group syntax (`{#id .class key=val}`, sec5.3), TASK-7's
@@ -983,22 +1715,23 @@
   no simple rule this file relies on) rather than a fixed rule keyed on
   position or a preceding space -- see the `TextBase` branch of
   `convert-inline`, which exists solely to see through this wrapper
-  whenever it does appear. Parser instances are immutable and safe to reuse
+  whenever it does appear. One `LinkRefProcessor` is registered too,
+  `attributed-ref-processor` (TASK-190), so an attributed bracket over a
+  defined reference does not cost an enclosing link its link. Parser
+  instances are immutable and safe to reuse
   (flexmark's own documented usage pattern). Hinted `^Parser` so `parse`'s
   `(.parse cm-parser ...)` call resolves without reflection."
-  (.build (.customDelimiterProcessor
-           (.customInlineParserExtensionFactory
-            (.customInlineParserExtensionFactory
-             (.customInlineParserExtensionFactory
-              (Parser/builder (doto (MutableDataSet.)
-                                (.set Parser/EXTENSIONS
-                                      (java.util.List/of (AttributesExtension/create)
-                                                         (TablesExtension/create)
-                                                         (FootnoteExtension/create)))))
-              inline-math-extension-factory)
-             cross-ref-cite-extension-factory)
-            cite-bracket-extension-factory)
-           (highlight-delimiter-processor))))
+  (build-cm-parser true))
+
+(def ^:private ^Parser fragment-parser
+  "`cm-parser` without pipe tables, built once, for `mini-parse-inlines`:
+  a citation's prefix/suffix sits inside a paragraph, so it can never be
+  a table, but parsed on its own its first line starts the paragraph,
+  and any later delimiter row (`|---|`) then makes a table of it --
+  escaping the first line does not help, `\\| a |` is still a row
+  (TASK-171). Leaving the extension out, rather than escaping the row,
+  keeps a code span that runs over the row intact (TASK-171 review)."
+  (build-cm-parser false))
 
 (def ^:private escapable-punctuation
   "ASCII punctuation characters a CommonMark backslash escape (sec2.4) may
@@ -1026,6 +1759,18 @@
           (if (and (= c \\) (< (inc i) n) (escapable-punctuation (.charAt s (inc i))))
             (recur (+ i 2) (.append out (.charAt s (inc i))))
             (recur (inc i) (.append out c))))))))
+
+(defn- with-title
+  "`node` (a `:link` or `:image` Inline) with `:title` set to the
+  backslash-unescaped text of `title` (a flexmark BasedSequence, the
+  `\"Title\"` of `[text](url \"Title\")` or of a reference definition),
+  when there is one. An absent or empty title leaves `:title` OUT rather
+  than `\"\"`: the key is optional in `haselnuss.ast`, and a node with no
+  title stays exactly the shape it always had (TASK-140)."
+  [node ^BasedSequence title]
+  (let [text (unescape-backslashes (.toString title))]
+    (cond-> node
+      (seq text) (assoc :title text))))
 
 (declare alt-text)
 
@@ -1091,6 +1836,7 @@
             ;; of its own until the resolver runs: an alt text is fixed
             ;; at parse time and the resolver never revisits it.
             :cross-ref (str "@" (:label inline))
+            :book-ref (str "@{" (:ref inline) "}")
             :cite (cite-alt-text inline)
             ""))
         inlines)))
@@ -1150,6 +1896,23 @@
   (->> (re-seq #"\S+|\s+" s)
        (mapv (fn [tok] (if (str/blank? tok) {:t :space} {:t :str :text tok})))))
 
+(defn- join-inlines
+  "Inlines `a` followed by Inlines `b`, with a `:str` ending `a` and a
+  `:str` starting `b` merged into one (TASK-160). Text with no space
+  between is one word, and one `:str` -- which is what flexmark gives the
+  same characters when they arrive as a single text run, as they do when
+  the `.hdoc` writer escapes an undefined bracket's `[`/`]` (`x\\[$i$\\]`
+  re-parses with `x[` as one word). Without this, `x[$i$]` is `x` `[`
+  `$i$` ... and does not round-trip."
+  [a b]
+  (let [last-a (peek a)
+        first-b (first b)]
+    (if (and (= :str (:t last-a)) (= :str (:t first-b)))
+      (-> (pop a)
+          (conj (assoc last-a :text (str (:text last-a) (:text first-b))))
+          (into (subvec b 1)))
+      (into a b))))
+
 ;; --- Attribute groups (TASK-5, sec4.1/5.3) ----------------------------------
 ;;
 ;; `AttributesExtension` reliably *positions* an `AttributesNode` as the
@@ -1163,6 +1926,19 @@
 ;; *content* itself (`attribute-token`), and separately watches for the
 ;; "flexmark gave up and left literal text" case (`attr-attempt-re`) to
 ;; satisfy AC #4 (a diagnostic, not a silent drop) in both failure modes.
+
+(defn- backslash-in-token!
+  "Throws `ex-info` (`:type error-type`, carrying `:token`) if `s` -- the
+  `what` part (\"an id\", \"a class\", \"a key\", \"an unquoted value\") of
+  the attribute token `token` -- contains a backslash (TASK-197, sec5.3).
+  A token has no escapes: flexmark keeps the backslash of `{#x\\}` in the
+  id, where it would reach a LaTeX label or a cross-reference as a broken
+  one rather than as a message. Quote a value that needs a backslash."
+  [what ^String s token error-type]
+  (when (str/includes? s "\\")
+    (throw (ex-info (str "malformed attribute group: " what " cannot contain a backslash"
+                         " (an attribute token has no escapes; quote a value that needs one)")
+                    {:type error-type :token token}))))
 
 (defn- attribute-token
   "One flexmark `AttributeNode` (a single token inside a `{...}` group) as
@@ -1180,17 +1956,27 @@
   these three forms -- flexmark's own extension accepts it regardless, so
   this must be caught explicitly -- and throws `ex-info`
   (`:type ::malformed-attributes`) rather than silently becoming an
-  unlabeled prop or being dropped (AC #4)."
+  unlabeled prop or being dropped (AC #4).
+
+  A backslash in an id, a class, a key or an UNQUOTED value is refused the
+  same way (`backslash-in-token!`, TASK-197); a quoted value keeps its
+  backslashes verbatim, as before."
   [^AttributeNode node]
-  (cond
-    (.isId node) [:id (.toString (.getValue node))]
-    (.isClass node) [:class (.toString (.getValue node))]
-    (not (str/blank? (.toString (.getAttributeSeparator node))))
-    [:prop (.toString (.getName node)) (.toString (.getValue node))]
-    :else
-    (throw (ex-info "malformed attribute group: token is not #id, .class, or key=val"
-                    {:type ::malformed-attributes
-                     :token (.toString (.getChars node))}))))
+  (let [token (.toString (.getChars node))
+        value (.toString (.getValue node))]
+    (cond
+      (.isId node) (do (backslash-in-token! "an id" value token ::malformed-attributes) [:id value])
+      (.isClass node) (do (backslash-in-token! "a class" value token ::malformed-attributes) [:class value])
+      (not (str/blank? (.toString (.getAttributeSeparator node))))
+      (let [k (.toString (.getName node))]
+        (backslash-in-token! "a key" k token ::malformed-attributes)
+        (when (str/blank? (.toString (.getOpeningMarker node)))
+          (backslash-in-token! "an unquoted value" value token ::malformed-attributes))
+        [:prop k value])
+      :else
+      (throw (ex-info "malformed attribute group: token is not #id, .class, or key=val"
+                      {:type ::malformed-attributes
+                       :token token})))))
 
 (defn- parse-attr-group
   "An `AttributesNode` (a whole `{...}` group) as a `haselnuss.ast` Attr
@@ -1215,10 +2001,23 @@
   attempt trips it."
   #"\{(?:[#.]|[A-Za-z_][\w-]*=)")
 
+(def ^:private unescaped-attr-attempt-re
+  "`attr-attempt-re` for raw inline source, where backslash escapes are
+  still in the text: only a `{` that is NOT itself escaped -- one behind
+  an even run of backslashes, none included, so `\\\\{.c` (an escaped
+  backslash, then a bare brace) still counts -- is an attempt. A `\\{` is
+  a literal brace like any other CommonMark escape (sec2.4), and flexmark
+  already leaves `\\{.c}` as plain text rather than splitting a group out
+  of it; before TASK-189 this check read it as an unclosed group all the
+  same and refused it, so a literal `{.c}` -- which the `.hdoc` emitter
+  writes as `\\{.c}` -- could never be written back."
+  #"(?<!\\)(?:\\\\)*\{(?:[#.]|[A-Za-z_][\w-]*=)")
+
 (defn- check-no-attribute-attempt!
   "Throws `ex-info` (`:type ::malformed-attributes`) if raw source text
   `s` still contains what looks like an attempted attribute group (see
-  `attr-attempt-re`). `AttributesExtension` splits any group it can fully
+  `attr-attempt-re`) behind an unescaped `{` (`unescaped-attr-attempt-re`,
+  TASK-189: `\\{.c}` is literal text). `AttributesExtension` splits any group it can fully
   parse out of its surrounding Text node entirely (confirmed via REPL:
   the successfully-parsed span is gone from what remains), so by the time
   `s` is a Text node's own content, any such match is one flexmark
@@ -1227,9 +2026,36 @@
   containing a token that itself is not valid syntax at all) -- never a
   case this parser should silently pass through as prose (AC #4)."
   [^String s]
-  (when (re-find attr-attempt-re s)
+  (when (re-find unescaped-attr-attempt-re s)
     (throw (ex-info "malformed attribute group: unclosed, or invalid and rejected outright"
                     {:type ::malformed-attributes :text s}))))
+
+(defn attribute-group-at?
+  "True if the `{` at index `i` of `s` (raw inline source, backslash
+  escapes still in it) would be read by flexmark as an attribute group --
+  so `haselnuss.emit.hdoc` can tell a literal `{` that needs a backslash
+  (`{x}`, which re-parses as a group and is refused) from one that is
+  prose (`{}`, `{1}`, `{x,y}`, an unclosed `{x`), TASK-161. Like
+  `reference-at?`, the emitter's half of a decision the parser makes --
+  and the very check the parser makes it with, `attribute-group-closes?`
+  (TASK-172): stackless, so a `{x` before a run of any length gets an
+  answer, never a `StackOverflowError`. Wider than `attr-attempt-re`: a
+  bare name is a valid token to flexmark (`{x}`), though not to
+  Haselnuss, and its whitespace runs cross a line break."
+  [^String s i]
+  (attribute-group-closes? s i))
+
+(defn attribute-attempt-at?
+  "True if the `{` at index `i` of `s` (raw inline source) opens what
+  `check-no-attribute-attempt!` reads as an attempted attribute group --
+  `{#`, `{.` or `{key=` (`attr-attempt-re`) -- whether or not it closes.
+  Left bare and unclosed (`{.c`), such a brace is refused; escaped, it is
+  literal text (TASK-189). So `haselnuss.emit.hdoc` escapes a literal `{`
+  that this or `attribute-group-at?` holds for."
+  [^String s i]
+  (let [m (re-matcher attr-attempt-re s)]
+    (.region m (int i) (.length s))
+    (.lookingAt m)))
 
 ;; --- Section folding -------------------------------------------------------
 ;;
@@ -1251,21 +2077,24 @@
         below (pop stack)]
     (conj (pop below)
           (update (peek below) :blocks conj
-                  {:t :section
-                   :level (:level top)
-                   :heading (:heading top)
-                   :blocks (:blocks top)
-                   :attr (:attr top)}))))
+                  (with-meta {:t :section
+                              :level (:level top)
+                              :heading (:heading top)
+                              :blocks (:blocks top)
+                              :attr (:attr top)}
+                    (meta (:source top)))))))
 
 (defn- open-section
   "Closes every open section at `level` or deeper, then pushes a new open
-  section at `level` with heading Inlines `heading` and Attr `attr`."
-  [stack level attr heading]
+  section at `level` with heading Inlines `heading` and Attr `attr`.
+  `source` is an empty map whose metadata is the heading's source position
+  (TASK-143), or nil."
+  [stack level attr heading source]
   (let [stack (loop [s stack]
                 (if (and (> (count s) 1) (>= (:level (peek s)) level))
                   (recur (close-top s))
                   s))]
-    (conj stack {:level level :attr attr :heading heading :blocks []})))
+    (conj stack {:level level :attr attr :heading heading :blocks [] :source source})))
 
 (defn- append-block
   "Appends completed Block `block` to the innermost open section on `stack`."
@@ -1287,7 +2116,7 @@
   [items]
   (let [final (reduce (fn [stack item]
                         (if (::heading item)
-                          (open-section stack (:level item) (:attr item) (:heading item))
+                          (open-section stack (:level item) (:attr item) (:heading item) (:source item))
                           (append-block stack item)))
                       [{:level 0 :blocks []}]
                       items)
@@ -1317,6 +2146,154 @@
   to a same-shaped `LinkRef` Java class check."
   [^LinkRef node]
   (str/blank? (.toString (.getTextClosingMarker node))))
+
+;; --- Attributed brackets flexmark flattened (TASK-184) ----------------------
+;;
+;; When an inline Link forms -- and any LinkRef or ImageRef too --
+;; flexmark's `InlineParserImpl.parseCloseBracket` calls
+;; `collapseLinkRefChildren` on it, which turns every LinkRef child (and
+;; every undefined ImageRef child) back into text merged with its
+;; neighbours (confirmed by decompiling 0.64.8): a link may not hold a
+;; link. A Span is not a link, but `[text]{...}` is a LinkRef until
+;; `convert-children` reads it, so in `[a [s]{.c}](u)` the Link's children
+;; arrive as the text `a [s]` and a group with nothing to attach to; a
+;; citation-shaped bracket `parse-cite-bracket!` declined (`[See
+;; [@doe]{.c}](u)`) the same way, its `@doe` left between the text pieces.
+;; A bracket holding a span, `[b [c]{.x}]{.y}`, never forms at all for the
+;; same reason, and leaves the same shape.
+;;
+;; The bracket is still in the source, so `regroup-attributed-brackets`
+;; finds it again: it splits the text at its unescaped brackets, matches
+;; them the way flexmark does (a `]` closes the latest open `[`), and makes
+;; a bracket whose `]` the group follows a Span over what lies between.
+;; flexmark has already parsed that content into nodes -- the citation,
+;; emphasis, code -- so the Span keeps them. Every other bracket goes back
+;; into the text it came from, unchanged.
+
+(defn- bracket-pieces
+  "The text of flexmark `Text` `node` split around each unescaped `[` and
+  `]` -- an unescaped `!` straight before a `[` goes with it, as flexmark
+  opens an image there -- as `{:node t :origin node :kind k}`, `t` a
+  detached `Text` over the piece's own source span and `k` one of `:open`,
+  `:image-open`, `:close` or `:text`."
+  [^Text node]
+  (let [text (.getChars node)
+        s (.toString text)
+        n (count s)
+        piece (fn [from to kind]
+                {:node (Text. (.subSequence text (int from) (int to))) :origin node :kind kind})
+        cut (fn [out start i to kind]
+              (cond-> out
+                (< start i) (conj (piece start i :text))
+                true (conj (piece i to kind))))]
+    (loop [i 0 start 0 out []]
+      (if (>= i n)
+        (cond-> out (< start n) (conj (piece start n :text)))
+        (let [c (.charAt s i)]
+          (cond
+            (= c \\) (recur (+ i 2) start out)
+            (and (= c \!) (< (inc i) n) (= \[ (.charAt s (inc i))))
+            (recur (+ i 2) (+ i 2) (cut out start i (+ i 2) :image-open))
+            (= c \[) (recur (inc i) (inc i) (cut out start i (inc i) :open))
+            (= c \]) (recur (inc i) (inc i) (cut out start i (inc i) :close))
+            :else (recur (inc i) start out)))))))
+
+(defn- bracket-items
+  "`children` as the items `regroup-attributed-brackets` matches over:
+  each `Text` as its `bracket-pieces`, a `TextBase` as its own children's
+  items (it is only flexmark's wrapper, see `convert-inline`), an
+  AttributesNode as `:attrs`, anything else as an opaque `:node`."
+  [children]
+  (mapcat (fn [^Node c]
+            (cond
+              (instance? Text c) (bracket-pieces c)
+              (instance? TextBase c) (bracket-items (.getChildren c))
+              (instance? AttributesNode c) [{:node c :kind :attrs}]
+              :else [{:node c :kind :node}]))
+          children))
+
+(defn- items->nodes
+  "Items back to what `convert-children` converts: adjacent pieces of one
+  `Text` merged again, a piece run covering a whole `Text` as that very
+  node, and a regrouped bracket as an `::attributed-bracket` map."
+  [items]
+  (let [runs (reduce (fn [acc {:keys [origin] :as it}]
+                       (let [prev (peek acc)
+                             ^Node prev-node (:node prev)
+                             ^Node node (:node it)]
+                         (if (and origin (identical? origin (:origin prev))
+                                  (= (.getEndOffset prev-node) (.getStartOffset node)))
+                           (conj (pop acc)
+                                 (assoc prev :node (Text. (.baseSubSequence (.getChars prev-node)
+                                                                            (.getStartOffset prev-node)
+                                                                            (.getEndOffset node)))))
+                           (conj acc it))))
+                     [] items)]
+    (mapv (fn [{:keys [kind ^Node node ^Node origin] :as it}]
+            (cond
+              (= kind :span) {::attributed-bracket true
+                              :open (:node (:open it))
+                              :image? (= :image-open (:kind (:open it)))
+                              :content (items->nodes (:content it))
+                              :close (:node (:close it))
+                              :attrs (:attrs it)}
+              (and origin (= (.getStartOffset node) (.getStartOffset origin))
+                   (= (.getEndOffset node) (.getEndOffset origin)))
+              origin
+              :else node))
+          runs)))
+
+(defn- trim-edge-items
+  "`items` (a regrouped bracket's content) with the leading whitespace of a
+  first `:text` piece and the trailing whitespace of a last one trimmed --
+  what flexmark's `collapseLinkRefChildren` does to the children of a
+  bracket it does form, so `[a [ r ]{.c}](u)` holds the Span(r) that
+  `[ r ]{.c}` is (TASK-190 review). A line break is a node of its own and
+  stays, as it does there."
+  [items]
+  (let [trim (fn [items idx f]
+               (let [it (get items idx)]
+                 (if (= :text (:kind it))
+                   (assoc items idx (assoc it :node (Text. ^BasedSequence (f (.getChars ^Node (:node it))))))
+                   items)))]
+    (if (empty? items)
+      items
+      (-> (vec items)
+          (trim 0 #(.trimStart ^BasedSequence %))
+          (trim (dec (count items)) #(.trimEnd ^BasedSequence %))))))
+
+(defn- regroup-attributed-brackets
+  "`children` with each bracket flexmark flattened into text ahead of its
+  own attribute group (see this section's comment) made an
+  `::attributed-bracket` again, or `children` itself when there is none --
+  only an AttributesNode straight after text can be one, and anything
+  else is converted exactly as before."
+  [children]
+  (if-not (some (fn [[a b]] (and (instance? AttributesNode b)
+                                 (or (instance? Text a) (instance? TextBase a))))
+                (map vector children (rest children)))
+    children
+    (let [items (vec (bracket-items children))
+          n (count items)
+          out (loop [i 0 out [] stack ()]
+                (if (>= i n)
+                  out
+                  (let [it (nth items i)
+                        nxt (get items (inc i))]
+                    (case (:kind it)
+                      (:open :image-open) (recur (inc i) (conj out it) (conj stack (count out)))
+                      :close (if (and (seq stack) (= :attrs (:kind nxt)))
+                               (let [o (peek stack)]
+                                 (recur (+ i 2)
+                                        (conj (subvec out 0 o) {:kind :span :open (nth out o)
+                                                                :content (trim-edge-items (subvec out (inc o)))
+                                                                :close it :attrs (:node nxt)})
+                                        (pop stack)))
+                               (recur (inc i) (conj out it) (if (seq stack) (pop stack) stack)))
+                      (recur (inc i) (conj out it) stack)))))]
+      (if (some #(= :span (:kind %)) out)
+        (items->nodes out)
+        children))))
 
 (defn- convert-children
   "Converts an explicit sequence of flexmark inline nodes `children` to a
@@ -1350,6 +2327,10 @@
       the resolved link target rather than silently becoming a
       target-less Span, which is what this same-Java-class check used to
       do before this was distinguished from the bracket-only case above);
+    - a reference-style `ImageRef` (full `![x][r]`, collapsed `![x][]` or
+      shortcut `![x]`) -> `attach-link-ref-attr` too (TASK-169): a defined
+      one becomes the `:image` an inline `![x](u){...}` would, an
+      undefined one TASK-166's fallback in an attributed Span;
     - an `Image` or `Link` (already has its own `:attr` in the AST) ->
       merges the parsed Attr directly into that node's own `:attr` (AC #2,
       image case, and by the same mechanism, Link);
@@ -1362,14 +2343,19 @@
   and for the same reason: sec4.4 gives it an `Attr` of its own, so it
   needs no wrapping Span.
 
+  A bracket flexmark flattened back into text ahead of its group -- a
+  span inside link text, `[a [s]{.c}](u)`, or one holding a span --
+  is found again first (`regroup-attributed-brackets`, TASK-184) and
+  makes the same Span a bracket-only LinkRef does.
+
   Anything else immediately followed by an AttributesNode (e.g.
   `**bold**{.x}`) is deliberately left alone here, falling through to
-  `convert-inline`'s existing default `::unsupported-node` error on the
-  `AttributesNode` itself -- out of this task's explicit scope, and not a
+  `convert-inline`'s `::unsupported-node` error on the `AttributesNode`
+  itself, worded by `orphan-group-message` (TASK-191) -- not a
   silently-ignored no-op, consistent with this file's established
   error-handling ethos."
   [^Document document active-footnotes children]
-  (let [children (vec children)
+  (let [children (regroup-attributed-brackets (vec children))
         n (count children)]
     (loop [i 0 acc []]
       (if (>= i n)
@@ -1378,13 +2364,33 @@
               nxt (when (< (inc i) n) (nth children (inc i)))
               attrs-node (when (instance? AttributesNode nxt) nxt)]
           (cond
-            (and attrs-node (instance? LinkRef child) (bracket-only-link-ref? child))
-            (recur (+ i 2)
-                   (conj acc {:t :span
-                              :inlines (convert-children document active-footnotes (.getChildren ^Node child))
-                              :attr (parse-attr-group attrs-node)}))
+            ;; A bracket and its group flexmark flattened into text
+            ;; (TASK-184): the same Span a bracket-only LinkRef makes, and
+            ;; for `![` the same one an undefined ImageRef does, its `![`
+            ;; and `]` literal around the content.
+            (::attributed-bracket child)
+            (let [{:keys [open close content image? attrs]} child]
+              (recur (inc i)
+                     (conj acc (at-node open
+                                        {:t :span
+                                         :inlines (convert-children document active-footnotes
+                                                                    (if image? (concat [open] content [close]) content))
+                                         :attr (parse-attr-group attrs)}))))
 
-            (and attrs-node (instance? LinkRef child))
+            ;; `attributed-ref-node`: a bracket-only `[r]{.c}` over a
+            ;; defined `r` (TASK-190), the same Span.
+            (and attrs-node (or (attributed-ref-node? child)
+                                (and (instance? LinkRef child) (bracket-only-link-ref? child))))
+            (recur (+ i 2)
+                   (conj acc (at-node child
+                                      {:t :span
+                                       :inlines (convert-children document active-footnotes (.getChildren ^Node child))
+                                       :attr (parse-attr-group attrs-node)})))
+
+            ;; An ImageRef (`![x][r]`, `![x][]`, `![x]`) takes the same
+            ;; path as a full/collapsed LinkRef (TASK-169): an image has no
+            ;; bracket-only Span form to compete with.
+            (and attrs-node (or (instance? LinkRef child) (instance? ImageRef child)))
             (recur (+ i 2)
                    (into acc (attach-link-ref-attr document active-footnotes child (parse-attr-group attrs-node))))
 
@@ -1400,12 +2406,16 @@
 
             (and attrs-node (instance? Code child))
             (recur (+ i 2)
-                   (conj acc {:t :span
-                              :inlines (convert-inline document active-footnotes child)
-                              :attr (parse-attr-group attrs-node)}))
+                   (conj acc (at-node child
+                                      {:t :span
+                                       :inlines (convert-inline document active-footnotes child)
+                                       :attr (parse-attr-group attrs-node)})))
 
+            ;; `join-inlines`, not `into`: an undefined bracket's literal
+            ;; `[`/`]` is one word with prose touching it (`x[$i$]`),
+            ;; TASK-160.
             :else
-            (recur (inc i) (into acc (convert-inline document active-footnotes child)))))))))
+            (recur (inc i) (join-inlines acc (convert-inline document active-footnotes child)))))))))
 
 (defn- convert-inlines
   "Converts every child of `node` to Inlines -- see `convert-children`,
@@ -1470,6 +2480,43 @@
   [^Node node]
   (text->inlines (unescape-backslashes (.toString (.getChars node)))))
 
+(defn- undefined-link-ref
+  "The Inlines for a LinkRef `node` whose reference is undefined (see
+  `resolve-reference`) -- `[see @{bible:x}]`, `[$x^2$]`, `[foo][nope]`:
+  its brackets (and any `[ref]`) kept as literal text around its OWN
+  converted children (TASK-160).
+
+  flexmark has already parsed the bracket's content into those children
+  -- a cross-reference, a citation, inline math, a book reference,
+  emphasis -- so converting them keeps every one, where `literal-ref-text`
+  re-read the whole span as prose and flattened them all. What lies
+  outside the children is the bracket syntax itself, taken from the raw
+  source on each side and unescaped like any other text. That text is
+  split by `text->inlines` like any other, because it is not always bare
+  syntax: flexmark leaves a bracket's edge whitespace out of the children,
+  so `[ foo ]` has `\"[ \"` and `\" ]\"` outside them, which must stay
+  `:space` nodes. `join-inlines` then makes a bracket one word with the
+  text it touches, so a plain `[foo]` is still the single `:str`
+  `\"[foo]\"`, exactly what a re-parse of the escaped `\\[foo\\]` gives.
+
+  An undefined ImageRef -- `![$x$][nope]`, `![a *b*]` -- takes the same
+  path (TASK-166): its children are its alt text and its span starts at
+  the `!`, so the leading syntax is `![` and nothing else changes.
+
+  A LinkRef/ImageRef with no children at all has nothing to keep and
+  falls back to `literal-ref-text`."
+  [^Document document active-footnotes ^Node node]
+  (let [first-child (.getFirstChild node)
+        last-child (.getLastChild node)]
+    (if (nil? first-child)
+      (literal-ref-text node)
+      (let [base (.getBaseSequence (.getChars node))
+            raw (fn [from to]
+                  (text->inlines (unescape-backslashes (str (.subSequence base (int from) (int to))))))]
+        (-> (raw (.getStartOffset node) (.getStartOffset first-child))
+            (join-inlines (convert-inlines document active-footnotes node))
+            (join-inlines (raw (.getEndOffset last-child) (.getEndOffset node))))))))
+
 (defn- attach-link-ref-attr
   "`convert-children`'s handling for a full/collapsed reference-style
   LinkRef `child` (i.e. `bracket-only-link-ref?` is false) that has a
@@ -1488,14 +2535,23 @@
   #4's no-silent-drop philosophy applied here too): since plain text has
   no `:attr` field of its own (per `haselnuss.ast`), the literal fallback
   text is wrapped in a Span carrying `attr`, the same device already used
-  for a Code span (which likewise has no `:attr` field of its own)."
-  [^Document document active-footnotes ^LinkRef child attr]
-  (if-let [reference (resolve-reference document child)]
-    [{:t :link
-      :target (unescape-backslashes (.toString (.getUrl reference)))
-      :inlines (convert-inlines document active-footnotes child)
-      :attr attr}]
-    [{:t :span :inlines (literal-ref-text child) :attr attr}]))
+  for a Code span (which likewise has no `:attr` field of its own).
+
+  A reference-style ImageRef `child` -- full `![x][r]`, collapsed `![x][]`
+  or shortcut `![x]` -- takes the same two paths (TASK-169): a defined one
+  is the `:image` `convert-inline` makes for it with `attr` set, which is
+  exactly what an inline `![x](a.png){...}` gives, so a lone one in a
+  paragraph is promoted to a figure the same way (see `figure-caption`);
+  an undefined one is TASK-166's literal fallback in an `attr`-bearing
+  Span, like an undefined LinkRef's. Either way the defined node is
+  converted by `convert-inline` itself, so its link/image branch stays
+  the one place that shape is built."
+  [^Document document active-footnotes ^RefNode child attr]
+  (if (resolve-reference document child)
+    [(assoc (first (convert-inline document active-footnotes child)) :attr attr)]
+    ;; `at-node`: the Span is a node this conversion synthesizes, so it
+    ;; takes the reference's own line, as a bracket-only Span does.
+    [(at-node child {:t :span :inlines (undefined-link-ref document active-footnotes child) :attr attr})]))
 
 ;; --- Citation item parsing (TASK-9, sec5.11) --------------------------------
 ;;
@@ -1504,6 +2560,44 @@
 ;; here, once `convert-inline` reaches it, since it needs `convert-inlines`
 ;; (already in scope by this point in the file) to turn a segment's own
 ;; prefix/suffix text into real Inlines.
+
+(def ^:private block-line-re
+  "A line that is only a setext-heading underline (one run of `=` or `-`)
+  or a thematic break (three or more of one of `*`/`-`/`_`, spaces
+  allowed between), capturing its indent (group 1) and the rest (group
+  2)."
+  #"([ \t]*)((?:=+|-+|(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*)")
+
+(defn- guard-last-line
+  "`s` with a backslash before the first character of its last line when
+  `s` has more than one line and that line matches `block-line-re` -- see
+  `mini-parse-inlines`. A backslash before punctuation reads back as the
+  bare character, so this changes no text, only what the line can start."
+  [^String s]
+  (let [nl (.lastIndexOf s "\n")]
+    (if-let [[_ indent body] (when (>= nl 0) (re-matches block-line-re (subs s (inc nl))))]
+      (str (subs s 0 (inc nl)) indent "\\" body)
+      s)))
+
+(defn- guard-first-line
+  "`s` (already left-trimmed) with a backslash before what its first line
+  opens with -- the `.`/`)` after a run of 1-9 digits (an ordered-list
+  marker's own digits cannot be escaped), else EVERY character of its
+  leading run of one ASCII punctuation character, else `s` unchanged --
+  see `mini-parse-inlines`. The whole run, not just its first character:
+  escaping one backtick of `` ``` `` would leave a `` `` `` run that can
+  pair with a later one into a code span the paragraph never had
+  (TASK-167 review). Only ever applied to a fragment whose first line
+  parsed as some block other than a paragraph even without its
+  indentation, so the escaped run was a block marker there, never inline
+  markup."
+  [^String s]
+  (if-let [[_ digits] (re-find #"^(\d{1,9})[.)]" s)]
+    (str digits "\\" (subs s (count digits)))
+    (if (and (seq s) (re-matches #"\p{Punct}" (subs s 0 1)))
+      (let [run (count (take-while #(= % (first s)) s))]
+        (str (str/join (repeat run (str "\\" (first s)))) (subs s run)))
+      s)))
 
 (defn- mini-parse-inlines
   "Parses freestanding text `s` (a citation segment's own prefix/locator/
@@ -1546,13 +2640,46 @@
   prefix/suffix that happens to also look like a block construct -- a
   deliberate, narrow trade-off, consistent with this file's other
   documented heuristic scope limits, since a citation's own prefix/suffix
-  text is never expected to need block-level markup in the first place."
+  text is never expected to need block-level markup in the first place.
+
+  Both ends of `s` are partial lines of the paragraph, though, so the
+  fallback above is a last resort rather than the rule. Its FIRST line
+  starts right after the `[`, `;` or key that began the fragment, so in
+  the paragraph it was mid-line text, but here it starts a line and can
+  open a heading, list item, blockquote, fence or HTML block (`[# x @a]`,
+  `[- x\\nfoo @a]`, `[@a, 1. x]`), or be indented code merely for its
+  four leading spaces (`- foo [@a;\\n      *x* @b]`). When the mini-parse
+  does not start with a Paragraph, the fragment is parsed again without
+  its leading whitespace, and only if that is still no Paragraph does
+  `guard-first-line` escape its opening marker for a third parse
+  (TASK-167) -- an indented `*x*` keeps its emphasis. Plain text then keeps its
+  inline markup and its line breaks, which the fallback lost (it also
+  kept a trailing space a Paragraph trims). A wrapped citation (TASK-165)
+  gives `s` line breaks, and its LAST line is cut short at the `@`, `;`
+  or `]` that ended the segment, so it can be a bare `---`/`===`/`***`
+  that was ordinary text in the paragraph but would be a setext underline
+  or thematic break here -- `guard-last-line` escapes it first. Its middle
+  lines are whole paragraph lines that already did not start a block
+  there, with one exception that needs the lines before it: a delimiter
+  row (`|---|`). It makes a table of the lines above it when they all
+  hold a `|` and start the paragraph, which the fragment's first line
+  does even where the paragraph's did not (`[| a |\\n|---| @c]`, TASK-171).
+  So the fragment is parsed with `fragment-parser`, which has no tables
+  at all -- a fragment of a paragraph never is one."
   [^String s]
   (when-not (str/blank? s)
-    (let [mini-doc (.parse cm-parser s)
+    (let [^String guarded (guard-last-line s)
+          ^String trimmed (str/triml guarded)
+          parse (fn ^Document [^String text] (.parse fragment-parser text))
+          para-first? (fn [^Document d] (instance? Paragraph (first (.getChildren d))))
+          ^Document mini-doc (or (some #(let [d (parse %)] (when (para-first? d) d))
+                                       [guarded trimmed])
+                                 (parse (guard-first-line trimmed)))
           mini-para (first (.getChildren mini-doc))]
       (if (instance? Paragraph mini-para)
-        (convert-inlines mini-doc #{} mini-para)
+        ;; No position: these lines are numbered from the citation's own
+        ;; text, not from the file (TASK-143).
+        (binding [*line-base* nil] (convert-inlines mini-doc #{} mini-para))
         (text->inlines (unescape-backslashes s))))))
 
 (defn- strip-leading-comma
@@ -1565,31 +2692,130 @@
   [s]
   (str/replace-first (str/trim s) #"^,\s*" ""))
 
-(def ^:private citation-segment-re
-  "Splits one `;`-separated citation segment (sec5.11, already known via
-  `citation-bracket-content?` to contain an unescaped `@key` marker) into:
-  any prefix text before the key (group 1, lazy so it stops at the
-  *first* unescaped `@` a dash/key could start at); an optional `-`
-  immediately before the `@` (group 2) -- pandoc's own well-known
+(defn- citation-segment-parts
+  "Splits one `;`-separated citation segment `seg` (sec5.11, already known
+  via `citation-bracket-content?` to contain an `@key` marker) into
+  `[prefix dash cite-key suffix]`, around its FIRST marker
+  (`cite-key-index`): any prefix text before the key; `\"-\"` when a `-`
+  sits immediately before the `@`, else nil -- pandoc's own well-known
   suppress-author/\"year-only\" convention (SPEC.md documents
   `haselnuss.ast`'s CiteItem `:mode :year` as \"year-only\" without
   spelling out a trigger syntax of its own, and reusing pandoc's matches
   this project's own stated \"muscle memory\" preference for cross-refs,
-  decision D3, applied the same way here); the key itself (group 3,
-  `ref-token-char?`'s alphabet); and any trailing locator/suffix text
-  (group 4, `strip-leading-comma` cleans it up). The same `(?<!\\\\)`
-  negative lookbehind as `citation-item-marker-re` sits directly before
-  the mandatory `@` literal, so a backslash-escaped `\\@` earlier in the
-  segment (CommonMark sec2.4) is skipped over as ordinary prefix text
-  rather than mistaken for the key's own start (review finding #4) --
-  consistent with `citation-bracket-content?` already having required
-  the segment to contain a *later*, genuinely unescaped `@key` marker
-  before this regex ever runs on it at all."
-  #"^(.*?)(-)?(?<!\\)@([\w:-]+)\s*(.*)$")
+  decision D3, applied the same way here); the key itself; and any
+  trailing locator/suffix text with its leading whitespace dropped
+  (`strip-leading-comma` cleans it up further). A backslash-escaped `\\@`
+  earlier in the segment (CommonMark sec2.4, review finding #4), or an
+  `@` inside a code span or inline math (TASK-167), is not a marker, so
+  it stays ordinary prefix text. Prefix and suffix may span a line
+  break, as a citation group may (TASK-165, see
+  `cite-bracket-close-index`)."
+  [^String seg]
+  (let [[at key-end] (cite-key-index seg)
+        dash? (and (pos? at) (= \- (.charAt seg (int (dec at)))))]
+    [(subs seg 0 (if dash? (dec at) at))
+     (when dash? "-")
+     (subs seg (inc at) key-end)
+     (str/triml (subs seg key-end))]))
+
+(defn- node-column
+  "The 1-based column of flexmark `node`'s first character on its own line
+  of the text that was parsed (TASK-142)."
+  [^com.vladsch.flexmark.util.ast.Node node]
+  (let [seq-chars (.getChars node)
+        text (str (.getBaseSequence seq-chars))
+        off (.getStartOffset seq-chars)]
+    (inc (.codePointCount text (int (inc (.lastIndexOf text "\n" (int (dec off))))) (int off)))))
+
+(defn- orphan-group-message
+  "What to tell the author about an attribute group `node` that
+  `convert-children` found nothing to attach to (TASK-191). Only the
+  wording is chosen here; which inputs are refused is unchanged.
+
+  flexmark keeps a group that follows whitespace in the middle of text as
+  its own node -- it drops that whitespace only when the group ends its
+  paragraph, heading or link text -- so `x [s] {.c} y` arrives here, as do
+  a second group (`[s]{.c}{.d}`), one opening the text, and one straight
+  after something no group attaches to (`**b**{.c}`). Each gets a message
+  naming the fix. The `]` case also reads the source, because a bracket
+  can reach here flattened into text (`regroup-attributed-brackets`); a
+  lone or escaped `]`, or a footnote marker's, takes the general wording,
+  since writing the group right after it would still be refused."
+  [^AttributesNode node]
+  (let [span (.getChars node)
+        base (.getBaseSequence span)
+        group (str span)
+        literal "write `\\{` for a literal `{`"
+        prev (.getPrevious node)
+        char-at (fn [i] (when (>= i 0) (.charAt base (int i))))
+        space-at? (fn [i] (and (>= i 0) (Character/isWhitespace (.charAt base (int i)))))
+        blank-before? (space-at? (dec (.getStartOffset span)))]
+    (cond
+      (instance? AttributesNode prev)
+      (let [inner (fn [s] (str/trim (subs s 1 (dec (count s)))))
+            prev-group (str (.getChars ^Node prev))]
+        (str "attribute group `" group "` follows another group, `" prev-group
+             "`; one construct takes one group, so merge them into `{"
+             (inner prev-group) " " (inner group) "}`, or " literal))
+
+      (nil? prev)
+      (str "attribute group `" group "` starts the text, with nothing before it to attach to; "
+           literal)
+
+      blank-before?
+      (let [p (loop [p prev]
+                (if (and p (str/blank? (str (.getChars ^Node p)))) (recur (.getPrevious ^Node p)) p))
+            end (loop [i (dec (.getStartOffset span))]
+                  (if (space-at? i) (recur (dec i)) i))
+            escaped? (fn [i] (odd? (count (take-while #{\\} (map char-at (range (dec i) -1 -1))))))
+            ;; A `]` that closes a bracket a group could take: a reference
+            ;; bracket, or one flattened into text (`[a [s] {.c}](u)`),
+            ;; found as an unescaped `[` -- not a footnote's `[^` -- before
+            ;; any other `]` in that text. Not a lone or escaped `]`.
+            opens? (fn [^Node p]
+                     (let [lo (.getStartOffset (.getChars p))]
+                       (loop [i (dec end)]
+                         (cond
+                           (< i lo) false
+                           (escaped? i) (recur (dec i))
+                           (= \] (char-at i)) false
+                           (= \[ (char-at i)) (not= \^ (char-at (inc i)))
+                           :else (recur (dec i))))))
+            bracket? (and (= \] (char-at end)) (not (escaped? end))
+                          (or (instance? LinkRef p) (instance? ImageRef p) (attributed-ref-node? p)
+                              (and (or (instance? Text p) (instance? TextBase p)) (opens? p))))
+            [what fix] (cond
+                         (instance? Image p) ["the image" "write it right after the image's `)`, as in `![alt](src){.c}`"]
+                         (instance? Link p) ["the link" "write it right after the link's `)`, as in `[text](url){.c}`"]
+                         (instance? Code p) ["the code span" "write it right after the closing backtick"]
+                         (highlight-node? p) ["the highlight" "write it right after the closing `==`, as in `==text=={.c}`"]
+                         bracket? ["the `]`" "write it right after the `]`, as in `[text]{.c}`"])]
+        (if what
+          (str "attribute group `" group "` is separated by whitespace from " what
+               " before it; a group attaches only to what it directly follows, so " fix ", or " literal)
+          (str "attribute group `" group "` follows whitespace in the middle of text, where it has "
+               "nothing to attach to; write it right after a `[text]` span, link, image, code span or "
+               "highlight, as in `[text]{.c}`, or " literal)))
+
+      :else
+      (str "attribute group `" group "` follows something it cannot attach to; in running text a "
+           "group attaches only to a `[text]` span, link, image, code span or highlight, so wrap "
+           "the text in brackets, as in `[text]{.c}`, or " literal))))
+
+(defn- orphan-group-error
+  "The located `::unsupported-node` error for an attribute group `node`
+  with nothing to attach to, worded by `orphan-group-message` (TASK-191)."
+  [^AttributesNode node]
+  (ex-info (orphan-group-message node)
+           {:type ::unsupported-node
+            :chunk-line (inc (.getLineNumber node))
+            :chunk-column (node-column node)
+            :class (.getName (class node))
+            :text (.toString (.getChars node))}))
 
 (defn- citation-segment->item
   "One sec5.11 CiteItem (AC #2) for a single `;`-separated citation segment
-  `seg` -- see `citation-segment-re`. `:prefix`/`:suffix` are set only when
+  `seg` -- see `citation-segment-parts`. `:prefix`/`:suffix` are set only when
   their respective text (trimmed, and for suffix with `strip-leading-comma`
   applied) is non-blank (see `mini-parse-inlines`); `:mode` is `:year` when
   the segment had a suppress-author `-` immediately before its `@`,
@@ -1597,7 +2823,7 @@
   mode -- is a wholly different, unbracketed construct, see
   `cite-author-node`, and never reaches this function at all)."
   [seg]
-  (let [[_ prefix dash cite-key suffix] (re-matches citation-segment-re seg)
+  (let [[prefix dash cite-key suffix] (citation-segment-parts seg)
         prefix-inlines (mini-parse-inlines prefix)
         suffix-inlines (mini-parse-inlines (strip-leading-comma suffix))]
     (cond-> {:key cite-key :mode (if dash :year :normal)}
@@ -1607,12 +2833,14 @@
 (defn- cite-bracket-node->cite
   "The `:cite` Inline (AC #2) for a `cite-bracket-node`: one CiteItem (see
   `citation-segment->item`) per `;`-separated segment of its raw inner
-  text, in source order."
+  text (`cite-segments`), in source order."
   [^DelimitedNodeImpl node]
   {:t :cite
-   :items (mapv citation-segment->item (str/split (.toString (.getText node)) #";"))})
+   :items (mapv citation-segment->item (cite-segments (.toString (.getText node))))})
 
-(defn- convert-inline
+(declare convert-inline)
+
+(defn- convert-inline-node
   "Converts one flexmark inline `node` to a vector of 0+ `haselnuss.ast`
   Inlines. `document` is the enclosing flexmark Document, needed only to
   resolve LinkRef/ImageRef (reference-style and shortcut-reference links/
@@ -1702,6 +2930,10 @@
     [{:t :math-inline :tex (.toString (.getText ^DelimitedNodeImpl node))}]
     (cross-ref-node? node)
     [{:t :cross-ref :label (.toString (.getText ^DelimitedNodeImpl node))}]
+    ;; TASK-152: the ref exactly as written, unescaped and unvalidated --
+    ;; see the BOOK REFERENCES comment.
+    (book-ref-node? node)
+    [{:t :book-ref :ref (.toString (.getText ^DelimitedNodeImpl node))}]
     (cite-author-node? node)
     [{:t :cite :items [{:key (.toString (.getText ^DelimitedNodeImpl node)) :mode :author}]}]
     (cite-bracket-node? node) [(cite-bracket-node->cite node)]
@@ -1714,6 +2946,11 @@
     [{:t :highlight
       :inlines (convert-inlines document active-footnotes node)
       :attr default-attr}]
+    ;; TASK-137: `~~struck text~~`, converted like a highlight minus the
+    ;; `:attr` (sec4.4 gives `:strike` none).
+    (strike-node? node)
+    [{:t :strike
+      :inlines (convert-inlines document active-footnotes node)}]
     (instance? Footnote node)
     (let [label (.toString (.getText ^Footnote node))
           footnote-block (.getReferenceNode ^Footnote node document)]
@@ -1739,14 +2976,16 @@
     (let [alt-inlines (convert-inlines document active-footnotes node)
           src (unescape-backslashes (.toString (.getUrl ^Image node)))]
       (note-in-alt! src alt-inlines)
-      [{:t :image
-        :src src
-        :alt (alt-text alt-inlines)
-        :attr default-attr}])
-    (instance? Link node) [{:t :link
-                            :target (unescape-backslashes (.toString (.getUrl ^Link node)))
-                            :inlines (convert-inlines document active-footnotes node)
-                            :attr default-attr}]
+      [(with-title {:t :image
+                    :src src
+                    :alt (alt-text alt-inlines)
+                    :attr default-attr}
+         (.getTitle ^Image node))])
+    (instance? Link node) [(with-title {:t :link
+                                        :target (unescape-backslashes (.toString (.getUrl ^Link node)))
+                                        :inlines (convert-inlines document active-footnotes node)
+                                        :attr default-attr}
+                             (.getTitle ^Link node))]
     ;; Both of CommonMark's autolink spellings (sec6.5). flexmark's core
     ;; parser already
     ;; produces these two node types and this parser simply had no branch
@@ -1760,22 +2999,87 @@
       (let [alt-inlines (convert-inlines document active-footnotes node)
             src (unescape-backslashes (.toString (.getUrl reference)))]
         (note-in-alt! src alt-inlines)
-        [{:t :image
-          :src src
-          :alt (alt-text alt-inlines)
-          :attr default-attr}])
-      (literal-ref-text node))
+        [(with-title {:t :image
+                      :src src
+                      :alt (alt-text alt-inlines)
+                      :attr default-attr}
+           (.getTitle reference))])
+      ;; The same fallback as an undefined LinkRef (TASK-166): the alt
+      ;; text's children are kept, `![`, `]` and any `[ref]` literal
+      ;; around them -- the node's span starts at its `!`.
+      (undefined-link-ref document active-footnotes node))
     (instance? LinkRef node)
     (if-let [reference (resolve-reference document node)]
-      [{:t :link
-        :target (unescape-backslashes (.toString (.getUrl reference)))
-        :inlines (convert-inlines document active-footnotes node)
-        :attr default-attr}]
-      (literal-ref-text node))
+      [(with-title {:t :link
+                    :target (unescape-backslashes (.toString (.getUrl reference)))
+                    :inlines (convert-inlines document active-footnotes node)
+                    :attr default-attr}
+         (.getTitle reference))]
+      (undefined-link-ref document active-footnotes node))
+    ;; `attributed-ref-processor` only makes one ahead of its own group,
+    ;; which `convert-children` takes with it. One arriving alone is a bug
+    ;; here, not a document error: a link made from it could sit inside
+    ;; the link around it, which flexmark would not have allowed.
+    ;; `attributed-bracket?` claims it across whitespace too, which only
+    ;; attaches when the group ends the text: `x [r] {.c} y` is the
+    ;; document error TASK-191 explains, reported at the group.
+    (attributed-ref-node? node)
+    (let [nxt (.getNext node)
+          group (loop [n nxt]
+                  (if (and n (str/blank? (str (.getChars ^Node n)))) (recur (.getNext ^Node n)) n))]
+      ;; Only across a blank gap: a group touching the bracket that still
+      ;; arrives here is `convert-children`'s bug, not the author's.
+      (if (and (instance? AttributesNode group) (not (identical? group nxt)))
+        (throw (orphan-group-error group))
+        (throw (ex-info "internal error: an attributed bracket over a defined reference lost its attribute group"
+                        {:type ::internal-error
+                         :chunk-line (inc (.getLineNumber node))
+                         :chunk-column (node-column node)
+                         :text (.toString (.getChars node))}))))
+    ;; TASK-152: a `{…}` straight after an `@` that `book-ref-end` declined
+    ;; -- `\@{x}`, or an `@{` whose `}` is on a later line -- reaches here
+    ;; as an attribute group. Say what was probably meant.
+    (and (instance? AttributesNode node)
+         (let [span (.getChars node)
+               off (.getStartOffset span)]
+           (and (pos? off) (= \@ (.charAt (.getBaseSequence span) (dec off))))))
+    (throw (ex-info (str "`@{` starts a book reference, written `@{ref}` on one line; "
+                         "write `@\\{` for a literal `@{`")
+                    {:type ::unsupported-node
+                     :chunk-line (inc (.getLineNumber node))
+                     :chunk-column (node-column node)
+                     :class (.getName (class node))
+                     :text (.toString (.getChars node))}))
+    ;; TASK-191: any other group `convert-children` left here had nothing
+    ;; to attach to -- the same refusal, with what to write instead.
+    (instance? AttributesNode node)
+    (throw (orphan-group-error node))
     :else (throw (ex-info "unsupported inline construct"
                           {:type ::unsupported-node
+                           :chunk-line (inc (.getLineNumber node))
+                           :chunk-column (node-column node)
                            :class (.getName (class node))
                            :text (.toString (.getChars node))}))))
+
+(defn- convert-inline
+  "`convert-inline-node`'s Inlines, each one that can be the subject of a
+  diagnostic -- a cross-reference, a citation, or anything carrying an Attr
+  (and so possibly an id) -- recording `node`'s source position (TASK-143).
+  So does inline math (TASK-219): `--untrusted` refuses math by its line,
+  and the LaTeX build warns about a link it drops from math the same way.
+  Plain text and breaks are left bare: there are very many of them and no
+  diagnostic names one.
+
+  An Inline that already has a position keeps it: it was recorded from
+  its own, more precise node -- a cross-reference on the third line of an
+  undefined `[...]` that starts on the second (TASK-160)."
+  [^Document document active-footnotes ^Node node]
+  (mapv (fn [inline]
+          (if (and (or (:attr inline) (contains? #{:cross-ref :book-ref :cite :math-inline} (:t inline)))
+                   (nil? (ast/source inline)))
+            (at-node node inline)
+            inline))
+        (convert-inline-node document active-footnotes node)))
 
 ;; --- Block conversion --------------------------------------------------------
 
@@ -1915,11 +3219,16 @@
   whole document."
   [^Paragraph para]
   (let [stripped (str/replace-first (.toString (.getContentChars para)) table-caption-re "")
-        mini-doc (.parse cm-parser stripped)
+        ^Document mini-doc (binding [*caption-parse* true] (.parse cm-parser stripped))
         mini-para (first (.getChildren mini-doc))]
     (if mini-para
       (let [[attr children] (pop-trailing-attr-group mini-para)]
-        [(convert-children mini-doc #{} children) attr])
+        ;; The caption is parsed on its own, so its line 0 is the line the
+        ;; caption paragraph starts on (TASK-143).
+        [(binding [*line-base* (some-> *line-base* (+ (.getLineNumber para)))
+                   *line-starts* (when *line-base* (doc-line-starts mini-doc))]
+           (convert-children mini-doc #{} children))
+         attr])
       [[] default-attr])))
 
 (defn- table-cell-align
@@ -2119,19 +3428,23 @@
 
   `image` is the already-converted Image Inline, used only for the
   fallback: a Paragraph that converts to a lone Image always holds that
-  Image as a direct child (an `ImageRef` cannot reach here, since a
-  promoted figure needs an id and only an `Image` takes an attribute
-  group -- see `convert-children`), and if that ever stops being true
-  the caption is the flattened alt text rather than nothing, which sec4.3
-  requires to be a vector."
+  Image's flexmark node -- an `Image`, or since TASK-169 a defined
+  `ImageRef`, which takes an attribute group too (see `convert-children`)
+  -- as a direct child, and if that ever stops being true the caption is
+  the flattened alt text rather than nothing, which sec4.3 requires to be
+  a vector. Missing the `ImageRef` here was not hypothetical: it silently
+  flattened a reference-style figure's caption to that alt text."
   [^Document document active-footnotes ^Node paragraph image]
-  (if-let [image-node (first (filter #(instance? Image %) (.getChildren paragraph)))]
+  (if-let [image-node (first (filter #(or (instance? Image %) (instance? ImageRef %))
+                                     (.getChildren paragraph)))]
     (convert-inlines document active-footnotes image-node)
     (text->inlines (:alt image))))
 
 (declare math-paragraph-block)
 
-(defn- convert-block
+(declare convert-block)
+
+(defn- convert-block-node
   "Converts one flexmark block-level `node` (never a Heading -- those are
   intercepted by `convert-blocks` for section folding) to a
   `haselnuss.ast` Block. `document` is threaded through to `convert-inlines`
@@ -2194,15 +3507,29 @@
     (instance? BlockQuote node) {:t :block-quote :blocks (convert-blocks document active-footnotes node)}
     (instance? FencedCodeBlock node) (code-block node (fenced-lang node))
     (instance? IndentedCodeBlock node) (code-block node nil)
-    (instance? ListBlock node) {:t :list
-                                :ordered (instance? OrderedList node)
-                                :tight (.isTight ^ListBlock node)
-                                :items (mapv #(list-item-blocks document active-footnotes %) (.getChildren node))
-                                :attr default-attr}
+    (instance? ListBlock node) (cond-> {:t :list
+                                        :ordered (instance? OrderedList node)
+                                        :tight (.isTight ^ListBlock node)
+                                        :items (mapv #(list-item-blocks document active-footnotes %) (.getChildren node))
+                                        :attr default-attr}
+                                 ;; CommonMark sec5.3: an ordered list's start number is
+                                 ;; authored content (TASK-129); only recorded when not
+                                 ;; the default 1.
+                                 (and (instance? OrderedList node)
+                                      (not= 1 (.getStartNumber ^OrderedList node)))
+                                 (assoc :start (.getStartNumber ^OrderedList node)))
     :else (throw (ex-info "unsupported block construct"
                           {:type ::unsupported-node
+                           :chunk-line (inc (.getLineNumber node))
+                           :chunk-column (node-column node)
                            :class (.getName (class node))
                            :text (.toString (.getChars node))}))))
+
+(defn- convert-block
+  "`convert-block-node`'s Block, recording `node`'s source position
+  (TASK-143)."
+  [^Document document active-footnotes ^Node node]
+  (at-node node (convert-block-node document active-footnotes node)))
 
 (defn- block-items
   "The flat sequence of completed Blocks and `heading-marker`s for `node`'s
@@ -2255,15 +3582,16 @@
             (instance? Heading child)
             (let [[attr heading-children] (pop-trailing-attr-group child)]
               (recur (inc i)
-                     (conj acc (heading-marker (.getLevel ^Heading child) attr
-                                               (convert-children document active-footnotes heading-children)))))
+                     (conj acc (cond-> (heading-marker (.getLevel ^Heading child) attr
+                                                       (convert-children document active-footnotes heading-children))
+                                 *line-base* (assoc :source (at-node child {}))))))
 
             (and (instance? TableBlock child) (table-caption-paragraph? child nxt))
             (let [[caption attr] (table-caption-and-attr nxt)]
-              (recur (+ i 2) (conj acc (convert-table document active-footnotes child caption attr))))
+              (recur (+ i 2) (conj acc (at-node child (convert-table document active-footnotes child caption attr)))))
 
             (instance? TableBlock child)
-            (recur (inc i) (conj acc (convert-table document active-footnotes child [] default-attr)))
+            (recur (inc i) (conj acc (at-node child (convert-table document active-footnotes child [] default-attr))))
 
             :else
             (recur (inc i) (conj acc (convert-block document active-footnotes child)))))))))
@@ -2414,8 +3742,12 @@
   #"[A-Za-z_][\w-]*=")
 
 (defn- split-attr-tokens
-  "The inside of a `{...}` group as a vector of whitespace-separated
-  tokens, with a quoted value kept as one token and its quotes removed.
+  "The inside of a `{...}` group as a vector of `[token start quoted?]`
+  triples (`start` is the 0-based offset of the token's first character
+  within `inner`; `quoted?` is true when the token's value was quoted, so
+  `header-token-at` lets a backslash through there and nowhere else,
+  TASK-197) of whitespace-separated tokens, with a quoted value kept as one
+  token and its quotes removed.
 
   A quote character only opens a quoted run where a *value* can start --
   immediately after a `key=` (see `attr-value-start-re`) -- so an
@@ -2434,30 +3766,32 @@
   - anything but whitespace after a closing quote, so `key=\"a\"x` is an
     error rather than the value `ax`."
   [inner error-type text]
-  (loop [[c & more] (seq inner), token "", tokens [], quote-ch nil, closed? false]
-    (cond
-      (nil? c)
-      (if quote-ch
-        (throw (ex-info (str "unterminated " quote-ch "-quoted attribute value")
+  (loop [[c & more] (seq inner), i 0, token "", start 0, tokens [], quote-ch nil, closed? false, quoted? false]
+    (let [i' (inc i)
+          flushed (cond-> tokens (seq token) (conj [token start quoted?]))]
+      (cond
+        (nil? c)
+        (if quote-ch
+          (throw (ex-info (str "unterminated " quote-ch "-quoted attribute value")
+                          {:type error-type :text text}))
+          flushed)
+
+        quote-ch
+        (if (= c quote-ch)
+          (recur more i' token start tokens nil true true)
+          (recur more i' (str token c) start tokens quote-ch false true))
+
+        (and closed? (not (Character/isWhitespace ^char c)))
+        (throw (ex-info (str "unexpected " c " after a closing quote in an attribute value")
                         {:type error-type :text text}))
-        (cond-> tokens (seq token) (conj token)))
 
-      quote-ch
-      (if (= c quote-ch)
-        (recur more token tokens nil true)
-        (recur more (str token c) tokens quote-ch false))
+        (and (contains? #{\" \'} c) (re-matches attr-value-start-re token))
+        (recur more i' token start tokens c false true)
 
-      (and closed? (not (Character/isWhitespace ^char c)))
-      (throw (ex-info (str "unexpected " c " after a closing quote in an attribute value")
-                      {:type error-type :text text}))
+        (Character/isWhitespace ^char c)
+        (recur more i' "" start flushed nil false false)
 
-      (and (contains? #{\" \'} c) (re-matches attr-value-start-re token))
-      (recur more token tokens c false)
-
-      (Character/isWhitespace ^char c)
-      (recur more "" (cond-> tokens (seq token) (conj token)) nil false)
-
-      :else (recur more (str token c) tokens nil false))))
+        :else (recur more i' (str token c) (if (empty? token) i start) tokens nil false quoted?)))))
 
 (defn- directive-header-token
   "One token inside a directive's `{...}` header group (sec5.5) as
@@ -2486,6 +3820,30 @@
     :else (throw (ex-info "malformed directive header: token is not a name, #id, .class, or key=val"
                           {:type ::malformed-directive :token tok}))))
 
+(defn- header-token-at
+  "`(directive-header-token tok)`, with a malformed-token error given where
+  the token sits: `:group-text` (the whole `{...}` group) and
+  `:token-offset` (0-based in the group, braces counted; `start` is the
+  offset within the group's inside), so `offending-column` needs no text
+  search for the token (TASK-142).
+
+  A backslash in an id, a class or an unquoted value (`quoted?` false) is
+  refused with `error-type`, as `attribute-token` refuses it on flexmark's
+  path (TASK-197); a name or key cannot hold one, `directive-header-token`'s
+  own productions refuse it."
+  [tok start quoted? group error-type]
+  (try (let [[kind a b :as parsed] (directive-header-token tok)]
+         (case kind
+           :id (backslash-in-token! "an id" a tok error-type)
+           :class (backslash-in-token! "a class" a tok error-type)
+           :prop (when-not quoted? (backslash-in-token! "an unquoted value" b tok error-type))
+           nil)
+         parsed)
+       (catch clojure.lang.ExceptionInfo e
+         (throw (ex-info (ex-message e)
+                         (assoc (ex-data e) :group-text group :token-offset (inc start))
+                         (ex-cause e))))))
+
 (defn- parse-directive-header
   "`[name attr]` for a directive's opening-fence header text `header` (the
   fence line's content after its colon run, already trimmed) -- `header`
@@ -2501,8 +3859,8 @@
   [header]
   (if-let [inner (second (re-matches #"\{(.*)\}" header))]
     (let [tokens (split-attr-tokens inner ::malformed-directive header)
-          [dname attr] (reduce (fn [[dname attr] tok]
-                                 (let [[kind a b] (directive-header-token tok)]
+          [dname attr] (reduce (fn [[dname attr] [tok start quoted?]]
+                                 (let [[kind a b] (header-token-at tok start quoted? header ::malformed-directive)]
                                    (case kind
                                      :name (if dname
                                              (throw (ex-info "directive header has more than one name token"
@@ -2541,14 +3899,15 @@
   (if (str/blank? group-text)
     default-attr
     (if-let [inner (second (re-matches #"\{(.*)\}" group-text))]
-      (reduce (fn [attr tok]
-                (let [[kind a b] (directive-header-token tok)]
+      (reduce (fn [attr [tok start quoted?]]
+                (let [[kind a b] (header-token-at tok start quoted? group-text error-type)]
                   (case kind
                     :id (assoc attr :id a)
                     :class (update attr :classes conj a)
                     :prop (update attr :props assoc a b)
                     :name (throw (ex-info "malformed attribute group: token is not #id, .class, or key=val"
-                                          {:type error-type :token tok})))))
+                                          {:type error-type :token tok
+                                           :group-text group-text :token-offset (inc start)})))))
               default-attr
               (split-attr-tokens inner error-type group-text))
       (throw (ex-info "malformed attribute group: expected a single {...} group"
@@ -2620,9 +3979,39 @@
                             "malformed !include: the quoted path is empty"
                             (str "malformed !include: a quoted path must close at the end of "
                                  "the line, with nothing after it"))
-                          {:type ::malformed-include :line line})))
+                          {:type ::malformed-include :line line
+                           :body-column (inc (.codePointCount ^String line 0 (int (.lastIndexOf ^String line ^String raw))))})))
         path)
       raw)))
+
+;; --- Quote lines (TASK-152, doc-10) ------------------------------------------
+;;
+;; `!quote <book-ref>` on a line of its own transcludes a passage of another
+;; book: the format's second whole-line block construct, recognized in the
+;; same raw-line scan as `!include` and so sharing every consequence the
+;; comment above lists (shielded by code and math fences, block-level only,
+;; splits the text around it).
+;;
+;; As with `@{ref}` (see BOOK REFERENCES), the parser keeps the reference
+;; exactly as written -- the rest of the line, trimmed -- and leaves judging
+;; it to the resolver, which reports a malformed one as doc-10's
+;; `malformed-book-ref` warning rather than stopping the build. There is no
+;; quoting: a well-formed reference never contains whitespace, so a line
+;; whose rest does is a malformed reference, kept whole so the warning can
+;; show what was written. A bare `!quote` stays a paragraph, exactly like a
+;; bare `!include`, because `quote` is a reserved one-line directive name
+;; (`bang-directive-reserved-names`).
+
+(def ^:private quote-line-re
+  "A whole-line `!quote <ref>`: up to 3 leading spaces, the literal
+  `!quote`, at least one space or tab, then the ref (group 1) with
+  trailing whitespace trimmed off."
+  #"^ {0,3}!quote[ \t]+(\S.*?)[ \t]*$")
+
+(defn- quote-line
+  "The ref, as written, of `line` if it is a `!quote` line, else nil."
+  [line]
+  (second (re-matches quote-line-re line)))
 
 ;; --- One-line directives (TASK-114, sec5.5) --------------------------------
 ;;
@@ -2713,8 +4102,12 @@
   keeps its own copy on purpose (no emitter requires this one), and it
   decides which directives it may write in this spelling -- so a name
   reserved here but not there would be emitted as `!thatname` and read
-  back as something else."
-  #{"include"})
+  back as something else.
+
+  `quote` joined for the same reason when `!quote <ref>` arrived
+  (TASK-152): `quote-line` is tried first, so only a ref-less `!quote` or
+  a `!quote{...}` ever reaches this set."
+  #{"include" "quote"})
 
 (defn- bang-directive-line
   "`[name attr]` if `line` is a one-line body-less directive (see this
@@ -2747,9 +4140,64 @@
         (str/blank? group) (when-not reserved? [dname default-attr])
         (not (str/starts-with? group "{")) nil
         reserved? (throw (ex-info (str "\"" dname "\" is not a one-line directive name: "
-                                       "an include is written `!include <path>` (sec4.3)")
+                                       (if (= "quote" dname)
+                                         "a quote is written `!quote <book-ref>` (doc-10)"
+                                         "an include is written `!include <path>` (sec4.3)"))
                                   {:type ::malformed-directive :name dname :line line}))
         :else [dname (attr-group-attr group ::malformed-directive)]))))
+
+;; Error locations (TASK-134). An `ex-info` raised while the document body is
+;; being scanned or converted carries `:body-line`, the 1-based line within
+;; the BODY (the text after the front matter) that it came from. `parse`
+;; is the one place that knows the front matter's length and the source's
+;; name, so it alone turns `:body-line` into the final `:source-line` and
+;; the `path:line:` message prefix.
+
+(defn- located
+  "`e` rethrown-ready: the same `ex-info` with `:body-line` set to `line`
+  (and `:body-column`, 1-based, when `column` is non-nil) unless some inner,
+  more precise site already set a line."
+  ([e line] (located e line nil))
+  ([^clojure.lang.ExceptionInfo e line column]
+   (if (:body-line (ex-data e))
+     e
+     (ex-info (ex-message e)
+              (cond-> (assoc (ex-data e) :body-line line)
+                column (assoc :body-column column))
+              (ex-cause e)))))
+
+(defn- offending-column
+  "The 1-based column in `text` (one source line) of what a hand-parsed
+  error `data` points at, counted in code points with a tab as one column.
+  A malformed token carries `:group-text` and `:token-offset` (recorded
+  where the group is tokenized); the group ends its line, so it is found
+  from the end and an earlier look-alike cannot be mistaken for the token.
+  Otherwise the error's `:text` (a whole header or group), `:name` or
+  `:token` is searched for. Nil when none is found (TASK-142)."
+  [^String text data]
+  (letfn [(col [i] (inc (.codePointCount text 0 (int i))))
+          (find-from-end [needle]
+            (when-not (str/blank? (str needle))
+              (let [i (.lastIndexOf text ^String (str needle))]
+                (when (>= i 0) i))))]
+    (or (when-let [g (and (:token-offset data) (find-from-end (:group-text data)))]
+          (col (+ g (:token-offset data))))
+        (some-> (some find-from-end [(:text data) (:name data)]) col)
+        (let [needle (str (:token data))]
+          (when-not (str/blank? needle)
+            (let [i (.indexOf text needle)]
+              (when (>= i 0) (col i))))))))
+
+(defn- at-line
+  "Calls the thunk `f`, adding `:body-line` `line` to any `ex-info` it
+  throws that does not already name a line, and `:body-column` where the
+  error's offending token can be found on `line-text` (TASK-142)."
+  ([line f] (at-line line nil f))
+  ([line line-text f]
+   (try (f)
+        (catch clojure.lang.ExceptionInfo e
+          (throw (located e line (or (:body-column (ex-data e))
+                                     (when line-text (offending-column line-text (ex-data e))))))))))
 
 (defn- parse-directive-region
   "Recursive-descent scan of `lines` (the whole document body's lines,
@@ -2762,7 +4210,8 @@
   Returns `[segments next-i]`: `segments` is this level's own flat vector
   of `{:type :text :lines [...]}` /
   `{:type :directive :name .. :attr .. :segments [...]}` /
-  `{:type :include :src ..}` (TASK-38) entries in source
+  `{:type :include :src .. :line ..}` (TASK-38, TASK-163) /
+  `{:type :quote :ref .. :line ..}` (TASK-152) entries in source
   order, and `next-i` is the index of the line right after this level's own
   closing fence (irrelevant at the top level, where there is none to
   consume). A `:directive` entry comes from either of sec5.5's two
@@ -2810,37 +4259,49 @@
   found (AC #3)."
   [lines i open-len open-line]
   (loop [i i segments [] text-buf []]
-    (letfn [(flush-text [segs] (if (seq text-buf) (conj segs {:type :text :lines text-buf}) segs))]
+    (letfn [(flush-text [segs] (if (seq text-buf)
+                                 ;; `:start` is the 0-based body index of the
+                                 ;; segment's first line: the buffered lines
+                                 ;; are exactly the ones just before `i`.
+                                 (conj segs {:type :text :lines text-buf :start (- i (count text-buf))})
+                                 segs))]
       (if (>= i (count lines))
         (if open-len
           (throw (ex-info "unterminated directive fence: no matching closing fence found"
-                          {:type ::unterminated-directive :open-line open-line}))
+                          {:type ::unterminated-directive :open-line open-line :body-line open-line}))
           [(flush-text segments) i])
         (let [[line shielded?] (nth lines i)]
           (if-let [[len header] (and (not shielded?) (fence-line line))]
             (if (and open-len (str/blank? header) (>= len open-len))
               [(flush-text segments) (inc i)]
-              (let [[dname attr] (if (str/blank? header) ["" default-attr] (parse-directive-header header))
+              (let [[dname attr] (if (str/blank? header)
+                                   ["" default-attr]
+                                   (at-line (inc i) line #(parse-directive-header header)))
                     [inner next-i] (parse-directive-region lines (inc i) len (inc i))]
                 (recur next-i
-                       (conj (flush-text segments) {:type :directive :name dname :attr attr :segments inner})
+                       (conj (flush-text segments) {:type :directive :name dname :attr attr :segments inner
+                                                    :line (inc i)})
                        [])))
-            (if-let [src (and (not shielded?) (include-line line))]
+            (if-let [src (and (not shielded?) (at-line (inc i) line #(include-line line)))]
               ;; Ends the run of text before it and starts a fresh one
               ;; after, exactly as a directive fence does -- so an
               ;; `!include` written mid-paragraph splits that paragraph
               ;; in two rather than disappearing into it.
-              (recur (inc i) (conj (flush-text segments) {:type :include :src src}) [])
-              (if-let [[dname attr] (and (not shielded?) (bang-directive-line line))]
-                ;; TASK-114: a one-line body-less directive. Its
-                ;; `:segments` is empty by construction (this form has no
-                ;; body and consumes no further lines), so it needs no
-                ;; recursion and cannot be left unterminated.
-                (recur (inc i)
-                       (conj (flush-text segments)
-                             {:type :directive :name dname :attr attr :segments []})
-                       [])
-                (recur (inc i) segments (conj text-buf line))))))))))
+              (recur (inc i) (conj (flush-text segments) {:type :include :src src :line (inc i)}) [])
+              (if-let [written (and (not shielded?) (quote-line line))]
+                ;; TASK-152: splits the text around it exactly as
+                ;; `!include` does.
+                (recur (inc i) (conj (flush-text segments) {:type :quote :ref written :line (inc i)}) [])
+                (if-let [[dname attr] (and (not shielded?) (at-line (inc i) line #(bang-directive-line line)))]
+                  ;; TASK-114: a one-line body-less directive. Its
+                  ;; `:segments` is empty by construction (this form has no
+                  ;; body and consumes no further lines), so it needs no
+                  ;; recursion and cannot be left unterminated.
+                  (recur (inc i)
+                         (conj (flush-text segments)
+                               {:type :directive :name dname :attr attr :segments [] :line (inc i)})
+                         [])
+                  (recur (inc i) segments (conj text-buf line)))))))))))
 
 ;; --- Display math (TASK-7, sec5.7) ------------------------------------------
 ;;
@@ -2881,6 +4342,15 @@
 
   Anchored at column 0, for the reason `math-single-line-re` gives."
   #"^\$\$[ \t]*(\{[^}]*\})?[ \t]*$")
+
+(defn math-fence-line?
+  "True when `line` is a display math fence line (`math-fence-line-re`):
+  exactly the lines that close an open `$$` block, at column 0 of the raw
+  line scan and on a contained block's dedented Paragraph lines alike.
+  `haselnuss.emit.hdoc` refuses display math whose TeX holds one, since it
+  would end the block early on re-parse (TASK-196)."
+  [line]
+  (boolean (re-matches math-fence-line-re line)))
 
 (defn- math-attr-group
   "The Attr for a display math fence's optional trailing `{...}` group
@@ -2983,12 +4453,14 @@
   "`lines` with the whitespace every CONTINUATION line shares stripped off
   the front of each.
 
-  flexmark starts a Paragraph at its first non-space character but keeps
-  the source indentation of the lines after it, so a math block written
-  inside a list item comes back as `\"$$\\n    x = 1\\n    $$\"`. Removing the
-  shared prefix rather than all leading space keeps whatever alignment the
-  author put INSIDE the formula, which is the part a reader of the .tex
-  cares about."
+  `math-paragraph-block` reads a Paragraph's content lines, from which
+  flexmark has already stripped the container's own prefix (a list item's
+  indentation, a quote's `> `), but a paragraph indented by itself keeps
+  that indentation on the lines after its first: `  $$` / `  w = 4` /
+  `  $$` at the top level comes back as `\"$$\\n  w = 4\\n  $$\"` once
+  trimmed. Removing the shared prefix rather than all leading space keeps
+  whatever alignment the author put INSIDE the formula, which is the part
+  a reader of the .tex cares about."
   [lines]
   (if (< (count lines) 2)
     (vec lines)
@@ -3000,6 +4472,24 @@
             (map (fn [line]
                    (if (>= (count line) shared) (subs line shared) (str/triml line))))
             (rest lines)))))
+
+(defn- closing-line-located
+  "`e`, an attribute-group error raised for a contained display math
+  block's closing `$$` line, with `:chunk-line` and `:chunk-column` set to
+  where `close-line` (that line's flexmark content line) sits in the text
+  flexmark parsed (TASK-202). The column is found on the whole raw source
+  line, so a container's prefix -- a quote's `> `, a list item's
+  indentation, which `.getContentLines` has stripped -- is counted."
+  [^clojure.lang.ExceptionInfo e ^BasedSequence close-line]
+  (let [text (str (.getBaseSequence close-line))
+        off (.getStartOffset close-line)
+        start (inc (.lastIndexOf text "\n" (int (dec off))))
+        end (let [k (.indexOf text "\n" (int off))] (if (neg? k) (count text) k))
+        column (offending-column (subs text start end) (ex-data e))]
+    (ex-info (ex-message e)
+             (cond-> (assoc (ex-data e) :chunk-line (inc (count (filter #{\newline} (subs text 0 start)))))
+               column (assoc :chunk-column column))
+             (ex-cause e))))
 
 (defn- math-paragraph-block
   "The MathBlock for flexmark Paragraph `node` when the paragraph is
@@ -3015,9 +4505,19 @@
   keeps it there, so the block is a child of its list item, its quote or
   its directive, with its id, its number and its cross-reference intact.
 
-  `.getChars` is read rather than the converted inlines because the body is
-  raw TeX: `\\begin{cases}` run through inline conversion is read as an
-  attribute group and fails the build.
+  The paragraph's own source lines are read rather than the converted
+  inlines because the body is raw TeX: `\\begin{cases}` run through inline
+  conversion is read as an attribute group and fails the build. They are
+  read as `.getContentLines` -- each line with its container's own prefix
+  already stripped by flexmark -- rather than by splitting `.getChars`,
+  which spans the raw source and so keeps a block quote's `> ` on every
+  line after the first: `> $$` / `> x` / `> $$` came back as
+  `\"$$\\n> x\\n> $$\"`, matched no fence and stayed prose, while the same
+  block reached the writer's round trip as a MathBlock (TASK-188).
+  Unlike `.getChars`, the first content line keeps its own leading
+  indentation (`  $$` at the top level), so the joined text is trimmed at
+  both ends; `dedent` then applies to whatever indentation the later lines
+  have left once the container's own prefix is gone.
 
   The whole paragraph must be the block. A paragraph that merely STARTS
   with a fence and carries prose after the closer is left as prose --
@@ -3026,7 +4526,8 @@
   a wrong guess here silently swallows a sentence."
   [^Node node]
   (when (instance? Paragraph node)
-    (let [lines (dedent (str/split-lines (str/trimr (.toString (.getChars node)))))]
+    (let [lines (-> (str/split-lines (str/trim (str/join (.getContentLines ^Paragraph node))))
+                    dedent)]
       (cond
         (and (= 1 (count lines)) (re-matches math-single-line-re (first lines)))
         (let [[_ tex group] (re-matches math-single-line-re (first lines))]
@@ -3044,7 +4545,9 @@
         (let [[_ group] (re-matches math-fence-line-re (peek lines))]
           {:t :math-block
            :tex (str/trim (str/join "\n" (subvec lines 1 (dec (count lines)))))
-           :attr (math-attr-group group)})
+           :attr (try (math-attr-group group)
+                      (catch clojure.lang.ExceptionInfo e
+                        (throw (closing-line-located e (last (.getContentLines ^Paragraph node))))))})
 
         :else nil))))
 
@@ -3072,36 +4575,97 @@
   colon-fence syntax, `$$` collides with much more common plain-text use
   (AC #4's currency-text concern extended to the block level), so an
   unterminated attempt falls back to literal text rather than erroring."
-  [lines]
-  (let [annotated (annotate-code-fences lines)
-        n (count lines)]
-    (loop [i 0 chunks [] text-buf []]
-      (letfn [(flush-text [cs] (if (seq text-buf) (conj cs {:type :text :lines text-buf}) cs))]
-        (if (>= i n)
-          (flush-text chunks)
-          (let [line (nth lines i)
-                in-code-fence? (second (nth annotated i))]
-            (cond
-              in-code-fence?
-              (recur (inc i) chunks (conj text-buf line))
+  ([lines] (extract-math-chunks lines 0))
+  ([lines base]
+   ;; `base` is the 0-based body index of `lines`' first line (TASK-134);
+   ;; every `:text` chunk records its own `:start` from it.
+   (let [annotated (annotate-code-fences lines)
+         n (count lines)]
+     (loop [i 0 chunks [] text-buf []]
+       (letfn [(flush-text [cs] (if (seq text-buf)
+                                  (conj cs {:type :text :lines text-buf :start (+ base (- i (count text-buf)))})
+                                  cs))
+               (math-attr [group] (at-line (+ base i 1) #(math-attr-group group)))]
+         (if (>= i n)
+           (flush-text chunks)
+           (let [line (nth lines i)
+                 in-code-fence? (second (nth annotated i))]
+             (cond
+               in-code-fence?
+               (recur (inc i) chunks (conj text-buf line))
 
-              (re-matches math-single-line-re line)
-              (let [[_ tex group] (re-matches math-single-line-re line)]
-                (recur (inc i)
-                       (conj (flush-text chunks) {:type :math-block :tex (str/trim tex) :attr (math-attr-group group)})
-                       []))
+               (re-matches math-single-line-re line)
+               (let [[_ tex group] (re-matches math-single-line-re line)]
+                 (recur (inc i)
+                        (conj (flush-text chunks) {:type :math-block :tex (str/trim tex) :attr (math-attr group)
+                                                   :line (+ base i 1)})
+                        []))
 
-              (re-matches math-fence-line-re line)
-              (if-let [close-i (math-fence-bounded-close-index lines i n)]
-                (let [[_ group] (re-matches math-fence-line-re (nth lines close-i))
-                      tex (str/join "\n" (subvec lines (inc i) close-i))]
-                  (recur (long (inc close-i))
-                         (conj (flush-text chunks) {:type :math-block :tex (str/trim tex) :attr (math-attr-group group)})
-                         []))
-                (recur (inc i) chunks (conj text-buf line)))
+               (re-matches math-fence-line-re line)
+               (if-let [close-i (math-fence-bounded-close-index lines i n)]
+                 (let [close-line (nth lines close-i)
+                       [_ group] (re-matches math-fence-line-re close-line)
+                       tex (str/join "\n" (subvec lines (inc i) close-i))
+                       ;; The group is on the CLOSING line, so that is
+                       ;; where its error is, with the column of the
+                       ;; offending token (TASK-202).
+                       attr (at-line (+ base close-i 1) close-line #(math-attr-group group))]
+                   (recur (long (inc close-i))
+                          (conj (flush-text chunks) {:type :math-block :tex (str/trim tex) :attr attr
+                                                     :line (+ base i 1)})
+                          []))
+                 (recur (inc i) chunks (conj text-buf line)))
 
-              :else
-              (recur (inc i) chunks (conj text-buf line)))))))))
+               :else
+               (recur (inc i) chunks (conj text-buf line))))))))))
+
+(defn- chunk-body-line
+  "The 1-based body line an error raised while converting the `:text`
+  `chunk` came from. `data` is the error's `ex-data`: a throw site that had
+  a flexmark node recorded its `:chunk-line` (1-based within the chunk);
+  failing that, the first chunk line containing the error's `:text` (or
+  `:token`), and failing that the chunk's own first line."
+  [text-chunk data]
+  (let [start (:start text-chunk 0)
+        needle (some-> (or (:text data) (:token data)) str (str/split #"\n" 2) first)
+        idx (when-not (str/blank? needle)
+              (first (keep-indexed (fn [k l] (when (str/includes? l needle) k)) (:lines text-chunk))))]
+    (cond
+      (:chunk-line data) (+ start (:chunk-line data))
+      idx (+ start idx 1)
+      :else (inc start))))
+
+(defn- untracked-node-error?
+  "True if `e` is the failure flexmark's node tracker raises when a
+  post-processor meets a node it was never told about (`NodeClassifierVisitor`,
+  0.64.8: \"Parent node: ... is not tracked, some post processor forgot to
+  call tracker.nodeAdded().\") -- see `parse-chunk-text`."
+  [^Throwable e]
+  (and (instance? IllegalStateException e)
+       (str/includes? (str (.getMessage e)) "is not tracked")))
+
+(defn- parse-chunk-text
+  "flexmark's Document for one `:text` chunk's `text`, with an
+  IllegalStateException from flexmark's own post-processing turned into an
+  `ex-info` that `math-chunk-items` locates (TASK-190). The one known way
+  to reach it is a *defined* reference link inside link text with an
+  attribute group after whitespace, `[a [x][r] {.c}](u)`: a link cannot
+  hold a link, so flexmark dissolves the outer one, and the attributes
+  post-processor then fails on what that left. `:text` is the dissolved
+  link's text where flexmark's message names it, for `chunk-body-line`.
+  Only that failure (`untracked-node-error?`) is translated: any other
+  IllegalStateException -- one of this file's own extensions going wrong,
+  say -- propagates unchanged rather than posing as a document error."
+  ^Document [^String text]
+  (try (binding [*chunk-parse* true] (.parse cm-parser text))
+       (catch IllegalStateException e
+         (when-not (untracked-node-error? e) (throw e))
+         (throw (ex-info (str "markup flexmark cannot parse, likely a reference link inside link text "
+                              "with an attribute group after a space: a link cannot hold a link, "
+                              "so remove the outer one")
+                         {:type ::unparsable-markup
+                          :text (second (re-find #"(?s)\{text=(.*?), url=" (str (.getMessage e))))}
+                         e)))))
 
 (defn- math-chunk-items
   "The flat Block/heading-marker items (see `block-items`) for one chunk
@@ -3112,9 +4676,17 @@
   flexmark for its raw TeX content entirely (sec5.7 AC #2/#3)."
   [math-chunk]
   (case (:type math-chunk)
-    :text (let [fm-doc (.parse cm-parser ^String (str/join "\n" (:lines math-chunk)))]
-            (block-items fm-doc #{} fm-doc))
-    :math-block [{:t :math-block :tex (:tex math-chunk) :attr (:attr math-chunk)}]))
+    ;; Realized here, inside the try, because a lazy seq escaping would
+    ;; throw its conversion error with no location. The flexmark parse is
+    ;; inside it too: an attribute group can fail there (TASK-168).
+    :text (try (let [fm-doc (parse-chunk-text (str/join "\n" (:lines math-chunk)))]
+                 (binding [*line-base* (+ *body-line-offset* (:start math-chunk 0) 1)
+                           *line-starts* (doc-line-starts fm-doc)]
+                   (vec (block-items fm-doc #{} fm-doc))))
+               (catch clojure.lang.ExceptionInfo e
+                 (throw (located e (chunk-body-line math-chunk (ex-data e)) (:chunk-column (ex-data e))))))
+    :math-block [(ast/with-source {:t :math-block :tex (:tex math-chunk) :attr (:attr math-chunk)}
+                   *source-file* (+ *body-line-offset* (:line math-chunk)))]))
 
 (declare segments->blocks)
 
@@ -3129,14 +4701,22 @@
   same way (AC #1/#2 of TASK-6)."
   [segment]
   (case (:type segment)
-    :text (mapcat math-chunk-items (extract-math-chunks (:lines segment)))
+    :text (mapcat math-chunk-items (extract-math-chunks (:lines segment) (:start segment 0)))
     ;; TASK-38: the Block itself; `haselnuss.resolver/expand-includes`
     ;; later replaces it with the referenced document's own Blocks.
-    :include [{:t :include :src (:src segment)}]
-    :directive [{:t :directive
-                 :name (:name segment)
-                 :attr (:attr segment)
-                 :blocks (segments->blocks (:segments segment))}]))
+    ;; TASK-163: positioned like `:book-quote`, so an unreadable or
+    ;; cyclic include can name the `!include` line that caused it.
+    :include [(ast/with-source {:t :include :src (:src segment)}
+                *source-file* (+ *body-line-offset* (:line segment)))]
+    ;; TASK-152: the ref as written; the resolver's quote expansion
+    ;; (doc-10 step 0b) fills in the rest.
+    :quote [(ast/with-source {:t :book-quote :ref (:ref segment)}
+              *source-file* (+ *body-line-offset* (:line segment)))]
+    :directive [(ast/with-source {:t :directive
+                                  :name (:name segment)
+                                  :attr (:attr segment)
+                                  :blocks (segments->blocks (:segments segment))}
+                  *source-file* (+ *body-line-offset* (:line segment)))]))
 
 (defn- segments->blocks
   "Converts a vector of `parse-directive-region` segments into Blocks,
@@ -3205,7 +4785,59 @@
             :else
             (recur (inc i) (conj acc [line false]))))))))
 
+;; --- Input normalisation -----------------------------------------------------
+;;
+;; TASK-162: a `.hdoc` saved with Windows line endings or a UTF-8
+;; byte-order mark is the same document as its plain-LF, BOM-less twin.
+;; Rather than teach every line-based rule (the front-matter fences, the
+;; whole-line `!include`/`!quote`/`!name` scan, the directive and math
+;; fences) about a trailing `\r`, the source is normalised once, at the
+;; two public entry points that take source text (`parse`, `front-matter`).
+;; Every reader of a `.hdoc` file -- the CLI's input, the `!include` loads
+;; (CLI and filesystem library alike), a filesystem book -- reaches the
+;; parser through one of them, so an included file is normalised the same
+;; way as the file including it.
+;;
+;; Positions survive it: `\r\n` -> `\n` keeps one line per line, so every
+;; line number is unchanged; a line loses only the `\r` at its very end,
+;; so every column before it is unchanged. The one column that moves is
+;; on line 1 of a file with a BOM, which an editor does not display as a
+;; character either -- so it moves to the column the author sees.
+;;
+;; A lone `\r` (classic Mac OS) is left alone, and a file using it is
+;; inconsistent today: flexmark already treats a lone `\r` as a line
+;; break, while this parser's own line rules (front matter, the
+;; whole-line scan, fences, positions) split on `\n` only. Making the two
+;; agree is out of TASK-162's scope.
+
+(def byte-order-mark
+  "The UTF-8 byte-order mark as Java decodes it, one leading `U+FEFF`.
+  Public for the same reason as `front-matter-opening`."
+  "\uFEFF")
+
+(defn normalize-source
+  "`s` with one leading `byte-order-mark` removed and every `\\r\\n`
+  turned into `\\n` (see the comment above). `parse` and `front-matter`
+  apply it themselves; a caller need not."
+  ^String [^String s]
+  (let [s (if (str/starts-with? s byte-order-mark) (subs s (count byte-order-mark)) s)]
+    (if (str/includes? s "\r\n") (str/replace s "\r\n" "\n") s)))
+
 ;; --- Front matter ------------------------------------------------------------
+
+(def front-matter-opening
+  "The exact first line (of `normalize-source`d text split on `\\n`: no
+  BOM, no `\\r\\n`, no leading blank line) that opens a front-matter block
+  (SPEC.md sec5.2). Public so a reader that streams only the front
+  matter -- the filesystem library's listing (TASK-151) -- applies the
+  very same rule as `parse`."
+  "---")
+
+(defn front-matter-closing?
+  "True when `line` (of `normalize-source`d text split on `\\n`) closes a
+  front-matter block."
+  [line]
+  (contains? #{"---" "..."} line))
 
 (defn- split-front-matter
   "If `source` begins with a YAML front-matter block -- a line of exactly
@@ -3214,9 +4846,9 @@
   `[nil source]` (no front matter, `source` is the whole body)."
   [source]
   (let [lines (vec (str/split source #"\n" -1))]
-    (if (= "---" (first lines))
+    (if (= front-matter-opening (first lines))
       (let [end-idx (->> (subvec lines 1)
-                         (keep-indexed (fn [i l] (when (contains? #{"---" "..."} l) i)))
+                         (keep-indexed (fn [i l] (when (front-matter-closing? l) i)))
                          first)]
         (if end-idx
           [(str/join "\n" (subvec lines 1 (inc end-idx)))
@@ -3279,6 +4911,103 @@
                              (str/join ", " (sort (keys top-level-divisions))) ")")
                         {:type ::unknown-top-level-division :text text})))))
 
+(defn- yaml-kind
+  "How a front-matter author would name the YAML value `data` -- the whole
+  block when it is not a map (TASK-178), or one field's value that has the
+  wrong kind (TASK-209's `bibliography`)."
+  [data]
+  (cond
+    (string? data) "a string"
+    (map? data) "a map"
+    (sequential? data) "a list"
+    (number? data) "a number"
+    (boolean? data) "a boolean"
+    (inst? data) "a date"
+    :else "some other kind of value"))
+
+(defn- yaml-root-line
+  "The line, in the whole file, where the YAML document `yaml-text`'s
+  root value starts -- past any leading comments or blank lines -- or the
+  first line inside the fences when snakeyaml cannot say. Same arithmetic
+  as the TASK-144 marks: 0-based YAML line, plus the opening `---`, plus
+  one to count from 1. Only called on the error path, so composing the
+  text a second time costs nothing a valid document pays."
+  [yaml-text]
+  (or (try (some-> (.compose (org.yaml.snakeyaml.Yaml.) (java.io.StringReader. ^String yaml-text))
+                   .getStartMark
+                   .getLine
+                   (+ 2))
+           (catch Exception _ nil))
+      2))
+
+(defn- front-matter-not-a-map!
+  "Throws the located error for front matter whose YAML parsed to `data`,
+  a value that is not a map (TASK-178). Same shape as a TASK-144 YAML
+  error: `:source-line` (and `:source-file` when `source` is given) in the
+  data, `path:line: ` ahead of the message when there is a path."
+  [yaml-text data source]
+  (let [line (yaml-root-line yaml-text)
+        message (str "front matter must be a YAML map of `key: value` fields, but this one is "
+                     (yaml-kind data))]
+    (throw (ex-info (if source (str source ":" line ": " message) message)
+                    (cond-> {:type ::front-matter-not-a-map :source-line line}
+                      source (assoc :source-file source))))))
+
+(defn- yaml-key-line
+  "The line, in the whole file, of the last top-level `key:` named `k` (a
+  string) in the YAML map `yaml-text` -- the last because that is the
+  occurrence clj-yaml keeps when a key repeats -- or `yaml-root-line` when
+  snakeyaml cannot place it. Same arithmetic and same error-path-only
+  second pass as `yaml-root-line`."
+  [yaml-text k]
+  (or (try (let [node (.compose (org.yaml.snakeyaml.Yaml.) (java.io.StringReader. ^String yaml-text))]
+             (when (instance? org.yaml.snakeyaml.nodes.MappingNode node)
+               (some->> (.getValue ^org.yaml.snakeyaml.nodes.MappingNode node)
+                        (map #(.getKeyNode ^org.yaml.snakeyaml.nodes.NodeTuple %))
+                        (filter #(and (instance? org.yaml.snakeyaml.nodes.ScalarNode %)
+                                      (= k (.getValue ^org.yaml.snakeyaml.nodes.ScalarNode %))))
+                        last
+                        (#(.getLine (.getStartMark ^org.yaml.snakeyaml.nodes.Node %)))
+                        (+ 2))))
+           (catch Exception _ nil))
+      (yaml-root-line yaml-text)))
+
+(defn- bibliography-not-a-path!
+  "Throws the located error for a front-matter `bibliography` whose value
+  `v` is not a string (TASK-209): before, `str` turned a list into the
+  path `clojure.lang.LazySeq@...` and a number into `\"42\"`, and the build
+  then failed to find a nonsense file. Located at the `bibliography:` key,
+  TASK-178's shape otherwise: `:source-line` (and `:source-file` when
+  `source` is given) in the data, `path:line: ` ahead of the message when
+  there is a path. `:value` is what YAML read, for a caller that reports
+  the mistake itself rather than failing on it (`haselnuss.library.
+  filesystem`)."
+  [yaml-text v source]
+  (let [line (yaml-key-line yaml-text "bibliography")
+        message (str "front-matter bibliography must be a path to a CSL-JSON file (a string),"
+                     " but this one is " (yaml-kind v)
+                     (when (or (number? v) (boolean? v) (inst? v))
+                       "; quote it to use it as a file name"))]
+    (throw (ex-info (if source (str source ":" line ": " message) message)
+                    (cond-> {:type ::bibliography-not-a-path :source-line line :value v}
+                      source (assoc :source-file source))))))
+
+(defn- front-matter-bibliography
+  "Meta `cond->` step for the front-matter YAML map `data`'s
+  `bibliography` (TASK-209). A string is the path, as written -- a blank
+  one included, which every consumer already reads as no bibliography; a
+  YAML null (`bibliography:` with nothing after it, or `~`) is no
+  bibliography and leaves the key out; anything else is
+  `bibliography-not-a-path!`'s located error, or, with
+  `omit-non-path?`, left out of Meta for a caller that reports it
+  itself."
+  [m data yaml-text source omit-non-path?]
+  (let [v (:bibliography data)]
+    (cond
+      (string? v) (assoc m :bibliography v)
+      (or (nil? v) omit-non-path?) m
+      :else (bibliography-not-a-path! yaml-text v source))))
+
 (defn- parse-front-matter
   "Parses `yaml-text` (the raw front-matter block, or nil if there was
   none) into a `haselnuss.ast` Meta map, mapping exactly the fields AC #1
@@ -3287,21 +5016,49 @@
   `:csl-style`), and `lang` -- plus `topLevelDivision` (->
   `:top-level-division`, TASK-53). Any other front-matter key is ignored
   -- a deliberate scope limit to what AC #1 asks for, not a claim that
-  Meta can't carry more later."
-  [yaml-text]
-  (if (str/blank? yaml-text)
-    {}
-    (let [data (yaml/parse-string yaml-text)]
-      (cond-> {}
-        (contains? data :title) (assoc :title (text->inlines (str (:title data))))
-        (or (contains? data :author) (contains? data :authors))
-        (assoc :authors (coerce-authors (or (:authors data) (:author data))))
-        (contains? data :date) (assoc :date (coerce-date (:date data)))
-        (contains? data :bibliography) (assoc :bibliography (str (:bibliography data)))
-        (contains? data :cslStyle) (assoc :csl-style (str (:cslStyle data)))
-        (contains? data :lang) (assoc :lang (str (:lang data)))
-        (contains? data :topLevelDivision)
-        (assoc :top-level-division (coerce-top-level-division (:topLevelDivision data)))))))
+  Meta can't carry more later.
+
+  A YAML syntax error is rethrown as `ex-info` (`:type
+  ::malformed-front-matter`, TASK-144) carrying `:source-line`, the line in
+  the whole file (YAML's own line, 0-based in the mark, plus 2: the
+  opening `---` and the 1-based count), and `:source-file` when `source`
+  is given; the message gains `path:line: ` ahead of snakeyaml's own
+  unchanged text. An error with no mark is rethrown as it came.
+
+  YAML that parses to something other than a map -- a string, a list, a
+  number, a boolean -- is `front-matter-not-a-map!`'s located error
+  (TASK-178). YAML that parses to nothing at all (an empty block, only
+  comments, an explicit `null`/`~`) is no fields, as before.
+
+  A `bibliography` that is not a path is `front-matter-bibliography`'s
+  located error (TASK-209) unless `omit-non-path-bibliography?`."
+  ([yaml-text] (parse-front-matter yaml-text nil false))
+  ([yaml-text source omit-non-path-bibliography?]
+   (if (str/blank? yaml-text)
+     {}
+     (let [data (try (yaml/parse-string yaml-text)
+                     (catch org.yaml.snakeyaml.error.MarkedYAMLException e
+                       (let [mark (or (.getProblemMark e) (.getContextMark e))
+                             line (when mark (+ (.getLine mark) 2))]
+                         (if line
+                           (throw (ex-info (if source (str source ":" line ": " (ex-message e)) (ex-message e))
+                                           (cond-> {:type ::malformed-front-matter :source-line line}
+                                             source (assoc :source-file source))
+                                           e))
+                           (throw e)))))]
+       (when-not (or (nil? data) (map? data))
+         (front-matter-not-a-map! yaml-text data source))
+       (cond-> {}
+         (contains? data :title) (assoc :title (text->inlines (str (:title data))))
+         (or (contains? data :author) (contains? data :authors))
+         (assoc :authors (coerce-authors (or (:authors data) (:author data))))
+         (contains? data :date) (assoc :date (coerce-date (:date data)))
+         (contains? data :bibliography)
+         (front-matter-bibliography data yaml-text source omit-non-path-bibliography?)
+         (contains? data :cslStyle) (assoc :csl-style (str (:cslStyle data)))
+         (contains? data :lang) (assoc :lang (str (:lang data)))
+         (contains? data :topLevelDivision)
+         (assoc :top-level-division (coerce-top-level-division (:topLevelDivision data))))))))
 
 ;; --- Entry point --------------------------------------------------------------
 
@@ -3314,9 +5071,15 @@
   `meta.bibliography`, which is in the document being parsed. Reading
   just the front matter is cheaper and far less surprising than parsing
   twice, and the front matter is by definition self-contained -- it ends
-  at its own closing `---` before any body construct begins."
-  [s]
-  (parse-front-matter (first (split-front-matter s))))
+  at its own closing `---` before any body construct begins.
+
+  `opts` takes `:source` as `parse` does (TASK-144): a YAML error then
+  names `path:line:`. It also takes `parse`'s
+  `:omit-non-path-bibliography?`."
+  ([s] (front-matter s {}))
+  ([s {:keys [source omit-non-path-bibliography?]}]
+   (parse-front-matter (first (split-front-matter (normalize-source s))) source
+                       omit-non-path-bibliography?)))
 
 (defn parse
   "Parses Haselnuss `.hdoc` source `s` into a `haselnuss.ast/Document`.
@@ -3334,6 +5097,28 @@
   Both are optional and both default to the pre-TASK-47 behavior, so
   this namespace still parses standalone with no resolver in sight.
 
+  `:source`, a path string, names where `s` came from (TASK-134). A parse
+  error that can be placed gets `:source-line` (1-based, counted in the
+  whole file, front matter included) in its `ex-data` whether or not
+  `:source` is given; with it, `:source-file` too, and the message gains a
+  `path:line: ` prefix ahead of its unchanged wording. Where the offending
+  token is known, the error also carries `:source-column` (1-based, counted
+  in code points of the source line, a tab being one column) and the
+  prefix is `path:line:column: ` (TASK-142). This holds for a
+  malformed front-matter YAML block too (TASK-144).
+
+  A front-matter `bibliography` that is not a path -- a list, a number,
+  a map -- is such a located error too (`::bibliography-not-a-path`,
+  TASK-209, at the `bibliography:` key's line), unless
+  `:omit-non-path-bibliography?` is true: then it is left out of Meta, for
+  a caller that reports the mistake itself and must still parse the
+  document (`haselnuss.library.filesystem`, whose books warn rather than
+  fail a host build).
+
+  `s` is `normalize-source`d first (TASK-162): CRLF line endings and a
+  leading UTF-8 byte-order mark parse exactly as their LF, BOM-less
+  equivalent, at the same lines and columns.
+
   Throws `ex-info` (`:type ::unsupported-node`) if `s` contains a
   CommonMark construct this parser does not yet handle (e.g. raw HTML), and
   `ex-info` (`:type ::invalid-ast`) if the constructed AST unexpectedly
@@ -3341,7 +5126,7 @@
   caller error, since every path above is expected to always produce a
   conforming Document; this is a safety net, not routine validation."
   ([s] (parse s {}))
-  ([s {:keys [kinds cite-keys]}]
+  ([s {:keys [kinds cite-keys source omit-non-path-bibliography?]}]
    ;; Both vocabularies are matched against substrings of the source, so
    ;; a set of keywords -- the obvious mistake, since a lexicon is keyed
    ;; by keyword -- would match nothing and silently turn every
@@ -3357,13 +5142,37 @@
    ;; (`parse-cross-ref-or-cite!`), and anything realized after the
    ;; binding closed would see the defaults instead.
    (binding [*known-kinds* kinds
-             *known-cite-keys* cite-keys]
-     (let [[yaml-text body] (split-front-matter s)
-           [segments] (parse-directive-region (annotate-fences (str/split body #"\n" -1)) 0 nil nil)
-           document {:meta (parse-front-matter yaml-text)
-                     :blocks (segments->blocks segments)}]
-       (when-not (ast/valid? ast/Document document)
-         (throw (ex-info "parser produced an AST that does not conform to haselnuss.ast/Document"
-                         {:type ::invalid-ast
-                          :explanation (ast/explain ast/Document document)})))
-       document))))
+             *known-cite-keys* cite-keys
+             *source-file* source]
+     (let [s (normalize-source s)
+           [yaml-text body] (split-front-matter s)
+           ;; Lines the front matter took off the top: a body line's
+           ;; number in the file is its body number plus this (TASK-134).
+           fm-lines (- (count (str/split s #"\n" -1)) (count (str/split body #"\n" -1)))]
+       (binding [*body-line-offset* fm-lines]
+         (try
+           (let [[segments] (parse-directive-region (annotate-fences (str/split body #"\n" -1)) 0 nil nil)
+                 document {:meta (parse-front-matter yaml-text source omit-non-path-bibliography?)
+                           :blocks (segments->blocks segments)}]
+             (when-not (ast/valid? ast/Document document)
+               (throw (ex-info "parser produced an AST that does not conform to haselnuss.ast/Document"
+                               {:type ::invalid-ast
+                                :explanation (ast/explain ast/Document document)})))
+             document)
+           (catch clojure.lang.ExceptionInfo e
+             (if-let [body-line (:body-line (ex-data e))]
+               ;; The message keeps its wording; `path:line: ` goes in front
+               ;; (TASK-134). With no `:source` there is no path to print,
+               ;; so only the data carries the line.
+               (let [line (+ body-line fm-lines)
+                     column (:body-column (ex-data e) (:chunk-column (ex-data e)))]
+                 (throw (ex-info (if source
+                                   (str source ":" line (when column (str ":" column)) ": " (ex-message e))
+                                   (ex-message e))
+                                 (-> (ex-data e)
+                                     (dissoc :body-line :chunk-line :body-column :chunk-column)
+                                     (assoc :source-line line)
+                                     (cond-> column (assoc :source-column column))
+                                     (cond-> source (assoc :source-file source)))
+                                 (ex-cause e))))
+               (throw e)))))))))

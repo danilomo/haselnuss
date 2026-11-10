@@ -37,3 +37,4 @@
 /*.fls
 /*.fdb_latexmk
 /*.synctex.gz
+/.clj-kondo/babashka/

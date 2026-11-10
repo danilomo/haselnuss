@@ -132,11 +132,11 @@
   the common case (one directive per file); a collection is for a file
   defining several at once.
 
-  `value` reaching here has already been through `sandbox`'s own
-  `force-realized` (inside `sci-call!`, before this function is ever
-  called), so `(vec value)` for a lazy seq is realizing an already-forced,
-  cached seq -- cheap, not a second pass over unbounded, uncaptured
-  computation."
+  `value` reaching here has already been settled by `sandbox/sci-call!`
+  (`:spec`), on the worker and under its timeout: copied into plain data
+  and functions, every lazy seq in it realised, anything else rejected --
+  so nothing below, the `pr-str`s in its error messages included, can run
+  script code on the calling thread (TASK-211)."
   [value path]
   (cond
     (map? value) [value]
@@ -186,7 +186,7 @@
                                          {:type ::missing-extension-file :path path})))
                        (let [source (slurp file)
                              value (sandbox/sci-call! #(sci/eval-string* @ctx source)
-                                                      (str "extension file " path) opts false)]
+                                                      (str "extension file " path) opts :spec)]
                          (->> (extension-entries value path)
                               (map (fn [entry]
                                      (normalize-entry (validate-entry! path entry)

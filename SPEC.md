@@ -189,6 +189,8 @@ type Block =
   | { t: "BlockQuote"; blocks: Block[] }
   | { t: "Directive";  name: string; blocks: Block[]; attr: Attr; fallback?: Fallback }
   | { t: "Include";    src: string }                             // multi-file (implemented)
+  | { t: "BookQuote";  ref: string; canonical?: string; title?: Inline[];
+      blocks?: Block[]; url?: string }                           // `!quote <ref>` (doc-10)
   | { t: "ThematicBreak" };
 
 type Row = { cells: Cell[] };
@@ -220,10 +222,12 @@ type Inline =
   | { t: "Sup";       inlines: Inline[] }
   | { t: "Code";      text: string }
   | { t: "MathInline";tex: string }
-  | { t: "Link";      target: string; inlines: Inline[]; attr: Attr }
-  | { t: "Image";     src: string; alt: string; attr: Attr }
+  | { t: "Link";      target: string; title?: string; inlines: Inline[]; attr: Attr }
+  | { t: "Image";     src: string; title?: string; alt: string; attr: Attr }
   | { t: "Span";      inlines: Inline[]; attr: Attr }            // inline role carrier
   | { t: "CrossRef";  label: string; suppressPrefix?: boolean }  // → "Figure 3" (resolved)
+  | { t: "BookRef";   ref: string; passage?: Passage; canonical?: string;
+      text?: Inline[]; url?: string }                            // `@{ref}` (doc-10)
   | { t: "Cite";      items: CiteItem[] }
   | { t: "Note";      blocks: Block[] }                          // footnote
   | { t: "Highlight"; inlines: Inline[]; attr: Attr }            // annotation: marked run
@@ -236,6 +240,13 @@ type CiteItem = {
   mode: "normal" | "author" | "year";   // [@k] | @k (author-in-text) | year-only
 };
 ```
+
+**`BookRef` / `BookQuote`** link to and quote a passage of another book (doc-10, the
+libraries-and-books design). `ref` is the book reference exactly as written — the parser
+never validates it, so a malformed one reaches the resolver and becomes a
+`malformed-book-ref` warning rather than a parse error. Every other field is optional and
+filled by resolution; `Passage` is `{ form: "label", label } | { form: "range", from, to } |
+{ form: "locator", locator }`, `haselnuss.book-ref`'s own shape.
 
 The lossy `FontType` (which lumped `em`/`it`/`strong`) from the current model is replaced by
 distinct `Emph`/`Strong`/`Sub`/`Sup`/… nodes.
@@ -285,6 +296,18 @@ reference flavor is **Djot** (whose native attributes/divs/spans map almost 1:1 
 Paragraphs, ATX headings (`#`…`######`), emphasis (`*`/`_`), strong (`**`), inline code and
 fenced code blocks, blockquotes, ordered/unordered lists, links, images, thematic breaks.
 
+Two GFM additions are decided here:
+
+- **Strikethrough is in.** `~~struck text~~` produces a `Strike` (§4.4), with ordinary markup
+  allowed inside. A single `~` is plain text. `Strike` carries no `Attr`, so an attribute group
+  after the closer is not accepted. It renders as `<s>` in HTML and `\sout{}` in LaTeX, and
+  round-trips through `--target hdoc` as `~~…~~` (a strike nested inside another strike
+  cannot be spelled, and is written back as a `[text]{.strike}` role span).
+- **Task lists are out.** `- [ ] item` and `- [x] item` are *not* a construct: they are
+  ordinary list items whose text begins with the literal characters `[ ]` / `[x]`. A document
+  format has no use for an interactive checkbox, and a `ListItem` has nowhere to record the
+  state. A document that wants a checked/unchecked marker writes the symbol it wants.
+
 ### 5.2 Front matter
 
 A YAML block at the very top populates `Meta`:
@@ -306,6 +329,11 @@ The parser maps exactly seven keys — `title`, `author`/`authors` (either spell
 rather than carrying it into `Meta`. `Meta` itself stays open-ended, so that is a scope
 limit rather than a claim about the model.
 
+The block must be a YAML map. One that holds nothing (no lines, only comments, or `null`)
+is no fields; one that is a string, a list, a number or a boolean — `---`, a bare title
+line, `---` is the easy way to write one — is a parse error naming the file and the line
+its value starts on.
+
 > **Not implemented.** `bibliography` reads CSL-JSON only. A `.bib` file is not parsed;
 > instead, a native-mode LaTeX build *generates* one from the CSL-JSON alongside its `.tex`,
 > which is what makes `\\bibliography{}` work with no hand-maintained database.
@@ -324,6 +352,14 @@ code blocks, directives:
 `x := 1`{.code-term}
 ![A hazel tree](tree.png){#fig:tree width=60%}
 ```
+
+An attribute token has no escapes. A backslash in an id, a class, a key or an unquoted
+value is a build error naming the line (and, in a directive header or a `!name{…}` line,
+the column) rather than a token that keeps it — an id with one would reach a LaTeX label or
+a cross-reference broken. This covers `{.c\}`: the escaped `}` does not hide the group, it
+leaves a class `c\`, and is refused. A value that needs a backslash is quoted —
+`k="a\b"` or `k='a\b'` — and keeps it verbatim; a quote character inside a quoted value
+is written by switching delimiters, never with a backslash. (TASK-197)
 
 ### 5.4 Sections & headings
 
@@ -371,10 +407,15 @@ spelling was written. Three rules define it:
   matching `!include`'s own tolerance. But a `{` commits the line: from there the rest of it
   must be exactly one group, so both `!toc{unclosed` and `!toc{a=1} trailing` are build
   errors rather than silently prose.
-- `include` is **reserved**: `!include` is §4.3's include line, and a bare `!include` with no
-  path stays the ordinary paragraph it already is.
+- `include` and `quote` are **reserved**: `!include <path>` is §4.3's include line and
+  `!quote <book-ref>` the book-quote line (a `BookQuote`, doc-10). A bare `!include` or
+  `!quote` with nothing after it stays an ordinary paragraph, and `!include{…}` or
+  `!quote{…}` is a build error naming the right spelling. A directive that really is named
+  `quote` (or `include`) is still written with a fence, `:::{quote}` … `:::`. (Before
+  `!quote` existed, a bare `!quote` was a body-less directive named `quote`, and
+  `!quote some words` was prose; it is now a `BookQuote` whose ref is `some words`.)
 
-`!` puts this beside `!include` — the format's other whole-line block construct — rather than
+`!` puts this beside `!include` and `!quote` — the format's other whole-line block constructs — rather than
 opening a second family with a shorter colon run. Which spelling to write is decided by whether
 the directive has a body, never by taste.
 
@@ -433,6 +474,12 @@ it.
 Consider the [free monoid]{.term #def:free-monoid}.
 ```
 
+A Span may sit anywhere inline text does, including inside link text and inside another Span:
+`[see [the monoid]{.term}](https://example.org)` is a link holding a Span, and
+`[a [b]{.x}]{.y}` is a Span holding one. Only a link may not hold a link. The bracket is a
+Span even where its text names a link reference definition (`[b]: url`), so it does not count
+as a link there either: `[see [b]{.term}](https://example.org)` is still a link holding a Span.
+
 `==marked text==` produces a `Highlight` (§4.4) — an annotation over a run of words:
 
 ```markdown
@@ -468,6 +515,22 @@ $$ e^{i\pi} + 1 = 0 $$ {#eq:euler}
 
 Raw TeX is stored verbatim in `.tex`. It passes through to LaTeX untouched and is rendered by
 KaTeX/MathJax for HTML/EPUB.
+
+A display block may also sit inside a container -- a list item, a footnote, a directive or a
+block quote -- and stays that container's child, id and number included. Each of its lines
+carries the container's own prefix, like any other Block's: the item's indentation, or `> `
+on every line in a quote (TASK-188):
+
+```markdown
+> $$
+> e^{i\pi} + 1 = 0
+> $$ {#eq:euler}
+```
+
+Inside a list item, footnote or quote the block is recognised only when it is a whole
+paragraph of its own, so its TeX can hold no blank line and no line that would start another
+Block there (a `- ` item, a `#` heading, a `>` quote, a code fence). A directive's body has no
+such limit: its `$$` lines sit at column 0, like the top level's.
 
 ### 5.8 Figures
 
@@ -543,6 +606,16 @@ role form `[3]{ref=fig:tree}` or an explicit `[]{ref=… suppressPrefix}`.
 A bare `@token` whose prefix names no numbering kind, and no citation key, is left as prose —
 so "cc @someone" in a paragraph is not a dangling reference.
 
+`@{…}` with braces is not a cross-reference but a link to another book (`@{bible:romanos#14:8}`,
+a `BookRef`), and a line `!quote <book-ref>` quotes one (a `BookQuote`) — doc-10. The braces
+are what keep a bare `@reformed:heidelberg` meaning a local cross-reference. Write `@\{` for
+a literal `@{`. A link resolves alongside the cross-references, to the passage's title as its
+text ("Heidelberg Catechism, Section 3") and a URL when the book's library entry has a URL
+template; one that cannot be resolved reads `??` with a warning, as a dangling `@fig:x` does.
+A filled-in template value is percent-encoded and can never set the URL's scheme, and an empty
+`{shelf}` (a book at the library's root) takes the `/` after it with it, so no `//` appears
+(doc-10, "URLs").
+
 ### 5.11 Citations
 
 Bracketed `@key` is a **citation** (disambiguated from bare-`@` cross-refs):
@@ -551,6 +624,25 @@ Bracketed `@key` is a **citation** (disambiguated from bare-`@` cross-refs):
 Hazelnuts are optimal [@knuth1984, p. 42] and widely enjoyed [@smith2020; @jones2019].
 Bare author-in-text: @knuth1984 showed that …
 ```
+
+A bracket is a citation when every `;`-separated segment holds an `@key`; a key in brackets is a
+run of ASCII letters, digits, `_`, `:` and `-` (`[@a.b]` is the key `a` with the suffix `.b`).
+A trailing `;` ends the last item rather than opening an empty one, and so does a trailing `;`
+followed by nothing but whitespace: `[@k;]` and `[@k; ]` are both the citation `[@k]`, and
+`[@k; ](u)` is that citation followed by the text `(u)`, as `[@k;](u)` is — not a link. An empty
+or blank segment between two items still makes the bracket no citation (`[@a; ; @b]`).
+
+A bracket with an attribute group straight after it is a `Span` (§5.6) whatever it holds, so
+`[@doe]{.c}` is a Span around the author-in-text citation `@doe`; an attributed bracketed
+citation is written with the Span around it, `[[@doe]]{.c}`. A group that ends a heading or a
+table caption is that block's own (§5.3), and the bracket before it stays a citation.
+
+Whitespace between the `]` and the group — spaces, tabs, a line break — counts as straight
+after, for a citation-shaped bracket exactly as for any other: `[@doe] {.c}` is the Span
+`[@doe]{.c}` is, as `[s] {.c}` is the Span `[s]{.c}` is, and the space is not kept. A group
+attaches across whitespace only where it ends its text, so `x [@doe] {.c} y` is refused like
+`x [s] {.c} y`; and a spaced group that ends a heading or a table caption is still that block's,
+so `# See [@doe] {#sec:x}` keeps its citation, as `# See [s] {#sec:x}` keeps a literal `[s]`.
 
 ### 5.12 Footnotes
 
@@ -578,7 +670,10 @@ Hazelnuts are a pome.[^actually]
   custom link text or suppressing the prefix word (decision D3). *(The role form is not
   implemented -- see §5.10.)*
 - **Dangling references** (a `@fig:x` with no matching id) produce a build warning and a visible
-  `??` placeholder, mirroring LaTeX.
+  `??` placeholder, mirroring LaTeX. An id written on an *inline* node (an image sharing its
+  paragraph with text or another image; only an image alone in its paragraph is a figure) is not a
+  numbering target and stays unresolved, but its warning names the node kind (`id "fig:x" is on an
+  inline image, which is not referenceable`) rather than saying no target exists.
 
 ### 6.1 The label lexicon (settles how kinds print, per language)
 
@@ -752,6 +847,54 @@ author-defined directive:
 > `lower`-time computation — its bounds, and their honest limits, are documented where an
 > author actually reads them, the README's "Author-defined extensions" and "Scripted
 > transformations" sections, rather than restated here.
+>
+> **What an untrusted extension may emit (settled 2026-11-10, TASK-215).** The sandbox bounds
+> what an extension's code can *do*; this bounds what it can *emit*. The project owner chose
+> to sanitise untrusted output rather than declare every extension fully trusted. An
+> extension whose registration is not `:trusted` — every `--extensions` file unless the build
+> passes `--trusted-extensions`, and every built-in registered without it — is held to:
+>
+> - the `[:raw]` and `Rendered` gates TASK-89/TASK-213 already set (refused);
+> - an HTML element allow-list of structural, text-level, list, table, image/media and inert
+>   interactive elements, so no `script`, `style`, `link`, `meta`, `base`, `iframe`, `object`,
+>   `embed`, form controls, `svg`, `math`, `template` or custom elements (refused);
+> - the document sanitiser's attribute rules on its hiccup — `on…` handlers and URL attributes
+>   failing the `http`/`https`/`mailto`/relative scheme test dropped — plus `is` and
+>   malformed attribute names (dropped, with a warning);
+> - the document sanitiser itself on the AST it hands `:render-blocks`/`:render-inlines` and
+>   on the Blocks its `lower` rule returns (dropped, with a warning), on both targets;
+> - a TeX **allow-list** on every string of that AST an emitter writes unescaped: math may use
+>   only ordinary mathematical control words, a few safe control symbols and `\begin`/`\end`
+>   of amsmath's matrix and alignment environments (an `array` spec of `l c r |` only); any
+>   other string may hold no control sequence, and an image path or citation key none of
+>   `% # & $ ^ ~`; `^^`, unbalanced braces and an allowed word run on into `@`/`:` are refused.
+>   A string the directive itself holds where TeX is spliced is exempt, since the document's
+>   own TeX is trusted; prose it holds (a code sample) is not (refused).
+>
+> The rule behind refuse-versus-drop: what a document can cause (a URL copied from a prop) is
+> neutralised with a warning, as the document pass does; what only extension code can cause
+> fails the build naming the directive and its source line. `--trusted-extensions` lifts all
+> of it. The TeX check is strict but best-effort — an allow-list reasoning about TeX's
+> tokenisation under the document's normal catcodes, not a TeX interpreter. A `--transform`
+> rule is outside it: its output is sanitised as the document is and its TeX counts as the
+> document's. The README's "What an untrusted extension may emit" has the exact lists.
+>
+> **The document's own TeX (settled 2026-11-10, TASK-219).** By default the document author is
+> trusted in the LaTeX build: math reaches pdflatex as written. Two exceptions apply. First,
+> on every LaTeX build, `\href`, `\url` and the four-argument `\hyperref` are dropped from
+> document math, with a located warning: `\href`/`\hyperref` keep their text and `\url` is
+> removed, so `$\href{javascript:…}{x}$` makes no PDF link. A CSL-JSON `URL`/`DOI` with an
+> unsafe scheme is likewise left out of the generated `.bib`, with a warning. Second, `--untrusted` is an opt-in strict mode. It holds every string of the
+> resolved document that the LaTeX build splices as TeX to the allow-list above, with no
+> exemption for authored TeX. That covers math, image paths, citation keys and attribute
+> values, and includes included files, overlays and transform output. The first string
+> outside the allow-list fails the build with `file:line` and the token. The flag is LaTeX-only:
+> HTML math is already confined by MathJax's configuration (TASK-217), and json/hdoc filter
+> nothing. It is independent of `--trusted-extensions`. Without it the document author's TeX is
+> trusted, so the LaTeX build carries no script only under `--untrusted`. Dropping the three
+> link commands is a convenience: the pdfTeX primitives (`\pdfstartlink`, `\pdfannot`,
+> `\special{pdf:…}`) still make links, and only `--untrusted` stops every route. The README's "Converting
+> a document you do not trust" states the user-facing model.
 
 Any `lower` rule or `babel` block that *executes code* (to produce a poster/results) is
 **off by default**. The rules:
@@ -785,10 +928,116 @@ Pure function `resolve(ast, ctx) → { ast: ResolvedAST, meta, diagnostics }`:
 4. **Derive** the table of contents, list-of-figures/tables, and section `next`/`previous`
    links (these are *derived*, never authored — a fix over the current model where
    `SectionType.next/previous` are stored by hand).
-5. **Collect diagnostics** — dangling refs/cites, duplicate ids, unknown directive names.
+5. **Collect diagnostics** — dangling refs/cites, duplicate ids, unknown directive names. A reference to a duplicated id resolves to its first definition (with the duplicate-id warning, not a dangling one); later nodes keep their own numbers.
 
 The resolver is target-independent. Target-specific reduction of custom elements happens later,
 in `lower` (§8.3).
+
+### 9.1 Book references: links, quotes and libraries
+
+A document can reach another **book** — a `.hdoc` file in a library, or a book generated by
+code — through a **book reference** (doc-10, the libraries-and-books design, is the full
+design record; this section is the contract).
+
+**Syntax.**
+
+```
+book-ref   = book-id [ "#" passage ]
+book-id    = library ":" [ shelf-path "/" ] slug       ; reformed:confessions/reformed/heidelberg
+name       = [a-z0-9] *[a-z0-9-]                      ; library, each shelf segment, slug
+passage    = label [ ".." label ]                     ; sec:q1, or sec:q1..sec:q3
+           | locator                                  ; 14:8-9 — anything not starting "kind:"
+```
+
+| Form | Written | Node |
+| --- | --- | --- |
+| Link (inline) | `@{bible:romanos#14:8}` | `BookRef` |
+| Quote (block) | `!quote bible:romanos#14:8-9`, a line of its own | `BookQuote` |
+
+The braces of `@{…}` are required: a bare `@reformed:heidelberg` stays a local cross-reference
+(§5.10), and `@\{` is a literal `@{`. `!quote` is reserved beside `!include` (§5.5) and may
+stand wherever a block may, a directive's body included:
+
+```markdown
+:::{small-collapsable summary="Romanos 14:8" label="(2)"}
+!quote bible:romanos#14:8
+:::
+```
+
+The **canonical** form of a book ID includes its shelf path; a reference may omit it
+(`bible:romanos`). Resolution uses only library + slug, so a book moved to another shelf is
+still found, with a `stale-shelf` note. A passage starting `kind:` is a label or a range of
+sibling labels in document order; anything else is a locator, which only a book that
+understands locators (a generated or in-process book) can answer.
+
+**Nodes** (§4.3, §4.4). The parser keeps only `ref`, as written, and never validates it.
+Resolution fills in the rest:
+
+| Node | After resolution |
+| --- | --- |
+| `BookRef` | `passage` (as written; absent for a whole book), `canonical` (the canonical reference), `text` (link text the book supplies: "Heidelberg Catechism, Section 1.1", "Romanos 14:8"), `url` when the library has a URL template |
+| `BookQuote` | `canonical`, `title` (the passage's title, e.g. "Romanos 14:8"), `blocks` (the quoted passage), `url` when the library has a URL template |
+
+The `json` and `hdoc` targets run no resolution and keep both nodes as written; the `hdoc`
+emitter writes `@{…}` and `!quote …` back verbatim.
+
+**Resolution.** Quotes expand right after `!include`s (and overlays), before numbering; links
+resolve beside cross-references (§9 step 2). Quoted content stays outside the host's
+numbering: every `attr.id` in it is stripped, its headings are unnumbered and absent from the
+TOC and lists of figures/tables, and a local `@prefix:label` inside it becomes a `BookRef` to
+the source book. Quotes inside quotes expand recursively, up to depth 8. The library
+directory — a YAML list from `--libraries`, `$HASELNUSS_LIBRARIES` or
+`~/.config/haselnuss/libraries.yaml` (README "Libraries and books") — is read only when a
+document actually holds a book reference. A URL is never guessed: it comes only from the
+library entry's `url` template (`{library}`, `{shelf}`, `{slug}`, `{label}`, `{locator}`).
+
+**Rendering.**
+
+| Target | `BookRef` | `BookQuote` |
+| --- | --- | --- |
+| HTML | `<a class="book-ref" href=…>text</a>`, or a `<span class="book-ref">` without a URL | `<figure class="book-quote-figure"><blockquote class="book-quote" data-source="<canonical>" cite="<url>">…</blockquote><figcaption>— <cite>title</cite></figcaption></figure>` |
+| LaTeX | the text, or `\href{url}{text}` | a `quote` environment whose last line is the source, `--- title`, flush right |
+
+A reference that cannot be resolved never stops the build: a link prints `??`, a quote a
+`?? <ref>` placeholder paragraph, and a diagnostic names the reference as written and its
+`file:line`.
+
+**Diagnostics.** None stops a build. Reference diagnostics carry `:level` (`warning`, or `info`
+for `stale-shelf`); the library directory's are `error`, meaning its file needs fixing.
+
+| `:type` | Level | When |
+| --- | --- | --- |
+| `malformed-book-ref` | warning | The text in `@{…}` or after `!quote` does not match the grammar |
+| `no-library-directory` | warning | A document uses a book reference and no directory file exists |
+| `unknown-library` | warning | The directory names no such library |
+| `unavailable-library` | warning | The directory names it, but its entry failed to load (cause attached) |
+| `unknown-book` | warning | The library has no book with that slug |
+| `ambiguous-book` | warning | More than one book has the slug (see `duplicate-slug`) |
+| `stale-shelf` | info | The written shelf path is not the book's current one; it still resolves |
+| `unknown-label` | warning | The passage label is not in the book |
+| `bad-label-range` | warning | A range's end precedes its start, or its labels are not siblings |
+| `locator-unsupported` | warning | A locator on a book that does not answer locators |
+| `bad-locator` | warning | The book rejected the locator; the message is the book's |
+| `quote-cycle` / `quote-too-deep` | warning | Quotes quote themselves, or nest deeper than 8 |
+| `book-failed` | warning | A book's document cannot be read, parsed or produced |
+| `unreadable-include` / `include-cycle` | warning | Inside a quoted filesystem book, once per build |
+| `unreadable-bibliography` | warning | A quoted book's own bibliography cannot be read |
+| `duplicate-slug` | warning | Library scan: two books share a slug; both are named |
+| `invalid-book-name` | warning | Library scan: a file or folder name is not a valid `name` |
+| `invalid-front-matter` | warning | Library scan: a book's front matter cannot be read or listed as written |
+| `unreadable-shelf` | warning | Library scan: a folder cannot be listed |
+| `scripts-disabled` | warning | A generated shelf (`shelf.clj`) is used while its entry lacks `scripts: true` |
+| `script-failed` | warning | A `shelf.clj` threw, timed out, exceeded its output cap or answered something unusable |
+| `invalid-book-document` | warning | An in-process virtual book's `:document` or `:locate` fn returned something that is neither valid AST nor a diagnostic |
+| `invalid-generated-book` | warning | A generated document, passage or listing entry fails the AST schema |
+| `unsafe-url` | warning | A filled-in book URL has a scheme other than `http`, `https` or `mailto` and is dropped, as a link's is (README "Converting a document you do not trust") |
+| `duplicate-library` | error | Two directory entries share a name; neither is loaded |
+| `unknown-provider` | error | A directory entry names an unregistered `type` |
+| `invalid-library` | error | A directory entry's `url` template is invalid, or its provider could not build it |
+| `invalid-url-template` | error | A custom directory answered an invalid URL template; that library gets no URLs |
+
+A library directory file that cannot be read, or is not a valid list of entries, is a hard
+error, as is a book ID given as command-line input that cannot be found.
 
 ---
 

@@ -439,7 +439,9 @@
     when that substring is present, the LaTeX kernel's own differently-
     terminated `verbatim*` variant instead (see its own docstring).
   - `:link`/`:image` -> `\\href{target}{...}`/`\\includegraphics{src}`,
-    requiring `hyperref`/`graphicx`. Their own `target`/`src` are passed
+    requiring `hyperref`/`graphicx`. Their optional `:title` (a browser
+    tooltip) has no printed-page equivalent and is deliberately dropped,
+    without a diagnostic (TASK-140). Their own `target`/`src` are passed
     through mostly **verbatim**, not `escape-tex`-ed: confirmed empirically
     that hyperref's `\\href` URL argument already passes a raw
     `% # & _ { }` through unescaped when the braces are balanced, but a
@@ -457,7 +459,11 @@
     one or two things confirmed to break compilation -- a raw backslash
     always, and `{`/`}` only when unbalanced, since a balanced pair is
     the confirmed-working case above and must be left exactly as
-    authored. An Image `:src` is a FILENAME rather than a URI, where the
+    authored. A Link `:target` additionally has its `% # &` written
+    `\\% \\# \\&` (`argument-safe-url`, TASK-210): raw is safe only where
+    `\\href` itself tokenizes the URL, not inside a footnote, heading,
+    caption or table cell, and the escaped forms give the identical PDF
+    `/URI` in both places. An Image `:src` is a FILENAME rather than a URI, where the
     same rewrite would look up a file that doesn't exist on disk, so it
     stays fully verbatim and a build instead warns when it carries either
     hazard (`unescapable-image-path-text-diagnostics`, the one
@@ -483,9 +489,12 @@
     `attr.classes`/`attr.props` have no generic LaTeX target and are not
     translated, the same documented limitation as Span's."
   (:require [clojure.string :as str]
+            [haselnuss.ast :as ast]
+            [haselnuss.emit.quote :as book-quote]
             [haselnuss.extensions.derived-lists :as derived-lists]
             [haselnuss.extensions.front-matter :as front-matter]
             [haselnuss.registry :as registry]
+            [haselnuss.sanitize :as sanitize]
             [haselnuss.select :as select]))
 
 (def ^:private combining-cluster-re
@@ -753,6 +762,27 @@
     (if (balanced-braces? url)
       escaped
       (-> escaped (str/replace "{" "%7B") (str/replace "}" "%7D")))))
+
+(defn- argument-safe-url
+  "`latex-safe-url` of `url`, with `#`, `%` and `&` also written `\\#`,
+  `\\%` and `\\&` (TASK-156), for a book link or quote's `:url` and a
+  Link's `:target` (TASK-210).
+
+  hyperref's `\\href` reads a raw `#`, `%` or `&` correctly only when it
+  is the one tokenizing its URL. Inside another command's argument -- a
+  `\\footnote`, a heading, the `\\mbox` a highlight needs -- that argument
+  was tokenized first, so a raw `#` is a fatal `Illegal parameter number
+  in definition of \\Hy@tempa` and a raw `%` comments out the rest of the
+  line. A book URL nearly always has a `#` (`…/heidelberg.html#sec:q1`)
+  and TASK-155 percent-encodes what it fills in, so both are the normal
+  case there, not an edge. hyperref reads the escaped forms back as the
+  plain characters, in an argument and out of one alike (checked against
+  the `/URI` pdflatex writes)."
+  [url]
+  (-> (latex-safe-url url)
+      (str/replace "%" "\\%")
+      (str/replace "#" "\\#")
+      (str/replace "&" "\\&")))
 
 (def ^:private section-commands
   "The LaTeX sectioning commands (article class), deepest-nesting-first
@@ -1370,8 +1400,14 @@
   `:text` Inlines through the ordinary pipeline (AC #3), exactly as
   `haselnuss.emit.html/render-cite` does with the same field."
   [ctx {:keys [items text]}]
+  ;; TASK-156: inside a quoted passage (`:in-book-quote`) a citation
+  ;; always renders its `:text`. Quote expansion formatted it against the
+  ;; BOOK's bibliography, while a `\\citep` would look its key up in the
+  ;; host's `.bib`: an undefined `?`, or the host's entry for a key the
+  ;; two happen to share.
   (if (or (:computed-numbers ctx)
           (not (:native-bibliography ctx))
+          (:in-book-quote ctx)
           (empty? items))
     (render-inlines ctx text)
     (if (every? plain-cite-item? items)
@@ -1414,16 +1450,23 @@
    :sup (fn [ctx inline]
           (highlight-protected ctx inline (render-wrapped ctx inline "\\textsuperscript{" "}")))
    :code (fn [_ctx inline] (str "\\texttt{" (escape-tex (:text inline)) "}"))
-   ;; Link :target passed through `latex-safe-url`, not `escape-tex` --
-   ;; see namespace docstring for why (hyperref's own URL-argument
+   ;; Link :target passed through `argument-safe-url`, not `escape-tex`
+   ;; -- see namespace docstring for why (hyperref's own URL-argument
    ;; scanning, not ordinary text escaping, and confirmed empirically
    ;; that escape-tex actively breaks it) and `latex-safe-url`'s own
-   ;; docstring for the two characters it does rewrite (TASK-78).
+   ;; docstring for the two characters it rewrites (TASK-78).
+   ;; TASK-210: `#`, `%` and `&` are written `\#`, `\%`, `\&` as for a
+   ;; book link, because a Link in a footnote, heading, caption or table
+   ;; cell sits in an argument tokenized before `\href` sees it (a raw
+   ;; `#` there is fatal, a raw `%` comments out the line). Everywhere,
+   ;; not only in an argument: the emitter has no general notion of being
+   ;; inside one, and the escaped forms give the same PDF `/URI` at top
+   ;; level too (measured with qpdf; `link-url-in-arguments-test`).
    :link (fn [ctx inline]
            (highlight-protected
             ctx inline
             (render-wrapped ctx inline
-                            (str "\\href{" (latex-safe-url (:target inline)) "}{") "}")))
+                            (str "\\href{" (argument-safe-url (:target inline)) "}{") "}")))
    ;; Image :src likewise passed through verbatim -- see namespace
    ;; docstring (graphicx's own filename-argument handling already
    ;; tolerates a raw underscore etc; no AC requires rendering :alt,
@@ -1460,7 +1503,22 @@
    ;; `\pdfmarkupcomment`'s soul-marked run all three are a FATAL build
    ;; error unwrapped, and an `\mbox` around each fixes all three.
    :cross-ref (fn [ctx inline] (highlight-protected ctx inline (render-cross-ref ctx inline)))
-   :cite (fn [ctx inline] (highlight-protected ctx inline (render-cite ctx inline)))})
+   :cite (fn [ctx inline] (highlight-protected ctx inline (render-cite ctx inline)))
+   ;; TASK-156 (doc-10 "Emitters"): `\href{url}{text}` when resolution
+   ;; gave the link a `:url`, through `argument-safe-url` (a book URL's
+   ;; `#` must survive a `\footnote`), and boxed in a highlight as a
+   ;; Link is (only then: plain text needs no `\mbox`, which would stop
+   ;; it breaking across lines); plain text otherwise. `text` is `??` for
+   ;; a link that failed to resolve, printed as computed mode prints a
+   ;; dangling cross-reference. A node no resolution ran over (no
+   ;; `:text`) shows its ref as written.
+   :book-ref (fn [ctx {:keys [text url] :as inline}]
+               (let [body (if text (render-inlines ctx text) (escape-tex (:ref inline)))
+                     href (when url (str "\\href{" (argument-safe-url url) "}{" body "}"))]
+                 (cond
+                   (not href) body
+                   (:in-highlight? ctx) (str "\\mbox{" href "}")
+                   :else href)))})
 
 (defn- unsupported-inline!
   "The declared default `render-inline` dispatches an unrecognized Inline
@@ -1650,9 +1708,18 @@
   directly after `\\begin{itemize}`, before any `\\item` has run, would
   capture no meaningful counter value the way a Section's own numbered
   heading command does)."
-  [ctx {:keys [ordered items]}]
-  (let [env (if ordered "enumerate" "itemize")]
+  [ctx {:keys [ordered start items]}]
+  (let [env (if ordered "enumerate" "itemize")
+        ;; LaTeX counts `enumerate` nesting only (an `itemize` between does not
+        ;; count): depth 1 uses `enumi`, 2 `enumii`, 3 `enumiii`, 4 `enumiv`.
+        depth (cond-> (:enum-depth ctx 0) ordered inc)
+        ctx (assoc ctx :enum-depth depth)]
     (str "\\begin{" env "}\n"
+         ;; TASK-129: a list starting at N sets its depth's counter to N-1 so the first
+         ;; \item prints N (core LaTeX, no package).
+         (when (and ordered start (not= 1 start))
+           (str "\\setcounter{" (nth ["enumi" "enumii" "enumiii" "enumiv"] (min 3 (dec depth)))
+                "}{" (dec start) "}\n"))
          (apply str (map (fn [item-blocks] (str "\\item " (render-list-item ctx item-blocks) "\n"))
                          items))
          "\\end{" env "}")))
@@ -3404,7 +3471,12 @@
    directive]
   (if a-float
     (render-float ctx spec directive nil)
-    (let [computed? (:computed-numbers ctx)
+    ;; TASK-156: inside a quoted passage, native mode takes the uncounted
+    ;; form too. Quote expansion stripped every id, so nothing quoted is
+    ;; numbered or referenced -- but a counted `theorem` would still step
+    ;; LaTeX's counter and push every later host theorem one ahead of
+    ;; the number its `\Cref` prints. Front matter has the same gap.
+    (let [computed? (or (:computed-numbers ctx) (:in-book-quote ctx))
           numbered? (boolean (and counter (not computed?)))
           env (if (and counter computed?) (or unnumbered unnumbered-environment) environment)
           head (when (and counter computed?)
@@ -3525,7 +3597,21 @@
   ;; exactly, for the full reasoning (unforgeable by a v2 renderer's own
   ;; code today, and unreachable outright once TASK-90's sandbox excludes
   ;; this namespace from its allowed-namespace list).
+  ;;
+  ;; TASK-213: being unconstructible is not enough -- `assoc` on a record
+  ;; keeps its type, so a renderer handed one could rewrite its `:tex`.
+  ;; An untrusted renderer's `Rendered` is therefore spliced only when it
+  ;; is the very instance a ctx callback issued during that call
+  ;; (`haselnuss.registry/issued?`), exactly as in `haselnuss.emit.html`.
            [tex])
+
+(def ^:private ^:dynamic *issued*
+  "The `haselnuss.registry/issued-fragments` set of the `render-directive`
+  call in progress on this thread, for this namespace's OWN v2 renderer
+  (`derived-list-renderer`), which builds a `Rendered` itself. A var, not
+  a ctx key, so a renderer handed that ctx cannot reach it -- see
+  `haselnuss.emit.html`'s own `*issued*`."
+  nil)
 
 (defprotocol ^:private RenderData
   (render-data [node ctx]
@@ -3552,9 +3638,12 @@
       controls); otherwise a loud `ex-info` naming the directive.
     - any other vector, or any `ISeq` (a `map`/`for`/`list` result) -- a
       fragment: every child `render-data`-ed and concatenated.
-    - a `Rendered` (this namespace's own) -- spliced verbatim,
-      unconditionally: already-rendered, already-`escape-tex`-ed output
-      from `ctx`'s `:render-blocks`/`:render-inlines` callbacks.
+    - a `Rendered` (this namespace's own) -- spliced verbatim:
+      already-rendered, already-`escape-tex`-ed output from `ctx`'s
+      `:render-blocks`/`:render-inlines` callbacks. Unless `ctx`'s
+      `:trusted?` is true, only the very instance a callback issued
+      during this call is (TASK-213); any other is a loud `ex-info`
+      (`forged-fragment!`).
     - anything else -- a loud `ex-info` naming the value and its class."))
 
 (defn- untrusted-raw-output!
@@ -3572,6 +3661,23 @@
                ":trusted? true (haselnuss.registry/register) may emit unescaped output")
           {:type ::untrusted-raw-output :directive-name (:directive-name ctx)})))
 
+(defn- forged-fragment!
+  "Raises the `ex-info` (`:type ::forged-rendered`) an untrusted v2
+  renderer's return value gets for holding a `Rendered` none of its ctx
+  callbacks issued during this call (TASK-213), naming the directive and,
+  when known, its source position. Mirrors `haselnuss.emit.html`'s own
+  function of the same name."
+  [ctx]
+  (let [where (::source-label ctx)]
+    (throw (ex-info
+            (str "directive " (pr-str (:directive-name ctx)) (when where (str " (" where ")"))
+                 "'s renderer returned a Rendered fragment its ctx's :render-blocks/:render-inlines "
+                 "did not produce in this call (changed with assoc/merge/into, or kept from another "
+                 "call), but its own registry entry is not :trusted -- an untrusted renderer may "
+                 "return such a fragment only exactly as the callback handed it back")
+            (cond-> {:type ::forged-rendered :directive-name (:directive-name ctx)}
+              where (assoc :source where))))))
+
 (extend-protocol RenderData
   nil
   (render-data [_ _ctx] "")
@@ -3586,7 +3692,10 @@
   (render-data [n _ctx] (escape-tex (str n)))
 
   Rendered
-  (render-data [r _ctx] (:tex r))
+  (render-data [r ctx]
+    (if (or (:trusted? ctx) (registry/issued? (::issued ctx) r))
+      (:tex r)
+      (forged-fragment! ctx)))
 
   clojure.lang.IPersistentVector
   (render-data [v ctx]
@@ -3621,7 +3730,8 @@
   `haselnuss.emit.html/derived-list-renderer`'s own docstring, which
   mirrors this reasoning exactly."
   [directive ctx]
-  (->Rendered (render-derived-list ctx (derived-lists/spec directive) directive)))
+  (registry/issue! *issued*
+                   (->Rendered (render-derived-list ctx (derived-lists/spec directive) directive))))
 
 (defn register-derived-lists
   "Registers a real `:latex` renderer (`derived-list-renderer`, TASK-89)
@@ -3690,12 +3800,31 @@
         spec (get directive-environments directive-name)]
     (cond
       (and (ifn? renderer) (registry/v2? renderer))
-      (let [ctx' (assoc ctx
+      (let [issued (registry/issued-fragments)
+            trusted? (boolean (:trusted entry))
+            where (ast/source-label directive)
+            ;; TASK-215: an untrusted renderer's hand-built AST goes
+            ;; through `haselnuss.sanitize` before it is rendered, and TeX
+            ;; the document did not author may not use a dangerous
+            ;; primitive -- see `haselnuss.emit.html/render-directive`,
+            ;; which does the same. Built here, on the calling thread, so
+            ;; a callback run on a sandbox worker still reports.
+            vet (sanitize/fragment-vetter directive trusted?)
+            ctx' (assoc ctx
                         :directive-name directive-name
-                        :trusted? (boolean (:trusted entry))
-                        :render-blocks (fn [blocks] (->Rendered (render-blocks ctx blocks)))
-                        :render-inlines (fn [inlines] (->Rendered (render-inlines ctx inlines))))]
-        (render-data (renderer directive ctx') ctx'))
+                        :trusted? trusted?
+                        :render-blocks (fn [blocks]
+                                         (registry/issue! issued
+                                                          (->Rendered (render-blocks ctx (vet :blocks blocks)))))
+                        :render-inlines (fn [inlines]
+                                          (registry/issue! issued
+                                                           (->Rendered (render-inlines ctx (vet :inlines inlines))))))
+            result (binding [*issued* issued] (renderer directive ctx'))]
+        ;; `issued` reaches `render-data` only through this ctx, which the
+        ;; renderer never sees (TASK-213).
+        (render-data result (assoc ctx'
+                                   ::issued issued
+                                   ::source-label where)))
 
       (and (ifn? renderer) (not (environment-marker? renderer)))
       (renderer directive :latex)
@@ -3855,12 +3984,18 @@
     ;; the bare number and nothing for an unnumbered Section; see
     ;; `haselnuss.emit.html/section-number-html` for the decision and
     ;; why an unnumbered heading needs nothing to fill the gap.
-    (str "\\" (section-command ctx (:level block))
-         (when (or (:computed-numbers ctx) (:unnumbered ctx)) "*")
-         "{" (section-number-prefix ctx (:attr block))
-         (render-heading ctx (:heading block)) "}"
-         (unnumbered-label ctx (:attr block)) "\n"
-         (render-blocks ctx (:blocks block)))))
+    ;;
+    ;; TASK-156: the level is moved by `:level-shift`, set only inside a
+    ;; quoted passage (see `render-book-quote`), and the body sees
+    ;; `:section-level`, so a quote inside this Section knows how deep
+    ;; it sits.
+    (let [level (max 1 (+ (:level block) (:level-shift ctx 0)))]
+      (str "\\" (section-command ctx level)
+           (when (or (:computed-numbers ctx) (:unnumbered ctx)) "*")
+           "{" (section-number-prefix ctx (:attr block))
+           (render-heading ctx (:heading block)) "}"
+           (unnumbered-label ctx (:attr block)) "\n"
+           (render-blocks (assoc ctx :section-level level) (:blocks block))))))
 
 (defn- render-para
   "Renders Para `block` (sec4.3: `:inlines`) through the ordinary Inline
@@ -3892,6 +4027,63 @@
          (when-let [lang (:lang block)]
            (str "% haselnuss: language " (escape-tex lang) "\n"))
          "\\begin{" env "}\n" (:text block) "\n\\end{" env "}")))
+
+(defn- render-book-quote
+  "Renders BookQuote `block` (doc-10 \"Emitters\", TASK-156) as a `quote`
+  environment holding the quoted passage and, when resolution supplied a
+  `:title`, its source line, `--- title`, set flush right as the
+  passage's last line -- inside the environment, so it is indented with
+  the passage and `\\nobreak` keeps it on the passage's page. The title is
+  an `\\href` to the quote's `:url` when there is one, through
+  `argument-safe-url`.
+
+  A quote that failed to resolve has no `:title`, and its `:blocks` are
+  the resolver's placeholder paragraph `?? ref`, which is printed like any
+  passage. A node quote expansion never ran over (no `:blocks`) shows its
+  ref as written.
+
+  The passage is rendered with:
+
+  - `:unnumbered` (TASK-154): quoted content is outside the host's
+    numbering -- the resolver neither numbers nor lists it -- so it
+    renders as front matter does, starred headings and `\\caption*`,
+    kept out of LaTeX's own counters, `.toc` and `.lof`;
+  - `:in-book-quote`, which `render-cite` reads to print a citation's
+    book-formatted text instead of citing the host's `.bib`, and
+    `render-environment` reads to keep a theorem-like environment from
+    stepping the host's counter;
+  - `:level-shift` (`haselnuss.emit.quote/level-shift`), so the passage's
+    shallowest heading sits one level below the host Section around the
+    quote -- and never higher than the first level below `\\chapter`/
+    `\\part`, each of which starts a page, which inside a `quote` would
+    tear the quotation apart. That floor raises the shift for the whole
+    passage, so the passage's own nesting is kept below it."
+  [ctx {:keys [title url blocks] :as block}]
+  (let [min-level (cond (:parts ctx) 3 (:chapters ctx) 2 :else 1)
+        inner-ctx (assoc ctx
+                         :unnumbered true
+                         :in-book-quote true
+                         :level-shift (book-quote/level-shift (:section-level ctx 0) blocks min-level))
+        source (when (seq title)
+                 (let [title-tex (render-inlines ctx title)]
+                   (str "\n\\par\\nobreak{\\raggedleft --- "
+                        (if url (str "\\href{" (argument-safe-url url) "}{" title-tex "}") title-tex)
+                        "\\par}")))]
+    (str "\\begin{quote}\n"
+         ;; A sectioning command opening a list environment such as
+         ;; `quote` dies with `Something's wrong--perhaps a missing
+         ;; \item` (its leading `\par` meets the list's pending first
+         ;; item), and a passage quoted from a book very often opens
+         ;; with its heading. Clearing the `@newlist` flag is what lets
+         ;; it start the quote; measured against `\leavevmode`, the other
+         ;; known fix, it adds no blank line above the heading.
+         (when (= :section (:t (first blocks)))
+           "\\csname @newlistfalse\\endcsname\n")
+         (if blocks
+           (render-blocks inner-ctx blocks)
+           (escape-tex (:ref block)))
+         source
+         "\n\\end{quote}")))
 
 (defn- render-block-quote
   "Renders BlockQuote `block` (sec4.3: `:blocks`) as `quote`, its own
@@ -3981,6 +4173,7 @@
    :math-block render-math-block
    :directive render-directive
    :thematic-break (fn [_ctx _block] thematic-break-rule)
+   :book-quote render-book-quote
    :include (fn [_ctx block]
               (throw (ex-info (unresolved-include-message block)
                               {:type ::unresolved-include :block block})))})
@@ -4479,6 +4672,21 @@
                                   (->> (str "{"))
                                   (str "}"))))
 
+(defn- unsafe-bib-address?
+  "True when CSL-JSON `entry`'s `k` (`:URL` or `:DOI`) holds an address
+  with a scheme the document pass drops (`sanitize/unsafe-url?`). A DOI's
+  own `doi:` prefix is not a scheme."
+  [entry k]
+  (when-let [v (some-> (get entry k) str)]
+    (sanitize/unsafe-url? (if (= :DOI k) (str/replace-first v #"(?i)^doi:" "") v))))
+
+(defn- safe-bib-address
+  "`entry`'s `k` (`:URL` or `:DOI`), or nil when it is unsafe
+  (`unsafe-bib-address?`) and so not written into the `.bib` (TASK-219
+  review: BibTeX's `\\url` turned `javascript:` into a live PDF link)."
+  [entry k]
+  (when-not (unsafe-bib-address? entry k) (get entry k)))
+
 (defn- bibtex-entry
   "One CSL-JSON reference entry as a BibTeX entry string, keyed by its
   own `:id` -- the same key every `\\cite` in the emitted document
@@ -4506,8 +4714,11 @@
                        ;; here breaks the surrounding `field = {value}`
                        ;; grouping every bit as fatally as it breaks
                        ;; `\href`'s own.
-                       [(bibtex-raw-field "doi" (some-> (:DOI entry) latex-safe-url))
-                        (bibtex-raw-field "url" (some-> (:URL entry) latex-safe-url))])]
+                       ;; TASK-219 review: one whose scheme the document
+                       ;; pass would drop is not written at all, or
+                       ;; BibTeX's \url makes it a live PDF link.
+                       [(bibtex-raw-field "doi" (some-> (safe-bib-address entry :DOI) latex-safe-url))
+                        (bibtex-raw-field "url" (some-> (safe-bib-address entry :URL) latex-safe-url))])]
     (str "@" entry-type "{" id ",\n"
          (str/join ",\n" (remove nil? fields))
          "\n}")))
@@ -4519,6 +4730,17 @@
   own token alphabet is letters, digits, `_`, `-` and `:`), so this
   guards a bibliography file rather than a document."
   #"[^\s,{}\"@=#%\\]+")
+
+(defn- bibtex-entries
+  "The CSL-JSON entries of `bibliography` that `csl-json->bibtex` writes
+  for `keys-to-emit`, sorted by key: cited, with a key BibTeX can parse."
+  [bibliography keys-to-emit]
+  (let [wanted (set keys-to-emit)]
+    (->> (sort-by key bibliography)
+         (filter (fn [[k entry]]
+                   (and (contains? wanted k)
+                        (re-matches bibtex-key-re (str (:id entry))))))
+         (map val))))
 
 (defn csl-json->bibtex
   "The cited entries of `bibliography` -- a
@@ -4551,15 +4773,31 @@
   unrecognized CSL `type` becomes `misc`, which requires no fields. The
   reverse direction -- reading `.bib` -- is still not implemented, and
   is not needed: this makes CSL-JSON the single source both worlds read
-  from."
+  from.
+
+  A `:URL`/`:DOI` with a scheme other than http, https or mailto is left
+  out (TASK-219 review): BibTeX's `\\url` would make it a live PDF link.
+  `bibtex-address-diagnostics` names each one."
   ([bibliography] (csl-json->bibtex bibliography (set (keys bibliography))))
   ([bibliography keys-to-emit]
-   (->> (sort-by key bibliography)
-        (filter (fn [[k entry]]
-                  (and (contains? (set keys-to-emit) k)
-                       (re-matches bibtex-key-re (str (:id entry))))))
-        (map (comp bibtex-entry val))
+   (->> (bibtex-entries bibliography keys-to-emit)
+        (map bibtex-entry)
         (str/join "\n\n"))))
+
+(defn bibtex-address-diagnostics
+  "One warning per `:URL`/`:DOI` that `csl-json->bibtex` leaves out of the
+  `.bib` it writes for `bibliography` and `keys-to-emit` because its
+  scheme is unsafe (TASK-219 review), naming the entry and the address --
+  the `.bib` counterpart of the document pass's own dropped-link warning."
+  [bibliography keys-to-emit]
+  (vec (for [entry (bibtex-entries bibliography keys-to-emit)
+             [k field] [[:URL "url"] [:DOI "doi"]]
+             :when (unsafe-bib-address? entry k)]
+         {:type :unsafe-url
+          :url (str (get entry k))
+          :message (str "Dropped the " field " \"" (get entry k) "\" of bibliography entry "
+                        (pr-str (str (:id entry))) " from the generated .bib: only http,"
+                        " https, mailto and relative URLs are kept.")})))
 
 (defn bib-resource-name
   "The `\\bibliography{}` argument (`bibliography-block`) derived from
@@ -4724,6 +4962,13 @@
   (`document-class`, chosen from `meta.topLevelDivision`), this
   namespace's own fixed `preamble`, an optional `meta-preamble` title
   block, then the rendered body (`render-blocks`).
+
+  Writes `document`'s own TeX as given: a library caller converting a
+  document it does not trust runs `haselnuss.sanitize/sanitize-document`,
+  `neutralise-math-links` and (strict) `vet-untrusted-document` over it
+  first, as `haselnuss.cli/run` does (TASK-219), and binds
+  `sanitize/*untrusted-diagnostics*` to collect what is dropped from an
+  untrusted extension's output.
 
   `opts` (default `{}`) accepts:
 

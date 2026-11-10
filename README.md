@@ -109,6 +109,12 @@ own `examples/hazelnuts.hdoc`/`examples/hazelnuts.json` do) would have that bibl
 silently overwritten by `haselnuss hazelnuts.hdoc --target json`; the build refuses this,
 the same way it already refuses to overwrite its own `.hdoc` input.
 
+### GFM strikethrough and task lists
+
+`~~struck text~~` is strikethrough (a `:strike`; `<s>` in HTML, `\sout` in LaTeX). Task-list
+markers are **not** supported: `- [ ] item` and `- [x] item` are ordinary list items whose
+text starts with the literal characters `[ ]` / `[x]`. See SPEC §5.1 for the decision.
+
 ### Title, authors, date
 
 ```
@@ -151,6 +157,101 @@ CommonMark gives it. Angle brackets around something that is *not* a URI stay pr
 (`<3 apples>`), while a raw HTML tag stops the build the way raw HTML does everywhere else
 — and by CommonMark's rules `<notauri>` is a tag, not prose, because a bare word in angle
 brackets is a valid HTML open tag.
+
+A link or image may carry a CommonMark title, `[text](url "Tip")` or `![alt](src 'Tip')`,
+including in a reference definition. It is kept in the document and written as the `title`
+attribute in HTML and back out by `--target hdoc`; LaTeX has nowhere to put it and drops it
+without a warning.
+
+### Converting a document you do not trust
+
+The parser refuses raw HTML, and the HTML build goes one step further so that a page
+converted from someone else's document does not carry script. The LaTeX build makes the
+same promise only under `--untrusted` (see "Math in the LaTeX build" below). By default it
+trusts the document author's TeX: math, and attribute values such as an image's `width`,
+reach pdflatex as written, so they can make a PDF link or read a file. Three things are
+removed before output on both targets, each with a warning on stderr that names it (the
+build still succeeds):
+
+- A link or image whose URL has a scheme other than `http`, `https` or `mailto` —
+  `javascript:`, `data:`, `vbscript:` and anything else. Relative paths and `#fragment`
+  targets are kept. A dropped link leaves its text behind; a dropped image leaves its alt
+  text. Tabs, newlines and letter case inside the scheme (`JaVa\tScript:`) do not get past it.
+- An attribute whose name begins with `on` (`onclick`, `onerror`, ...), whether it came
+  from an attribute group (`{onclick="..."}`) or from a `describe` prop; and an attribute
+  whose value fails the URL test above and whose name is on this closed list: `href`,
+  `src`, `poster`, `action`, `formaction`, `xlink:href`, `data`, `srcset`, `ping`,
+  `background`, `cite`, `longdesc`, `dynsrc` and `lowsrc` (every entry of a `srcset` or
+  `ping` list is tested).
+  The list is closed because an attribute is only known to be a URL by name; one not on it
+  passes as written.
+- A directive's `poster` fallback image whose `src` fails the URL test: the fallback is
+  replaced by a `drop`, so the directive renders nothing rather than an unsafe image.
+
+Math is not filtered on the way out — it reaches the page as the TeX you wrote — so HTML
+output loads one exact MathJax release (3.2.2) and configures it so that math cannot make
+a link or set page-level attributes:
+
+- `\href`, `\class`, `\cssId`, `\style` and `\unicode` are left undefined and `\require`
+  is removed, so each renders as a red undefined-macro error instead.
+- MathJax's `safe` extension drops every URL the math produces, so
+  `\mmlToken{mi}[href="javascript:..."]{x}` makes no link either. It also drops an `id` or
+  `class` that does not start with `mjx-`, and it reduces a `style` (from `\mmlToken` or
+  `\bbox`) to a short allow-list of properties: colour, border, margin, padding, font,
+  opacity and a few more, with bounded sizes and no `javascript:` or `data:`.
+- A token's `fontfamily`, `fontweight` and `fontstyle`, which MathJax copies into the
+  page's CSS as written, are kept only when they are letters, digits, spaces, commas,
+  hyphens or underscores.
+
+Ordinary math renders exactly as before. The configuration is an inline `<script>`, so a
+Content-Security-Policy that forbids inline script also stops it — and stops a
+`javascript:` link from running, too.
+
+**Math in the LaTeX build.** LaTeX output writes the document's math as the TeX you wrote,
+and pdflatex runs it — so by default math may do anything TeX can, including read a file
+(`\input`) or define macros. That is fine for your own document. Two things limit it:
+
+- Always, flag or not: `\href`, `\url` and the four-argument
+  `\hyperref{url}{category}{name}{text}` are dropped from math, each with a warning naming
+  the link and its `file:line`. `$\href{javascript:alert(1)}{x}$` becomes `{x}` (the text
+  stays, and the PDF has no link), and `\url{...}` is removed with its URL. No ordinary
+  formula needs a link. This is a convenience, not a boundary. It covers those three
+  commands as written, and TeX has other direct ways to make a link: the pdfTeX primitives
+  `\pdfstartlink` and `\pdfannot`, `\special{pdf:...}`, `\csname href\endcsname`. Only
+  `--untrusted` stops every route.
+- `--untrusted` (latex only) holds the document's own TeX to the allow-list an untrusted
+  extension's output is held to (see "What an untrusted extension may emit" below): math
+  may use only ordinary mathematical commands, a few spacing and escape symbols, and
+  `\begin`/`\end` of amsmath's matrix and alignment environments (an `array` column spec
+  of `l c r |` only). An image path or citation key may hold no command and none of
+  `% # & $ ^ ~`. Any other string the LaTeX build writes without escaping, such as an
+  attribute value, may hold no command at all. The first string outside these rules fails
+  the build. The error names the file, the line and the token
+  (`doc.hdoc:12: document math uses TeX \input, ...`), and nothing is written. A document
+  that keeps to ordinary math builds byte-for-byte as it does without the flag. The check
+  is deliberately over-strict outside math. A backslash or a lone brace is refused even in
+  a string the emitter would have escaped, such as an author name or a link target. An
+  image `width=0.5\textwidth` is refused too; write `width=50%` instead.
+
+`--untrusted` has no effect, and says so, on `--target html` (MathJax is already
+configured as described above) and on `json`/`hdoc`, which filter nothing. It covers the
+whole resolved document: included files, overlays and a `--transform` rule's output. The
+bibliography's generated `.bib` is covered on every LaTeX build: a CSL-JSON `URL` or `DOI`
+whose scheme is not `http`, `https` or `mailto` is left out of it, with a warning, since
+BibTeX's `\url` would make it a live link. The flag does not cover what an extension emits. That is governed by `--trusted-extensions`, so the
+two flags are independent. The check is strict but best-effort, the same as for extensions:
+it reasons about how TeX tokenises under the document's normal catcodes, and it is not a TeX
+interpreter.
+
+This is the whole of the promise for the document itself. It is **not** a general HTML
+sanitiser: other attributes (including `style`) pass through as written, and `--target
+json` and `--target hdoc` write the document as parsed and do no filtering. An
+`--extensions` file loaded *without* `--trusted-extensions` is held to the same rules and a
+few more (see "What an untrusted extension may emit" under "Author-defined extensions"), but
+`--extensions`/`--transform` still run author-supplied code, the TeX check there is strict
+but best-effort, a `--transform` rule's output is filtered only as the document is, and
+`--trusted-extensions` lifts every check — so do not load them from a source you do not
+trust. If you serve converted output to others, still apply a Content-Security-Policy.
 
 ### Bibliographies
 
@@ -258,6 +359,12 @@ Pass `--no-stylesheet` to leave it out, for embedding the output in a page that 
 own CSS. The handful of inline styles the emitter writes per node — a cell's alignment, a
 column's width, the equation number's float, small-caps — stay either way: a stylesheet
 cannot know an authored value, and small-caps is meaning rather than presentation.
+
+The one external fetch HTML output can make is the MathJax 3.2.2 script from a CDN (with the
+extensions it loads from there, including the `safe` one "Converting a document you do not
+trust" describes). It is included only when the document actually contains math, so a
+math-free page makes no third-party request. Library callers can pass `{:mathjax false}` to `emit-document` to
+omit it even then (for offline use); there is no CLI flag for that.
 
 ### Abstracts and keywords
 
@@ -766,7 +873,9 @@ the offending include is dropped and the rest of the document still converts. An
 file that exists but fails to parse is different: it fails the whole build, naming the
 file, exactly as the same content would if it were the top-level document being
 converted — parsing it can drop authored content (a whole chapter, in the worst case), so
-it does not get the warn-and-drop treatment the other two do. To write the literal text,
+it does not get the warn-and-drop treatment the other two do. All three are reported at the
+`!include` line that caused them, as `path:line:` before the message when the document has
+a path (input read from stdin has none, so its messages carry no prefix). To write the literal text,
 indent it four spaces or wrap it in backticks — the same shielding that protects a `:::`
 directive fence.
 
@@ -784,13 +893,168 @@ prefix names a different kind than the directive itself does (`:::{lemma
 as a theorem) — are printed to stderr as warnings and do not stop the
 build.
 
+A reference to an id written on an inline node -- an image that shares its
+paragraph with text or another image is an inline image, not a figure; only
+`![a](a.png){#fig:x}` alone in its paragraph is -- is not resolved (it renders
+as `??`), but its warning says the id is on an inline image, which is not
+referenceable, rather than that no target exists. Put the image in a paragraph
+of its own to make it referenceable.
+
+A duplicated id is warned about once, and a reference to it (`@fig:x`)
+resolves to its **first** definition rather than being reported as
+dangling. Each later node using that id keeps its own number (the second
+`{#fig:x}` figure is still Figure 2) and is emitted under a distinct
+`<id>-dup<n>` id, so the output has no repeated anchors.
+
 Exit codes, so a `make`-style tool can act on them:
 
 | code | meaning |
 | ---- | ------- |
 | 0 | the document was converted and written |
-| 1 | the build failed (no representation for the target, a parse error, an unreadable file); nothing was written |
-| 2 | the command line was wrong; usage is printed |
+| 1 | the build failed (no representation for the target, a parse error, a missing or unreadable input file, a book ID or `--list-books` library that cannot be found, an invalid library directory file); nothing was written |
+| 2 | the command line was wrong; the error and a one-line pointer to `--help` are printed |
+
+### Libraries and books
+
+A document can link to a passage of another book, `@{reformed:heidelberg#sec:q1}`, and
+quote one, a `!quote reformed:heidelberg#sec:q1..sec:q3` line of its own (doc-10). The
+books live in **libraries**, listed in a **library directory** file -- a YAML list:
+
+```yaml
+- name: reformed
+  type: filesystem
+  path: ~/books/reformed          # relative paths are relative to this file
+  url: "https://example.org/reformed/{slug}.html#{label}"   # optional link template
+```
+
+Each entry needs a `name` (lowercase `[a-z0-9-]`, unique in the file) and a `type`;
+`filesystem` takes a `path`, and may take `url` and `scripts`. A broken entry costs only
+its own library: an unknown `type` or a library that cannot be built is reported, and the
+other entries still load.
+
+A `filesystem` library is a folder tree, and the folder path is the book's shelf:
+
+```
+~/books/reformed/                  <- library root (its name comes from the entry)
+  confessions/                     <- shelf
+    reformed/                      <- shelf confessions/reformed
+      heidelberg.hdoc              <- single-file book, slug heidelberg
+      westminster/                 <- book folder (it holds book.hdoc), slug westminster
+        book.hdoc                  <- the book's entry document
+        chapters/ch01.hdoc         <- part of the book through !include, not a book
+  _drafts/                         <- ignored (a leading _ or .)
+```
+
+- A folder holding `book.hdoc` is a **book folder**: its slug is the folder name and
+  everything inside it is that book's (its `!include`s resolve as they always do).
+- Any other `*.hdoc` file is a **single-file book**, its slug the file name.
+- Any other folder is a shelf. Names starting with `.` or `_` are ignored, and a file or
+  folder whose name is not lowercase `[a-z0-9-]` is skipped with an `invalid-book-name`
+  warning.
+- The slug comes from the name on disk, never from front matter, and must be unique in the
+  whole library (two books sharing one are a `duplicate-slug` warning, and a reference to
+  that slug fails as `ambiguous-book`). Listing a library reads only front matter.
+
+A book's canonical ID is `library:shelf/.../slug`, e.g. `reformed:confessions/reformed/
+heidelberg`, but a reference only needs `library:slug`; a shelf path that no longer
+matches (the book moved) still resolves, with a `stale-shelf` note. A passage after `#` is
+a label (`#sec:q1`), a range of labels (`#sec:q1..sec:q3`), or a **locator** the book
+itself interprets (`#14:8-9`).
+
+#### Generated shelves and `scripts: true`
+
+A shelf folder holding `shelf.clj` is a **generated shelf**: its books come from that
+script rather than from `.hdoc` files -- for instance a whole Bible from one data file.
+The script's last form is a map:
+
+```clojure
+{:data     ["almeida.json"]               ; files beside it the host reads and parses
+ :books    (fn [data] [{:slug "romanos" :title "Romanos" :lang "pt-BR"} ...])
+ :document (fn [data slug] {:meta {...} :blocks [...]})   ; the AST as plain data
+ :locate   (fn [data slug locator] {:title "Romanos 14:8" :blocks [...]})}   ; optional
+```
+
+`data` maps each `:data` path, as written, to its parsed value (`.json`, `.yaml`/`.yml`,
+`.edn`); the paths must stay inside the shelf folder. Everything else in that folder is
+the script's data, not books. The script runs in the same sandbox as `--extensions` (no
+file, network or process access, a 5 s timeout, output caps), every result is checked
+against the AST schema, and a failure costs only that shelf (`script-failed`,
+`invalid-generated-book`). The sandbox has no `parse-long`; parse digits with
+`read-string`.
+
+Scripts are **off by default**. Only the library's own entry can switch them on --
+no document can:
+
+```yaml
+- name: bible
+  type: filesystem
+  path: ~/books/bible
+  scripts: true
+```
+
+Without it the shelf's books are missing and a reference to one says why
+(`scripts-disabled`).
+
+A worked example is committed as a test fixture: `test/fixtures/libraries/bible/` is a
+library whose `nt/shelf.clj` serves a small sample of a Portuguese Almeida text, and
+`test/fixtures/catechism/` holds a cut-down Heidelberg catechism that quotes its proof
+texts from it, with the `libraries.yaml` that enables the script. The sample's licence is
+unverified. Its upstream source withdrew the text for that reason, so do not reuse it; the
+fixture's own README has the details.
+
+```
+:::{small-collapsable summary="Romanos 14:8" label="(2)"}
+!quote bible:romanos#14:8
+:::
+```
+
+```
+mkdir -p examples/out
+lein run -- --libraries test/fixtures/catechism/libraries.yaml \
+  test/fixtures/catechism/catecismo-domingo-1.hdoc --output examples/out/catecismo.html
+```
+
+Each quote renders as a `<blockquote class="book-quote" data-source="bible:nt/romanos#14:8">`
+with a "— Romanos 14:8" caption in HTML, and as a `quote` environment closed by that
+source line in LaTeX.
+
+The directory file is the first of these that exists:
+
+1. `--libraries <file>` (which must exist);
+2. `$HASELNUSS_LIBRARIES`;
+3. `~/.config/haselnuss/libraries.yaml`.
+
+None at all only matters to a document that uses a book reference.
+
+```
+haselnuss --libraries libs.yaml paper.hdoc               # resolve its book references
+haselnuss --libraries libs.yaml --list-books reformed    # what is there to cite?
+haselnuss --libraries libs.yaml reformed:heidelberg --target latex   # -> ./heidelberg.tex
+```
+
+`--list-books <library>` prints the canonical ID and title of every book, one per line,
+tab-separated and sorted by ID. An unknown library is an error, and a build-only flag
+given with it (`--target`, `--output`, ...) is warned about as having no effect.
+
+A **book ID as input** builds that book: the argument is taken as a book ID when it
+parses as one and no file or folder of that name exists. The output goes to `<slug>.<ext>`
+in the current directory by default, not into the library -- and never over a file that
+is already there, on any target: the name is one you never typed, so an existing
+`<slug>.<ext>` (your own `apostles.hdoc`, or an earlier build) is refused until
+`--output` names it. A book ID that cannot be
+found is an error, and so is an unknown library or a library that failed to load. So is
+no library directory at all. `--in-place` is refused with a book ID.
+
+Book references resolve on the `html` and `latex` targets; `json` and `hdoc` keep them as
+written, so `--libraries` there is warned about as having no effect (except to find a
+book-ID input). A reference that cannot be resolved renders `??` (a quote: a `?? <ref>`
+placeholder paragraph). It is reported as a warning naming the reference as written and
+its `file:line`, plus the book's canonical ID once the book is known. The library
+directory's own problems -- an entry with an unknown `type`, a library that failed to load,
+a name defined twice -- are printed once per build, located at their line in the
+directory file. None of these fails the build: the output is still written and the exit
+code is 0. A directory file that cannot be read, or is not a valid list of libraries,
+does fail it.
 
 ### Overlays
 
@@ -865,7 +1129,12 @@ The fence spelling parses identically and still works.
 Every prop other than `target` merges into the target node's own `attr.props`. This needs
 no schema change (`props` already exists on every node's `Attr`) and is invisible to both
 emitters by default: HTML renders it as an ordinary tag attribute on the target element
-(present in the markup, never as visible page text), and LaTeX has no generic `props`
+(present in the markup, never as visible page text), with one exception: on a Figure,
+`alt` is not a valid `<figure>` attribute and assistive technology reads it from `<img>`,
+so `alt` replaces the alt of the figure's own `<img>` and is never emitted on `<figure>`.
+A figure made of subfigure panels has no image of its own, so `alt` on the parent is
+dropped; `describe` each panel by its own id instead. Every other prop (and `alt` on a
+non-figure target) lands as an attribute on the target's own element. LaTeX has no generic `props`
 target at all, so a `describe`d prop never appears in the `.tex` output. That is exactly
 the "present but not shown unless something opts in" shape a use case like a per-figure
 textual description — for an eventual audiobook or accessibility pass — wants.
@@ -1112,8 +1381,79 @@ the file.
 A separate flag, `--trusted-extensions`, allows every `--extensions` file loaded in that
 run to emit genuinely verbatim, unescaped output (`haselnuss.ext/raw`) — needed for
 something that must be script or markup exactly as written, a browser-only interactive
-widget being the motivating case. It defaults to off, and a sidecar file can never grant
-itself this on its own.
+widget being the motivating case — and lifts every filter described under "What an
+untrusted extension may emit" below. It defaults to off, and a sidecar file can never grant
+itself this on its own. Without it, what `:render-blocks`/`:render-inlines` hand back may be
+returned only exactly as handed back, in the same call: one changed (with `assoc`, `merge`,
+`into`, …) or kept from an earlier call fails the build with an error naming the directive
+and its line, since it would otherwise be verbatim output by another route.
+
+**What an untrusted extension may emit.** Without `--trusted-extensions`, an extension's
+output — what its renderers return and render through their callbacks, and what its `:lower`
+rule returns — is filtered by the same rules as the document ("Converting a document you do
+not trust"), plus two refusals. The rule of thumb: what a *document* can cause — a URL or attribute a
+renderer copied from the directive's props — is dropped with a warning naming the directive
+and its line, and the build goes on; what only the *extension's own code* can cause fails
+the build with an error naming the directive, its line and the offending tag or command.
+
+- **HTML elements** must be on an allow-list: `a abbr address article aside audio b bdi bdo
+  blockquote br button caption cite code col colgroup data dd del details dfn div dl dt em
+  figcaption figure footer h1`–`h6 header hgroup hr i img ins kbd label li main mark meter
+  nav ol p picture pre progress q rp rt ruby s samp section small source span strong sub
+  summary sup table tbody td tfoot th thead time tr track u ul var video wbr`. Anything else
+  — `script`, `style`, `link`, `meta`, `base`, `iframe`, `object`, `embed`, `form` and its
+  controls, `svg`, `math`, `template`, a custom element — is refused.
+- **HTML attributes**: an `on…` handler, an attribute from the closed URL list whose value
+  fails the scheme test (every `srcset`/`ping` entry included), `is` (which turns an element
+  into a custom element), and an attribute name that is not a well-formed name
+  (`"x onclick"`) are each dropped with a warning. `style` passes, as it does on the
+  document.
+- **AST** — what a renderer hands `:render-blocks`/`:render-inlines`, and the Blocks a
+  `:lower` rule returns — goes through the document pass first: a hand-built link to
+  `javascript:…` renders as its text, an `onmouseover` prop is dropped, each with a warning,
+  on both targets.
+- **TeX** in that AST is held to an **allow-list**, and the build is refused at the first
+  token outside it. In math (`:tex`), the allowed control words are ordinary mathematics:
+  Greek letters; large operators and named functions (`\sum`, `\int`, `\lim`, `\sin`,
+  `\log`, …); binary operators, relations and arrows (`\cdot`, `\le`, `\equiv`, `\in`,
+  `\subseteq`, `\to`, `\Rightarrow`, …); symbols (`\infty`, `\partial`, `\nabla`, `\ldots`,
+  …); delimiters and sizing (`\left`, `\right`, `\middle`, `\big`…`\Bigg`, `\langle`, …);
+  accents (`\hat`, `\bar`, `\vec`, `\widehat`, `\overline`, `\overbrace`, …); fonts
+  (`\mathrm`, `\mathbf`, `\mathit`, `\mathsf`, `\mathtt`, `\mathcal`, `\mathbb`,
+  `\mathfrak`, `\boldsymbol`) and text (`\text`, `\textrm`, `\textbf`, `\textit`, `\mbox`,
+  `\operatorname`); `\frac`, `\dfrac`, `\tfrac`, `\sqrt`, `\binom`, `\boxed`, `\phantom`;
+  spacing and style (`\quad`, `\qquad`, `\displaystyle`, `\limits`, …); `\bmod`, `\pmod`;
+  `\tag`, `\notag`, `\nonumber`, `\hline`. The control symbols `\,` `\;` `\!` `\:` `\>`
+  `\ ` `\\` `\{` `\}` `\|` `\#` `\$` `\%` `\&` `\_` are allowed, and `\begin`/`\end` only
+  around `matrix`, `pmatrix`, `bmatrix`, `Bmatrix`, `vmatrix`, `Vmatrix`, `smallmatrix`,
+  `cases`, `aligned`, `alignedat`, `gathered`, `split` or `array` — with `array`'s column
+  spec limited to `l`, `c`, `r` and `|` (after an optional `[t]`/`[b]`/`[c]`) and
+  `alignedat`'s to a column count, since a `*{n}{…}` repeat hangs pdflatex and `@{}`, `!{}`,
+  `>{}`, `<{}` and `p{}` carry arbitrary TeX. `\label` and `\color` are
+  not on the list (a label writes to the `.aux` file and can collide with the document's);
+  `src/haselnuss/sanitize.clj` (`tex-math-words`) has the complete list. Every other string
+  the LaTeX emitter writes unescaped — an image path, a citation key — may hold no control
+  sequence at all, and an image path or citation key none of `%`, `#`, `&`, `$`, `^`, `~`
+  either. (An image's alt text is never TeX: LaTeX does not render it.) In either, `^^` notation, an unbalanced brace, and an allowed word
+  directly followed by `@` or `:` (the start of a longer `\makeatletter` or expl3 name such
+  as `\tex_input:D`) are refused.
+
+  This check is strict but **best-effort**: TeX is a programmable macro language, and an
+  allow-list is far harder to get past than the deny-list it replaced (which an expl3
+  `\ior_open:Nn`, `\UseName{input}` and `\begin{input}` all got through), but it reasons
+  about how TeX tokenises under the document's normal catcodes rather than running TeX.
+  TeX the *document* wrote is exempt: a string the directive itself holds where TeX is
+  spliced (its own math, its props) passes, so a renderer passing the directive's own body
+  through renders the author's math exactly as it would render outside the directive. Prose
+  the document wrote does not count — a code sample's `\input{...}` that an extension moves
+  into a math node is refused.
+
+A renderer's own LaTeX output needs no further filter: on that target a returned string is
+always escaped, so the only ways to emit raw TeX are `haselnuss.ext/raw` and the callbacks,
+both covered above. All of this applies to every registration that is not `:trusted`,
+the built-in `collapsable` included (which emits nothing it would catch). A `--transform`
+rule is not an extension in this sense: its output runs through the document pass like
+authored content, and its TeX counts as the document's own.
 
 `examples/reveal.clj` and `examples/reveal-demo.hdoc` are a worked example of exactly
 this: a `reveal` directive — a small quiz prompt with a button that reveals its answer —
@@ -1250,20 +1590,27 @@ actually meets it:
   normalized wrapping — the same note under "Usage" above — so running a `--transform` file
   whose every rule matches nothing at all still rewrites the document: the diff is the
   formatter's own canonical re-spelling, not evidence a rule silently changed something.
-- **Five `Inline` variants have no `.hdoc` spelling of their own.** `:strike`,
-  `:small-caps`, `:sub`, `:sup` and `:sticky-note` are schema-valid and every emitter renders
+  Two parts of that re-spelling worth knowing: footnotes are **renumbered** in order of
+  first reference (`[^one]` becomes `[^1]`), because the parsed document keeps no
+  footnote label to write back; and a backslash is written only where the character would
+  otherwise read differently (`>` or `:::` at the start of a line, an `@word` that is a
+  real reference), so `Links: x`, `7 > 3` and `cc @someone` stay as written.
+- **Four `Inline` variants have no `.hdoc` spelling of their own.** `:small-caps`, `:sub`,
+  `:sup` and `:sticky-note` are schema-valid and every emitter renders
   them, but nothing in `.hdoc`'s own surface syntax ever parses into one — the one way to
   meet this is a rule's own `:transform` constructing one directly (wrapping matched text in
-  `{:t :strike ...}` to mark it deprecated, say), or, for a sticky note, an `--overlay`
-  annotation. Write that back out through `--target hdoc`/`--in-place` and the first four
-  come back as a generic `[text]{.strike}`-shaped role span, which re-parses as a `:span`
+  `{:t :small-caps ...}`, say), or, for a sticky note, an `--overlay`
+  annotation. Write that back out through `--target hdoc`/`--in-place` and the first three
+  come back as a generic `[text]{.sub}`-shaped role span, which re-parses as a `:span`
   rather than the tag the rule built; a sticky note comes back as a footnote, which preserves
   every block of its body but not its `Attr`, since a footnote has none.
   `haselnuss.emit.hdoc/lossy-role-span-diagnostics` can report every occurrence a document
   carries, but nothing on the command line calls it today, so this is silent unless you know
   to look for it. `:highlight` is the exception: `==…==` is its own spelling, so it is an
   exact round trip — except one nested inside another, which that spelling cannot express and
-  which comes back as a `[text]{.highlight}` role span.
+  which comes back as a `[text]{.highlight}` role span. `:strike` is the same kind of
+  exception since `~~…~~` became its spelling: an exact round trip, except one strike nested
+  inside another, which comes back as a `[text]{.strike}` role span.
 
 `examples/publish.clj` and `examples/draft.hdoc` are a worked example: three rules
 stripping the drafting scaffolding a real page might actually carry before it goes out — an
@@ -1316,10 +1663,15 @@ The two outputs agree on every number and citation. They differ where
 the graceful-degradation contract says they should: the `collapsable`
 directive is an interactive `<details>` widget in HTML and flattens to
 its content in print, and the `admonition` directive is a styled
-`<blockquote class="admonition">` in HTML and an indented italic block
+`<div class="admonition" role="note">` in HTML and an indented italic block
 in print. Both carry the same head — `Note 1` — and both are
 cross-referenceable, which is what lets the document's conclusion point
-back at the admonition by id.
+back at the admonition by id. Lowered directives (theorem-like, admonition, figure
+panel grids) are `<div>`s, never `<blockquote>`s; only a node carrying the
+in-memory `:container` marker that the CLI sets becomes one, so an authored quote
+with a `.proof` class stays a quote. Props are written as HTML attributes
+(`lang=en` is a real `lang`), except the document-model ones `caption`, `key` and
+`ref`, which are never emitted.
 
 `--computed-numbers` is what makes the two outputs agree number for number, which is what
 this example is for. A native-mode build works too: it delegates the reference list to

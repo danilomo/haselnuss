@@ -169,7 +169,7 @@
             rather than being silently skipped downstream"
     (let [tags (mapcat #(schema-variant-tags (get ast/registry %))
                        [::ast/block ::ast/inline ::ast/fallback])]
-      (is (= 35 (count tags)) "11 Block + 20 Inline + 4 Fallback variants")
+      (is (= 37 (count tags)) "12 Block + 21 Inline + 4 Fallback variants")
       (doseq [tag tags]
         (testing (str tag)
           (is (contains? (:children walk/table) tag)))))))
@@ -188,6 +188,16 @@
             [:attr [:one ::ast/attr]]]
            (get-in walk/table [:children :sticky-note]))
         ":sticky-note is note-shaped, plus the Attr :note never had")))
+
+(deftest book-nodes-derive-their-own-table-entries-test
+  (testing "TASK-152: the two book nodes reach the table through their
+            OPTIONAL resolved fields alone -- an unresolved node has no
+            children, a resolved one is walked into like any other"
+    (is (= [[:text [:many ::ast/inline]]]
+           (get-in walk/table [:children :book-ref])))
+    (is (= [[:title [:many ::ast/inline]]
+            [:blocks [:many ::ast/block]]]
+           (get-in walk/table [:children :book-quote])))))
 
 ;; --- schema declaration order (AC #2) --------------------------------------
 

@@ -51,6 +51,7 @@
             [clojure.string :as str]
             [haselnuss.anchor :as anchor]
             [haselnuss.ast :as ast]
+            [haselnuss.book-ref :as book-ref]
             [haselnuss.walk :as walk]))
 
 (def default-lexicon
@@ -292,6 +293,12 @@
     :figure [(:content block)]
     :table (mapcat :blocks (table-cells block))
     :para (inline-blocks (:inlines block))
+    ;; TASK-154: a quote's spliced passage is deliberately NOT a child
+    ;; here. Everything built on this traversal -- numbering, the TOC,
+    ;; the lists of figures and tables, the structural diagnostics --
+    ;; is about the host's own body, and quoted content belongs to the
+    ;; book it came from (doc-10, step 0b: never numbered, never listed).
+    :book-quote []
     []))
 
 ;; --- Include expansion (TASK-38, sec4.3) -----------------------------------
@@ -341,6 +348,23 @@
 ;; this namespace's own docstring already commits to, while still matching
 ;; exactly what `haselnuss.cli`'s real `:load` (`slurp` then `parser/parse`)
 ;; actually raises for each case.
+
+(defn- locate-warning
+  "Diagnostic `w` placed at `node`'s source position (TASK-143): the position
+  the parser recorded (`haselnuss.ast/source`) as `:source-line` and, when
+  the document was parsed with a `:source` path, `:source-file`, with
+  `path:line: ` prepended to the unchanged message -- the same form a
+  located parse error prints. A node with no recorded position (built
+  by a rule, read from JSON, or parsed without a path for the message)
+  leaves `w` as it was. Defined here, ahead of include expansion, because
+  that is its first user (TASK-163: an include diagnostic names the
+  `!include` line)."
+  [node w]
+  (if-let [{:keys [file line]} (ast/source node)]
+    (cond-> (assoc w :source-line line)
+      file (-> (assoc :source-file file)
+               (update :message #(str file ":" line ": " %))))
+    w))
 
 (declare expand-blocks)
 
@@ -451,6 +475,13 @@
     file -- expands twice as it should, while a true loop stops at the
     edge that closes it.
 
+  Both, and the `::unparseable-include` error below, are placed at the
+  `!include` line that caused them (TASK-163, `locate-warning`):
+  `:source-line`, plus `:source-file` and a `path:line: ` message prefix
+  when the including document was parsed with a `:source`. An include
+  with no recorded position (read from JSON, built by a rule) reports
+  exactly as before.
+
   A file that WAS read but failed to parse is neither of those (TASK-105
   AC #1): `:load` throwing anything other than a `java.io.IOException` --
   a malformed YAML front matter, an unsupported inline construct, any
@@ -500,12 +531,14 @@
                       ^java.io.File file (resolve-include-path dir src)
                       path (canonical-path file)]
                   (if (contains? (set stack) path)
-                    (warn! {:type :include-cycle
-                            :src src
-                            :path path
-                            :cycle (conj (vec stack) path)
-                            :message (str "include cycle: " (pr-str src) " is already being"
-                                          " included, via " (str/join " -> " (conj (vec stack) path)))})
+                    (warn! (locate-warning
+                            include
+                            {:type :include-cycle
+                             :src src
+                             :path path
+                             :cycle (conj (vec stack) path)
+                             :message (str "include cycle: " (pr-str src) " is already being"
+                                           " included, via " (str/join " -> " (conj (vec stack) path)))}))
                     (let [included (try (load-document file)
                                         ;; A missing file, a directory, a
                                         ;; permission error -- confirmed
@@ -515,11 +548,13 @@
                                         ;; content lost, so this stays a
                                         ;; warning (TASK-105 AC #2).
                                         (catch java.io.IOException e
-                                          (warn! {:type :unreadable-include
-                                                  :src src
-                                                  :path path
-                                                  :message (str "cannot include " (pr-str src)
-                                                                " (" path "): " (ex-message e))})
+                                          (warn! (locate-warning
+                                                  include
+                                                  {:type :unreadable-include
+                                                   :src src
+                                                   :path path
+                                                   :message (str "cannot include " (pr-str src)
+                                                                 " (" path "): " (ex-message e))}))
                                           ::failed)
                                         ;; Anything else `:load` threw is a
                                         ;; file that WAS read but failed to
@@ -556,12 +591,13 @@
                                         ;; `lower`/emit try/catches already
                                         ;; set.
                                         (catch Exception e
-                                          (throw (ex-info
-                                                  (str "cannot include " (pr-str src)
-                                                       " (" path "): " (ex-message e))
-                                                  {:type ::unparseable-include :src src :path path
-                                                   :warnings @warnings}
-                                                  e))))]
+                                          (let [data (locate-warning
+                                                      include
+                                                      {:type ::unparseable-include :src src :path path
+                                                       :warnings @warnings
+                                                       :message (str "cannot include " (pr-str src)
+                                                                     " (" path "): " (ex-message e))})]
+                                            (throw (ex-info (:message data) (dissoc data :message) e)))))]
                       (if (= ::failed included)
                         []
                         ;; Recur with the included file's OWN directory
@@ -579,6 +615,271 @@
                               []))]
        {:document (assoc document :blocks expanded)
         :warnings @warnings}))))
+
+;; --- Quote expansion (TASK-154, doc-10 "Resolver" step 0b) -----------------
+;;
+;; Every `:book-quote` (a `!quote <ref>` line) gets the blocks of the
+;; passage its reference names spliced inside it, as `:blocks`, along with
+;; the passage's canonical reference (`:canonical`), its title and its URL.
+;;
+;; Finding the book and its passage is not this namespace's job: the
+;; library providers require this namespace, so it cannot require them.
+;; The caller injects a `:resolve` fn instead -- exactly as `!include`
+;; gets the parser through `:includes`' `:load` -- and
+;; `haselnuss.library.references/books-option` is the one a build uses. It
+;; is called only for a quote that exists, so a document with no `!quote`
+;; never loads the library directory.
+;;
+;; Quoted content belongs to the book it came from, not to the host, and
+;; is made so here:
+;;
+;; - every `attr.id` in it is stripped, so nothing quoted is a cross-
+;;   reference target, an overlay target, or a duplicate of a host id;
+;; - every `:cross-ref` in it becomes a `:book-ref` to the source book,
+;;   still pointing where its author meant: one the book resolved keeps
+;;   the book's text and gets `:canonical`; one that dangled in the book
+;;   gets `??`, no `:canonical`, and an `:unknown-label` warning at the
+;;   `!quote` (see `quoted-cross-ref`);
+;; - it is never numbered, never in the TOC or the lists of figures and
+;;   tables: `block-children` does not descend into a `:book-quote`, and
+;;   with no ids nothing in it has a number for an emitter to print;
+;; - its citations were formatted against the BOOK's bibliography when the
+;;   book was resolved, so `resolve-document` hides quoted blocks from the
+;;   host's own citation pass (`detach-quoted`).
+;;
+;; A quote inside quoted content expands too. The books being expanded
+;; form a chain from the host down; a quote whose book is already on it
+;; is a `:quote-cycle` (one book quoting itself included, as `!include`
+;; treats a file), and a quote more than `max-quote-depth` levels down is
+;; `:quote-too-deep`. Both are measured from the host, never cached: the
+;; passage context caches each book's resolved document WITHOUT its quotes
+;; expanded, so what a book resolves to never depends on who quoted it
+;; first, and loading one never re-enters another's loading.
+;;
+;; A failed quote keeps its node, with a placeholder paragraph naming the
+;; reference as its `:blocks` and no `:canonical`, and a warning placed at
+;; the `!quote` line; the build continues.
+
+(def max-quote-depth
+  "How deeply quotes may nest (doc-10): a quote in the host is at depth 1,
+  a quote inside what it quotes at depth 2, and one beyond this is
+  `:quote-too-deep`."
+  8)
+
+(defn- quote-placeholder
+  "The visible paragraph a quote that could not be resolved leaves behind,
+  naming its reference as written -- the `??` a dangling cross-reference
+  prints, for a whole block."
+  [written]
+  {:t :para :inlines [{:t :str :text (str "?? " written)}]})
+
+(defn- quoted-cross-ref
+  "`cross-ref`, a `:cross-ref` inline inside a passage of the book `id`, as
+  a `:book-ref` to that label of that book. `:canonical` means a RESOLVED
+  target, so it depends on what the book's own resolution made of the
+  reference:
+
+  - resolved (a `:target`): `:canonical` set, and the book's text
+    (\"Section 3\") kept as the link text, so the quote still reads as its
+    author wrote it. Already resolved: link resolution leaves it alone.
+  - dangling in the book (`:target nil`): NO `:canonical`, and `:text`
+    the same `??` placeholder the book printed. `sanitize-quoted` reports
+    it (`:unknown-label`, at the host's `!quote`), so it is resolved --
+    to a failure -- here, and link resolution leaves it alone too.
+  - never resolved by the book (no `:target` key: a passage a book's own
+    `locate` built): neither `:canonical` nor `:text` -- an ordinary
+    unresolved `:book-ref`, for link resolution (TASK-155) to resolve
+    and, if it dangles, report."
+  [id {:keys [label text] :as cross-ref}]
+  (let [canonical (book-ref/format-book-ref {:id id :passage {:form :label :label label}})
+        node {:t :book-ref :ref canonical :passage {:form :label :label label}}]
+    (cond
+      (not (contains? cross-ref :target)) node
+      (nil? (:target cross-ref)) (assoc node :text [{:t :str :text "??"}])
+      :else (cond-> (assoc node :canonical canonical)
+              (string? text) (assoc :text [{:t :str :text text}])))))
+
+(defn- sanitize-quoted
+  "`blocks`, a passage of the book `id`, made fit to sit inside the host:
+  every `attr.id` stripped (at every position, a Directive's `:fallback`
+  included, since lowering can bring it in later) and every `:cross-ref`
+  rewritten into a `:book-ref` to the source book (`quoted-cross-ref`),
+  calling `dangling!` with the label of each one that dangled in the
+  book. Source positions survive, so a quote nested in the passage is
+  still reported at the line of the book it was written on. A rewritten
+  reference with no position of its own (a locator's blocks) takes
+  `quote-node`'s, so link resolution (TASK-155) can report it at the
+  `!quote` that brought it in."
+  [id blocks quote-node dangling!]
+  (let [{quote-file :file quote-line :line} (ast/source quote-node)
+        walker {:table walk/table
+                :scope walk/every-ref-kind
+                :rewrite-fn
+                (fn [ref-kind node]
+                  (cond
+                    (not (map? node)) [node]
+                    (and (= ::ast/inline ref-kind) (= :cross-ref (keyword (:t node))))
+                    (do (when (and (contains? node :target) (nil? (:target node)))
+                          (dangling! (:label node)))
+                        [(cond-> (with-meta (quoted-cross-ref id node) (meta node))
+                           (nil? (ast/source node)) (ast/with-source quote-file quote-line))])
+                    (and (map? (:attr node)) (contains? (:attr node) :id))
+                    [(update node :attr dissoc :id)]
+                    :else [node]))}]
+    (into [] (mapcat #(walk/rewrite walker ::ast/block %)) blocks)))
+
+(def ^:private quote-scope
+  "Where a `:book-quote` can sit: every block and inline position of the
+  document, `meta.title` included (a footnote in a title can hold
+  blocks), but not a Directive's target-specific `:fallback`."
+  #{::ast/block ::ast/inline ::ast/cell ::ast/row ::ast/cite-item ::ast/meta})
+
+(defn- chain-text
+  [chain]
+  (str/join " -> " (map book-ref/format-book-id chain)))
+
+(declare expand-quotes-in)
+
+(defn- expand-quote
+  "`node`, a `:book-quote` at `depth` with the books `chain` above it, with
+  its passage spliced in, or with a placeholder when that failed. Warnings
+  go to `(:warn! env)`."
+  [{resolve-ref :resolve warn! :warn! :as env} chain depth node]
+  (let [written (:ref node)
+        parsed (book-ref/parse-book-ref written)
+        report! (fn [diagnostic]
+                  (warn! (locate-warning node (merge {:level :warning} diagnostic {:ref written}))))
+        fail (fn [diagnostic]
+               (report! diagnostic)
+               (-> node
+                   (dissoc :canonical :title :url)
+                   (assoc :blocks [(quote-placeholder written)])))]
+    (cond
+      (book-ref/malformed? parsed) (fail parsed)
+
+      (some #(book-ref/same-book? % (:id parsed)) chain)
+      (fail {:type :quote-cycle
+             :cycle (conj (mapv book-ref/format-book-id chain) (book-ref/format-book-id (:id parsed)))
+             :message (str "quote cycle: !quote " written
+                           " names a book that is already being quoted, via "
+                           (chain-text (conj chain (:id parsed))))})
+
+      (> depth max-quote-depth)
+      (fail {:type :quote-too-deep
+             :depth depth
+             :message (str "!quote " written " is nested " depth " quotes deep, more than the "
+                           max-quote-depth " allowed, via " (chain-text chain))})
+
+      :else
+      (let [{:keys [passage id failure warnings diagnostics]} (resolve-ref written parsed)]
+        (run! warn! diagnostics)
+        (if failure
+          (fail failure)
+          (do (run! report! warnings)
+              (cond-> (-> node
+                          (dissoc :url)
+                          (assoc :canonical (:ref passage)
+                                 :title (:title passage)
+                                 :blocks (expand-quotes-in
+                                          env (conj chain id) (inc depth)
+                                          (sanitize-quoted
+                                           id (:blocks passage) node
+                                           (fn [label]
+                                             (report!
+                                              {:type :unknown-label
+                                               :label label
+                                               :book (book-ref/format-book-id id)
+                                               :canonical (:ref passage)
+                                               :message (str "!quote " written ": the quoted passage"
+                                                             " refers to @" label ", which book "
+                                                             (book-ref/format-book-id id)
+                                                             " does not have; it reads ??")}))))))
+                (:url passage) (assoc :url (:url passage)))))))))
+
+(defn- quote-walker
+  "The `haselnuss.walk/rewrite` walker that expands every quote it meets at
+  `depth` below `chain`. An expanded node is marked (in its metadata) so
+  that the walk, which goes on into what it just spliced, does not expand
+  the quotes in there a second time."
+  [env chain depth]
+  {:table walk/table
+   :scope quote-scope
+   :rewrite-fn (fn [ref-kind node]
+                 (if (and (= ::ast/block ref-kind)
+                          (= :book-quote (keyword (:t node)))
+                          (not (::expanded (meta node))))
+                   [(vary-meta (expand-quote env chain depth node) assoc ::expanded true)]
+                   [node]))})
+
+(defn- expand-quotes-in
+  [env chain depth blocks]
+  (let [walker (quote-walker env chain depth)]
+    (into [] (mapcat #(walk/rewrite walker ::ast/block %)) blocks)))
+
+(defn expand-quotes
+  "Splices into every `:book-quote` in `document` the passage its `:ref`
+  names (doc-10 step 0b; see this section's comment), returning
+  `{:document document' :warnings warnings}`.
+
+  `opts` is `resolve-document`'s `:books`:
+
+  - `:resolve`, `(fn [written parsed] result)`: `written` the reference
+    as written, `parsed` what `haselnuss.book-ref/parse-book-ref` made of it
+    (never malformed -- that is reported here). `result` is `{:passage
+    Passage :id BookId :warnings [...] :diagnostics [...]}` -- `:id` the
+    book's current, canonical id -- or `{:failure diagnostic :diagnostics
+    [...]}`. `:warnings` (and `:failure`) concern this reference and are
+    placed at its `!quote` line; `:diagnostics` concern the build (a
+    library directory's load problems, a book's own load warnings) and
+    are reported as they are. Without `:resolve` this pass is a no-op and
+    every `:book-quote` is left as parsed, as `expand-includes` leaves an
+    `:include` without a `:load`.
+  - `:self`, the BookId of the document itself when it is a book of a
+    library, so that a quote back into it is a cycle.
+
+  Every warning carries `:ref`, the reference as written, and a `:level`
+  (`:warning`, or `:info` for a `:stale-shelf`)."
+  ([document] (expand-quotes document {}))
+  ([document {resolve-ref :resolve self :self}]
+   (if-not resolve-ref
+     {:document document :warnings []}
+     (let [warnings (volatile! [])
+           env {:resolve resolve-ref :warn! #(vswap! warnings conj %)}
+           walker (quote-walker env (if self [self] []) 1)]
+       {:document (first (walk/rewrite walker ::ast/document document))
+        :warnings @warnings}))))
+
+(defn- detach-quoted
+  "`[document' quoted]`: `document` with every outermost spliced quote's
+  `:blocks` taken out and set aside in `quoted`, for a pass that must not
+  see them (`reattach-quoted` puts them back)."
+  [document]
+  (let [quoted (volatile! [])
+        walker {:table walk/table
+                :scope quote-scope
+                :rewrite-fn (fn [ref-kind node]
+                              (if (and (= ::ast/block ref-kind)
+                                       (= :book-quote (keyword (:t node)))
+                                       (contains? node :blocks))
+                                (let [n (count @quoted)]
+                                  (vswap! quoted conj (:blocks node))
+                                  [(assoc node :blocks [] ::quoted n)])
+                                [node]))}]
+    [(first (walk/rewrite walker ::ast/document document)) @quoted]))
+
+(defn- reattach-quoted
+  [document quoted]
+  (if (empty? quoted)
+    document
+    (let [walker {:table walk/table
+                  :scope quote-scope
+                  :rewrite-fn (fn [ref-kind node]
+                                (if (and (= ::ast/block ref-kind) (contains? node ::quoted))
+                                  [(-> node
+                                       (assoc :blocks (nth quoted (::quoted node)))
+                                       (dissoc ::quoted))]
+                                  [node]))}]
+      (first (walk/rewrite walker ::ast/document document)))))
 
 ;; --- Overlay application (TASK-83.1/TASK-83.2, doc-5) ----------------------
 ;;
@@ -1592,14 +1893,23 @@
                    (= :roman (:number-format entry)) (roman-numeral (first own-path))
                    :else (str/join "." own-path)))
         entries' (if own-path
-                   (let [word-info (words-for entry lang)]
-                     (assoc (:entries state) id
-                            (cond-> {:kind kind
-                                     :path own-path
-                                     :number number
-                                     :word (:singular word-info)
-                                     :text (format-text word-info number)}
-                              sublabel (assoc :sublabel sublabel))))
+                   ;; A duplicated id (TASK-133) keeps its FIRST entry: a
+                   ;; reference to it resolves, deterministically, to the
+                   ;; first definition -- the one a browser's `#id` jump
+                   ;; lands on -- while `duplicate-id-diagnostics`
+                   ;; separately warns about the collision. The later node
+                   ;; still consumes a number (counters advance above), as
+                   ;; in a native build, but does not overwrite the label.
+                   (if (contains? (:entries state) id)
+                     (:entries state)
+                     (let [word-info (words-for entry lang)]
+                       (assoc (:entries state) id
+                              (cond-> {:kind kind
+                                       :path own-path
+                                       :number number
+                                       :word (:singular word-info)
+                                       :text (format-text word-info number)}
+                                sublabel (assoc :sublabel sublabel)))))
                    (:entries state))
         child-section-path (cond
                              ;; Unconditional for a chapter, unlike the
@@ -1789,20 +2099,40 @@
   node's own `:suppress-prefix` is set, just the bare `:number` (e.g.
   \"2.3\") with no prefix word.
 
+  An id defined more than once (TASK-133) is not dangling: `labels`
+  holds the FIRST definition's entry (see `number-block`), so the
+  reference resolves to it, and the collision is reported separately as
+  `:duplicate-id`.
+
   No match is a dangling reference (TASK-12 AC #3): `node'` gets `:target
   nil` and `:text \"??\"` (a visible placeholder, mirroring LaTeX's own
   behavior for an unresolved `\\ref`, instead of a crash), and `warnings`
-  carries one `{:type :dangling-cross-ref :label :message}` map."
-  [labels {:keys [label suppress-prefix] :as cross-ref}]
+  carries one `{:type :dangling-cross-ref :label :message}` map (plus
+  `:node-kind` when the id is on an inline node).
+
+  TASK-141: when `inline-ids` (an id -> node-kind map of ids written on
+  INLINE nodes, see `inline-node-ids`) holds the label, the id is not
+  absent -- it sits on an inline image/link/span, which is not a
+  numbering target (only a lone-image paragraph becomes a figure). The
+  result is the same `??` placeholder, but the message names the node
+  kind instead of claiming there is no target."
+  [labels inline-ids {:keys [label suppress-prefix] :as cross-ref}]
   (if-let [entry (get labels label)]
     [(assoc cross-ref
             :target label
             :text (if suppress-prefix (:number entry) (:text entry)))
      []]
     [(assoc cross-ref :target nil :text "??")
-     [{:type :dangling-cross-ref
-       :label label
-       :message (str "dangling cross-reference: no target with id \"" label "\"")}]]))
+     [(if-let [kind (get inline-ids label)]
+        {:type :dangling-cross-ref
+         :label label
+         :node-kind kind
+         :message (str "dangling cross-reference: id \"" label "\" is on an inline "
+                       (name kind) ", which is not referenceable; only a block "
+                       "(for an image, one alone in its paragraph) can be a target")}
+        {:type :dangling-cross-ref
+         :label label
+         :message (str "dangling cross-reference: no target with id \"" label "\"")})]]))
 
 (def ^:private cross-ref-scope
   "`haselnuss.walk/rewrite`'s own `:scope` for `resolve-cross-refs`
@@ -1829,6 +2159,18 @@
   against."
   #{::ast/block ::ast/inline ::ast/cell ::ast/row ::ast/cite-item ::ast/meta})
 
+(defn- inline-node-ids
+  "id -> node kind (`:image`, `:link`, ...) for every INLINE node under
+  `document` carrying an `attr.id` (TASK-141). First occurrence wins."
+  [document]
+  (walk/fold {:table walk/table :scope cross-ref-scope
+              :visit (fn [acc _path ref-kind node]
+                       (let [id (get-in node [:attr :id])]
+                         (if (and (= ref-kind ::ast/inline) id (not (contains? acc id)))
+                           (assoc acc id (:t node))
+                           acc)))}
+             {} ::ast/document document))
+
 (defn- resolve-cross-refs-node
   "The CrossRef-resolution pass's own `:rewrite-fn` (TASK-86): a
   `:cross-ref` Inline is `resolve-cross-ref`'s alone to resolve; every
@@ -1847,10 +2189,10 @@
   namespace's own `expand-includes`/`apply-overlays` already use, called in
   the exact order `rewrite` visits nodes (document order, per
   `cross-ref-scope`)."
-  [labels warn! ref-kind node]
+  [labels inline-ids warn! ref-kind node]
   (if (and (= ref-kind ::ast/inline) (= :cross-ref (:t node)))
-    (let [[node' warnings] (resolve-cross-ref labels node)]
-      (run! warn! warnings)
+    (let [[node' warnings] (resolve-cross-ref labels inline-ids node)]
+      (run! (comp warn! (partial locate-warning node)) warnings)
       [node'])
     [node]))
 
@@ -1866,7 +2208,8 @@
   `document` with every `:cross-ref` node annotated per `resolve-cross-ref`
   (`:target`/`:text` on a match, TASK-12 AC #1/#2; `:target nil` `:text
   \"??\"` on a dangling reference, TASK-12 AC #3), and `warnings` is a
-  vector of `{:type :dangling-cross-ref :label :message}` maps, one per
+  vector of `{:type :dangling-cross-ref :label :message}` maps (with an
+  optional `:node-kind`), one per
   dangling reference encountered, in document order -- `document'` never
   contains a raw crash, only a visible placeholder plus a diagnostic,
   mirroring `resolve`'s own `{ast, meta, diagnostics}` shape at this
@@ -1882,9 +2225,104 @@
    (let [warnings (volatile! [])
          warn! (fn [w] (vswap! warnings conj w))
          walker {:table walk/table :scope cross-ref-scope
-                 :rewrite-fn (partial resolve-cross-refs-node labels warn!)}
+                 :rewrite-fn (partial resolve-cross-refs-node labels (inline-node-ids document) warn!)}
          document' (first (walk/rewrite walker ::ast/document document))]
      {:document document' :warnings @warnings})))
+
+;; --- Book links (TASK-155, doc-10 "Resolver" step 2) ------------------------
+;;
+;; Every `:book-ref` (an inline `@{<ref>}`) resolves alongside the cross-
+;; references: through the same injected `:books` option the quote step
+;; uses, it gets the passage it names (`:passage`), the target's canonical
+;; reference (`:canonical`), the passage's title as its link text
+;; (`:text`, e.g. "Heidelberg Catechism, Section 3") and, when the book's
+;; library entry has a URL template, a `:url`. One that cannot be resolved
+;; reads `??`, as a dangling `@fig:x` does, and is a warning placed at its
+;; own line.
+;;
+;; A `:book-ref` that already has `:text` was settled before this step --
+;; a quoted cross-reference the quote step rewrote (`quoted-cross-ref`):
+;; it keeps the book's own wording ("Section 1.1", faithful to the quote,
+;; and its `:suppress-prefix` choice, which the rewrite drops), and a
+;; dangling one was already reported at its `!quote`. Such a ref is never
+;; resolved or reported again; one with `:canonical` only gains the URL
+;; its template fills in, so it can link back to the book it quotes. Every
+;; other `:book-ref` -- the host's own, a book's own `@{...}` inside
+;; quoted content, a quoted cross-reference the book never resolved -- is
+;; resolved here.
+
+(defn- resolve-book-ref
+  "`node`, an unresolved `:book-ref`, resolved through `env`'s `:resolve`,
+  or with `??` text when that failed. Warnings go to `(:warn! env)`."
+  [{resolve-ref :resolve warn! :warn!} node]
+  (let [written (:ref node)
+        parsed (book-ref/parse-book-ref written)
+        fail (fn [diagnostic]
+               (warn! (locate-warning node (merge {:level :warning} diagnostic {:ref written})))
+               (cond-> (-> node
+                           (dissoc :canonical :url :passage)
+                           (assoc :text [{:t :str :text "??"}]))
+                 (:passage parsed) (assoc :passage (:passage parsed))))]
+    (if (book-ref/malformed? parsed)
+      (fail parsed)
+      (let [{:keys [passage failure warnings diagnostics]} (resolve-ref written parsed)]
+        (run! warn! diagnostics)
+        (if failure
+          (fail failure)
+          (do (run! #(warn! (locate-warning node (merge {:level :warning} % {:ref written})))
+                    warnings)
+              (cond-> (-> node
+                          (dissoc :passage :url)
+                          (assoc :canonical (:ref passage) :text (:title passage)))
+                (:passage parsed) (assoc :passage (:passage parsed))
+                (:url passage) (assoc :url (:url passage)))))))))
+
+(defn- link-settled-book-ref
+  "`node`, a `:book-ref` settled at quote time, with the URL its
+  `:canonical` reference's template fills in, when there is one."
+  [{url-of :url warn! :warn!} node]
+  (let [parsed (when (and url-of (string? (:canonical node)) (not (contains? node :url)))
+                 (book-ref/parse-book-ref (:canonical node)))]
+    (if (or (nil? parsed) (book-ref/malformed? parsed))
+      node
+      (let [{:keys [url diagnostics]} (url-of parsed)]
+        (run! warn! diagnostics)
+        (cond-> node url (assoc :url url))))))
+
+(defn resolve-book-refs
+  "Resolves every `:book-ref` in `document` (doc-10 step 2; see this
+  section's comment), returning `{:document document' :warnings
+  warnings}`.
+
+  `opts` is `resolve-document`'s `:books` (`expand-quotes`' own): its
+  `:resolve` resolves a reference as written, exactly as for a quote, and
+  its optional `:url`, `(fn [parsed-canonical-ref] {:url? :diagnostics})`,
+  fills in the URL of a reference settled at quote time
+  (`haselnuss.library.references/books-option` builds both). Without
+  `:resolve` this pass is a no-op and every `:book-ref` is left as parsed.
+
+  Every warning about a reference carries `:ref`, the reference as
+  written, a `:level` (`:warning`, or `:info` for a `:stale-shelf`) and,
+  when the node has a recorded source position, `:source-file`/
+  `:source-line` with a `file:line: ` message prefix; `:diagnostics` the
+  option hands back about the build are reported as they are."
+  ([document] (resolve-book-refs document {}))
+  ([document {resolve-ref :resolve url-of :url}]
+   (if-not resolve-ref
+     {:document document :warnings []}
+     (let [warnings (volatile! [])
+           env {:resolve resolve-ref :url url-of :warn! #(vswap! warnings conj %)}
+           walker {:table walk/table
+                   :scope cross-ref-scope
+                   :rewrite-fn (fn [ref-kind node]
+                                 (if (and (= ::ast/inline ref-kind) (map? node)
+                                          (= :book-ref (keyword (:t node))))
+                                   [(if (contains? node :text)
+                                      (link-settled-book-ref env node)
+                                      (resolve-book-ref env node))]
+                                   [node]))}]
+       {:document (first (walk/rewrite walker ::ast/document document))
+        :warnings @warnings}))))
 
 ;; Citation resolution and bibliography generation (TASK-13, sec7/sec9 step 3)
 ;;
@@ -2025,14 +2463,73 @@
       1 (first names)
       (str (str/join ", " (butlast names)) ", & " (last names)))))
 
+(defn- present
+  "`v` as a trimmed string when non-blank, else nil (CSL-JSON numbers such
+  as `volume 4` arrive as numbers or strings alike)."
+  [v]
+  (let [s (some-> v str str/trim)]
+    (when (seq s) s)))
+
+(defn- end-sentence
+  "`s` with a full stop appended unless it already ends in terminal
+  punctuation (`.`, `?` or `!`), so \"Nut Press Inc.\" and a title ending
+  \"?\" do not print doubled."
+  [s]
+  (if (re-find #"[.?!]$" s) s (str s ".")))
+
+(defn- container-text
+  "\"Container, vol(issue), pages\" for whichever of CSL-JSON `entry`'s
+  `container-title`, `volume`, `issue` and `page` are present, or nil."
+  [entry]
+  (let [volume (present (:volume entry))
+        issue (present (:issue entry))
+        vol-issue (cond (and volume issue) (str volume "(" issue ")")
+                        volume volume
+                        issue (str "(" issue ")"))]
+    (when-let [parts (seq (remove nil? [(present (:container-title entry))
+                                        vol-issue
+                                        (present (:page entry))]))]
+      (str/join ", " parts))))
+
+(defn- link-inline
+  "A `:link` Inline to `target` whose text is `shown`."
+  [target shown]
+  {:t :link :target target :inlines [(str-inline shown)]
+   :attr {:id nil :classes [] :props {}}})
+
+(defn- address-inlines
+  "The DOI and URL of CSL-JSON `entry` as linked Inlines separated by a
+  space (a DOI links to doi.org; a URL naming that same address prints
+  once), or an empty vector when it has neither."
+  [entry]
+  (let [doi (present (:DOI entry))
+        url (present (:URL entry))
+        doi-url (when doi
+                  (if (re-find #"(?i)^https?://" doi) doi (str "https://doi.org/" doi)))
+        links (cond-> []
+                doi-url (conj (link-inline doi-url doi-url))
+                (and url (not= url doi-url)) (conj (link-inline url url)))]
+    (vec (interpose {:t :space} links))))
+
 (defn- full-reference-text
   "The full formatted bibliography-entry text for CSL-JSON `entry`:
-  \"Authors (Year). Title.\", shared by every built-in style (only in-text
-  citation formatting, not the reference-list entry itself, differs
-  between `default-citation-styles`' built-ins)."
+  \"Authors (Year). Title. Container, vol(issue), pages. Publisher. DOI URL\"
+  (each part only when the entry has it; DOI and URL are linked), shared
+  by every built-in style (only in-text citation formatting, not the
+  reference-list entry itself, differs between `default-citation-styles`'
+  built-ins). Carries the container title, volume, issue, pages,
+  publisher, DOI and URL (TASK-132), so HTML and computed-numbers LaTeX
+  say what a citation refers to. It is not full field parity with
+  `haselnuss.emit.latex/csl-json->bibtex` (edition, note, place and
+  editors are not shown here)."
   [entry]
-  [(str-inline (str (authors-full-list entry) " (" (entry-year entry) "). "
-                    (or (:title entry) "") "."))])
+  (let [lead (str (authors-full-list entry) " (" (entry-year entry) "). "
+                  (end-sentence (or (:title entry) "")))
+        middle (keep (fn [s] (when s (end-sentence s)))
+                     [(container-text entry) (present (:publisher entry))])
+        links (address-inlines entry)]
+    (cond-> [(str-inline (str/join " " (cons lead middle)))]
+      (seq links) (into (cons {:t :space} links)))))
 
 (defn- numeric-item-core
   "The core in-text citation text for one CiteItem, given `citation-info`
@@ -2401,7 +2898,7 @@
                            (:suffix item) (update :suffix resolve-nested)))
                        (:items node))
           [node' warnings] (resolve-cite-node ctx (assoc node :items items'))]
-      (run! (:warn! ctx) warnings)
+      (run! (comp (:warn! ctx) (partial locate-warning node)) warnings)
       [node'])
     [node]))
 
@@ -3434,6 +3931,16 @@
 
 (declare id-locations-in-block)
 
+(defn- id-location
+  "One `:locations` entry for `node` at `path`: `{:node-type :path}`, plus
+  `:source-line` (and `:source-file` when known) when the parser recorded
+  where the node was written (TASK-143)."
+  [node path]
+  (let [{:keys [file line]} (ast/source node)]
+    (cond-> {:node-type (:t node) :path path}
+      line (assoc :source-line line)
+      file (assoc :source-file file))))
+
 (defn- id-locations-inline-visit
   "`id-locations-inline-walker`'s own `:visit` (TASK-87): every Inline
   this walk reaches contributes its own `attr.id` (`:link`/`:image`/
@@ -3457,7 +3964,7 @@
   `:note` reported `:duplicate-id` correctly."
   [acc path ref-kind node]
   (let [own (when-let [id (get-in node [:attr :id])]
-              [[id {:node-type (:t node) :path path}]])
+              [[id (id-location node path)]])
         acc (into acc own)]
     (if (= ref-kind ::ast/inline)
       (reduce (fn [acc field]
@@ -3499,7 +4006,7 @@
   [prefix-len acc path _ref-kind node]
   (let [legacy-path (into (subvec path 0 prefix-len) (compact-block-suffix (subvec path prefix-len)))
         own (when-let [id (get-in node [:attr :id])]
-              [[id {:node-type (:t node) :path legacy-path}]])
+              [[id (id-location node legacy-path)]])
         own-inline (case (:t node)
                      :section (id-locations-in-inlines (conj legacy-path :heading) (:heading node))
                      :para (id-locations-in-inlines (conj legacy-path :inlines) (:inlines node))
@@ -3534,6 +4041,13 @@
         (mapcat (fn [i block] (id-locations-in-block [i] block))
                 (range) (:blocks document))))
 
+(defn- location-label
+  "How `duplicate-id-diagnostics` names one node: its type, then `at
+  path:line` when it is known where it was written (TASK-143)."
+  [{:keys [node-type source-file source-line]}]
+  (str (name node-type) (when (and source-file source-line)
+                          (str " at " source-file ":" source-line))))
+
 (defn- duplicate-id-diagnostics
   "One `{:type :duplicate-id :id :locations :message}` diagnostic (AC #1)
   per id used by 2+ nodes anywhere in `document` -- Block-level or
@@ -3555,7 +4069,7 @@
                        :id id
                        :locations (mapv second group)
                        :message (str "duplicate id \"" id "\": used by " (count group)
-                                     " nodes (" (str/join ", " (map (comp name :node-type second) group))
+                                     " nodes (" (str/join ", " (map (comp location-label second) group))
                                      ")")}))))
           first-seen)))
 
@@ -3747,6 +4261,38 @@
        (into (division-kind-diagnostics document))
        (into (front-matter-diagnostics document front-matter-names lexicon)))))
 
+(defn- disambiguate-duplicate-ids
+  "Gives every LATER node that reuses an id its own unique id (TASK-133),
+  `<id>-dup<n>` (n = 2, 3, ... in document order), leaving the first
+  definition's id alone. Numbering, and every emitter's lookup of a node's
+  own number by its `attr.id`, then give each duplicate its own number
+  rather than the first node's, while an `@id` reference -- which names the
+  original id -- still resolves to the first definition. The collision
+  itself is reported from the document as authored (see `resolve-document`),
+  so the warning still names the id the author wrote.
+
+  A generated name an author already used (a document with `fig:x` twice
+  AND a node written `fig:x-dup2`) is skipped: the next free n is taken
+  instead (TASK-146), so the rename never creates a collision that nothing
+  reports."
+  [document]
+  (let [seen (volatile! {})
+        taken (into #{} (map first) (id-locations-in-document document))
+        walker {:table walk/table :scope cross-ref-scope
+                :rewrite-fn (fn [_ref-kind node]
+                              (if-let [id (get-in node [:attr :id])]
+                                (if (contains? @seen id)
+                                  (let [n (loop [n (get @seen id)]
+                                            (if (contains? taken (str id "-dup" n))
+                                              (recur (inc n))
+                                              n))]
+                                    (vswap! seen assoc id (inc n))
+                                    [(assoc-in node [:attr :id] (str id "-dup" n))])
+                                  (do (vswap! seen assoc id 2)
+                                      [node]))
+                                [node]))}]
+    (first (walk/rewrite walker ::ast/document document))))
+
 (defn resolve-document
   "The resolver's full pipeline (SPEC.md sec9 steps 1-3 and 5; step 4's
   derived TOC/list-of-figures/list-of-tables/navigation are read separately
@@ -3797,6 +4343,15 @@
   include expansion uses for itself) -- and its own warnings follow
   `include-warnings` in the returned `:diagnostics`, for the same reason.
 
+  Quote expansion (`expand-quotes`, TASK-154, doc-10 step 0b) runs after
+  both and before numbering, driven by `:books` (`expand-quotes`' own
+  opts, default none -- a no-op that leaves every `:book-quote` as
+  parsed); its warnings follow `overlay-warnings`. Quoted blocks are kept
+  out of the host's numbering, derived lists and citation pass (see
+  `expand-quotes`' section comment). The same `:books` resolves every
+  book link right after the cross-references (`resolve-book-refs`,
+  TASK-155, doc-10 step 2), whose warnings follow theirs.
+
   `([document])` uses every pass's own defaults. `([document opts])` takes
   an options map: `:includes` (`expand-includes`' own opts, default
   none -- so no expansion happens and every `:include` is left standing),
@@ -3823,7 +4378,7 @@
   ([document] (resolve-document document {}))
   ([document opts]
    (let [{:keys [lexicon bibliography citation-styles directive-registry directive-kinds includes
-                 overlay-sources front-matter-names sublabel-names]
+                 overlay-sources front-matter-names sublabel-names books]
           :or {directive-registry #{} directive-kinds {} front-matter-names #{}
                sublabel-names #{}}} opts
          lexicon (or lexicon default-lexicon)
@@ -3843,12 +4398,19 @@
          ;; `apply-overlays`' own docstring for the byte-identical-build
          ;; invariant this keeps.
          {document :document overlay-warnings :warnings} (apply-overlays document overlay-sources)
+         ;; Step 0b (TASK-154): quotes, before numbering -- quoted content
+         ;; is kept out of it -- and after overlays as well as includes,
+         ;; so a `!quote` an overlay splices in is expanded like any
+         ;; other. No `:books` (or none with a `:resolve`) is a no-op.
+         {document :document quote-warnings :warnings} (expand-quotes document books)
          ;; Numbering runs over the BODY only (TASK-54): a front-matter
          ;; block is not part of the numbered document, and everything
          ;; downstream of this table -- every CrossRef's own text, the
          ;; TOC, the lists of figures and tables, both emitters' printed
          ;; numbers -- inherits that from here rather than each
          ;; re-deciding it.
+         authored document
+         document (disambiguate-duplicate-ids document)
          labels (number-document document lexicon front-matter-names sublabel-names)
          ;; Cross-references and citations, by contrast, run over the
          ;; WHOLE document: an abstract may cite, and may refer to a
@@ -3866,22 +4428,37 @@
          ;; to the reference list dangled, in both targets, and TASK-13
          ;; AC #3's "can be cross-referenced" was never true. Neither
          ;; pass reads the other's output, so the order is free.
+         ;; Quoted blocks are set aside for it (TASK-154): their
+         ;; citations are already formatted against their own book's
+         ;; bibliography, and must neither be re-resolved against the
+         ;; host's nor take a number in the host's reference list.
+         [detached quoted] (detach-quoted document)
          {cite-doc :document cite-warnings :warnings
           ordered-keys :ordered-keys bib-id :bibliography-id
-          bib-heading :bibliography-heading} (resolve-citations document bib styles)
+          bib-heading :bibliography-heading} (resolve-citations detached bib styles)
+         cite-doc (reattach-quoted cite-doc quoted)
          ;; The generated section's own entry, merged in rather than
          ;; numbered: see `bibliography-label-entry` for why it carries
          ;; a word and no number.
          labels (merge labels (bibliography-label-entry bib-id bib-heading))
          {cr-doc :document cr-warnings :warnings} (resolve-cross-refs cite-doc labels)
-         diagnostics (structural-diagnostics cr-doc directive-registry lexicon directive-kinds
-                                             front-matter-names)]
+         ;; Step 2's other half (TASK-155): book links, through the same
+         ;; `:books` option as quotes; no-op without one.
+         {cr-doc :document link-warnings :warnings} (resolve-book-refs cr-doc books)
+         ;; Duplicates are reported against the document as authored
+         ;; (`disambiguate-duplicate-ids` has renamed them in `cr-doc`);
+         ;; every other structural check runs on the resolved document.
+         diagnostics (into (duplicate-id-diagnostics authored)
+                           (remove #(= :duplicate-id (:type %)))
+                           (structural-diagnostics cr-doc directive-registry lexicon directive-kinds
+                                                   front-matter-names))]
      {:document cr-doc
       ;; Warning order follows the passes, which now run citations
       ;; first (TASK-64) -- a reader tracing a build reads them in the
       ;; order the passes produced them.
-      :diagnostics (-> [] (into include-warnings) (into overlay-warnings) (into cite-warnings)
-                       (into cr-warnings) (into diagnostics))
+      :diagnostics (-> [] (into include-warnings) (into overlay-warnings) (into quote-warnings)
+                       (into cite-warnings)
+                       (into cr-warnings) (into link-warnings) (into diagnostics))
       :labels labels
       :ordered-keys ordered-keys
       :bibliography-id bib-id})))

@@ -57,6 +57,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [haselnuss.ast :as ast]
+            [haselnuss.parser :as parser]
             [haselnuss.resolver :as resolver]))
 
 (def attr
@@ -290,6 +291,48 @@
                :label "fig:missing"
                :message "dangling cross-reference: no target with id \"fig:missing\""}]
              warnings)))))
+
+(deftest cross-ref-to-inline-image-id-names-the-node-kind-test
+  (testing "TASK-141: an id on an inline image (one sharing its paragraph
+            with text, or with another image) is not a numbering target,
+            but the warning says so instead of claiming no target exists"
+    (doseq [[label src] [["image with text" "See ![a](a.png){#fig:x} here and @fig:x.\n"]
+                         ["two images" "![a](a.png){#fig:x} ![b](b.png){#fig:y}\n\n@fig:y and @fig:x\n"]]]
+      (testing label
+        (let [doc (parser/parse src)
+              {:keys [warnings]} (resolver/resolve-cross-refs doc)]
+          (is (seq warnings))
+          (doseq [w warnings]
+            (is (= :dangling-cross-ref (:type w)))
+            (is (= :image (:node-kind w)))
+            (is (re-find #"inline image.*not referenceable" (:message w))))))))
+  (testing "a lone-image paragraph is still a figure and resolves"
+    (let [doc (parser/parse "![a](a.png){#fig:x}\n\n@fig:x\n")]
+      (is (empty? (:warnings (resolver/resolve-cross-refs doc))))))
+  (testing "a truly absent id keeps the plain message"
+    (let [{:keys [warnings]} (resolver/resolve-cross-refs (parser/parse "@fig:nope\n"))]
+      (is (= "dangling cross-reference: no target with id \"fig:nope\""
+             (:message (first warnings)))))))
+
+(deftest cross-ref-to-duplicate-id-resolves-to-first-definition-test
+  (testing "TASK-133: a duplicated figure id is not dangling -- the
+            reference resolves to the FIRST definition, and the collision
+            is reported once, as :duplicate-id"
+    (let [doc {:meta {} :blocks [(figure "fig:x") (figure "fig:x") (para (cross-ref "fig:x"))]}
+          {:keys [document warnings]} (resolver/resolve-cross-refs doc)
+          [resolved] (resolved-cross-refs {:document document})]
+      (is (empty? warnings))
+      (is (= "fig:x" (:target resolved)))
+      (is (= "Figure 1" (:text resolved)))
+      (is (= [:duplicate-id] (map :type (resolver/structural-diagnostics doc))))))
+  (testing "likewise a duplicated section id"
+    (let [doc {:meta {} :blocks [(section "sec:a" []) (section "sec:a" []) (para (cross-ref "sec:a"))]}
+          {:keys [document warnings]} (resolver/resolve-cross-refs doc)
+          [resolved] (resolved-cross-refs {:document document})]
+      (is (empty? warnings))
+      (is (= "sec:a" (:target resolved)))
+      (is (= "Section 1" (:text resolved)))
+      (is (= [:duplicate-id] (map :type (resolver/structural-diagnostics doc)))))))
 
 (deftest cross-ref-resolution-does-not-touch-unrelated-nodes-test
   (testing "resolving a CrossRef leaves sibling nodes and the referenced
@@ -2704,24 +2747,32 @@
                              (not= :note tag) (assoc :attr attr)))]))
           tags)))
 
+(def ^:private inline-wrapper-fields
+  "Each Inline variant that carries nested INLINES, mapped to the field
+  that holds them: `:inlines` for all of them but TASK-152's `:book-ref`,
+  whose resolved link text is `:text`."
+  (->> (get ast/registry ::ast/inline)
+       (drop 2)
+       (keep (fn [[tag [_map & field-specs]]]
+               (some (fn [spec]
+                       (when (= [:vector [:ref ::ast/inline]] (last spec))
+                         [tag (first spec)]))
+                     field-specs)))
+       (into {})))
+
 (def ^:private inline-wrappers
   "One wrapper per Inline variant that carries nested INLINES, likewise
   derived -- the outer layer a `block-bearing-inlines` wrapper is put
   inside, so each test below exercises \"Block inside a Block-bearing
   Inline inside an Inline container\", which is the shape that broke."
-  (let [tags (->> (get ast/registry ::ast/inline)
-                  (drop 2)
-                  (keep (fn [[tag [_map & field-specs]]]
-                          (when (some (fn [spec] (= [:vector [:ref ::ast/inline]] (last spec)))
-                                      field-specs)
-                            tag))))]
-    (into {} (map (fn [tag]
-                    [tag (fn [inline]
-                           (cond-> {:t tag :inlines [inline]}
-                             (contains? #{:link :span :highlight} tag)
-                             (assoc :attr attr)
-                             (= :link tag) (assoc :target "u")))]))
-          tags)))
+  (into {} (map (fn [[tag field]]
+                  [tag (fn [inline]
+                         (cond-> {:t tag field [inline]}
+                           (contains? #{:link :span :highlight} tag)
+                           (assoc :attr attr)
+                           (= :link tag) (assoc :target "u")
+                           (= :book-ref tag) (assoc :ref "bible:romanos#14:8")))]))
+        inline-wrapper-fields))
 
 (deftest inline-container-coverage-is-derived-test
   (testing "the two derived sets are non-empty and actually contain the
@@ -2760,7 +2811,8 @@
                 {:keys [document warnings]} (resolver/apply-overlays doc [overlay])]
             (is (= [] (mapv :type warnings)))
             (is (= [appended]
-                   (get-in document [:blocks 0 :inlines 0 :inlines 0 :blocks 0 :blocks])))))))))
+                   (get-in document [:blocks 0 :inlines 0 (inline-wrapper-fields inline-tag) 0
+                                     :blocks 0 :blocks])))))))))
 
 (deftest include-expansion-reaches-every-inline-container-test
   (testing "an :include inside a Block-bearing Inline, itself inside any
@@ -2777,7 +2829,8 @@
                                              doc {:load loader :base-dir "/x"})]
             (is (= [] (mapv :type warnings)))
             (is (= [expanded]
-                   (get-in document [:blocks 0 :inlines 0 :inlines 0 :blocks])))))))))
+                   (get-in document [:blocks 0 :inlines 0 (inline-wrapper-fields inline-tag) 0
+                                     :blocks])))))))))
 
 (deftest duplicate-ids-are-found-inside-every-inline-container-test
   (testing "a duplicate attr.id inside a Block-bearing Inline, itself
@@ -3274,3 +3327,27 @@
       (is (= [:annotation-body-unsupported-block] diagnostics))
       (is (= 1 (count (highlight-nodes inlines))))
       (is (= 1 (count (sticky-note-nodes inlines)))))))
+
+(deftest resolve-document-generated-dup-id-skips-authored-id-test
+  (testing "TASK-146: an authored fig:x-dup2 is not collided with by the
+            generated name for the second fig:x"
+    (let [doc {:meta {} :blocks [(figure "fig:x") (figure "fig:x") (figure "fig:x-dup2") (figure "fig:x")]}
+          {:keys [document diagnostics]} (resolver/resolve-document doc)
+          ids (map #(get-in % [:attr :id]) (:blocks document))]
+      (is (= ["fig:x" "fig:x-dup3" "fig:x-dup2" "fig:x-dup4"] ids))
+      (is (= (count ids) (count (set ids))))
+      (is (= [:duplicate-id] (map :type diagnostics)))
+      (is (= "fig:x" (:id (first diagnostics)))))))
+
+(deftest resolve-document-duplicate-ids-keep-own-numbers-test
+  (testing "TASK-133: the later duplicate has its own id and number; a
+            reference still resolves to the first; the warning names the
+            authored id"
+    (let [doc {:meta {} :blocks [(figure "fig:x") (figure "fig:x") (para (cross-ref "fig:x"))]}
+          {:keys [document labels diagnostics]} (resolver/resolve-document doc)]
+      (is (= ["fig:x" "fig:x-dup2"] (map #(get-in % [:attr :id]) (take 2 (:blocks document)))))
+      (is (= "Figure 1" (:text (get labels "fig:x"))))
+      (is (= "Figure 2" (:text (get labels "fig:x-dup2"))))
+      (is (= "Figure 1" (:text (first (resolved-cross-refs {:document document})))))
+      (is (= [:duplicate-id] (map :type diagnostics)))
+      (is (= "fig:x" (:id (first diagnostics)))))))

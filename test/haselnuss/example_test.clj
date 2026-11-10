@@ -66,7 +66,7 @@
       ;; number and no anchor, and the document could not reference it.
       (is (re-find #"\\begin\{hnadmonitionstar\}\{Note 1\}\\phantomsection\\label\{adm:pollination\}" latex)
           "the LaTeX-native directive, numbered and anchored")
-      (is (re-find #"<blockquote id=\"adm:pollination\" class=\"admonition\">" html)
+      (is (re-find #"<div id=\"adm:pollination\" class=\"admonition\" role=\"note\">" html)
           "and anchored in HTML too")
       (is (re-find #"<a href=\"#adm:pollination\">Note 1</a>" html)
           "TASK-40: the document can reference its own admonition again")

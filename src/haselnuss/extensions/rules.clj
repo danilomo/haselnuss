@@ -52,6 +52,7 @@
   emitter as verbatim, unescaped output by another name."
   (:require [clojure.java.io :as io]
             [haselnuss.sandbox :as sandbox]
+            [haselnuss.select :as select]
             [sci.core :as sci]))
 
 (defn- malformed!
@@ -74,6 +75,17 @@
   [select]
   (or (keyword? select) (map? select) (vector? select) (fn? select)))
 
+(defn- holds-var?
+  "True when `x` holds a sci var anywhere in it."
+  [x]
+  (boolean (some #(instance? sci.lang.Var %) (tree-seq coll? seq x))))
+
+(defn- show
+  "`x` printed for a refusal message -- unless it holds a sci var, whose
+  printing reads metadata the script controls (TASK-214)."
+  [x]
+  (if (holds-var? x) "a var" (pr-str x)))
+
 (defn- validate-rule!
   "Throws a `::malformed-transform-rule` `ex-info` naming both `path` and
   what is wrong with rule map `entry` (AC #8), or returns `entry`
@@ -85,20 +97,26 @@
   [path label entry]
   (when-not (contains? entry :select)
     (malformed! path (str label " has no :select") {:value entry}))
+  ;; TASK-214: a sci var prints through its own metadata, which the script
+  ;; can set to anything (`alter-meta!`), and `haselnuss.transform` prints
+  ;; `:select` to name an unnamed rule -- refused here, before anything
+  ;; prints it, rather than copied, since a function says the same thing.
+  (when (holds-var? (:select entry))
+    (malformed! path (str label "'s :select holds a var (#'...); use the function itself") {}))
   (when-not (selector-shape? (:select entry))
     (malformed! path (str label "'s :select must be a keyword, a map, a vector or a function, got "
-                          (pr-str (:select entry)))
+                          (show (:select entry)))
                 {:value entry}))
   (when-not (contains? entry :transform)
     (malformed! path (str label " has no :transform") {:value entry}))
   (when-not (ifn? (:transform entry))
-    (malformed! path (str label "'s :transform is not a function: " (pr-str (:transform entry)))
+    (malformed! path (str label "'s :transform is not a function: " (show (:transform entry)))
                 {:value entry}))
   (when (and (contains? entry :name) (not (string? (:name entry))))
-    (malformed! path (str label "'s :name must be a string, got " (pr-str (:name entry)))
+    (malformed! path (str label "'s :name must be a string, got " (show (:name entry)))
                 {:value entry}))
   (when (and (contains? entry :scope) (not (set? (:scope entry))))
-    (malformed! path (str label "'s :scope must be a set, got " (pr-str (:scope entry)))
+    (malformed! path (str label "'s :scope must be a set, got " (show (:scope entry)))
                 {:value entry}))
   entry)
 
@@ -148,6 +166,57 @@
                            [label (validate-rule! path label entry)])))
           entries)))
 
+(defn- script-code?
+  "True when selector `select` holds script code anywhere in it -- a
+  function or a regex (a var is refused by `validate-rule!`), at the top or nested in a map value, a
+  `:prop` map or a vector -- which `haselnuss.select/matches?` would call
+  or match (a regex can backtrack catastrophically) on the calling thread.
+  A selector of plain data alone compares only plain data the load
+  already copied (`haselnuss.sandbox/plain-copy`), so it runs host-side."
+  [select]
+  (boolean (some (fn [x] (or (fn? x) (instance? java.util.regex.Pattern x)))
+                 (tree-seq coll? seq select))))
+
+(defn- sandboxed-matcher
+  "The `haselnuss.transform` `:matcher` for selector `select`, or nil when
+  it holds no script code and so runs host-side as it is. `sandboxed`
+  turns a selector into a host predicate that runs `select/matches?` on it
+  in the sandbox.
+
+  Each sandboxed match costs a worker thread (about 70us; see the TASK-214
+  notes), so a map or vector selector is split, and the sandbox runs only
+  when the host-side part leaves the answer open:
+
+  - a map is an AND: its plain-data entries are matched host-side, its
+    script entries in the sandbox only when those all matched, so
+    `{:t :list :text #\"^TODO:\"}` runs its regex only on lists. A map's
+    entries have no order an author controls, so this gives the same
+    match as the whole map; only which of two failing entries raises
+    first can differ (a malformed plain entry now always raises before a
+    throwing script one), as it already could between hash orders.
+  - a vector is an OR that `select/matches?` evaluates left to right,
+    short-circuiting (its docstring): only the LEADING run of plain-data
+    elements is matched host-side, and everything from the first element
+    holding script code on is matched in the sandbox, in order -- so
+    `[(fn [_] true) {:prop 3}]` still matches without reaching the
+    malformed element, and `[(fn [_] (throw ...)) :para]` still throws on
+    a paragraph, exactly as before."
+  [select sandboxed]
+  (when (script-code? select)
+    (cond
+      (map? select)
+      (let [plain (into {} (remove script-code?) select)
+            script (sandboxed (into {} (filter script-code?) select))]
+        (fn [node] (and (select/matches? plain node) (script node))))
+
+      (vector? select)
+      (let [[prefix rest-of] (split-with (complement script-code?) select)
+            prefix (vec prefix)
+            script (sandboxed (vec rest-of))]
+        (fn [node] (or (select/matches? prefix node) (script node))))
+
+      :else (sandboxed select))))
+
 (defn- normalize-rule
   "Validated rule map `entry` (from a sidecar file, `path`'s own source,
   named `label` -- `rule-entries`' own, so a later `sci-call!` failure
@@ -157,16 +226,30 @@
   per matched node, not merely once at load, which is exactly why
   `wrap-fn`'s own call-time re-binding matters here at all
   (`haselnuss.sandbox`'s own docstring) -- goes through the same bound
-  `sandbox/sci-call!` applies to loading the file itself. `:select`,
-  `:name` and `:scope` pass through untouched: `:select` is read only by
-  `haselnuss.select/matches?`, plain data plus, at most, a sandboxed
-  function value already safe to call directly (`fn?` is true of a sci
-  function value, verified live); `:name`/`:scope` are inert data
-  `haselnuss.transform` reads directly. `ctx` is `wrap-fn`'s own -- the
-  forked sci context this entry's `:transform` was extracted from,
-  re-established around every later call."
+  `sandbox/sci-call!` applies to loading the file itself.
+
+  `:select` stays as the script wrote it, which is what names the rule in
+  `haselnuss.transform`'s messages, but when it holds script code
+  (`script-code?`) the rule also gets a `:matcher`
+  (`sandboxed-matcher`): the `select/matches?` call on that code, run
+  through `wrap-fn` too, so a looping or
+  throwing selector function, or a catastrophically backtracking regex,
+  hits the same timeout, runs with the script's sci context, and fails as
+  a sandbox error naming the rule rather than hanging the build or
+  handing the script's own exception to the host (TASK-214). Any
+  `:matcher` the script itself supplied is dropped first.
+  `:name`/`:scope` are inert data `haselnuss.transform` reads directly.
+  `ctx` is `wrap-fn`'s own -- the forked sci context this entry's
+  functions were extracted from, re-established around every later call."
   [label entry path ctx opts]
-  (update entry :transform sandbox/wrap-fn ctx (str label " (" path ")'s :transform") opts))
+  (let [matcher (sandboxed-matcher (:select entry)
+                                   (fn [selector]
+                                     (sandbox/wrap-fn (fn [node] (select/matches? selector node))
+                                                      ctx (str label " (" path ")'s :select") opts)))]
+    (cond-> (-> entry
+                (dissoc :matcher)
+                (update :transform sandbox/wrap-fn ctx (str label " (" path ")'s :transform") opts))
+      matcher (assoc :matcher matcher))))
 
 (defn load-transforms
   "Loads every sidecar file named in `paths` (in order), returning a
@@ -210,7 +293,7 @@
                                          {:type ::missing-transform-file :path path})))
                        (let [source (slurp file)
                              value (sandbox/sci-call! #(sci/eval-string* @ctx source)
-                                                      (str "transform file " path) opts false)]
+                                                      (str "transform file " path) opts :spec)]
                          (map (fn [[label entry]] (normalize-rule label entry path @ctx opts))
                               (rule-entries value path))))))
            paths))))

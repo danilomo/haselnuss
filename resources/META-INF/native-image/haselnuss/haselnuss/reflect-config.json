@@ -600,6 +600,12 @@
   "name":"com.vladsch.flexmark.ext.attributes.AttributesNode"
 },
 {
+  "name":"com.vladsch.flexmark.ext.attributes.internal.AttributesInlineParserExtension$Factory"
+},
+{
+  "name":"com.vladsch.flexmark.ext.attributes.internal.AttributesNodePostProcessor$Factory"
+},
+{
   "name":"com.vladsch.flexmark.ext.footnotes.Footnote"
 },
 {
@@ -627,6 +633,9 @@
   "name":"com.vladsch.flexmark.ext.tables.TablesExtension"
 },
 {
+  "name":"com.vladsch.flexmark.parser.InlineParser"
+},
+{
   "name":"com.vladsch.flexmark.parser.InlineParserExtension"
 },
 {
@@ -636,7 +645,16 @@
   "name":"com.vladsch.flexmark.parser.LightInlineParser"
 },
 {
+  "name":"com.vladsch.flexmark.parser.LinkRefProcessor"
+},
+{
+  "name":"com.vladsch.flexmark.parser.LinkRefProcessorFactory"
+},
+{
   "name":"com.vladsch.flexmark.parser.Parser"
+},
+{
+  "name":"com.vladsch.flexmark.parser.core.delimiter.Bracket"
 },
 {
   "name":"com.vladsch.flexmark.parser.core.delimiter.Delimiter"
@@ -661,11 +679,17 @@
   "name":"com.vladsch.flexmark.util.data.MutableDataSet"
 },
 {
+  "name":"com.vladsch.flexmark.util.data.NullableDataKey"
+},
+{
   "name":"com.vladsch.flexmark.util.sequence.BasedOptionsHolder$Options",
   "allPublicFields":true
 },
 {
   "name":"com.vladsch.flexmark.util.sequence.BasedSequence"
+},
+{
+  "name":"com.vladsch.flexmark.util.sequence.Escaping"
 },
 {
   "name":"com.vladsch.flexmark.util.sequence.builder.ISegmentBuilder$Options",
@@ -726,6 +750,9 @@
   "name":"haselnuss.ast__init"
 },
 {
+  "name":"haselnuss.book_ref__init"
+},
+{
   "name":"haselnuss.cli__init"
 },
 {
@@ -748,6 +775,9 @@
 },
 {
   "name":"haselnuss.emit.latex__init"
+},
+{
+  "name":"haselnuss.emit.quote__init"
 },
 {
   "name":"haselnuss.ext__init"
@@ -774,7 +804,79 @@
   "name":"haselnuss.json__init"
 },
 {
+  "name":"haselnuss.library.Book"
+},
+{
+  "name":"haselnuss.library.Directory"
+},
+{
+  "name":"haselnuss.library.Library"
+},
+{
+  "name":"haselnuss.library.LibraryDiagnostics"
+},
+{
+  "name":"haselnuss.library.LibraryDirectory"
+},
+{
+  "name":"haselnuss.library.Locatable"
+},
+{
+  "name":"haselnuss.library.LocatableVirtualBook"
+},
+{
+  "name":"haselnuss.library.UrlTemplates"
+},
+{
+  "name":"haselnuss.library.VirtualBook"
+},
+{
+  "name":"haselnuss.library.directory__init"
+},
+{
+  "name":"haselnuss.library.filesystem.FileSystemBook"
+},
+{
+  "name":"haselnuss.library.filesystem.FileSystemLibrary"
+},
+{
+  "name":"haselnuss.library.filesystem__init"
+},
+{
+  "name":"haselnuss.library.generated.GeneratedBook"
+},
+{
+  "name":"haselnuss.library.generated.LocatableGeneratedBook"
+},
+{
+  "name":"haselnuss.library.generated__init"
+},
+{
+  "name":"haselnuss.library.memory.MemoryLibrary"
+},
+{
+  "name":"haselnuss.library.memory__init"
+},
+{
+  "name":"haselnuss.library.passage__init"
+},
+{
+  "name":"haselnuss.library.references__init"
+},
+{
+  "name":"haselnuss.library.url__init"
+},
+{
+  "name":"haselnuss.library__init"
+},
+{
   "name":"haselnuss.lower__init"
+},
+{
+  "name":"haselnuss.parser.AttributedRefNodeTag"
+},
+{
+  "name":"haselnuss.parser.BookRefNodeTag"
 },
 {
   "name":"haselnuss.parser.CiteAuthorNodeTag"
@@ -789,6 +891,9 @@
   "name":"haselnuss.parser.HighlightNodeTag"
 },
 {
+  "name":"haselnuss.parser.StrikeNodeTag"
+},
+{
   "name":"haselnuss.parser__init"
 },
 {
@@ -799,6 +904,12 @@
 },
 {
   "name":"haselnuss.sandbox__init"
+},
+{
+  "name":"haselnuss.sanitize__init"
+},
+{
+  "name":"haselnuss.select.InterruptibleChars"
 },
 {
   "name":"haselnuss.select__init"
@@ -850,6 +961,9 @@
 },
 {
   "name":"java.io.FileWriter"
+},
+{
+  "name":"java.io.IOException"
 },
 {
   "name":"java.io.InputStream"
@@ -951,6 +1065,9 @@
   "name":"java.lang.String"
 },
 {
+  "name":"java.lang.Thread"
+},
+{
   "name":"java.lang.ThreadLocal"
 },
 {
@@ -1016,6 +1133,9 @@
 },
 {
   "name":"java.net.URLEncoder"
+},
+{
+  "name":"java.nio.charset.StandardCharsets"
 },
 {
   "name":"java.nio.file.CopyOption"

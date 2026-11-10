@@ -18,6 +18,10 @@
                  ;; version TASK-89's own review used to verify the
                  ;; `sci.lang.Var` behavior `haselnuss.registry/renderer-v2`
                  ;; now accounts for -- see that function's docstring).
+                 ;; TASK-158: `haselnuss.library.generated` also binds the
+                 ;; internal `sci.impl.utils/*in-try*` to `:sci/error` so a
+                 ;; shelf.clj error keeps its line on a sandbox worker; an
+                 ;; upgrade must re-check `generated-test`'s line assertions.
                  [org.babashka/sci "0.12.51"]
                  ;; TASK-126: not called from anywhere in `src/`, and that is
                  ;; the point. GraalVM's closed-world analysis has to decide,
@@ -83,7 +87,12 @@
   ;; the committed example document, and reading it off the classpath
   ;; keeps that independent of the runner's working directory.
   :profiles {:uberjar {:aot :all}
-             :test {:resource-paths ["examples"]}
+             ;; TASK-147: `haselnuss.test-parallel` runs the tests of `^:parallel`
+             ;; namespaces concurrently (they are bound by child pdflatex/lein
+             ;; processes, not CPU in this JVM). `lein test` only.
+             :test {:resource-paths ["examples"]
+                    :injections [(require 'haselnuss.test-parallel)
+                                 ((resolve 'haselnuss.test-parallel/install!))]}
              ;; Leiningen implicitly activates a profile named `:repl` for the
              ;; `repl` task and for that task only (leiningen.repl/repl ->
              ;; project/profiles-with-matching-meta, keyed by

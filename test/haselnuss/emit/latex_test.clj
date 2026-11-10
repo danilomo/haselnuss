@@ -1,4 +1,4 @@
-(ns haselnuss.emit.latex-test
+(ns ^:parallel haselnuss.emit.latex-test
   "Fixtures for `haselnuss.emit.latex` (TASK-21, extended by TASK-22): the
   LaTeX emitter core. AC #1 of TASK-21 (\"a document exercising every
   covered block/inline node produces a .tex file that compiles without
@@ -18,11 +18,14 @@
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [haselnuss.ast :as ast]
             [haselnuss.emit.html :as html]
             [haselnuss.emit.latex :as latex]
             [haselnuss.lower :as lower]
+            [haselnuss.parser :as parser]
             [haselnuss.registry :as registry]
-            [haselnuss.resolver :as resolver])
+            [haselnuss.resolver :as resolver]
+            [haselnuss.sanitize :as sanitize])
   (:import (java.awt.image BufferedImage)
            (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)
@@ -267,6 +270,13 @@
       (is (re-find #"\\author\{Jane Doe\}" out))
       (is (re-find #"\\date\{2026-08-07\}" out))
       (is (re-find #"\\maketitle" out))
+      (assert-compiles! out))))
+
+(deftest parsed-strikethrough-compiles-test
+  (testing "TASK-137 AC #1: ~~x~~ in source reaches LaTeX as \\sout and
+            the result really compiles (ulem is in the preamble)"
+    (let [out (latex/emit-document (parser/parse "a ~~gone~~ b\n"))]
+      (is (str/includes? out "\\sout{gone}"))
       (assert-compiles! out))))
 
 (deftest section-number-test
@@ -561,6 +571,150 @@
       (is (= 1 (count warnings)))
       (is (= 0x03B1 (:code-point (first warnings))))
       (is (str/includes? (:message (first warnings)) "the document")))))
+
+(deftest forged-rendered-test
+  ;; TASK-213: the LaTeX twin of `haselnuss.emit.html-test`'s own -- a
+  ;; rewritten `Rendered` would splice arbitrary TeX (an \input, a
+  ;; \write18) past the [:raw ...] trust gate.
+  (let [d {:t :directive :name "widget" :attr empty-attr
+           :blocks [(para (str-inline "50% body"))]}
+        emit (fn [renderer & {:keys [trusted?]}]
+               (latex/emit-document {:meta {} :blocks [d d]}
+                                    {:registry (registry/register
+                                                {} {:name "widget" :trusted? trusted?
+                                                    :emit {:latex (registry/renderer-v2 renderer)}})}))
+        stash (atom nil)
+        forgeries {"assoc" (fn [_d ctx] (assoc ((:render-blocks ctx) []) :tex "\\input{/etc/passwd}"))
+                   "merge, nested in a fragment" (fn [_d ctx]
+                                                   ["x" (merge ((:render-inlines ctx) [])
+                                                               {:tex "\\input{/etc/passwd}"})])
+                   "constructed" (fn [_d _ctx] (latex/->Rendered "\\input{/etc/passwd}"))
+                   "kept from another call" (fn [directive ctx]
+                                              (or @stash
+                                                  (reset! stash ((:render-blocks ctx)
+                                                                 (:blocks directive)))))}]
+    (doseq [[label renderer] forgeries]
+      (testing (str "refused unless it is the very instance a ctx callback issued in
+                     this call: " label)
+        (try (emit renderer)
+             (is false "expected a refusal")
+             (catch clojure.lang.ExceptionInfo e
+               (is (= ::latex/forged-rendered (:type (ex-data e))))
+               (is (= "widget" (:directive-name (ex-data e))))
+               (is (str/includes? (ex-message e) "not :trusted"))))))
+    (testing "the callback's own result, unchanged, still renders and compiles"
+      (let [out (emit (fn [directive ctx]
+                        ["Note: " ((:render-blocks ctx) (:blocks directive))
+                         (list ((:render-inlines ctx) []))]))]
+        (is (= 2 (count (re-seq #"Note: 50\\% body" out))))
+        (assert-compiles! out)))
+    (testing "a trusted registration may still return any Rendered"
+      (is (str/includes? (emit (get forgeries "assoc") :trusted? true) "\\input{/etc/passwd}")))))
+
+(deftest untrusted-extension-output-test
+  ;; TASK-215: the LaTeX half of `haselnuss.emit.html-test`'s own. The AST
+  ;; an untrusted renderer hands its ctx callbacks is sanitised, and TeX
+  ;; in it the document did not author may not use a dangerous primitive.
+  (let [d (ast/with-source {:t :directive :name "widget" :attr empty-attr
+                            :blocks [(para (str-inline "50% body ")
+                                           {:t :math-inline :tex "\\def\\x{1}\\x + \\frac{1}{2}"}
+                                           {:t :code :text "\\input{/etc/hostname}"})]}
+            "doc.hdoc" 4)
+        emit (fn [renderer & {:keys [trusted?]}]
+               (let [warnings (atom [])
+                     out (binding [sanitize/*untrusted-diagnostics* warnings]
+                           (latex/emit-document
+                            {:meta {} :blocks [d]}
+                            {:registry (registry/register
+                                        {} {:name "widget" :trusted? trusted?
+                                            :emit {:latex (registry/renderer-v2 renderer)}})}))]
+                 [out @warnings]))
+        evil-link {:t :link :target "javascript:alert(1)"
+                   :attr (assoc empty-attr :props {"onmouseover" "alert(2)"})
+                   :inlines [(str-inline "click")]}
+        reproductions
+        {"\\input in :render-inlines math" ["\\input" (fn [_d ctx]
+                                                        ((:render-inlines ctx)
+                                                         [{:t :math-inline :tex "\\input{/etc/passwd}"}]))]
+         "\\write18 in :render-blocks display math" ["\\immediate"
+                                                     (fn [_d ctx]
+                                                       ((:render-blocks ctx)
+                                                        [{:t :math-block :attr empty-attr
+                                                          :tex "\\immediate\\write18{rm -rf x}"}]))]
+         "^^ notation" ["^^" (fn [_d ctx]
+                               ((:render-inlines ctx) [{:t :math-inline :tex "^^5cinput{/etc/passwd}"}]))]
+         "a catcode change" ["\\catcode" (fn [_d ctx]
+                                           ((:render-inlines ctx)
+                                            [{:t :math-inline :tex "\\catcode`\\@=0"}]))]
+         "an image path that breaks out of \\includegraphics"
+         ["an unbalanced }" (fn [_d ctx]
+                              ((:render-inlines ctx)
+                               [{:t :image :src "x}\\input{/etc/passwd}{" :alt "" :attr empty-attr}]))]
+         "a command in an image path" ["\\input" (fn [_d ctx]
+                                                   ((:render-inlines ctx)
+                                                    [{:t :image :src "x\\input{/etc/passwd}"
+                                                      :alt "" :attr empty-attr}]))]
+         "a citation key" ["an unbalanced }"
+                           (fn [_d ctx]
+                             ((:render-inlines ctx)
+                              [{:t :cite :items [{:key "k}\\input{/etc/passwd}\\citep{k"}]
+                                :text []}]))]
+         ;; TASK-215 review: bypasses of the first, deny-list check.
+         "expl3 \\tex_input:D" ["\\ExplSyntaxOn"
+                                (fn [_d ctx]
+                                  ((:render-inlines ctx)
+                                   [{:t :math-inline
+                                     :tex "\\ExplSyntaxOn \\tex_input:D {secret} \\ExplSyntaxOff"}]))]
+         "expl3 file write" ["\\ExplSyntaxOn"
+                             (fn [_d ctx]
+                               ((:render-inlines ctx)
+                                [{:t :math-inline
+                                  :tex (str "\\ExplSyntaxOn \\iow_new:N \\g_x_iow \\iow_open:Nn "
+                                            "\\g_x_iow {pwned.txt} \\iow_now:Nn \\g_x_iow {owned}"
+                                            " \\ExplSyntaxOff")}]))]
+         "\\UseName" ["\\UseName" (fn [_d ctx]
+                                    ((:render-inlines ctx)
+                                     [{:t :math-inline :tex "\\UseName{input}{secret}"}]))]
+         "\\NewDocumentCommand" ["\\NewDocumentCommand"
+                                 (fn [_d ctx]
+                                   ((:render-inlines ctx)
+                                    [{:t :math-inline :tex "\\NewDocumentCommand\\zz{}{\\zz}\\zz"}]))]
+         "\\begin{input}" ["\\begin{input}{file}"
+                           (fn [_d ctx]
+                             ((:render-inlines ctx)
+                              [{:t :math-inline :tex "\\begin{input}{file}"}]))]
+         "a code sample's text moved into math" ["\\input"
+                                                 (fn [d ctx]
+                                                   ((:render-inlines ctx)
+                                                    [{:t :math-inline
+                                                      :tex (-> d :blocks first :inlines last :text)}]))]}]
+    (doseq [[label [token renderer]] reproductions]
+      (testing (str "refused, naming the directive, its line and the primitive: " label)
+        (try (emit renderer)
+             (is false "expected a refusal")
+             (catch clojure.lang.ExceptionInfo e
+               (is (= ::sanitize/untrusted-tex (:type (ex-data e))))
+               (is (= token (:token (ex-data e))))
+               (is (= "doc.hdoc:4" (:source (ex-data e))))
+               (is (str/includes? (ex-message e) "directive \"widget\" (doc.hdoc:4)"))))))
+    (testing "a hand-built :link with a javascript: target renders as its text, with warnings"
+      (let [[out warnings] (emit (fn [_d ctx] ((:render-blocks ctx) [(para evil-link)])))]
+        (is (not (str/includes? out "javascript")))
+        (is (str/includes? out "\\begin{document}\nclick\n"))
+        (is (= #{:event-handler-attribute :unsafe-url} (set (map :type warnings))))
+        (is (every? #(str/starts-with? (:message %) "directive \"widget\" (doc.hdoc:4)") warnings))))
+    (testing "an ordinary renderer is unchanged -- the document's own math, which is trusted,
+              included -- and still compiles"
+      (let [[out warnings] (emit (fn [directive ctx]
+                                   ["Note: " ((:render-blocks ctx) (:blocks directive))]))]
+        (is (str/includes? out "Note: 50\\% body \\(\\def\\x{1}\\x + \\frac{1}{2}\n\\)"))
+        (is (empty? warnings))
+        (assert-compiles! out)))
+    (testing "a trusted registration is not checked"
+      (let [[out warnings] (emit (second (get reproductions "\\input in :render-inlines math"))
+                                 :trusted? true)]
+        (is (str/includes? out "\\(\\input{/etc/passwd}"))
+        (is (empty? warnings))))))
 
 (deftest unsupported-node-test
   (testing "the fallback for a node outside the schema entirely. Every
@@ -1902,7 +2056,7 @@
               either link spelling, since an autolink (TASK-72) and an
               ordinary link both lower to the same Link node"
       (let [out (latex/emit-document (link-doc "https://example.com/a\\b"))]
-        (is (str/includes? out "\\href{https://example.com/a%5Cb}{"))
+        (is (str/includes? out "\\href{https://example.com/a\\%5Cb}{"))
         (is (not (re-find #"\\href\{[^}]*\\\\" out))
             "no raw backslash reaches the href target at all")
         (assert-compiles! out))))
@@ -1914,13 +2068,16 @@
       (is (not ok?) "the raw case really does fail, or this test proves nothing")
       (is (str/includes? (str (:out result)) "hyper")))
     (let [out (latex/emit-document (link-doc "https://example.com/a{b"))]
-      (is (str/includes? out "\\href{https://example.com/a%7Bb}{"))
+      (is (str/includes? out "\\href{https://example.com/a\\%7Bb}{"))
       (assert-compiles! out)))
-  (testing "AC #3: an ordinary URL -- including the raw % # & _ ~ ^ $ and
-            a BALANCED brace pair hyperref already carries correctly -- is
+  (testing "AC #3: an ordinary URL -- including the raw _ ~ ^ $ and a
+            BALANCED brace pair hyperref already carries correctly -- is
             unaffected: none of those characters is touched, so the URL
-            in the .tex is byte-for-byte the one that was authored"
-    (let [ordinary "https://example.com/a?x=1&y=2#frag_here~a^b$c{d}%20"
+            in the .tex is byte-for-byte the one that was authored. (The
+            % # & this once pinned raw too are written \\% \\# \\& since
+            TASK-210, `link-url-in-arguments-test`, which checks the PDF
+            target is still exactly the authored URL.)"
+    (let [ordinary "https://example.com/a?x=1_frag_here~a^b$c{d}"
           out (latex/emit-document (link-doc ordinary))]
       (is (str/includes? out (str "\\href{" ordinary "}")))
       (assert-compiles! out)))
@@ -1928,7 +2085,7 @@
             spelled %5C) is passed through unchanged rather than encoded a
             second time into %255C"
     (let [out (latex/emit-document (link-doc "https://example.com/a%5Cb"))]
-      (is (str/includes? out "\\href{https://example.com/a%5Cb}"))
+      (is (str/includes? out "\\href{https://example.com/a\\%5Cb}"))
       (is (not (str/includes? out "%255C")))))
   (testing "AC #2: a bibliography url/doi field gets the identical
             treatment, since a raw backslash or unbalanced brace breaks
@@ -1949,7 +2106,75 @@
             raw backslash and an unbalanced brace -- gets both fixed, not
             just whichever one this function happens to handle first"
     (let [out (latex/emit-document (link-doc "https://example.com/a\\b{c"))]
-      (is (str/includes? out "\\href{https://example.com/a%5Cb%7Bc}{"))
+      (is (str/includes? out "\\href{https://example.com/a\\%5Cb\\%7Bc}{"))
+      (assert-compiles! out))))
+
+(defn- pdf-uris
+  "Every `/URI` link target in `pdf-file`, in object order, read from the
+  PDF itself after `qpdf --qdf --decode-level=all` expands it -- the
+  address a reader's click actually opens, which a `.tex` string is not
+  evidence of."
+  [pdf-file]
+  (let [expanded (io/file (.getParentFile ^java.io.File pdf-file) "expanded.pdf")
+        {:keys [exit]} (shell/sh "qpdf" "--qdf" "--decode-level=all"
+                                 (str pdf-file) (str expanded))]
+    (when (zero? exit)
+      (mapv second (re-seq #"/URI \(([^)]*)\)" (slurp expanded))))))
+
+(def ^:private hostile-url
+  "A URL carrying everything TASK-210 is about -- a query `&`, a
+  percent-encoding `%` and a fragment `#` -- plus the `_` and balanced
+  braces hyperref already carried raw. Each placement appends its own
+  suffix so its target in the PDF can be told apart."
+  "https://e.org/a_b{c}?x=1&y=%20#frag-")
+
+(defn- link-placements-source
+  "An hdoc document with a Link to `hostile-url` in a heading, at top
+  level, in a footnote, a figure caption, a longtable caption and a table
+  cell, and as an autolink. Returns `[source expected-uris]`."
+  []
+  (let [u #(str hostile-url %)]
+    [(str "# Heading [h](" (u "h") ") end {#sec:h}\n\n"
+          "Top [t](" (u "t") ") and a note.[^n]\n\n"
+          "[^n]: Note [n](" (u "n") ") here.\n\n"
+          "![Caption [c](" (u "c") ") end](pic.png){#fig:x}\n\n"
+          "| Cell | B |\n|------|---|\n"
+          "| [k](" (u "k") ") | 2 |\n"
+          ": Table [l](" (u "l") ") caption {#tbl:x}\n\n"
+          "Autolink <https://e.org/p%C3%A9?q=1&r=2#auto>.\n")
+     #{(u "h") (u "t") (u "n") (u "c") (u "l") (u "k") "https://e.org/p%C3%A9?q=1&r=2#auto"}]))
+
+(deftest link-url-in-arguments-test
+  (testing "TASK-210: a raw # in a footnote and a raw % in a heading are
+            fatal to a real pdflatex, so the fix below is not cosmetic"
+    (let [doc (fn [body] (str raw-href-preamble body "\n\\end{document}\n"))
+          [ok-hash result-hash] (compiles? (doc "x\\footnote{\\href{https://e.org/#f}{n}}"))
+          [ok-pct result-pct] (compiles? (doc "\\section{\\href{https://e.org/%20}{h}}"))]
+      (is (not ok-hash))
+      (is (str/includes? (str (:out result-hash)) "Illegal parameter number"))
+      (is (not ok-pct))
+      (is (str/includes? (str (:out result-pct)) "File ended while scanning"))))
+  (testing "AC #1: a Link whose URL has # % & -- in a heading, a footnote, a
+            figure caption, a longtable caption, a table cell and at top
+            level, in both numbering modes -- compiles, and every /URI
+            pdflatex writes is exactly the authored URL"
+    (let [[source expected] (link-placements-source)
+          document (parser/parse source)]
+      (doseq [opts [{} {:computed-numbers true}]]
+        (testing (pr-str opts)
+          (let [tex (latex/emit-document document opts)
+                pdf (compile-pdf! tex)]
+            (is (str/includes? tex "\\href{https://e.org/a_b{c}?x=1\\&y=\\%20\\#frag-n}{n}"))
+            (is (some? pdf) "the document compiles")
+            (when pdf
+              (let [uris (pdf-uris pdf)]
+                (is (= expected (set uris)))
+                (is (<= (count expected) (count uris))))))))))
+  (testing "AC #2: a URL with none of # % & (or \\ or an unbalanced brace) is
+            written exactly as before, character for character"
+    (let [url "https://e.org/a_b~c/{d}/x?y=1;z"
+          out (latex/emit-document (link-doc url))]
+      (is (str/includes? out (str "\\href{" url "}{")))
       (assert-compiles! out))))
 
 (deftest csl-json-to-bibtex-test
@@ -2557,7 +2782,7 @@
   is the existing precedent in this codebase for pinning a schema's
   variant set from a test."
   #{:section :para :list :code-block :math-block :figure :table
-    :block-quote :directive :include :thematic-break})
+    :block-quote :directive :include :book-quote :thematic-break})
 
 (defn- block-fixture
   "A minimal Block of variant `tag`, for `block-coverage-test`'s own
@@ -2576,6 +2801,7 @@
     :block-quote {:t :block-quote :blocks [(para (str-inline "x"))] :attr empty-attr}
     :directive (directive "theorem" nil (para (str-inline "x")))
     :include {:t :include :src "other.hdoc"}
+    :book-quote {:t :book-quote :ref "bible:romanos#14:8"}
     :thematic-break {:t :thematic-break}))
 
 (deftest block-coverage-test
@@ -2585,7 +2811,7 @@
             docstring, so a variant added later cannot quietly go
             unhandled. :include is the one variant that still raises, and
             it raises its own ::unresolved-include (TASK-37 AC #3)"
-    (is (= 11 (count all-block-tags)))
+    (is (= 12 (count all-block-tags)))
     (doseq [tag all-block-tags]
       (let [thrown (try
                      (latex/emit-document {:meta {} :blocks [(block-fixture tag)]}
@@ -2594,6 +2820,24 @@
                      (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))]
         (is (not= ::latex/unsupported-block thrown) (str tag))
         (is (= (when (= :include tag) ::latex/unresolved-include) thrown) (str tag))))))
+
+(deftest book-nodes-interim-rendering-test
+  (testing "TASK-152: until TASK-156 renders resolved book nodes, an
+            unresolved one shows its ref as written instead of throwing"
+    (let [out (latex/emit-document
+               {:meta {} :blocks [(para (str-inline "See ") {:t :book-ref :ref "bible:romanos#14:8"})
+                                  {:t :book-quote :ref "bible:romanos#14:8-9"}]})]
+      (is (str/includes? out "See bible:romanos\\#14:8"))
+      (is (str/includes? out "\\begin{quote}\nbible:romanos\\#14:8-9\n\\end{quote}"))))
+  (testing "resolved fields, when present, are what is rendered"
+    (let [out (latex/emit-document
+               {:meta {} :blocks [(para {:t :book-ref :ref "bible:romanos#14:8"
+                                         :text [(str-inline "Romanos 14:8")]})
+                                  {:t :book-quote :ref "bible:romanos#14:8"
+                                   :blocks [(para (str-inline "Porque"))]}]})]
+      (is (str/includes? out "Romanos 14:8"))
+      (is (not (str/includes? out "bible:romanos")))
+      (is (str/includes? out "\\begin{quote}\nPorque\n\\end{quote}")))))
 
 (deftest include-message-parity-test
   (testing "review finding #7: the two emitters' ::unresolved-include
@@ -3750,3 +3994,136 @@
                                    :blocks []}]}
                {:computed-numbers true})
               "\\texorpdfstring")))))
+
+;; ---------------------------------------------------------------------
+;; TASK-156: book links and quotes (doc-10 "Emitters").
+;; ---------------------------------------------------------------------
+
+(def ^:private book-document
+  "Both BookRef forms -- one whose URL carries every character hyperref
+  cannot read raw inside another command's argument, one in a footnote
+  -- a failed link, a host citation and theorem, a resolved BookQuote
+  whose passage has its own level-1 heading, citation and theorem, and a
+  failed quote: what TASK-154/155 resolution hands the emitter."
+  (let [link {:t :book-ref :ref "reformed:heidelberg#sec:q1"
+              :canonical "reformed:confessions/heidelberg#sec:q1"
+              :text [(str-inline "Heidelberg & Co, Section 1.1")]
+              :url "https://example.org/h_1.html?a=1&b=%7E#sec:q1"}
+        theorem (fn [text] {:t :directive :name "theorem" :attr empty-attr
+                            :blocks [(para (str-inline text))]})]
+    {:meta {}
+     :blocks [{:t :section :level 1 :heading [(str-inline "Host")]
+               :attr {:id "sec:host" :classes [] :props {}}
+               :blocks [(para (str-inline "See ") link
+                              (str-inline ", ")
+                              {:t :book-ref :ref "plain:p" :canonical "plain:p" :text [(str-inline "P")]}
+                              (str-inline " and ")
+                              {:t :book-ref :ref "nolib:x" :text [(str-inline "??")]}
+                              {:t :note :blocks [(para (str-inline "Also ") link)]}
+                              (str-inline " ")
+                              {:t :cite :items [{:key "knuth1984" :mode :normal}]
+                               :text [(str-inline "[1]")]})
+                        (theorem "Host theorem.")
+                        {:t :book-quote :ref "reformed:heidelberg#sec:comfort"
+                         :canonical "reformed:confessions/heidelberg#sec:comfort"
+                         :title [(str-inline "Heidelberg Catechism, Section 1")]
+                         :url "https://example.org/h.html#sec:comfort"
+                         :blocks [{:t :section :level 1 :heading [(str-inline "Comfort")]
+                                   :attr empty-attr
+                                   :blocks [(para (str-inline "Only comfort ")
+                                                  {:t :cite :items [{:key "knuth1984" :mode :normal}]
+                                                   :text [(str-inline "[7]")]})
+                                            (theorem "Quoted theorem.")]}]}
+                        {:t :book-quote :ref "plain:p" :canonical "plain:p"
+                         :title [(str-inline "P")]
+                         :blocks [(para (str-inline "Unlinked."))]}
+                        {:t :book-quote :ref "nolib:x_1"
+                         :blocks [(para (str-inline "?? nolib:x_1"))]}]}]}))
+
+(defn- document-body
+  [tex]
+  (subs tex (+ (str/index-of tex "\\begin{document}") (count "\\begin{document}\n"))
+        (str/index-of tex "\\end{document}")))
+
+(deftest book-nodes-golden-test
+  (testing "TASK-156 AC #2/#4: plain-text and \\href links, the quote environment
+            with its source line, and the failed placeholders, in native mode"
+    (let [tex (latex/emit-document book-document {:bibliography-id "sec:references"
+                                                  :bib-resource "refs"})]
+      (is (= (str "\\section{Host}\\label{sec:host}\n"
+                  "See \\href{https://example.org/h_1.html?a=1\\&b=\\%7E\\#sec:q1}"
+                  "{Heidelberg \\& Co, Section 1.1}, P and ??"
+                  "\\footnote{Also \\href{https://example.org/h_1.html?a=1\\&b=\\%7E\\#sec:q1}"
+                  "{Heidelberg \\& Co, Section 1.1}} \\citep{knuth1984}\n\n"
+                  "\\begin{theorem}\nHost theorem.\n\\end{theorem}\n\n"
+                  "\\begin{quote}\n"
+                  "\\csname @newlistfalse\\endcsname\n"
+                  "\\subsection*{Comfort}\n"
+                  "Only comfort [7]\n\n"
+                  "\\begin{hnunnumbered}{Theorem}\nQuoted theorem.\n\\end{hnunnumbered}\n"
+                  "\\par\\nobreak{\\raggedleft --- \\href{https://example.org/h.html\\#sec:comfort}"
+                  "{Heidelberg Catechism, Section 1}\\par}\n"
+                  "\\end{quote}\n\n"
+                  "\\begin{quote}\nUnlinked.\n"
+                  "\\par\\nobreak{\\raggedleft --- P\\par}\n\\end{quote}\n\n"
+                  "\\begin{quote}\n?? nolib:x\\_1\n\\end{quote}\n")
+             (document-body tex)))
+      (testing "and it compiles, the quoted citation printed as the book formatted it
+                and the quoted theorem stepping no counter"
+        (let [[ok? pdf log] (compile-with-bibtex! tex)
+              text (when ok? (pdf-text pdf))]
+          (is ok? log)
+          (when ok?
+            (is (str/includes? text "Theorem 1. Host theorem."))
+            (is (str/includes? text "Only comfort [7]"))
+            (is (str/includes? text "Theorem. Quoted theorem."))
+            (is (str/includes? text "— Heidelberg Catechism, Section 1"))
+            (is (str/includes? text "?? nolib:x_1")))))))
+  (testing "a link inside a highlight is boxed, as a Link is, and compiles"
+    (let [tex (annotated-tex (highlight (annotation-attr)
+                                        (str-inline "marked ")
+                                        {:t :book-ref :ref "b:x" :text [(str-inline "X")]
+                                         :url "https://e.org/x.html#sec:q1"}
+                                        (str-inline " and ")
+                                        {:t :book-ref :ref "b:y" :text [(str-inline "Y")]}))]
+      (is (str/includes? tex "\\mbox{\\href{https://e.org/x.html\\#sec:q1}{X}}"))
+      (is (not (str/includes? tex "\\mbox{Y}")) "plain text needs no box")
+      (assert-compiles! tex))))
+
+(deftest book-quote-headings-test
+  (testing "TASK-156: a quoted heading sits one level below the host Section
+            around the quote, and is never a \\chapter or \\part, which would
+            start a page inside the quotation"
+    (let [section (fn [level heading & blocks]
+                    {:t :section :level level :heading [(str-inline heading)]
+                     :attr empty-attr :blocks (vec blocks)})
+          ;; A book's h1/h2/h3: the nesting is what must survive.
+          q {:t :book-quote :ref "b:x" :canonical "b:x" :title [(str-inline "X")]
+             :blocks [(section 1 "Q" (section 2 "R" (section 3 "S")))]}
+          chapter (fn [& blocks] {:t :section :level 1 :heading [(str-inline "C")]
+                                  :attr {:id "ch:c" :classes [] :props {}} :blocks (vec blocks)})
+          emit (fn [division & blocks]
+                 (latex/emit-document {:meta {:top-level-division division} :blocks (vec blocks)} {}))
+          opening "\\begin{quote}\n\\csname @newlistfalse\\endcsname\n"]
+      (doseq [[label division expected]
+              [["at the top of an unchaptered host, from a section down" nil
+                "\\section*{Q}\n\\subsection*{R}\n\\subsubsection*{S}\n"]
+               ["at the top of a chaptered host, a section, not a chapter, nesting kept" :chapter
+                "\\section*{Q}\n\\subsection*{R}\n\\subsubsection*{S}\n"]
+               ["at the top of a parted host, a section, not a part or chapter, nesting kept" :part
+                "\\section*{Q}\n\\subsection*{R}\n\\subsubsection*{S}\n"]]]
+        (is (str/starts-with? (document-body (emit division q)) (str opening expected)) label))
+      (let [tex (emit :chapter (chapter q))]
+        (is (str/includes? tex (str "\\chapter{C}\\label{ch:c}\n" opening
+                                    "\\section*{Q}\n\\subsection*{R}\n\\subsubsection*{S}\n"))
+            "inside a chapter, one level below it")
+        (testing "a quote that opens with its heading compiles (a sectioning
+                  command opening a list environment is otherwise fatal)"
+          (assert-compiles! tex)))
+      (is (str/includes? (emit :part (assoc (chapter q) :level 2))
+                         (str opening "\\section*{Q}\n\\subsection*{R}\n"))
+          "inside a parted host's chapter, one level below it")
+      (is (not (str/includes? (latex/emit-document
+                               {:meta {} :blocks [(assoc q :blocks [(para (str-inline "x"))])]} {})
+                              "@newlistfalse"))
+          "a quote opening with prose needs no help"))))

@@ -29,6 +29,12 @@
   - `:scope`     -- optional set of `haselnuss.walk` reference kinds
     (`::ast/block`, `::ast/inline`, ...), defaulting to `default-scope`;
     see that var's own docstring.
+  - `:matcher`   -- optional `(fn [node] -> boolean)` deciding the match in
+    place of `(select/matches? select node)`, `:select` then serving only
+    to name the rule. `haselnuss.extensions.rules` sets it for a script's
+    rule whose selector holds script code (a function or a regex), so that
+    code runs in the sandbox, under its timeout, rather than on this
+    thread (TASK-214); it never takes one from the script itself.
 
   THE RETURN-VALUE CONTRACT (AC #1) -- what `:transform` hands back is the
   whole vocabulary a rule has for changing the tree:
@@ -99,7 +105,7 @@
   document, `apply-rule`'s own per-rule reduce never expands one),
   naming every `:src` still unexpanded so the report is something to act
   on rather than a bare 'this document has includes' -- see
-  `unexpanded-include-srcs`/`partial-document-diagnostics`, below. A
+  `unexpanded-includes`/`partial-document-diagnostics`, below. A
   document with no `:include` Blocks at all -- the common case, and every
   fixture in this namespace's own tests before this task -- produces
   none of this, unchanged.
@@ -304,18 +310,19 @@
   `:scope` deliberately widens to include `::ast/document` is a genuine
   match here, arity-checked by `apply-rule`'s own
   `expect-document-count-one!` once this call returns, not by anything in
-  this function. Otherwise runs `(select/matches? select node)`: no match
+  this function. Otherwise runs `(select/matches? select node)`, or the
+  rule's own `:matcher` when it has one: no match
   leaves `node` unchanged; a match flips `matched?` (a `volatile!`
   `apply-rule` reads back once its own `rewrite-post` call returns, AC
   #6), calls `(transform node ctx)` (AC #7, `ctx` built once by
   `apply-rule` and reused for every match this rule makes), and returns
   `translate-result`'s own vector, each element of it checked by
   `validate-replacement!` before this function hands it back (AC #4)."
-  [{:keys [select transform scope]} label ctx matched?]
+  [{:keys [select matcher transform scope]} label ctx matched?]
   (fn [path ref-kind node]
     (if-not (contains? scope ref-kind)
       [node]
-      (if-not (select/matches? select node)
+      (if-not (if matcher (matcher node) (select/matches? select node))
         [node]
         (do
           (vreset! matched? true)
@@ -372,9 +379,9 @@
                       :name label
                       :message (str label "'s selector matched no node")}])}))
 
-(defn- unexpanded-include-srcs
-  "Every `:src` an `:include` Block (`ast.clj`'s `:include` variant)
-  anywhere in `document` names, in document order (TASK-106) -- these
+(defn- unexpanded-includes
+  "Every `:include` Block (`ast.clj`'s `:include` variant) anywhere in
+  `document`, in document order (TASK-106) -- these
   Blocks are still unexpanded at the point `transform-document` runs,
   since `--transform` sits before `resolve/expand-includes` (this
   namespace's own docstring, 'RUNNING OVER A PARTIAL DOCUMENT').
@@ -395,27 +402,48 @@
     :visit (fn [acc _path ref-kind node]
              (cond-> acc
                (and (= ref-kind ::ast/block) (= :include (:t node)))
-               (conj (:src node))))}
+               (conj node)))}
    [] ::ast/document document))
 
+(defn- include-location
+  "One `:locations` entry for `include`: `{:src :source-line :source-file?}`,
+  or nil when the parser recorded no position for it (TASK-163)."
+  [include]
+  (when-let [{:keys [file line]} (ast/source include)]
+    (cond-> {:src (:src include) :source-line line}
+      file (assoc :source-file file))))
+
 (defn- partial-document-diagnostics
-  "`srcs` (`unexpanded-include-srcs`'s own return value) turned into `[]`
+  "`includes` (`unexpanded-includes`'s own return value) turned into `[]`
   when empty, or a single `{:type :transform-partial-document :includes
   :message}` diagnostic naming every one of them (TASK-106 AC #1/#2) --
   concretely, by path, rather than only stating that includes exist, so
   an author can tell exactly which chapters the rules that just ran never
-  saw. Joins `srcs` with `apply`/`interpose` (not `clojure.string/join`)
-  so this namespace's own AC #8 -- 'requires nothing beyond
-  haselnuss.ast/haselnuss.select/haselnuss.walk' -- stays true; the
-  functions doing it are `clojure.core`, already in scope everywhere."
-  [srcs]
-  (when (seq srcs)
-    [{:type :transform-partial-document
-      :includes (vec srcs)
-      :message (str "--transform ran before " (count srcs)
-                    (if (= 1 (count srcs)) " !include was" " !includes were")
-                    " expanded, so these rules never saw: "
-                    (apply str (interpose ", " srcs)))}]))
+  saw. `:includes` is their `:src`s. Each is also named with the
+  `path:line` of its `!include` when the parser recorded one, and the
+  diagnostic then carries `:locations` (`include-location`, TASK-163); an
+  include with no position (read from JSON, built by a rule) is named by
+  its `:src` alone, as before. Joins with `apply`/`interpose` (not
+  `clojure.string/join`) so this namespace's own AC #8 -- 'requires
+  nothing beyond haselnuss.ast/haselnuss.select/haselnuss.walk' -- stays
+  true; the functions doing it are `clojure.core`, already in scope
+  everywhere."
+  [includes]
+  (when (seq includes)
+    (let [srcs (mapv :src includes)
+          locations (into [] (keep include-location) includes)
+          named (map (fn [include]
+                       (if-let [label (ast/source-label include)]
+                         (str (:src include) " (" label ")")
+                         (:src include)))
+                     includes)]
+      [(cond-> {:type :transform-partial-document
+                :includes srcs
+                :message (str "--transform ran before " (count srcs)
+                              (if (= 1 (count srcs)) " !include was" " !includes were")
+                              " expanded, so these rules never saw: "
+                              (apply str (interpose ", " named)))}
+         (seq locations) (assoc :locations locations))])))
 
 (defn transform-document
   "Applies `rules` (a seq of `{:select :transform :name? :scope?}` maps,
@@ -450,6 +478,6 @@
        {:document document' :diagnostics (into diagnostics rule-diagnostics)}))
    {:document document
     :diagnostics (if (seq rules)
-                   (vec (partial-document-diagnostics (unexpanded-include-srcs document)))
+                   (vec (partial-document-diagnostics (unexpanded-includes document)))
                    [])}
    (map-indexed vector rules)))

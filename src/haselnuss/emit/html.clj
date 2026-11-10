@@ -71,14 +71,19 @@
   know, and the last two are cases where losing the style would cost
   meaning or produce broken output rather than an unstyled one.
 
-  `emit-document` always includes one async MathJax v3 CDN `<script>` tag
-  in `<head>` (unconditionally, not only when `document` actually
-  contains math -- detecting that would need either duplicating this
-  namespace's own render-time tree walk in a second, parallel checker, or
-  threading yet another accumulator through every render function
-  alongside `footnotes`/`ctx`, for a savings of one small, harmless
-  `<script>` tag on math-free documents) so formulas render correctly in
-  a real browser without any further reader setup.
+  `emit-document` includes one async MathJax v3 CDN `<script>` tag in
+  `<head>` only when the rendered output actually contains math
+  (`has-math?`, a check on the rendered HTML for the `math inline` /
+  `math display` class markers, which user text cannot forge because it
+  is escaped). Checking the output rather than the tree means a math
+  node a lowering pass dropped does not count, and avoids a second
+  parallel tree walker. A math-free page therefore makes no third-party
+  request (TASK-130). An inline `mathjax-config` script precedes it, so
+  a document's own math cannot make links or attributes (TASK-217).
+  Opt-out for offline use: pass `:mathjax false` in
+  `opts` to omit the script even for a document with math (the default,
+  `:auto`, is the behaviour above). It is a library opt only; the CLI
+  has no flag for it.
 
   CrossRef (AC #3): a `:cross-ref` inline reaching this namespace is
   expected to already be resolved (`haselnuss.resolver/resolve-cross-
@@ -145,9 +150,11 @@
   of corrupting the outer entry's own position."
   (:require [clojure.string :as str]
             [haselnuss.ast :as ast]
+            [haselnuss.emit.quote :as book-quote]
             [haselnuss.extensions.derived-lists :as derived-lists]
             [haselnuss.extensions.front-matter :as front-matter]
             [haselnuss.registry :as registry]
+            [haselnuss.sanitize :as sanitize]
             [haselnuss.select :as select]
             [haselnuss.walk :as walk]))
 
@@ -162,10 +169,19 @@
       (str/replace ">" "&gt;")
       (str/replace "\"" "&quot;")))
 
+(def ^:private directive-internal-props
+  "Prop names that belong to the document model, not to HTML (TASK-139):
+  `caption` (a float's caption text, or a theorem's, which LaTeX never
+  prints), `key` and `ref` (a reference's target). None is a valid
+  attribute on the elements they land on (`<blockquote caption=..>`,
+  `<span ref=..>`), so `prop-attrs` never writes them; genuine HTML
+  attributes such as `lang` still pass through."
+  #{"caption" "key" "ref"})
+
 (defn- prop-attrs
   "One ` escaped-key=\"escaped value\"` HTML attribute fragment per entry
   in `props` (an Attr's own `:props`, sec4.1's open-ended string-keyed
-  bag), concatenated together. Each entry passes through directly as a
+  bag, minus `directive-internal-props`), concatenated together. Each entry passes through directly as a
   literal HTML attribute name/value pair -- e.g. a `.note lang=en` Attr's
   `{\"lang\" \"en\"}` becomes a real `lang=\"en\"` HTML attribute -- the
   simplest reading of `props` consistent with how `parser_test.clj`'s own
@@ -180,7 +196,8 @@
   unescaped would let a key like `\"x\\\" onmouseover=\\\"alert(1)\"`
   break out of the attribute list."
   [props]
-  (apply str (map (fn [[k v]] (str " " (escape-html k) "=\"" (escape-html v) "\"")) props)))
+  (apply str (map (fn [[k v]] (str " " (escape-html k) "=\"" (escape-html v) "\""))
+                  (remove (comp directive-internal-props key) props))))
 
 (defn- attr-attrs
   "Every HTML attribute fragment for Attr `attr` (sec4.1: `:id`/
@@ -192,6 +209,17 @@
   (str (when id (str " id=\"" (escape-html id) "\""))
        (when (seq classes) (str " class=\"" (escape-html (str/join " " classes)) "\""))
        (prop-attrs props)))
+
+(defn- title-attr
+  "The ` title=\"...\"` fragment for a Link/Image `inline` carrying a
+  `:title` (CommonMark's `[t](url \"Title\")`; browsers show it as a
+  tooltip), or `\"\"` for one without. An authored `{title=...}` prop on
+  the same node wins: emitting both would be a duplicate attribute
+  (TASK-140)."
+  [inline]
+  (if (and (:title inline) (not (contains? (:props (:attr inline)) "title")))
+    (str " title=\"" (escape-html (:title inline)) "\"")
+    ""))
 
 (def ^:private image-style-props
   "The Image sizing props HTML expresses as CSS rather than as literal
@@ -522,6 +550,27 @@
        text-html)
      footnotes']))
 
+(defn- render-book-ref
+  "Renders BookRef `inline` (doc-10 \"Emitters\", TASK-156) to `[html
+  footnotes']`: `<a class=\"book-ref\" href=\"url\">text</a>` when
+  resolution gave it a `:url` (its library has a URL template), else
+  `<span class=\"book-ref\">text</span>` -- the class either way, so a
+  stylesheet can tell a book link from an ordinary one. `text` is the
+  resolved `:text` (`??` for a reference that failed to resolve, the
+  placeholder a dangling `@fig:x` prints too); a node no resolution ever
+  ran over (no `:text`, e.g. the CLI before it is given a library
+  directory) shows its `:ref` as written, so it neither throws nor
+  vanishes. `:url` reaches here only through `haselnuss.sanitize`, which
+  drops an unsafe-scheme one, and is attribute-escaped like a Link's."
+  [ctx {:keys [text url] :as inline} footnotes]
+  (let [[html footnotes'] (if text
+                            (render-inlines ctx text footnotes)
+                            [(escape-html (:ref inline)) footnotes])]
+    [(if url
+       (str "<a class=\"book-ref\" href=\"" (escape-html url) "\">" html "</a>")
+       (str "<span class=\"book-ref\">" html "</span>"))
+     footnotes']))
+
 (def built-in-inline-handlers
   "The built-in `:t -> (fn [ctx inline footnotes] -> [rendered
   footnotes'])` table `render-inline` dispatches through (TASK-88): every
@@ -558,11 +607,13 @@
    :link (fn [ctx inline footnotes]
            (render-wrapped ctx inline footnotes
                            (str "<a href=\"" (escape-html (:target inline)) "\""
+                                (title-attr inline)
                                 (attr-attrs (:attr inline)) ">")
                            "</a>"))
    :image (fn [_ctx inline footnotes]
             [(str "<img src=\"" (escape-html (:src inline)) "\" alt=\""
                   (escape-html (:alt inline)) "\""
+                  (title-attr inline)
                   (attr-attrs (image-attr (:attr inline))) "/>")
              footnotes])
    :span (fn [ctx inline footnotes]
@@ -582,6 +633,7 @@
    :sticky-note render-sticky-note
    :math-inline (fn [_ctx inline footnotes] [(render-math-inline inline) footnotes])
    :cross-ref (fn [_ctx inline footnotes] [(render-cross-ref inline) footnotes])
+   :book-ref render-book-ref
    :cite render-cite})
 
 (defn- unsupported-inline!
@@ -716,7 +768,7 @@
   own docstring). `:li-id-prefix` is stripped from `ctx` before recursing
   into each item's own nested content (`render-list-item`), so a List
   nested inside one bibliography entry never inherits it too."
-  [ctx {:keys [ordered tight items attr]} footnotes]
+  [ctx {:keys [ordered start tight items attr]} footnotes]
   (let [tag (if ordered "ol" "ul")
         prefix (:li-id-prefix ctx)
         item-ctx (dissoc ctx :li-id-prefix)
@@ -727,7 +779,8 @@
                     [(str html li-open item-html "</li>") footnotes']))
                 ["" footnotes]
                 (map-indexed vector items))]
-    [(str "<" tag (attr-attrs attr) ">" items-html "</" tag ">") footnotes']))
+    [(str "<" tag (when (and ordered start (not= 1 start)) (str " start=\"" start "\""))
+          (attr-attrs attr) ">" items-html "</" tag ">") footnotes']))
 
 (defn- render-code-block
   "Renders CodeBlock `block` (sec4.3: `:lang?`/`:text`/`:attr`) as
@@ -825,6 +878,18 @@
        :else nil)
      footnotes']))
 
+(defn- set-image-alt
+  "Returns `node` (a Block/Inline tree) with the `:alt` of every `:image`
+  in it replaced by `alt`, NOT descending into a nested `:figure` -- a
+  subfigure panel owns its own alt (its own `describe`)."
+  [node alt]
+  (cond
+    (and (map? node) (= :figure (:t node))) node
+    (and (map? node) (= :image (:t node))) (assoc node :alt alt)
+    (map? node) (update-vals node #(set-image-alt % alt))
+    (sequential? node) (into (empty node) (map #(set-image-alt % alt)) node)
+    :else node))
+
 (defn- render-figure
   "Renders Figure `block` (sec4.3: `:content`/`:caption`/`:attr`) as
   `<figure attr>{rendered content}<figcaption>{render-caption}</figcaption>
@@ -832,7 +897,13 @@
   `render-caption` returns nil (neither a resolved number nor an authored
   caption)."
   [ctx {:keys [content caption attr]} footnotes]
-  (let [[content-html footnotes'] (render-blocks ctx [content] footnotes)
+  (let [alt (get-in attr [:props "alt"])
+        ;; `alt` is not a valid <figure> attribute and assistive
+        ;; technology reads it from <img>: a `describe`d alt moves onto the
+        ;; figure's own images (TASK-131).
+        attr (update attr :props dissoc "alt")
+        content (cond-> content alt (set-image-alt alt))
+        [content-html footnotes'] (render-blocks ctx [content] footnotes)
         [caption-text footnotes''] (render-caption ctx (:id attr) caption footnotes')]
     [(str "<figure" (attr-attrs attr) ">" content-html
           (when caption-text (str "<figcaption>" caption-text "</figcaption>"))
@@ -1037,7 +1108,21 @@
   ;; it becomes unreachable outright rather than merely inconvenient --
   ;; adequate for today's threat model (doc-6: "prevent accident and
   ;; casual mischief, not a determined attacker").
+  ;;
+  ;; TASK-213: being unconstructible is not enough -- `assoc` on a record
+  ;; keeps its type, so a renderer handed one could rewrite its `:html`.
+  ;; An untrusted renderer's `Rendered` is therefore spliced only when it
+  ;; is the very instance a ctx callback issued during that call
+  ;; (`haselnuss.registry/issued?`); see `render-data`'s own clause.
            [html])
+
+(def ^:private ^:dynamic *issued*
+  "The `haselnuss.registry/issued-fragments` set of the `render-directive`
+  call in progress on this thread, for this namespace's OWN v2 renderers
+  (`derived-list-renderer`), which build a `Rendered` themselves rather
+  than through a ctx callback. A var, not a ctx key, so a renderer handed
+  that ctx -- a sandboxed one included -- has no way to reach it."
+  nil)
 
 (defprotocol ^:private RenderData
   (render-data [node ctx]
@@ -1059,10 +1144,16 @@
       `ex-info` naming the directive, never a silent downgrade to escaped
       text and never a silent splice.
     - a vector `[tag attrs? & children]`, `tag` a keyword other than
-      `:raw`, `attrs?` an optional leading map -- a hiccup-shaped HTML
+      `:raw`, `attrs?` an optional leading map that is not a record (a
+      leading record, e.g. a `Rendered`, is the first child, TASK-216) -- a hiccup-shaped HTML
       element: `<tag attrs>children</tag>`, `attrs`' own keys/values
       escaped as an ordinary attribute (`element-attrs`), each child
-      itself `render-data`-ed and concatenated.
+      itself `render-data`-ed and concatenated. Unless `ctx`'s
+      `:trusted?` is true (TASK-215), `tag` must be one of
+      `untrusted-element-tags` -- anything else is a loud `ex-info` -- and
+      an event-handler attribute, a malformed attribute name or a URL
+      attribute failing `haselnuss.sanitize`'s scheme test is dropped
+      with a warning.
     - any other vector, or any `ISeq` (a `map`/`for`/`list` result) --
       a FRAGMENT: every child `render-data`-ed and concatenated, no
       wrapping tag at all. (A vector fragment whose own first child could
@@ -1070,10 +1161,14 @@
       instead, which is never read as an element in any hiccup
       convention -- see this method's own `IPersistentVector` clause.)
     - a `Rendered` (this namespace's own -- see its own docstring) --
-      spliced verbatim, unconditionally: it is this namespace's own
-      already-rendered, already-escaped output, returned by `ctx`'s
+      spliced verbatim: it is this namespace's own already-rendered,
+      already-escaped output, returned by `ctx`'s
       `:render-blocks`/`:render-inlines` callbacks, never something a v2
-      renderer's own code constructs.
+      renderer's own code constructs. Unless `ctx`'s `:trusted?` is true,
+      only the very instance a callback issued during this call is
+      (TASK-213); one rewritten with `assoc`/`merge`/`into`, built some
+      other way or kept from another call is a loud `ex-info`
+      (`forged-fragment!`).
     - anything else -- a loud `ex-info` naming the value and its class,
       rather than silently stringifying or dropping something a renderer
       almost certainly did not mean to return this way."))
@@ -1147,17 +1242,102 @@
                    "markup outside the tag position it appears in")
               {:type ::invalid-element-tag :tag tag})))))
 
+(def ^:private untrusted-element-tags
+  "The elements an untrusted v2 renderer (TASK-215) may build, lower-cased:
+  structure, text-level semantics, lists, tables, images and media, and
+  `details`/`summary`/`button`/`label`, which do nothing without script.
+  Nothing that runs or loads script or styles (`script`, `style`, `link`,
+  `noscript`, `template`), changes how the page is read (`base`, `meta`,
+  `html`/`head`/`body`/`title`), embeds another document (`iframe`,
+  `frame`, `object`, `embed`), submits anything (`form` and its controls),
+  switches parsing namespace (`svg`, `math`), or names a custom element,
+  whose behaviour is whatever script defines it."
+  #{"a" "abbr" "address" "article" "aside" "audio" "b" "bdi" "bdo" "blockquote" "br"
+    "button" "caption" "cite" "code" "col" "colgroup" "data" "dd" "del" "details" "dfn"
+    "div" "dl" "dt" "em" "figcaption" "figure" "footer" "h1" "h2" "h3" "h4" "h5" "h6"
+    "header" "hgroup" "hr" "i" "img" "ins" "kbd" "label" "li" "main" "mark" "meter" "nav"
+    "ol" "p" "picture" "pre" "progress" "q" "rp" "rt" "ruby" "s" "samp" "section" "small"
+    "source" "span" "strong" "sub" "summary" "sup" "table" "tbody" "td" "tfoot" "th"
+    "thead" "time" "tr" "track" "u" "ul" "var" "video" "wbr"})
+
+(def ^:private attribute-name-re
+  "What an untrusted renderer's attribute name must look like (TASK-215):
+  `element-attrs` escapes a name's `<`/`&`/`\"` but not a space or `=`, so
+  a key like `\"x onclick\"` would otherwise become two attributes."
+  #"[a-zA-Z_:][-a-zA-Z0-9_:.]*")
+
+(defn- untrusted-element-refusal!
+  "Raises the `ex-info` (`:type ::untrusted-element`) an untrusted
+  renderer's hiccup gets for an element not in `untrusted-element-tags`."
+  [ctx tag-name]
+  (let [where (::source-label ctx)]
+    (throw (ex-info
+            (str "directive " (pr-str (:directive-name ctx)) (when where (str " (" where ")"))
+                 "'s renderer returned a <" tag-name "> element, which an untrusted extension "
+                 "may not emit -- only --trusted-extensions lifts this")
+            (cond-> {:type ::untrusted-element :directive-name (:directive-name ctx)
+                     :name tag-name}
+              where (assoc :source where))))))
+
+(defn- untrusted-attrs
+  "`attrs` with every attribute an untrusted renderer may not set removed
+  (TASK-215) -- a malformed name, `is`, an event handler, a URL attribute whose
+  URL fails `haselnuss.sanitize`'s scheme test -- each reported through
+  `ctx`'s `::report`, the way the document pass reports its own."
+  [ctx attrs]
+  (let [dropped (volatile! [])
+        kept (into {}
+                   (remove (fn [[k v]]
+                             (when (some? v)
+                               (let [n (element-attr-name k)
+                                     d (cond
+                                         (not (re-matches attribute-name-re n))
+                                         {:type :malformed-attribute-name
+                                          :name n
+                                          :message (str "Dropped the attribute named " (pr-str n)
+                                                        ": not a well-formed attribute name.")}
+                                         ;; `is` makes a built-in a customized
+                                         ;; custom element: whatever script
+                                         ;; defines it, like a custom tag.
+                                         (= "is" (str/lower-case n))
+                                         {:type :custom-element-attribute
+                                          :name n
+                                          :message (str "Dropped the attribute is=\"" v
+                                                        "\": it makes the element a custom element.")}
+                                         :else (sanitize/attribute-diagnostic n (str v)))]
+                                 (when d (vswap! dropped conj d))))))
+                   attrs)]
+    (when (seq @dropped)
+      ((::report ctx) (map #(sanitize/extension-diagnostic (:directive-name ctx)
+                                                           (::source-label ctx) %)
+                           @dropped)))
+    kept))
+
 (defn- render-element
   "One hiccup element `<tag attrs>children</tag>` -- `tag` a keyword,
   validated by `element-tag-name!` before either tag is built, `rest-args`
   everything after it in the vector `render-data`'s own
   `IPersistentVector` clause matched, an optional leading attrs map then
-  every child, each `render-data`-ed against `ctx` and concatenated."
+  every child, each `render-data`-ed against `ctx` and concatenated.
+
+  For an untrusted renderer (TASK-215) the tag must also be one of
+  `untrusted-element-tags` (otherwise refused), and the attributes go
+  through `untrusted-attrs`.
+
+  Only a plain map is the attrs map (TASK-216): a record is a map too,
+  and a `Rendered` from a ctx callback is one, so `[:div rendered]` would
+  otherwise render it as `<div html=\"...\">`. A record in that position
+  is a child like any other, and goes through `render-data` -- the
+  TASK-213 forging check included."
   [tag rest-args ctx]
-  (let [[attrs children] (if (map? (first rest-args))
+  (let [[attrs children] (if (and (map? (first rest-args)) (not (record? (first rest-args))))
                            [(first rest-args) (rest rest-args)]
                            [nil rest-args])
-        tag-name (element-tag-name! tag)]
+        tag-name (element-tag-name! tag)
+        untrusted? (not (:trusted? ctx))
+        _ (when (and untrusted? (not (contains? untrusted-element-tags (str/lower-case tag-name))))
+            (untrusted-element-refusal! ctx tag-name))
+        attrs (if (and untrusted? attrs) (untrusted-attrs ctx attrs) attrs)]
     (str "<" tag-name (element-attrs attrs) ">"
          (apply str (map #(render-data % ctx) children))
          "</" tag-name ">")))
@@ -1178,6 +1358,23 @@
                ":trusted? true (haselnuss.registry/register) may emit unescaped output")
           {:type ::untrusted-raw-output :directive-name (:directive-name ctx)})))
 
+(defn- forged-fragment!
+  "Raises the `ex-info` (`:type ::forged-rendered`) an untrusted v2
+  renderer's return value gets for holding a `Rendered` none of its ctx
+  callbacks issued during this call (TASK-213) -- one it rewrote with
+  `assoc`/`merge`/`into`, or kept from an earlier call -- naming the
+  directive and, when the parser recorded one, where it is in the source."
+  [ctx]
+  (let [where (::source-label ctx)]
+    (throw (ex-info
+            (str "directive " (pr-str (:directive-name ctx)) (when where (str " (" where ")"))
+                 "'s renderer returned a Rendered fragment its ctx's :render-blocks/:render-inlines "
+                 "did not produce in this call (changed with assoc/merge/into, or kept from another "
+                 "call), but its own registry entry is not :trusted -- an untrusted renderer may "
+                 "return such a fragment only exactly as the callback handed it back")
+            (cond-> {:type ::forged-rendered :directive-name (:directive-name ctx)}
+              where (assoc :source where))))))
+
 (extend-protocol RenderData
   nil
   (render-data [_ _ctx] "")
@@ -1192,7 +1389,10 @@
   (render-data [n _ctx] (escape-html (str n)))
 
   Rendered
-  (render-data [r _ctx] (:html r))
+  (render-data [r ctx]
+    (if (or (:trusted? ctx) (registry/issued? (::issued ctx) r))
+      (:html r)
+      (forged-fragment! ctx)))
 
   clojure.lang.IPersistentVector
   (render-data [v ctx]
@@ -1251,19 +1451,34 @@
     (cond
       (and (ifn? renderer) (registry/v2? renderer))
       (let [footnotes-atom (atom footnotes)
+            issued (registry/issued-fragments)
+            trusted? (boolean (:trusted entry))
+            where (ast/source-label directive)
+            ;; TASK-215: captured here, on the calling thread, so a callback
+            ;; a sandboxed renderer runs on its worker still reports.
+            report! (sanitize/untrusted-reporter)
+            vet (sanitize/fragment-vetter directive trusted?)
             ctx' (assoc ctx
                         :directive-name directive-name
-                        :trusted? (boolean (:trusted entry))
+                        :trusted? trusted?
                         :render-blocks (fn [blocks]
-                                         (let [[html fs'] (render-blocks ctx blocks @footnotes-atom)]
+                                         (let [[html fs'] (render-blocks ctx (vet :blocks blocks)
+                                                                         @footnotes-atom)]
                                            (reset! footnotes-atom fs')
-                                           (->Rendered html)))
+                                           (registry/issue! issued (->Rendered html))))
                         :render-inlines (fn [inlines]
-                                          (let [[html fs'] (render-inlines ctx inlines
+                                          (let [[html fs'] (render-inlines ctx (vet :inlines inlines)
                                                                            @footnotes-atom)]
                                             (reset! footnotes-atom fs')
-                                            (->Rendered html))))]
-        [(render-data (renderer directive ctx') ctx') @footnotes-atom])
+                                            (registry/issue! issued (->Rendered html)))))
+            result (binding [*issued* issued] (renderer directive ctx'))]
+        ;; `issued` and `report!` reach `render-data` only through this
+        ;; ctx, which the renderer never sees (TASK-213, TASK-215).
+        [(render-data result (assoc ctx'
+                                    ::issued issued
+                                    ::report report!
+                                    ::source-label where))
+         @footnotes-atom])
 
       (ifn? renderer)
       [(renderer directive :html) footnotes]
@@ -1293,7 +1508,7 @@
   docstring), so a list can never itself introduce a footnote."
   [directive ctx]
   (let [spec (derived-lists/spec directive)]
-    (->Rendered (first (render-derived-list ctx spec directive [])))))
+    (registry/issue! *issued* (->Rendered (first (render-derived-list ctx spec directive []))))))
 
 (defn register-derived-lists
   "Registers a real `:html` renderer (`derived-list-renderer`, TASK-89)
@@ -1349,17 +1564,23 @@
 (defn- render-section
   "Renders Section `block` (sec4.3: `:level`/`:heading`/`:blocks`/`:attr`)
   as `<section attr><hN>number heading</hN>body</section>` (`tag` per
-  `heading-tag`, the number per `section-number-html`, TASK-41)."
+  `heading-tag`, the number per `section-number-html`, TASK-41).
+
+  The level is `:level` moved by `ctx`'s `:level-shift` (TASK-156: set
+  inside a quoted passage, see `render-book-quote`), and the body is
+  rendered with `:section-level` set to it, so a quote inside this
+  Section knows how deep it sits."
   [ctx block footnotes]
   (let [[heading-html footnotes'] (render-inlines ctx (:heading block) footnotes)
-        tag (heading-tag (:level block))
+        level (max 1 (+ (:level block) (:level-shift ctx 0)))
+        tag (heading-tag level)
         ;; TASK-20: the generated bibliography Section's own direct List
         ;; gets each <li> tagged for render-cite's own anchors to target
         ;; -- see render-list's own docstring.
-        section-ctx (if (and (:bibliography-id ctx)
-                             (= (:bibliography-id ctx) (get-in block [:attr :id])))
-                      (assoc ctx :li-id-prefix (:bibliography-id ctx))
-                      ctx)
+        section-ctx (cond-> (assoc ctx :section-level level)
+                      (and (:bibliography-id ctx)
+                           (= (:bibliography-id ctx) (get-in block [:attr :id])))
+                      (assoc :li-id-prefix (:bibliography-id ctx)))
         [body-html footnotes''] (render-blocks section-ctx (:blocks block) footnotes')]
     [(str "<section" (attr-attrs (:attr block)) ">"
           "<" tag ">" (section-number-html ctx (:attr block)) heading-html "</" tag ">"
@@ -1372,9 +1593,71 @@
   (let [[html footnotes'] (render-inlines ctx (:inlines block) footnotes)]
     [(str "<p>" html "</p>") footnotes']))
 
+(defn- render-book-quote
+  "Renders BookQuote `block` (doc-10 \"Emitters\", TASK-156) to `[html
+  footnotes']`: the quoted passage in `<blockquote class=\"book-quote\"
+  data-source=\"canonical\" cite=\"url\">`, each attribute only when
+  resolution supplied it, followed by the source line `— title` when it
+  supplied a `:title` -- a link when there is a `:url`.
+
+  The source line is attribution, and the HTML standard puts attribution
+  OUTSIDE the `<blockquote>`, grouping the two in a `<figure>` with the
+  attribution as its `<figcaption>`; `<cite>` marks the title of the
+  work. So a resolved quote is `<figure class=\"book-quote-figure\">`
+  around both, and the stylesheet keeps that figure's content flush left
+  (`figure` is centred for images) and sets its caption on the right.
+
+  A quote that failed to resolve has no `:canonical` and its `:blocks`
+  are the resolver's placeholder paragraph `?? ref`, which renders inside
+  a bare blockquote like any passage, so it is visible. A node no quote
+  expansion ever ran over (no `:blocks`) shows its `:ref` as written the
+  same way.
+
+  Inside the passage (`ctx`):
+
+  - quoted headings move by `haselnuss.emit.quote/level-shift`, so the
+    shallowest sits one level below the host Section around the quote;
+  - a citation is not linked into the host's bibliography
+    (`:citation-positions` emptied): it was formatted against the
+    book's own bibliography, so its number names an entry there, and a
+    link to the host's entry for the same key would show one number and
+    jump to another."
+  [ctx {:keys [canonical title url blocks] :as block} footnotes]
+  (let [inner-ctx (-> ctx
+                      (assoc :level-shift (book-quote/level-shift (:section-level ctx 0) blocks))
+                      (assoc :citation-positions {}))
+        [body footnotes'] (if blocks
+                            (render-blocks inner-ctx blocks footnotes)
+                            [(str "<p>" (escape-html (:ref block)) "</p>") footnotes])
+        quote-html (str "<blockquote class=\"book-quote\""
+                        (when canonical (str " data-source=\"" (escape-html canonical) "\""))
+                        (when url (str " cite=\"" (escape-html url) "\""))
+                        ">" body "</blockquote>")]
+    (if (seq title)
+      (let [[title-html footnotes''] (render-inlines ctx title footnotes')
+            linked (if url
+                     (str "<a href=\"" (escape-html url) "\">" title-html "</a>")
+                     title-html)]
+        [(str "<figure class=\"book-quote-figure\">" quote-html
+              "<figcaption>— <cite>" linked "</cite></figcaption></figure>")
+         footnotes''])
+      [quote-html footnotes'])))
+
 (defn- render-block-quote
   "Renders BlockQuote `block` (sec4.3: `:blocks`, `:attr` optional) as
-  `<blockquote attr>...</blockquote>`. `attr-attrs` here, not a bare
+  `<blockquote attr>...</blockquote>`, or as `<div attr>` (TASK-139)
+  when the node carries the in-memory `:container` marker --
+  `:container :note` additionally writes `role=\"note\"`.
+
+  `haselnuss.cli` sets the marker on every BlockQuote it makes as the
+  vehicle for a lowered directive (theorem-like, admonition, a float's
+  grouping, a panel row): the AST has no generic container Block, and a
+  `<blockquote>` makes assistive technology and reader modes announce a
+  note or a figure grid as a quotation. The marker is a node key, not a
+  class or prop, so an author cannot set it from `.hdoc` source -- an
+  authored `.proof` class on a real quote stays a `<blockquote>`. It is
+  not part of the JSON interchange form; lowering happens in memory
+  just before emission. `attr-attrs` here, not a bare
   `<blockquote>`: BlockQuote carries an `Attr` like every other
   attr-bearing Block, and dropping it silently cost any BlockQuote its id
   -- so a resolved cross-reference to one emitted a link to an anchor
@@ -1382,8 +1665,10 @@
   directive degraded to a BlockQuote by a registry `:lower` rule keeps
   the directive's own id (see `haselnuss.cli`)."
   [ctx block footnotes]
-  (let [[html footnotes'] (render-blocks ctx (:blocks block) footnotes)]
-    [(str "<blockquote" (attr-attrs (:attr block)) ">" html "</blockquote>") footnotes']))
+  (let [[html footnotes'] (render-blocks ctx (:blocks block) footnotes)
+        tag (if (:container block) "div" "blockquote")
+        role (when (= :note (:container block)) " role=\"note\"")]
+    [(str "<" tag (attr-attrs (:attr block)) role ">" html "</" tag ">") footnotes']))
 
 (def built-in-block-handlers
   "The built-in `:t -> (fn [ctx block footnotes] -> [rendered
@@ -1417,6 +1702,7 @@
    ;; between sections of content -- self-closed, since this
    ;; namespace's own test suite parses its output as XML.
    :thematic-break (fn [_ctx _block footnotes] ["<hr/>" footnotes])
+   :book-quote render-book-quote
    :include (fn [_ctx block _footnotes]
               (throw (ex-info (unresolved-include-message block)
                               {:type ::unresolved-include :block block})))})
@@ -1674,10 +1960,88 @@
                      footnotes))
          "</ol></section>")))
 
+(def ^:private mathjax-config
+  "The inline `<script>` setting `window.MathJax` that `emit-document`
+  writes immediately before `mathjax-script` (TASK-217). MathJax reads
+  the global when its own script runs, so this one must come first; it
+  is a classic synchronous script and the CDN one is `async`, so it
+  always has.
+
+  Without it a document's own math could make script: MathJax v3's TeX
+  input autoloads its `html` extension, so `$\\href{javascript:...}{x}$`
+  became a live `javascript:` link and `\\class`/`\\cssId`/`\\style`
+  wrote attributes onto the page, getting around the promise
+  `haselnuss.sanitize` makes for the document (README \"Converting a
+  document you do not trust\"). Each setting closes a different door,
+  read off the MathJax 3.2.2 source -- the exact version
+  `mathjax-script` pins, so these claims stay true -- and checked by
+  rendering in headless Chrome against that CDN build:
+
+  - `tex.autoload.html = []` -- `\\href`, `\\class`, `\\cssId` and
+    `\\style` stay undefined, so they render as an undefined-macro
+    error rather than loading the extension.
+  - `tex.autoload.unicode = []` -- `\\unicode[font]{N}` (the extension's
+    only macro) copies its font argument into the `fontfamily`
+    attribute, which reaches the page's CSS unfiltered (see below).
+  - `tex.packages` minus `require` -- `\\require{html}` would otherwise
+    load the same extension by name (or any other).
+  - `ui/safe` with `safeOptions.allow.URLs = 'none'` -- the base
+    package's own `\\mmlToken{mi}[href=\"...\"]{x}` sets an `href`
+    without any extension, and the safe extension is what filters the
+    MathML attributes TeX produces. With its defaults it also drops an
+    `id` or `class` not starting `mjx-`, and passes a `style` attribute
+    through the browser's own CSS parser keeping only an allow-list of
+    properties (colour, border, margin, padding, font and a few more)
+    with bounded lengths and no `javascript:`/`data:` -- which is what
+    removes a `\\bbox` style's `background:url(...)`.
+    URLs are dropped outright, not left at safe's own `'safe'`: that
+    mode reads the scheme with `/^\\s*([a-z]+):/i`, so `java<TAB>script:`
+    or a leading control character reads as schemeless and is kept,
+    and the browser then strips those characters and runs it. Ordinary
+    math makes no links: a document's references are its own
+    CrossRefs, outside the math, and a MathJax `\\eqref` inside it would
+    lose only its link.
+  - `startup.ready` adds one filter safe lacks. MathJax's HTML output
+    joins a token's `fontfamily`, `fontweight` and `fontstyle` into its
+    `style` attribute as raw text, and safe checks none of the three,
+    so `\\mmlToken{mi}[fontfamily=\"x;position:fixed;...\"]{x}` could
+    cover the page and fetch a third-party image. The hook runs
+    MathJax's own `defaultReady` (which builds the document and its
+    `safe` object) and then maps those three attributes on that object
+    to a filter that keeps a value only if it is letters, digits,
+    spaces, commas, hyphens and underscores -- a plain font-family
+    list, nothing that can end a declaration or open a `url(`. Quotes
+    are refused too: once `\\unicode` is gone no ordinary TeX sets these
+    attributes at all, and an unbalanced quote could swallow the
+    declarations after it. Typesetting starts only after `ready`
+    returns, and if `safe` failed to load the hook throws and MathJax
+    typesets nothing, so it fails closed.
+
+  Every key here is an exact MathJax v3 option name; a misspelt one is
+  only a console warning, so `haselnuss.emit.html-test` pins the string.
+  It must stay well-formed XML (no `<` or `&`). A Content-Security-
+  Policy that forbids inline script would block this config, but the
+  same policy also blocks a `javascript:` link from running."
+  (str "<script>window.MathJax={"
+       "loader:{load:['ui/safe']},"
+       "tex:{packages:{'[-]':['require']},autoload:{html:[],unicode:[]}},"
+       "options:{safeOptions:{allow:{URLs:'none'}}},"
+       "startup:{ready:function(){"
+       "MathJax.startup.defaultReady();"
+       "var s=MathJax.startup.document.safe;"
+       "s.filterMethods.filterFontToken=function(_,v){return /^[-\\w ,]*$/.test(v)?v:null;};"
+       "['fontfamily','fontweight','fontstyle'].forEach(function(a){s.filterAttributes.set(a,'filterFontToken');});"
+       "}}"
+       "};</script>"))
+
 (def ^:private mathjax-script
-  "The MathJax v3 CDN `<script>` tag `emit-document` always includes in
-  `<head>` (AC #2) -- see this namespace's own docstring for why
-  unconditionally, and why no separate config script is needed.
+  "The MathJax v3 CDN `<script>` tag `emit-document` includes in
+  `<head>` when the output has math (TASK-130) -- see this namespace's
+  own docstring, and `mathjax-config` for the inline configuration that
+  always precedes it (TASK-217). Pinned to an exact release, 3.2.2,
+  not the floating `mathjax@3`: what `mathjax-config` guarantees was
+  read off that version's source, and a later 3.x could add a macro or
+  change a filter underneath it.
   `async=\"async\"` (the explicit-value boolean-attribute form), not a
   bare `async`, since this namespace's own test suite (and XML in
   general) requires every attribute to have a value -- a bare `async`
@@ -1686,7 +2050,12 @@
   boolean-attribute convention, so a browser still treats it as present/
   truthy exactly the same way."
   (str "<script id=\"MathJax-script\" async=\"async\""
-       " src=\"https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js\"></script>"))
+       " src=\"https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js\"></script>"))
+
+(defn- has-math?
+  "True when rendered HTML `html` contains a math span or div."
+  [html]
+  (boolean (re-find #"class=\"math (?:inline|display)" html)))
 
 (def default-stylesheet
   "The default stylesheet `emit-document` inlines into `<head>`
@@ -1750,17 +2119,25 @@
     "thead th{border-bottom-width:2px;text-align:left}"
     ;; A degraded directive keeps its own name as a class, which is the
     ;; only thing distinguishing an admonition from a plain quote.
-    "blockquote{margin:1.5rem 0;padding:.1rem 1rem;"
+    ;; TASK-139: those directives are <div>s (see `render-block-quote`),
+    ;; not <blockquote>s, so the quote look is given to both.
+    "blockquote,div.admonition,div.theorem,div.lemma,div.corollary,"
+    "div.definition,div.proof{margin:1.5rem 0;padding:.1rem 1rem;"
     "border-left:3px solid rgba(128,128,128,.4)}"
-    "blockquote.admonition{background:rgba(128,128,128,.08);font-style:italic}"
-    "blockquote.theorem,blockquote.lemma,blockquote.corollary,"
-    "blockquote.definition,blockquote.proof{background:rgba(128,128,128,.08)}"
-    "blockquote.theorem p:first-child,blockquote.lemma p:first-child,"
-    "blockquote.corollary p:first-child,blockquote.definition p:first-child,"
-    "blockquote.proof p:first-child,blockquote.admonition p:first-child{margin-top:.6rem}"
-    "blockquote.theorem p:last-child,blockquote.lemma p:last-child,"
-    "blockquote.corollary p:last-child,blockquote.definition p:last-child,"
-    "blockquote.proof p:last-child,blockquote.admonition p:last-child{margin-bottom:.6rem}"
+    "div.admonition{background:rgba(128,128,128,.08);font-style:italic}"
+    "div.theorem,div.lemma,div.corollary,"
+    "div.definition,div.proof{background:rgba(128,128,128,.08)}"
+    "div.theorem p:first-child,div.lemma p:first-child,"
+    "div.corollary p:first-child,div.definition p:first-child,"
+    "div.proof p:first-child,div.admonition p:first-child{margin-top:.6rem}"
+    "div.theorem p:last-child,div.lemma p:last-child,"
+    "div.corollary p:last-child,div.definition p:last-child,"
+    "div.proof p:last-child,div.admonition p:last-child{margin-bottom:.6rem}"
+    ;; TASK-156: a quoted passage and its source line share a <figure>
+    ;; (see `render-book-quote`), which must not centre the passage the
+    ;; way `figure` below centres an image; the source line sits right.
+    "figure.book-quote-figure{text-align:left}"
+    "figure.book-quote-figure figcaption{text-align:right;font-style:normal}"
     ;; Code: monospace at a readable size, and scrollable rather than
     ;; overflowing, since a code block's lines are not reflowable.
     "pre{overflow-x:auto;padding:.8rem 1rem;background:rgba(128,128,128,.1);"
@@ -1784,23 +2161,21 @@
     ;; author's own `columns` arrangement -- one row element per N
     ;; panels, decided when the directive was lowered -- so the panels
     ;; only have to share the row's width, never decide how many of them
-    ;; fit. `blockquote` because that is the Block a lowered directive
-    ;; has to group children in (see `haselnuss.cli`), which means
-    ;; undoing the quote styling the rule above gives every one of them.
-    "blockquote.subfigures{margin:0;padding:0;border-left:none}"
+    ;; fit. They are plain <div>s (TASK-139), which carry no quote
+    ;; styling, so there is nothing to undo.
+    "div.subfigures{margin:0}"
     ;; A grid, not a flex row: the row carries its own track count as an
     ;; inline style (see `haselnuss.cli/panel-rows`), so a trailing
     ;; partial row leaves its empty tracks empty and its panel keeps the
     ;; width its siblings have -- which is the width the LaTeX side
     ;; gives every panel. Flex-grow stretched a lone last panel across
     ;; the full line while the PDF kept it at half (found by review).
-    "blockquote.subfigure-row{display:grid;gap:1rem;align-items:end;"
-    "margin:0;padding:0;border-left:none}"
+    "div.subfigure-row{display:grid;gap:1rem;align-items:end;margin:0}"
     ;; A descendant selector, not a `>` child one: this namespace's own
     ;; documented stylesheet constraint is that its tests parse the
     ;; output as XML, where a bare `>` inside <style> is invalid. The
     ;; only figures inside a row are its own panels anyway.
-    "blockquote.subfigure-row figure{margin:.5rem 0}"
+    "div.subfigure-row figure{margin:.5rem 0}"
     "figure.subfigure figcaption{text-align:center}"
     ;; TASK-59: the three derived lists. The entries print their own
     ;; numbers, so the browser's list markers would set a second,
@@ -1995,8 +2370,9 @@
   `<head>` carrying a UTF-8 charset declaration, a `<title>` (from
   `meta.title`'s own `plain-text` rendering, or the literal string
   \"Untitled document\" when `meta.title` is absent/empty -- a valid HTML5
-  document always has a `<title>`) and the MathJax CDN `<script>` tag (AC
-  #2, `mathjax-script`), and a `<body>` holding the rendered Blocks (AC
+  document always has a `<title>`) and, when the document has math, the MathJax CDN `<script>` tag
+  (`mathjax-script`) preceded by its inline configuration
+  (`mathjax-config`, TASK-217), and a `<body>` holding the rendered Blocks (AC
   #1/#2/#3/#4) followed by the accumulated footnote list, if any (AC #3
   of TASK-19, `footnotes-section`).
 
@@ -2108,6 +2484,12 @@
           ;; correct for any HTML document, styled or not.
           "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
           "<title>" (escape-html title-text) "</title>"
-          (stylesheet-tag (:stylesheet opts)) mathjax-script "</head>"
+          (stylesheet-tag (:stylesheet opts))
+          (when (and (not (false? (:mathjax opts)))
+                     (has-math? (str title-html front-html body
+                                     (footnotes-section footnotes))))
+            ;; TASK-217: the config first -- MathJax reads it on load.
+            (str mathjax-config mathjax-script))
+          "</head>"
           "<body>" title-html front-html body (footnotes-section footnotes) "</body>"
           "</html>"))))

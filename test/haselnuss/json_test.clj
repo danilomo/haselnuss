@@ -16,7 +16,7 @@
 
 (def every-inline
   "One example of every Inline variant (sec4.4), all in one vector, so a
-  single Para below exercises all 20 in one place."
+  single Para below exercises all 21 in one place."
   [{:t :str :text "hi"}
    {:t :space}
    {:t :soft-break}
@@ -30,9 +30,23 @@
    {:t :code :text "x"}
    {:t :math-inline :tex "x"}
    {:t :link :target "https://example.com" :inlines [{:t :str :text "x"}] :attr attr}
-   {:t :image :src "x.png" :alt "x" :attr attr}
+   {:t :image :src "x.png" :title "An image" :alt "x" :attr attr}
+   {:t :link :target "https://example.com" :title "A link" :inlines [{:t :str :text "x"}] :attr attr}
    {:t :span :inlines [{:t :str :text "x"}] :attr attr}
    {:t :cross-ref :label "fig:tree" :suppress-prefix true}
+   ;; TASK-152: unresolved, as the parser writes it, and resolved, every
+   ;; optional field set -- `:passage`'s `:form` is the one keyword enum
+   ;; the JSON boundary has to turn back from a string.
+   {:t :book-ref :ref "bible:romanos#14:8"}
+   {:t :book-ref :ref "bible:romanos#14:8"
+    :passage {:form :locator :locator "14:8"}
+    :canonical "bible:scripture/nt/romanos#14:8"
+    :text [{:t :emph :inlines [{:t :str :text "Romanos 14:8"}]}]
+    :url "https://example.org/romanos#14:8"}
+   {:t :book-ref :ref "reformed:heidelberg#sec:q1..sec:q3"
+    :passage {:form :range :from "sec:q1" :to "sec:q3"}}
+   {:t :book-ref :ref "reformed:heidelberg#sec:q1"
+    :passage {:form :label :label "sec:q1"}}
    {:t :cite :items [{:key "smith2020" :mode :normal}
                      {:key "doe2021" :mode :author
                       :prefix [{:t :str :text "see"}]
@@ -43,8 +57,8 @@
     :attr attr}])
 
 (def document
-  "A whole Document exercising every one of the 11 Block variants (sec4.3)
-  and, via `every-inline`, every one of the 20 Inline variants (sec4.4),
+  "A whole Document exercising every one of the 12 Block variants (sec4.3)
+  and, via `every-inline`, every one of the 21 Inline variants (sec4.4),
   nested realistically rather than as a flat list."
   ;; `:top-level-division` is a keyword-valued enum, unlike every other
   ;; Meta field (TASK-53), so it is in the fixture rather than only in
@@ -75,17 +89,23 @@
       {:t :directive :name "theorem" :blocks [] :attr attr
        :fallback {:kind :poster :src "poster.png" :caption [{:t :str :text "poster"}]}}
       {:t :include :src "chapters/intro.hzn"}
+      {:t :book-quote :ref "bible:romanos#14:8-9"}
+      {:t :book-quote :ref "reformed:heidelberg#sec:q1..sec:q3"
+       :canonical "reformed:confessions/reformed/heidelberg#sec:q1..sec:q3"
+       :title [{:t :str :text "Heidelberg Catechism, Section 1"}]
+       :blocks [{:t :para :inlines [{:t :str :text "Q1."}]}]
+       :url "https://example.org/heidelberg.html#sec:q1"}
       {:t :thematic-break}]}]})
 
 (def all-block-tags
   "Every Block variant tag (sec4.3)."
   #{:section :para :list :code-block :math-block :figure :table
-    :block-quote :directive :include :thematic-break})
+    :block-quote :directive :include :book-quote :thematic-break})
 
 (def all-inline-tags
   "Every Inline variant tag (sec4.4)."
   #{:str :space :soft-break :line-break :emph :strong :strike :small-caps
-    :sub :sup :code :math-inline :link :image :span :cross-ref :cite :note
+    :sub :sup :code :math-inline :link :image :span :cross-ref :book-ref :cite :note
     :highlight :sticky-note})
 
 (defn- used-tags
@@ -99,8 +119,8 @@
 
 (deftest document-round-trip-test
   (testing "the fixture Document is itself valid, exercising every Block/Inline variant"
-    (is (= 11 (count all-block-tags)))
-    (is (= 20 (count all-inline-tags)))
+    (is (= 12 (count all-block-tags)))
+    (is (= 21 (count all-inline-tags)))
     (is (set/subset? all-block-tags (used-tags document))
         "document should exercise every Block variant")
     (is (set/subset? all-inline-tags (used-tags document))
@@ -145,9 +165,9 @@
       (is (= "#/definitions/haselnuss.ast~1document" (:$ref schema)))
       (is (contains? (:definitions schema) "haselnuss.ast/block"))
       (is (contains? (:definitions schema) "haselnuss.ast/inline"))
-      (is (= 11 (-> schema :definitions (get "haselnuss.ast/block") :oneOf count))
+      (is (= 12 (-> schema :definitions (get "haselnuss.ast/block") :oneOf count))
           "one oneOf branch per Block variant")
-      (is (= 20 (-> schema :definitions (get "haselnuss.ast/inline") :oneOf count))
+      (is (= 21 (-> schema :definitions (get "haselnuss.ast/inline") :oneOf count))
           "one oneOf branch per Inline variant")))
   (testing "the generated schema is itself well-formed, serializable JSON"
     (let [text (data-json/write-str json/document-json-schema)

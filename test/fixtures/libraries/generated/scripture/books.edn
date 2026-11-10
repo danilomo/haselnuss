@@ -1,0 +1,4 @@
+;; Slug and title of each book in biblia.json, by its abbreviation.
+{"jo" {:slug "joao" :title "João"}
+ "rm" {:slug "romanos" :title "Romanos"}
+ "hb" {:slug "hebreus" :title "Hebreus"}}

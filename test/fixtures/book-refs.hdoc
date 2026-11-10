@@ -1,0 +1,20 @@
+---
+title: Book references
+lang: pt-BR
+---
+
+# Proof texts {#sec:proofs}
+
+We are the Lord's (@{bible:romanos#14:8}), as the catechism's first answer
+says (@{reformed:confessions/reformed/heidelberg#sec:q1}), while a bare
+@sec:proofs is still a local cross-reference. A short form
+@{reformed:heidelberg#sec:q1..sec:q3} and a malformed @{Not A Ref} are both
+kept exactly as written; a literal @\{not:a-ref} stays prose.
+
+!quote bible:romanos#14:8-9
+
+:::{small-collapsable summary="Romanos 14:8" label="(2)"}
+!quote bible:romanos#14:8
+:::
+
+!quote reformed:heidelberg#sec:q1..sec:q3

@@ -1,4 +1,4 @@
-(ns haselnuss.degradation-test
+(ns ^:parallel haselnuss.degradation-test
   "The graceful-degradation contract, end to end (TASK-28).
 
   SPEC.md sec2/sec8.3's promise is that a `.hdoc` always produces a

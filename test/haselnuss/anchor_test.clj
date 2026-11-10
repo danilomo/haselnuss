@@ -289,7 +289,10 @@
            :figure {:t :figure :content (para (s "x")) :caption [needle] :attr attr}
            :table {:t :table :head {:cells []} :rows [] :caption [needle]
                    :colspec [] :attr attr}
-           :meta {:meta {:title [needle]} :blocks []}}
+           :meta {:meta {:title [needle]} :blocks []}
+           ;; TASK-152: a resolved quote's passage title, the one Inline
+           ;; field the book-quote Block has.
+           :book-quote {:t :book-quote :ref "bible:romanos#14:8" :title [needle]}}
           extra-containers
           {:table-cell {:t :table :head {:cells [{:blocks [(para needle)]}]} :rows []
                         :caption [] :colspec [] :attr attr}
@@ -529,6 +532,34 @@
       (is (= [:annotation-anchor-snapped] (mapv :type diagnostics)))
       (is (= :math-inline (:node-type (first diagnostics))))
       (is (str/includes? (:message (first diagnostics)) "math-inline")))))
+
+(deftest book-ref-is-atomic-test
+  (testing "TASK-152: a resolved :book-ref is ATOMIC, like a :cross-ref --
+            its computed link text is read across but never cut into, so
+            a boundary inside it snaps outward over the whole node"
+    (let [book-ref {:t :book-ref :ref "bible:romanos#14:8"
+                    :text [(s "Romanos 14:8")]}
+          [document diagnostics] (annotate (para (s "see ") book-ref (s " now")) "see Romanos")]
+      (is (= [:annotation-anchor-snapped] diagnostics))
+      (is (= [{:t :highlight :inlines [(s "see ") book-ref] :attr attr}
+              (s " now")]
+             (inlines-of document))
+          "the :book-ref is wrapped whole, its :text untouched")))
+  (testing "a quote entirely inside its text does not descend into it either"
+    (let [book-ref {:t :book-ref :ref "bible:romanos#14:8"
+                    :text [{:t :emph :inlines [(s "Romanos")]} (s " 14:8")]}
+          [document diagnostics] (annotate (para (s "see ") book-ref) "Romanos")]
+      (is (= [:annotation-anchor-snapped] diagnostics))
+      (is (= [(s "see ") {:t :highlight :inlines [book-ref] :attr attr}]
+             (inlines-of document)))))
+  (testing "and a sticky note edge inside it moves to a seam beside it"
+    (let [book-ref {:t :book-ref :ref "bible:x" :text [(s "Romanos 14:8")]}
+          node (para (s "see ") book-ref (s " now"))
+          {matched :range} (anchor/resolve-anchor node {:text "see Romanos"})
+          {:keys [document diagnostics]}
+          (anchor/apply-annotation node matched {:sticky-note (sticky "N") :at :end})]
+      (is (= [:annotation-anchor-snapped] (mapv :type diagnostics)))
+      (is (= [(s "see ") book-ref (sticky "N") (s " now")] (inlines-of document))))))
 
 (deftest sticky-note-is-a-point-not-a-range-test
   (testing "AC #6: a sticky note anchored with at=end is inserted

@@ -297,6 +297,38 @@
   [renderer]
   (boolean (::v2 (meta renderer))))
 
+;; --- fragment provenance (TASK-213) ------------------------------------------
+;;
+;; An emitter's `Rendered` is spliced verbatim, so a v2 renderer must not be
+;; able to make one with text of its own choosing. It cannot construct one
+;; (`->Rendered` is not in the sandbox), but it can change one it was given:
+;; `assoc`/`merge`/`into` on a record keep its type. So an emitter's
+;; `render-directive` opens a fresh `issued-fragments` set per call, its ctx
+;; callbacks `issue!` every `Rendered` they return into it, and an untrusted
+;; renderer's result may splice only a `Rendered` that is `issued?` there --
+;; by identity, since an `assoc`ed copy is a new instance. The set itself is
+;; never put in the ctx a renderer sees: only the callbacks close over it.
+
+(defn issued-fragments
+  "A fresh, empty identity set of fragments issued for one renderer call.
+  Synchronized: a sandboxed renderer calls its ctx callbacks on its own
+  worker thread (`haselnuss.sandbox`)."
+  ^java.util.Set []
+  (java.util.Collections/synchronizedSet
+   (java.util.Collections/newSetFromMap (java.util.IdentityHashMap.))))
+
+(defn issue!
+  "Records `fragment` in `issued` (an `issued-fragments` set, or nil for
+  none) and returns `fragment`."
+  [^java.util.Set issued fragment]
+  (when issued (.add issued fragment))
+  fragment)
+
+(defn issued?
+  "True when this very `fragment` instance was `issue!`d into `issued`."
+  [^java.util.Set issued fragment]
+  (boolean (and issued (.contains issued fragment))))
+
 (defn lookup
   "The entry registered under `name` in `registry`, or nil if `name` has
   no entry at all -- the \"no registry entry\" half of AC #3's

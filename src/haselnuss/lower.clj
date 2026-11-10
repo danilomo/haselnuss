@@ -46,6 +46,7 @@
   of `haselnuss.resolver`."
   (:require [haselnuss.ast :as ast]
             [haselnuss.registry :as registry]
+            [haselnuss.sanitize :as sanitize]
             [haselnuss.walk :as walk]))
 
 ;; Fallback application (sec4.5, AC #3)
@@ -337,7 +338,14 @@
                   (if (= :directive (:t block))
                     (lower-directive ctx block)
                     [block]))
-                (validate-lowered! directive target branch blocks))))))
+                (cond->> (validate-lowered! directive target branch blocks)
+                  ;; TASK-215: an untrusted extension's `:lower` rule
+                  ;; output joins the document after `haselnuss.sanitize`
+                  ;; ran, so it is vetted here exactly as what its renderer
+                  ;; hands `:render-blocks` is -- the document pass's
+                  ;; rules, warned about, and the TeX allow-list, refused.
+                  (and (= :lower-rule branch) (not (:trusted entry)))
+                  ((sanitize/fragment-vetter directive false) :blocks)))))))
 
 ;; Traversal (TASK-85): every position but `lower-directive`'s own decision
 ;; is reached through `haselnuss.walk/rewrite`, driven off the schema
@@ -398,7 +406,9 @@
 
   Returns the fully lowered Document directly -- there is nothing to
   report on success (unlike `haselnuss.resolver`'s passes, this one
-  produces no diagnostics/warnings of its own); a node with no
+  returns no diagnostics/warnings of its own -- what it drops from an
+  untrusted extension's `:lower` output, TASK-215, goes to
+  `haselnuss.sanitize/*untrusted-diagnostics*`); a node with no
   representation at all raises `ex-info` instead (AC #4), so a caller sees
   either a complete, emitter-ready Document or an exception naming the
   offending node, never a partially-lowered tree.

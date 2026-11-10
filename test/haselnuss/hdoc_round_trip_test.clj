@@ -200,8 +200,52 @@
             emitter has to write each one back so it re-parses to the
             same directive -- including the one-line `!highlight{...}`
             form, which TASK-115 made the emitter choose for a body-less
-            directive"
+            directive.
+
+            The rest are TASK-151's fixture libraries under
+            test/fixtures/libraries/, books and non-books alike (an
+            !include'd chapter, ignored and invalidly named files)."
     (let [names (into #{} (map (fn [^File f] (.getName f))) (committed-hdoc-files))]
       (is (= #{"catecismo-heidelberg.hdoc" "draft.hdoc" "hazelnuts.hdoc" "review.hdoc"
-               "reveal-demo.hdoc" "thesis.hdoc" "cross-format.hdoc"}
+               "reveal-demo.hdoc" "thesis.hdoc" "cross-format.hdoc"
+               ;; test/fixtures/libraries/ (TASK-151)
+               "heidelberg.hdoc" "book.hdoc" "ch01.hdoc" "Not_A_Book.hdoc" "apostles.hdoc"
+               "Nicene.hdoc" "notes.hdoc" "Bad Name.hdoc" "hidden-by-shelf.hdoc" "wip.hdoc"
+               "secret.hdoc" "_skip.hdoc" ".dotted.hdoc" "same.hdoc" "other.hdoc"
+               ;; TASK-152
+               "book-refs.hdoc"
+               ;; test/fixtures/libraries/passages/ (TASK-153)
+               "comfort.hdoc" "nicene.hdoc"
+               ;; ... and its book that quotes (TASK-154)
+               "quoting.hdoc"
+               ;; test/fixtures/libraries/generated/, beside a generated shelf (TASK-158)
+               "salmos-notas.hdoc"
+               ;; test/fixtures/catechism/, the excerpt that quotes its
+               ;; proof texts with !quote inside small-collapsable (TASK-159)
+               "catecismo-domingo-1.hdoc"}
              names)))))
+
+(deftest book-refs-fixture-test
+  (testing "TASK-152 AC #4: test/fixtures/book-refs.hdoc, which
+            `hdoc-round-trip-test` holds to both properties above, really
+            does contain both book nodes -- so that round trip is not
+            vacuous -- and the emitter writes each ref back verbatim"
+    (let [src (slurp "test/fixtures/book-refs.hdoc")
+          document (parser/parse src)
+          out (hdoc/emit-document document)
+          refs (fn [t] (->> (tree-seq coll? seq document)
+                            (filter #(and (map? %) (= t (:t %))))
+                            (mapv :ref)))]
+      (is (= ["bible:romanos#14:8" "reformed:confessions/reformed/heidelberg#sec:q1"
+              "reformed:heidelberg#sec:q1..sec:q3" "Not A Ref"]
+             (refs :book-ref)))
+      (is (= ["bible:romanos#14:8-9" "bible:romanos#14:8" "reformed:heidelberg#sec:q1..sec:q3"]
+             (refs :book-quote)))
+      (is (= ["sec:proofs"] (mapv :label (filter #(and (map? %) (= :cross-ref (:t %)))
+                                                 (tree-seq coll? seq document))))
+          "the bare @sec:proofs stays a cross-reference")
+      (doseq [written (refs :book-ref)]
+        (is (str/includes? out (str "@{" written "}")) written))
+      (doseq [written (refs :book-quote)]
+        (is (str/includes? out (str "!quote " written "\n")) written))
+      (is (str/includes? out "@\\{not:a-ref}")))))

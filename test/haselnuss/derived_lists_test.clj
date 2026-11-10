@@ -1,4 +1,4 @@
-(ns haselnuss.derived-lists-test
+(ns ^:parallel haselnuss.derived-lists-test
   "The table of contents, list of figures and list of tables an author
   can place in a document (TASK-59).
 

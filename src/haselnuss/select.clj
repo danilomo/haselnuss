@@ -81,6 +81,28 @@
   [actual]
   (if (keyword? actual) (name actual) (str actual)))
 
+(deftype ^:private InterruptibleChars [^CharSequence s]
+  ;; `java.util.regex` never checks for an interrupt, so a catastrophically
+  ;; backtracking pattern (`#"(a+)+$"` against a long run of `a`s ending in
+  ;; `b`) would run on in a sandbox worker after its timeout -- where
+  ;; `Thread.stop` is gone (JDK 20+, the native image), for good. Every
+  ;; character the matcher reads goes through `charAt`, so checking the
+  ;; flag there ends the match when the worker is interrupted (TASK-214).
+  CharSequence
+  (charAt [_ i]
+    (when (.isInterrupted (Thread/currentThread))
+      (throw (InterruptedException. "regex match interrupted")))
+    (.charAt s i))
+  (length [_] (.length s))
+  (subSequence [_ start end] (InterruptibleChars. (.subSequence s start end)))
+  (toString [_] (.toString s)))
+
+(defn- regex-find?
+  "Whether `pattern` finds a match in `subject`, read through
+  `InterruptibleChars` so an interrupted thread stops matching."
+  [^java.util.regex.Pattern pattern ^String subject]
+  (.find (.matcher pattern (InterruptibleChars. subject))))
+
 (defn- match-value
   "The one value-matching rule every map key shares (see the namespace
   docstring): `expected` is matched against `actual` by its own kind --
@@ -96,7 +118,7 @@
   [expected actual]
   (cond
     (set? expected) (contains? expected actual)
-    (instance? java.util.regex.Pattern expected) (boolean (re-find expected (regex-subject actual)))
+    (instance? java.util.regex.Pattern expected) (regex-find? expected (regex-subject actual))
     (fn? expected) (boolean (expected actual))
     :else (= expected actual)))
 
@@ -155,6 +177,8 @@
     :math-inline (:tex node)
     :image (:alt node)
     :cross-ref (or (:text node) "")
+    ;; TASK-152: like `:cross-ref`, only text resolution supplied.
+    :book-ref (inlines->text (:text node))
     :cite (apply join-parts (map cite-item-text (:items node)))
     ;; A sticky note's body is prose about the document rather than prose
     ;; in it, but it is prose all the same: `:text` selects on what a node
@@ -175,6 +199,8 @@
                        (inlines->text (:caption node)))
     :block-quote (blocks->text (:blocks node))
     :directive (blocks->text (:blocks node))
+    ;; TASK-152: the spliced passage, once quote expansion supplied one.
+    :book-quote (blocks->text (:blocks node))
 
     ;; :include's :src and :thematic-break carry no prose at all.
     (:include :thematic-break) ""

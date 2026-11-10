@@ -1,0 +1,9 @@
+---
+title: Heidelberg Catechism
+lang: en
+bibliography: refs.json
+---
+
+!include parts/comfort.hdoc
+
+!include parts/missing.hdoc

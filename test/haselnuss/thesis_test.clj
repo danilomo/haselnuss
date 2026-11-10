@@ -1,4 +1,4 @@
-(ns haselnuss.thesis-test
+(ns ^:parallel haselnuss.thesis-test
   "The thesis-shaped end-to-end fixture (TASK-61).
 
   Everything else that converts a whole document here is paper-shaped:
@@ -111,6 +111,12 @@
                 document of this shape should produce is none at all"
         (is (empty? (:diagnostics html)) (pr-str (:diagnostics html)))
         (is (empty? (:diagnostics tex)) (pr-str (:diagnostics tex))))
+      (testing "and --untrusted accepts it unchanged: its math and image paths are on
+                the allow-list (TASK-219)"
+        (let [strict (build! dir {:target "latex" :untrusted true
+                                  :output (str (io/file dir "thesis.tex"))})]
+          (is (= body (:output strict)))
+          (is (empty? (:diagnostics strict)) (pr-str (:diagnostics strict)))))
       (testing "chapters (TASK-53)"
         (is (str/starts-with? body "\\documentclass{report}"))
         (is (str/includes? body "\\chapter{Introduction}"))

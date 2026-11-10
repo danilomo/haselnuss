@@ -207,6 +207,24 @@
 
 ;; --- AC #7: no dependency beyond clojure.core and clojure.string -----------
 
+(deftest regex-match-stops-on-interrupt-test
+  (testing "TASK-214: a catastrophically backtracking regex stops when its
+            thread is interrupted -- what a sandbox worker is sent on
+            timeout, and all there is where Thread.stop is gone (JDK 20+)"
+    (let [result (promise)
+          worker (Thread. ^Runnable
+                  (fn []
+                    (deliver result
+                             (try (select/matches? {:text #"(.*a){12}b"}
+                                                   {:t :str :text (apply str (repeat 50 "a"))})
+                                  (catch InterruptedException _ :interrupted)))))]
+      (.setDaemon worker true)
+      (.start worker)
+      (Thread/sleep 200)
+      (is (not (realized? result)) "the pattern backtracks for longer than 200 ms")
+      (.interrupt worker)
+      (is (= :interrupted (deref result 5000 :still-running))))))
+
 (deftest namespace-dependencies-test
   (testing "the only aliased namespace this namespace requires is
             clojure.string -- clojure.core needs no alias to be used"

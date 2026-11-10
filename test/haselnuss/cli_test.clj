@@ -1,4 +1,4 @@
-(ns haselnuss.cli-test
+(ns ^:parallel haselnuss.cli-test
   "Fixtures for `haselnuss.cli` (TASK-25): the parse -> resolve -> lower
   -> emit pipeline.
 
@@ -94,13 +94,21 @@
                     (io/file dir "pic.png"))
      dir)))
 
+(def ^:private no-libraries
+  "TASK-157: what every build here gets in place of the process
+  environment and home folder, so no test reads the real
+  `$HASELNUSS_LIBRARIES` or `~/.config/haselnuss/libraries.yaml`: an empty
+  environment and a home folder that does not exist."
+  {:library-env {} :library-home "/nonexistent/haselnuss-test-home"})
+
 (defn- build!
   "`cli/build` over `dir`'s own `doc.hdoc` with `opts`, returning
   `{:output-path :diagnostics :output}` -- the last being the text
   actually written to disk, so assertions read the file rather than
   trusting the return value."
   [dir opts]
-  (let [result (cli/build (merge {:input (str (io/file dir "doc.hdoc")) :target "html"} opts))]
+  (let [result (cli/build (merge {:input (str (io/file dir "doc.hdoc")) :target "html"}
+                                 no-libraries opts))]
     (assoc result :output (slurp (:output-path result)))))
 
 (deftest html-target-test
@@ -120,7 +128,8 @@
         (is (str/includes? output "Figure 1.1: A hazel tree."))
         (is (str/includes? output "<a href=\"#fig:tree\">Figure 1.1</a>"))
         (is (str/includes? output "\\[E = mc^2\\]"))
-        (is (str/includes? output "<blockquote id=\"thm:main\" class=\"theorem\">"))
+        (is (str/includes? output "<div id=\"thm:main\" class=\"theorem\">"))
+        (is (not (str/includes? output "<blockquote")) "a theorem is not a quotation")
         (is (str/includes? output "<strong>Theorem 1</strong>")
             "the degraded head must carry the resolver's own number, matching the cross-reference to it")
         (is (str/includes? output "Knuth, D. (1984). The TeXbook."))
@@ -209,6 +218,20 @@
           flagged (:output (build! dir {:target "json" :computed-numbers true
                                         :fragment true :no-stylesheet true}))]
       (is (= plain flagged)))))
+
+(deftest json-target-leaves-book-nodes-unresolved-test
+  (testing "TASK-156 AC #3 (doc-10 \"Emitters\"): the json target runs no
+            resolve, so a book link and a quote come out exactly as parsed
+            -- only `:ref`, as written -- as an `!include` does"
+    (let [{:keys [output diagnostics]}
+          (cli/run "See @{bible:romanos#14:8}.\n\n!quote reformed:heidelberg#sec:q1..sec:q3\n"
+                   {:target "json"})
+          nodes (ast-nodes (json/json->ast output))]
+      (is (= [] diagnostics))
+      (is (= [{:t :book-ref :ref "bible:romanos#14:8"}]
+             (filterv #(= :book-ref (:t %)) nodes)))
+      (is (= [{:t :book-quote :ref "reformed:heidelberg#sec:q1..sec:q3"}]
+             (filterv #(= :book-quote (:t %)) nodes))))))
 
 (deftest json-target-coalesces-prose-test
   (testing "AC #1/#5 (TASK-81): a plain-prose paragraph decodes
@@ -450,7 +473,7 @@
       ([] (registry/register (build-registry) widget))
       ([labels] (registry/register (build-registry labels) widget)))))
 
-(deftest unescapable-image-path-diagnostic-independent-hazards-test
+(deftest ^:serial unescapable-image-path-diagnostic-independent-hazards-test
   (testing "TASK-89 review comments #16/#18: an ordinary core Image's own
             hazard and an UNRELATED trusted extension's own independent
             :raw hazard, both STRAY-OPEN-brace shaped -- the one shape
@@ -533,11 +556,11 @@
   (testing "AC #5: a parse error aborts the build too"
     (let [dir (fixture-dir! ":::{note}\nunterminated\n")]
       (is (thrown? clojure.lang.ExceptionInfo (build! dir {})))))
-  (testing "AC #5: a missing input file is a usage error"
+  (testing "AC #5 / TASK-138: a missing input file is an input error, not a usage error"
     (let [e (is (thrown? clojure.lang.ExceptionInfo
                          (cli/build {:input "/nonexistent/nope.hdoc" :target "html"})))]
-      (is (= :haselnuss.cli/usage-error (:type (ex-data e))))))
-  (testing "TASK-113 AC #1: a directory given as the input is a usage
+      (is (= :haselnuss.cli/input-error (:type (ex-data e))))))
+  (testing "TASK-113 AC #1: a directory given as the input is an input
             error too, but reports that it IS a directory rather than
             reusing the missing-file message -- the path is there, it is
             simply not a file, the same distinction
@@ -547,7 +570,7 @@
                                               (make-array FileAttribute 0)))
           e (is (thrown? clojure.lang.ExceptionInfo
                          (cli/build {:input dir :target "html"})))]
-      (is (= :haselnuss.cli/usage-error (:type (ex-data e))))
+      (is (= :haselnuss.cli/input-error (:type (ex-data e))))
       (is (str/includes? (ex-message e) "directory"))
       (is (str/includes? (ex-message e) dir))
       (is (not (str/includes? (ex-message e) "not found"))
@@ -690,8 +713,14 @@
           "exactly the two heads, so a third invented one would fail here")
       (testing "and the degraded node still says what it was, so parity
                 is not bought by erasing the only marker"
-        (is (str/includes? html "<blockquote class=\"admonition\">"))
-        (is (str/includes? html "<blockquote class=\"proof\">")))
+        (is (str/includes? html "<div class=\"admonition\" role=\"note\">"))
+        (is (str/includes? html "<div class=\"proof\">")))
+      (testing "TASK-139: a theorem's caption= is not written out as an
+                invalid attribute (LaTeX never prints it either)"
+        (let [dir2 (fixture-dir! ":::{theorem #thm:c caption=\"Named\"}\nBody.\n:::\n")
+              html2 (:output (build! dir2 {}))]
+          (is (not (str/includes? html2 "caption=")))
+          (is (str/includes? html2 "<div id=\"thm:c\" class=\"theorem\">"))))
       (testing "an authored class is kept alongside the directive's name"
         (let [out (:output (build! (fixture-dir! ":::{admonition .warning}\nx\n:::\n") {}))]
           (is (str/includes? out "class=\"warning admonition\"")))))))
@@ -732,7 +761,7 @@
   [& args]
   (let [err (java.io.StringWriter.)
         out (java.io.StringWriter.)
-        status (binding [*err* err *out* out] (cli/main* args))]
+        status (binding [*err* err *out* out] (cli/main* args no-libraries))]
     {:status status :out (str out) :err (str err)}))
 
 (defn- no-warnings?
@@ -784,7 +813,10 @@
     (let [bad (main-run "--nope" "x.hdoc")]
       (is (= 2 (:status bad)))
       (is (str/includes? (:err bad) "haselnuss: error: unknown option"))
-      (is (str/includes? (:err bad) "Usage: haselnuss")))
+      (is (str/includes? (:err bad) "--help"))
+      (is (not (str/includes? (:err bad) "Usage: haselnuss"))
+          "TASK-138: only a one-line pointer, not the whole usage text")
+      (is (< (count (str/split-lines (:err bad))) 4)))
     (let [help (main-run "--help")]
       (is (= 0 (:status help)))
       (is (str/includes? (:out help) "Usage: haselnuss"))
@@ -815,7 +847,7 @@
     (let [{:keys [out]} (main-run "--version" "--help")]
       (is (str/includes? out "Usage: haselnuss")))
     (let [{:keys [status err]} (main-run "--" "--version")]
-      (is (= 2 status))
+      (is (= 1 status))
       (is (str/includes? err "input file not found: --version")))))
 
 (deftest directory-vs-missing-vs-unreadable-input-test
@@ -824,23 +856,23 @@
             pins all three together so a future change to one cannot
             silently blur it back into another"
     (testing "AC #2: a genuinely nonexistent path is reported as not
-              found, exit 2, with the usage text printed"
+              found, exit 1 (TASK-138), no usage text"
       (let [{:keys [status err]} (main-run "/nonexistent/nope.hdoc")]
-        (is (= 2 status))
+        (is (= 1 status))
         (is (str/includes? err "haselnuss: error: input file not found: /nonexistent/nope.hdoc"))
-        (is (str/includes? err "Usage: haselnuss"))))
+        (is (not (str/includes? err "Usage: haselnuss")))))
     (testing "AC #1: a directory is reported as a directory, not as
-              missing, still exit 2 with the usage text printed -- same
+              missing, exit 1 with no usage text (TASK-138) -- same
               treatment as the nonexistent-path case above except for
               the message itself, which is now true of what is actually
               there"
       (let [dir (str (Files/createTempDirectory "haselnuss-cli-test-dir"
                                                 (make-array FileAttribute 0)))
             {:keys [status err]} (main-run dir)]
-        (is (= 2 status))
+        (is (= 1 status))
         (is (str/includes? err (str "haselnuss: error: input path is a directory: " dir)))
         (is (not (str/includes? err "not found")))
-        (is (str/includes? err "Usage: haselnuss"))))
+        (is (not (str/includes? err "Usage: haselnuss")))))
     (testing "AC #3: a file that exists but cannot be read keeps its
               current message and exit code -- unaffected by the
               directory check above, since it is a plain file as far as
@@ -909,7 +941,8 @@
               silently discarded -- --computed-numbers=false used to turn
               the flag ON"
       (doseq [arg ["--computed-numbers=false" "--help=nonsense" "--version=nonsense"
-                   "--no-stylesheet=false" "--trusted-extensions=nonsense"]]
+                   "--no-stylesheet=false" "--trusted-extensions=nonsense"
+                   "--untrusted=false"]]
         (let [{:keys [status err]} (main-run arg input)]
           (is (= 2 status) arg)
           (is (str/includes? err "takes no value") arg))))
@@ -1125,7 +1158,7 @@
   naively be expected to hold."
   #{"doc.hdoc" "refs.json" "pic.png"})
 
-(deftest in-place-test
+(deftest ^:serial in-place-test
   (testing "AC #1 (TASK-101): --in-place writes the converted document
             over the input file itself, nothing on stdout, and the file
             now holds hdoc's own canonical re-spelling -- proven the
@@ -1417,7 +1450,9 @@
           {:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))
           html (slurp (io/file dir "doc.html"))]
       (is (= 0 status) err)
-      (is (str/includes? err "haselnuss: warning: cannot include \"nowhere/missing.hdoc\""))
+      (is (str/includes? err (str "haselnuss: warning: " (io/file dir "doc.hdoc")
+                                  ":5: cannot include \"nowhere/missing.hdoc\""))
+          "TASK-163: and names the !include line that asked for it")
       (is (str/includes? html "Kept."))
       (is (str/includes? html "Also kept."))))
   (testing "AC #3: a cycle is a diagnostic naming the chain, not a hang
@@ -1428,7 +1463,8 @@
       (let [{:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))
             html (slurp (io/file dir "doc.html"))]
         (is (= 0 status) err)
-        (is (str/includes? err "haselnuss: warning: include cycle"))
+        (is (str/includes? err (str "haselnuss: warning: " (io/file dir "b.hdoc") ":3: include cycle"))
+            "TASK-163: at the !include that closes the loop, in the file it is written in")
         (is (str/includes? html "A.") "everything outside the loop still converts")
         (is (str/includes? html "B.")))))
   (testing "a loop back to the document being built is a cycle too: the
@@ -1467,10 +1503,12 @@
       (spit (io/file dir "broken.hdoc") ":::{!!!}\nx\n:::\n")
       (let [{:keys [status err]} (main-run (str (io/file dir "doc.hdoc")))]
         (is (= 1 status))
-        (is (str/includes? err "haselnuss: warning: cannot include \"gone.hdoc\""))
-        (is (str/includes? err "haselnuss: error: cannot include \"broken.hdoc\""))
-        (is (< (.indexOf err "haselnuss: warning: cannot include \"gone.hdoc\"")
-               (.indexOf err "haselnuss: error: cannot include \"broken.hdoc\"")))
+        (let [doc (str (io/file dir "doc.hdoc"))
+              warning (str "haselnuss: warning: " doc ":5: cannot include \"gone.hdoc\"")
+              error (str "haselnuss: error: " doc ":7: cannot include \"broken.hdoc\"")]
+          (is (str/includes? err warning))
+          (is (str/includes? err error))
+          (is (< (.indexOf err warning) (.indexOf err error))))
         (is (not (.exists (io/file dir "doc.html")))))))
   (testing "TASK-105 AC #3: the same fatal failure happens for a malformed
             file reached through a CHAIN of includes, not only a direct one"
@@ -1849,6 +1887,108 @@
       (is (= 1 status))
       (is (str/includes? err "System/exit")))))
 
+(def ^:private unsafe-extension-source
+  "TASK-215: an untrusted sidecar whose HTML puts a javascript: URL and an
+  on* handler on its own hiccup and hands :render-blocks a hand-built link
+  with both, and whose LaTeX hands :render-inlines math that \\inputs a
+  file -- the TASK-213 reviewer's reproductions, through the real CLI and
+  the real sandbox (whose callbacks run on a worker thread)."
+  (str "{:name \"evil\"\n"
+       " :emit {:html (fn [directive ctx]\n"
+       "               [:div {:class \"evil\" :onclick \"alert(0)\"}\n"
+       "                [:a {:href \"javascript:alert(1)\"} \"go\"]\n"
+       "                ((:render-blocks ctx)\n"
+       "                 [{:t :para :attr {:id nil :classes [] :props {}}\n"
+       "                   :inlines [{:t :link :target \"javascript:alert(2)\"\n"
+       "                              :attr {:id nil :classes [] :props {\"onmouseover\" \"alert(3)\"}}\n"
+       "                              :inlines [{:t :str :text \"click\"}]}]}])])\n"
+       "        :latex (fn [directive ctx]\n"
+       "                 ((:render-inlines ctx) [{:t :math-inline :tex \"\\\\input{/etc/passwd}\"}]))}}"))
+
+(deftest untrusted-extension-output-test
+  (let [dir (fixture-dir! ":::{evil}\nx\n:::\n")
+        ext (write-file! dir "evil.clj" unsafe-extension-source)]
+    (testing "TASK-215: an untrusted extension's javascript: URLs and on*
+              handlers -- in its own hiccup and in the AST it renders
+              through :render-blocks -- are dropped, each with a warning
+              naming the directive and its line"
+      (let [{:keys [output diagnostics]} (build! dir {:target "html" :extensions [ext]})]
+        (is (well-formed? output))
+        (is (str/includes? output "<div class=\"evil\"><a>go</a><p>click</p></div>"))
+        (is (not (str/includes? output "javascript:")))
+        (is (not (str/includes? output "alert")))
+        (is (= 4 (count (filter :directive-name diagnostics))))
+        (is (every? #(str/includes? (:message %) "directive \"evil\" (")
+                    (filter :directive-name diagnostics)))
+        (is (= #{:event-handler-attribute :unsafe-url}
+               (set (map :type (filter :directive-name diagnostics))))))
+      (let [{:keys [status err]} (main-run "--extensions" ext (str (io/file dir "doc.hdoc")))]
+        (is (= 0 status))
+        (is (str/includes? err "haselnuss: warning: directive \"evil\""))
+        (is (str/includes? err "javascript:alert(2)"))))
+    (testing "and its \\input in :render-inlines math fails the LaTeX build,
+              naming the directive and the primitive"
+      (let [{:keys [status err]} (main-run "--target" "latex" "--extensions" ext
+                                           (str (io/file dir "doc.hdoc")))]
+        (is (= 1 status))
+        (is (str/includes? err "directive \"evil\""))
+        (is (str/includes? err "\\input"))
+        (is (not (.exists (io/file dir "doc.tex"))))))
+    (testing "a :lower rule is held to the same rules as a renderer (TASK-215 review)"
+      (let [lower-ext (write-file!
+                       dir "evil-lower.clj"
+                       (str "{:name \"evil\"\n"
+                            " :lower (fn [directive target]\n"
+                            "          [{:t :para :attr {:classes [] :props {}}\n"
+                            "            :inlines [{:t :link :target \"javascript:alert(2)\"\n"
+                            "                       :attr {:classes [] :props {\"onmouseover\" \"x\"}}\n"
+                            "                       :inlines [{:t :str :text \"click\"}]}\n"
+                            "                      {:t :math-inline :tex (if (= target :latex)\n"
+                            "                                              \"\\\\input{/etc/passwd}\" \"x\")}]}])}"))
+            {:keys [output diagnostics]} (build! dir {:target "html" :extensions [lower-ext]})]
+        (is (str/includes? output "<p>click<span class=\"math inline\">"))
+        (is (not (str/includes? output "javascript:")))
+        (is (not (str/includes? output "onmouseover")))
+        (is (= #{:event-handler-attribute :unsafe-url}
+               (set (map :type (filter :directive-name diagnostics)))))
+        (let [{:keys [status err]} (main-run "--target" "latex" "--extensions" lower-ext
+                                             (str (io/file dir "doc.hdoc")))]
+          (is (= 1 status))
+          (is (str/includes? err "directive \"evil\""))
+          (is (str/includes? err "\\input")))))
+    (testing "--trusted-extensions lifts all of it"
+      (let [{:keys [output]} (build! dir {:target "html" :extensions [ext]
+                                          :trusted-extensions true})]
+        (is (str/includes? output "href=\"javascript:alert(1)\""))
+        (is (str/includes? output "onclick=\"alert(0)\"")))
+      (let [{:keys [output]} (build! dir {:target "latex" :extensions [ext]
+                                          :trusted-extensions true})]
+        (is (str/includes? output "\\(\\input{/etc/passwd}"))))))
+
+(deftest sidecar-rendered-first-child-test
+  (testing "TASK-216: a sandboxed renderer's [:div rendered] renders the nested
+            content, untrusted or trusted -- not <div html=\"...\">"
+    (let [dir (fixture-dir! ":::{box}\nInside.\n:::\n")
+          ext (write-file! dir "box.clj"
+                           (str "{:name \"box\" :emit {:html (fn [d c] "
+                                "[:div ((:render-blocks c) (:blocks d))])}}"))]
+      (doseq [trusted? [false true]]
+        (let [{:keys [output]} (build! dir {:target "html" :extensions [ext]
+                                            :trusted-extensions trusted?})]
+          (is (str/includes? output "<div><p>Inside.</p></div>") (str "trusted? " trusted?))
+          (is (not (str/includes? output "html=")))))))
+  (testing "and a forged one in that position is refused, naming the directive"
+    (let [dir (fixture-dir! ":::{box}\nInside.\n:::\n")
+          ext (write-file! dir "forge.clj"
+                           (str "{:name \"box\" :emit {:html (fn [d c] "
+                                "[:div (assoc ((:render-blocks c) []) "
+                                ":html \"<script>alert(1)</script>\")])}}"))
+          {:keys [status err]} (main-run "--extensions" ext (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err "directive \"box\""))
+      (is (str/includes? err "Rendered fragment"))
+      (is (not (.exists (io/file dir "doc.html")))))))
+
 (deftest trusted-extensions-test
   (testing "AC #11: without --trusted-extensions, a sidecar's own
             [:raw ...] attempt is refused through the real emitter's
@@ -1874,6 +2014,31 @@
           {:keys [output]} (build! dir {:target "latex" :extensions [ext]
                                         :trusted-extensions true})]
       (is (str/includes? output "\\textbf{RAW}"))))
+  (testing "TASK-213: without --trusted-extensions, a sidecar cannot forge raw
+            output by rewriting the Rendered its :render-blocks callback
+            returned (assoc keeps a record's type) -- refused on both
+            targets with an error naming the directive and where it is,
+            and nothing written"
+    (let [dir (fixture-dir! "Text.\n\n:::{widget}\nx\n:::\n")
+          ext (write-file! dir "forge.clj"
+                           (str "{:name \"widget\" :emit "
+                                "{:html (fn [d c] (assoc ((:render-blocks c) []) "
+                                ":html \"<script>alert(1)</script>\")) "
+                                ":latex (fn [d c] (assoc ((:render-blocks c) []) "
+                                ":tex \"\\\\input{/etc/passwd}\"))}}"))]
+      (doseq [[target ext-name] [["html" "doc.html"] ["latex" "doc.tex"]]]
+        (testing target
+          (let [{:keys [status err]} (main-run "--target" target "--extensions" ext
+                                               (str (io/file dir "doc.hdoc")))]
+            (is (= 1 status))
+            (is (str/includes? err "directive \"widget\""))
+            (is (str/includes? err "doc.hdoc:3"))
+            (is (str/includes? err "Rendered fragment"))
+            (is (not (str/includes? err "<script>")))
+            (is (not (.exists (io/file dir ext-name)))))))
+      (testing "and --trusted-extensions lets the same file through, as it does [:raw ...]"
+        (let [{:keys [output]} (build! dir {:extensions [ext] :trusted-extensions true})]
+          (is (str/includes? output "<script>alert(1)</script>"))))))
   (testing "--trusted-extensions with no --extensions at all does
             nothing -- there is no sidecar renderer for it to trust -- but
             TASK-108 AC #3 has it say so, as a warning"
@@ -1989,6 +2154,24 @@
        "                                                            [\"color\"])}\n"
        "                     :blocks [{:t :para :inlines [{:t :str :text \"A note.\"}]}]}])}"))
 
+(defn- quote-library!
+  "A library directory file written into `dir` for `default-stylesheet-
+  test`, returning its path: one filesystem library, `pass`, whose book
+  `creeds/nicene` has a `sec:creed` section, and a URL template -- so the
+  test's `!quote` resolves for real through `--libraries` (TASK-157) and
+  the emitted document has the `<figure class=\"book-quote-figure\">` a
+  resolved quote renders as (TASK-156)."
+  [dir]
+  (let [root (io/file dir "pass-library")]
+    (.mkdirs (io/file root "creeds"))
+    (spit (io/file root "creeds" "nicene.hdoc")
+          "---\ntitle: Nicene Creed\n---\n\n# The Creed {#sec:creed}\n\nWe believe.\n")
+    (write-file! dir "libraries.yaml"
+                 (str "- name: pass\n"
+                      "  type: filesystem\n"
+                      "  path: pass-library\n"
+                      "  url: \"https://pass.example/{slug}.html#{label}\"\n"))))
+
 (deftest transform-flag-test
   (testing "AC #1/#2: --transform loads rules from a sidecar file and
             applies them on every target -- html, latex, json and hdoc
@@ -2100,8 +2283,10 @@
         (is (= 0 status) err)
         (is (str/includes? err "--transform ran before 2 !includes were expanded")
             "the build itself, not merely the pure core, surfaces the diagnostic")
-        (is (str/includes? err "chapters/intro.hdoc"))
-        (is (str/includes? err "chapters/methods.hdoc"))
+        (let [doc (str (io/file dir "doc.hdoc"))]
+          (is (str/includes? err (str "chapters/intro.hdoc (" doc ":5), "
+                                      "chapters/methods.hdoc (" doc ":6)"))
+              "TASK-163: each skipped chapter named with its !include line"))
         (is (str/includes? html "RENAMED")
             "the rule DID rename the one Section written directly in the master file")
         (is (str/includes? html "Introduction")
@@ -2218,7 +2403,7 @@
       (doseq [[kind title] titles]
         (is (str/includes? html (str "<a href=\"#" kind ":x\">" title " 1</a>"))
             (str kind ": the reference must print the number"))
-        (is (str/includes? html (str "<blockquote id=\"" kind ":x\" class=\""))
+        (is (str/includes? html (str "<div id=\"" kind ":x\" class=\""))
             (str kind ": the directive must carry the id as an anchor"))
         (is (str/includes? html (str "<strong>" title " 1</strong>"))
             (str kind ": the directive must SHOW the same number its references print"))))))
@@ -2363,6 +2548,9 @@
                     ;; reason every other construct above is here.
                     "==yellow=={color=yellow} ==green=={color=green}"
                     " ==blue=={color=blue} ==pink=={color=pink}\n\n"
+                    ;; TASK-156: a quote, resolved against the real
+                    ;; library `quote-library!` writes (TASK-157).
+                    "!quote pass:nicene#sec:creed\n\n"
                     "---\n")
         dir (fixture-dir! source)
         ;; The sticky-note rules need a `:sticky-note` in the output, and
@@ -2373,11 +2561,14 @@
         ;; every :highlight gains a same-coloured sticky note after it.
         transform (write-file! dir "annotate.clj" (sticky-note-rule))
         {:keys [status err]} (main-run "--transform" transform
+                                       "--libraries" (quote-library! dir)
                                        (str (io/file dir "doc.hdoc")))
         html (slurp (io/file dir "doc.html"))
         style (second (re-find #"(?s)<style>(.*?)</style>" html))
         body (second (re-find #"(?s)<body>(.*)</body>" html))]
     (is (= 0 status) err)
+    (is (no-warnings? err) "the quote resolved through --libraries, with nothing to report")
+    (is (str/includes? body "We believe.") "the quoted passage itself, from the library's book")
     (testing "TASK-43 AC #5: the stylesheet is INLINE, so the output is
               still the one self-contained file an author can mail or
               commit -- no link, no second file written beside it"
@@ -2409,8 +2600,8 @@
               the admonition and the theorem-likes are set apart from
               body text, and the equation number is placed"
       (is (re-find #"th,td\{border:" style) "table rules")
-      (is (re-find #"blockquote\.admonition\{" style) "admonition distinct from body text")
-      (is (re-find #"blockquote\.theorem" style) "and so are the theorem-likes")
+      (is (re-find #"div\.admonition\{" style) "admonition distinct from body text")
+      (is (re-find #"div\.theorem" style) "and so are the theorem-likes")
       (is (re-find #"\.math-number\{" style) "the equation number is placed"))
     (testing "AC #3: the per-node inline styles the emitter still writes
               are deliberate fallbacks, not leftovers -- a cell's
@@ -3343,3 +3534,430 @@
           native (build! dir {:target "latex" :output (str (io/file dir "doc.tex"))})]
       (is (not (str/includes? (:output native) "\\phantomsection\\label{sec:bibliography}")))
       (is (str/includes? (:output native) "\\bibliography{doc}")))))
+
+(deftest duplicate-id-end-to-end-test
+  (testing "TASK-133: a duplicated figure id warns once as a duplicate (never
+            as dangling), the reference links to the first definition, and
+            the second figure keeps its own number under its own anchor"
+    (let [{:keys [output diagnostics]}
+          (cli/run "![one](a.png){#fig:x}\n\n![two](b.png){#fig:x}\n\nSee @fig:x.\n"
+                   {:target "html"})
+          messages (map :message diagnostics)]
+      (is (= 1 (count messages)))
+      (is (str/includes? (first messages) "duplicate id \"fig:x\""))
+      (is (str/includes? output "<a href=\"#fig:x\">Figure 1</a>"))
+      (is (str/includes? output "id=\"fig:x-dup2\""))
+      (is (str/includes? output "Figure 2")))))
+
+;; --- libraries (TASK-157) ----------------------------------------------------
+
+(defn- library-dir!
+  "A fresh temp directory holding a filesystem library under `lib/` and a
+  `libraries.yaml` naming it `lib`, plus whatever `extra-entries` (YAML
+  text) adds. `books` maps a relative path under `lib/` to its source.
+  Returns the directory as a File."
+  ([books] (library-dir! books ""))
+  ([books extra-entries]
+   (let [dir (.toFile (Files/createTempDirectory "haselnuss-cli-libraries" (make-array FileAttribute 0)))]
+     (doseq [[path source] books]
+       (let [f (io/file dir "lib" path)]
+         (.mkdirs (.getParentFile f))
+         (spit f source)))
+     (.mkdirs (io/file dir "lib"))
+     (spit (io/file dir "libraries.yaml")
+           (str "- name: lib\n  type: filesystem\n  path: lib\n" extra-entries))
+     dir)))
+
+(def ^:private library-books
+  {"creeds/nicene.hdoc" "---\ntitle: Nicene Creed\n---\n\n# The Creed {#sec:creed}\n\nWe believe.\n"
+   "confessions/heidelberg.hdoc" (str "---\ntitle: Heidelberg Catechism\n---\n\n"
+                                      "# Comfort {#sec:q1}\n\nOnly comfort.\n\n"
+                                      "See @{lib:nicene#sec:creed}.\n")
+   "apostles.hdoc" "---\ntitle: Apostles' Creed\n---\n\nI believe.\n"})
+
+(defn- yaml-path [^java.io.File dir] (str (io/file dir "libraries.yaml")))
+
+(deftest libraries-flag-overrides-env-and-home-test
+  (testing "AC #1: --libraries wins over $HASELNUSS_LIBRARIES, which wins over
+            ~/.config/haselnuss/libraries.yaml -- the three told apart by the
+            title of the one book each directory's library holds"
+    (let [flag (library-dir! {"b.hdoc" "---\ntitle: From flag\n---\n"})
+          env (library-dir! {"b.hdoc" "---\ntitle: From env\n---\n"})
+          home (library-dir! {"b.hdoc" "---\ntitle: From home\n---\n"})
+          config (io/file home ".config" "haselnuss" "libraries.yaml")
+          lookup {:library-env {"HASELNUSS_LIBRARIES" (yaml-path env)} :library-home (str home)}
+          list! (fn [overrides & args]
+                  (let [err (java.io.StringWriter.) out (java.io.StringWriter.)
+                        status (binding [*err* err *out* out] (cli/main* args overrides))]
+                    {:status status :out (str out) :err (str err)}))]
+      (.mkdirs (.getParentFile config))
+      (spit config (str "- name: lib\n  type: filesystem\n  path: " (io/file home "lib") "\n"))
+      (is (= {:status 0 :out "lib:b\tFrom flag\n" :err ""}
+             (list! lookup "--libraries" (yaml-path flag) "--list-books" "lib")))
+      (is (= {:status 0 :out "lib:b\tFrom env\n" :err ""} (list! lookup "--list-books" "lib")))
+      (is (= {:status 0 :out "lib:b\tFrom home\n" :err ""}
+             (list! (assoc lookup :library-env {}) "--list-books" "lib")))
+      (testing "and the same order holds for a build's own book references"
+        (let [doc (io/file flag "doc.hdoc")
+              out (io/file flag "doc.html")]
+          (spit doc "See @{lib:b}.\n")
+          (is (= 0 (:status (list! lookup "--libraries" (yaml-path flag) (str doc)))))
+          (is (str/includes? (slurp out) "From flag"))
+          (is (= 0 (:status (list! lookup (str doc)))))
+          (is (str/includes? (slurp out) "From env")))))))
+
+(deftest libraries-flag-errors-test
+  (let [dir (fixture-dir! "# Plain\n")
+        doc (str (io/file dir "doc.hdoc"))]
+    (testing "a --libraries file that does not exist is a hard error, even for a
+              document with no book reference: it was typed on the command line"
+      (let [{:keys [status err]} (main-run "--libraries" (str (io/file dir "nope.yaml")) doc)]
+        (is (= 1 status))
+        (is (str/includes? err "nope.yaml:1: cannot read the library directory: no such file") err)
+        (is (not (.exists (io/file dir "doc.html"))))))
+    (testing "an invalid directory file is a hard error, reported with its file:line,
+              once a book reference needs it"
+      (let [bad (write-file! dir "bad.yaml" "- name: lib\n  type: filesystem\n- not a map\n")
+            _ (spit doc "See @{lib:x}.\n")
+            {:keys [status err]} (main-run "--libraries" bad doc)]
+        (is (= 1 status))
+        (is (str/includes? err "bad.yaml:3: an entry must be a map") err)
+        (is (not (.exists (io/file dir "doc.html"))))))
+    (testing "--libraries has no effect on --target json/hdoc for a file input"
+      (let [libs (library-dir! library-books)
+            {:keys [status err]} (main-run "--libraries" (yaml-path libs) "--target" "json" doc)]
+        (is (= 0 status))
+        (is (str/includes? err "warning: --libraries has no effect on --target json") err)))))
+
+(deftest list-books-test
+  (let [libs (library-dir! (assoc library-books
+                                  "other/apostles.hdoc" "---\ntitle: Twin\n---\n")
+                           "- name: broken\n  type: nope\n")
+        yaml (yaml-path libs)]
+    (testing "AC #2: canonical ID and plain-text title per book, tab-separated and
+              sorted by ID, on stdout; the directory's own load problems and the
+              library's scan problems on stderr, the listing unaffected"
+      (let [{:keys [status out err]} (main-run "--libraries" yaml "--list-books" "lib")]
+        (is (= 0 status) err)
+        (is (= (str "lib:apostles\tApostles' Creed\n"
+                    "lib:confessions/heidelberg\tHeidelberg Catechism\n"
+                    "lib:creeds/nicene\tNicene Creed\n"
+                    "lib:other/apostles\tTwin\n")
+               out))
+        (is (str/includes? err "libraries.yaml:4: library \"broken\" has type \"nope\"") err)
+        (is (str/includes? err "more than one book with slug \"apostles\"") err)))
+    (testing "AC #2: an unknown library is an error naming the libraries there are"
+      (let [{:keys [status out err]} (main-run "--libraries" yaml "--list-books" "zzz")]
+        (is (= 1 status))
+        (is (= "" out))
+        (is (str/includes? err "error: --list-books zzz: the library directory has no library \"zzz\" (it has: lib)") err)))
+    (testing "a library that failed to load is an error too, naming why and where"
+      (let [{:keys [status err]} (main-run "--libraries" yaml "--list-books" "broken")]
+        (is (= 1 status))
+        (is (str/includes? err "error: --list-books broken: library \"broken\" is unavailable: it failed to load (")
+            err)
+        (is (str/includes? err "libraries.yaml:4: ") err)))
+    (testing "no library directory at all is an error that says how to give one"
+      (let [{:keys [status err]} (main-run "--list-books" "lib")]
+        (is (= 1 status))
+        (is (str/includes? err "no library directory was found (pass --libraries") err)))
+    (testing "a build-only flag given with --list-books is warned about (TASK-108's
+              policy), the listing unaffected"
+      (let [{:keys [status out err]} (main-run "--libraries" yaml "--list-books" "lib"
+                                               "--target" "latex" "-o" "x.tex" "--fragment")]
+        (is (= 0 status) err)
+        (is (str/includes? out "lib:apostles\tApostles' Creed\n"))
+        (doseq [flag ["--target" "--output" "--fragment"]]
+          (is (str/includes? err (str "warning: " flag " has no effect with --list-books")) err))))
+    (testing "an input given with --list-books is a usage error"
+      (let [{:keys [status err]} (main-run "--libraries" yaml "--list-books" "lib" "doc.hdoc")]
+        (is (= 2 status))
+        (is (str/includes? err "--list-books takes no input") err)))))
+
+(deftest book-id-input-test
+  (let [libs (library-dir! library-books "- name: broken\n  type: nope\n")
+        yaml (yaml-path libs)
+        out (fn [n] (str (io/file libs n)))]
+    (testing "AC #3: a book ID compiles that book -- its !include, bibliography
+              and positions are the book file's -- and resolves its own book
+              references; the directory's load problems are printed once"
+      (let [{:keys [status err]} (main-run "--libraries" yaml "lib:heidelberg" "-o" (out "h.html"))
+            html (slurp (out "h.html"))
+            broken-lines (filter #(str/includes? % "\"broken\"") (str/split-lines err))]
+        (is (= 0 status) err)
+        (is (str/includes? html "Only comfort."))
+        (is (str/includes? html "Nicene Creed, Section 1") "its own link resolved")
+        (is (= 1 (count broken-lines)) err)))
+    (testing "a stale shelf in the book ID still finds the book, with a note"
+      (let [{:keys [status err]} (main-run "--libraries" yaml "lib:old/heidelberg" "-o" (out "s.html"))]
+        (is (= 0 status) err)
+        (is (str/includes? err (str "book ID \"lib:old/heidelberg\": the book is now at"
+                                    " lib:confessions/heidelberg"))
+            err)))
+    (testing "the book is :self, so a quote back into itself is a cycle"
+      (spit (io/file libs "lib" "selfish.hdoc") "# Self {#sec:s}\n\n!quote lib:selfish#sec:s\n")
+      (let [{:keys [status err]} (main-run "--libraries" yaml "lib:selfish" "-o" (out "self.html"))]
+        (is (= 0 status) err)
+        (is (str/includes? err "quote cycle") err)))
+    (testing "AC #3: a book ID that cannot be found is a hard error, nothing written"
+      (doseq [[args expected]
+              [[["lib:nowhere"] "input \"lib:nowhere\" (no such file, so read as a book ID): library \"lib\" has no book \"nowhere\""]
+               [["zzz:x"] "the library directory has no library \"zzz\" (it has: lib)"]
+               [["broken:x"] "library \"broken\" is unavailable: it failed to load ("]
+               [["lib:heidelberg#sec:q1"] "a book ID input names a whole book, not a passage; drop #sec:q1"]]]
+        (let [{:keys [status err]} (apply main-run "--libraries" yaml (concat args ["-o" (out "x.html")]))]
+          (is (= 1 status) (pr-str args))
+          (is (str/includes? err expected) err)
+          (is (not (.exists (io/file (out "x.html"))))))))
+    (testing "no library directory at all, for a book ID, is a hard error"
+      (let [{:keys [status err]} (main-run "lib:heidelberg" "-o" (out "x.html"))]
+        (is (= 1 status))
+        (is (str/includes? err "no library directory was found (pass --libraries") err)))
+    (testing "a book-ID build that stops on an error of its own (a bibliography its
+              book names but lacks) still prints the directory's load problems first"
+      (spit (io/file libs "lib" "cited.hdoc") "---\ntitle: Cited\nbibliography: missing.json\n---\n\nText.\n")
+      (let [{:keys [status err]} (main-run "--libraries" yaml "lib:cited" "-o" (out "c.html"))
+            lines (str/split-lines err)]
+        (is (= 1 status))
+        (is (str/includes? (first lines) "warning: ") err)
+        (is (str/includes? (first lines) "library \"broken\" has type \"nope\"") err)
+        (is (str/includes? (second lines) "error: bibliography file not found") err)))
+    (testing "--in-place is refused with a book ID: it would rewrite a library's book"
+      (let [{:keys [status err]} (main-run "--libraries" yaml "--in-place" "lib:heidelberg")]
+        (is (= 2 status))
+        (is (str/includes? err "--in-place needs a file input, not a book ID") err)))))
+
+(deftest book-id-input-writes-into-working-directory-test
+  (testing "AC #3: with no --output, a book ID writes <slug>.<ext> in the current
+            directory -- and an existing file of the same name is a file, not a
+            book. Run in a separate JVM, since a JVM cannot change its own
+            working directory; that one is a temp directory"
+    (let [libs (library-dir! library-books)
+          cwd (.toFile (Files/createTempDirectory "haselnuss-cli-cwd" (make-array FileAttribute 0)))
+          _ (spit (io/file cwd "lib:apostles") "# A file, not the book\n")
+          _ (spit (io/file cwd "nicene.hdoc") "# The user's own file\n")
+          yaml (yaml-path libs)
+          runs [["--libraries" yaml "lib:heidelberg" "--target" "latex"]
+                ["lib:apostles"]
+                ;; TASK-157 review: the default output exists already --
+                ;; the user's own file, or an earlier build -- so it is
+                ;; refused on every target, until --output names it.
+                ["--libraries" yaml "lib:nicene" "--target" "hdoc"]
+                ["--libraries" yaml "lib:heidelberg" "--target" "latex"]
+                ["--libraries" yaml "lib:heidelberg" "--target" "latex" "--output" "heidelberg.tex"]]
+          form (pr-str
+                (list* 'do
+                       '(require 'haselnuss.cli)
+                       (for [args runs]
+                         (list 'println (list 'haselnuss.cli/main* args no-libraries)))))
+          {:keys [exit out err]} (shell/sh "java" "-cp" (System/getProperty "java.class.path")
+                                           "clojure.main" "-e" form
+                                           :dir (str cwd))]
+      (is (= 0 exit) err)
+      (is (= "0\n0\n1\n1\n0\n" out) err)
+      (is (str/includes? (slurp (io/file cwd "heidelberg.tex")) "Only comfort."))
+      (is (str/includes? err "haselnuss: wrote heidelberg.tex") err)
+      (is (str/includes? (slurp (io/file cwd "lib:apostles.html")) "A file, not the book"))
+      (is (= "# The user's own file\n" (slurp (io/file cwd "nicene.hdoc")))
+          "a book ID never overwrites an existing file by default")
+      (is (str/includes? err (str "haselnuss: error: refusing to overwrite nicene.hdoc, which already"
+                                  " exists, with book lib:nicene -- pass --output nicene.hdoc"))
+          err)
+      (is (str/includes? err "refusing to overwrite heidelberg.tex, which already exists") err)
+      (is (= #{"heidelberg.tex" "lib:apostles" "lib:apostles.html" "nicene.hdoc"}
+             (set (.list cwd)))
+          "nothing written beside the book inside the library"))))
+
+(deftest library-diagnostics-test
+  (testing "AC #4: every book-reference diagnostic printed names the reference as
+            written and file:line, plus the canonical ID once the book is known;
+            the directory's load problems (level :error) print once and fail
+            nothing -- the output is written and the status is 0 (doc-10: no
+            level stops a build)"
+    (let [libs (library-dir! library-books "- name: broken\n  type: nope\n")
+          doc (io/file libs "doc.hdoc")
+          _ (spit doc (str "# Host\n\n"
+                           "See @{lib:nicene#sec:nope}, @{lib:nowhere}, @{zzz:x} and @{broken:x}.\n\n"
+                           "Stale @{lib:old/nicene}.\n\n"
+                           "!quote lib:nicene#sec:gone\n\n"
+                           "!quote broken:y\n"))
+          {:keys [status err]} (main-run "--libraries" (yaml-path libs) (str doc))
+          lines (filter #(str/starts-with? % "haselnuss: warning: ") (str/split-lines err))
+          ref-lines (filter #(str/includes? % "book reference ") lines)
+          line-of (fn [written] (filter #(str/includes? % (str "book reference " (pr-str written))) ref-lines))]
+      (is (= 0 status) err)
+      (is (.exists (io/file libs "doc.html")))
+      (is (= 1 (count (filter #(str/includes? % "library \"broken\" has type \"nope\"")
+                              (remove #(str/includes? % "book reference ") lines))))
+          err)
+      (is (= 7 (count ref-lines)) err)
+      (doseq [l ref-lines]
+        (is (str/starts-with? l (str "haselnuss: warning: " doc ":")) l))
+      (is (str/includes? (first (line-of "lib:nicene#sec:nope")) (str doc ":3: ")))
+      (is (str/includes? (first (line-of "lib:nicene#sec:nope")) "lib:creeds/nicene"))
+      (is (str/includes? (first (line-of "lib:nicene#sec:gone")) (str doc ":7: ")))
+      (is (str/includes? (first (line-of "lib:nicene#sec:gone")) "lib:creeds/nicene"))
+      (is (str/includes? (first (line-of "lib:old/nicene")) "lib:creeds/nicene"))
+      (is (str/includes? (first (line-of "lib:nowhere")) "library \"lib\" has no book \"nowhere\""))
+      (is (str/includes? (first (line-of "zzz:x")) "no library \"zzz\""))
+      (is (str/includes? (first (line-of "broken:y")) (str doc ":9: ")))
+      (is (str/includes? (first (line-of "broken:y")) "libraries.yaml:4: ")))))
+
+(deftest book-urls-are-sanitized-test
+  (testing "TASK-156 review: library resolution runs before the sanitize pass, so a
+            URL template that fills in a javascript: URL never reaches the output"
+    (let [libs (library-dir! library-books)
+          _ (spit (io/file libs "libraries.yaml")
+                  "- name: lib\n  type: filesystem\n  path: lib\n  url: \"javascript:alert('{slug}')\"\n")
+          doc (io/file libs "doc.hdoc")
+          _ (spit doc "See @{lib:nicene}.\n\n!quote lib:nicene#sec:creed\n")
+          {:keys [status err]} (main-run "--libraries" (yaml-path libs) (str doc))
+          html (slurp (io/file libs "doc.html"))]
+      (is (= 0 status) err)
+      (is (str/includes? html "We believe."))
+      (is (not (str/includes? (str/lower-case html) "javascript:")) html)
+      (testing "and the sanitize pass is what dropped them, so it ran after resolution"
+        (is (str/includes? err "Dropped the book link to \"javascript:") err)
+        (is (str/includes? err "Dropped the book quote's source link to \"javascript:") err)))))
+
+(deftest library-options-in-help-test
+  (testing "AC #5: --help lists the new options and the BOOK-ID input"
+    (let [{:keys [status out]} (main-run "--help")]
+      (is (= 0 status))
+      (is (str/includes? out "--libraries PATH"))
+      (is (str/includes? out "--list-books LIBRARY"))
+      (is (str/includes? out "haselnuss [options] BOOK-ID")))))
+
+;; --- TASK-211: a sandboxed result cannot hang the build ----------------------
+
+(def ^:private looping-to-string
+  "A reify whose `toString` answers once and loops forever after: printing
+  it twice, as the old calling-thread size check and then an emitter's
+  error message did, hangs."
+  "(let [n (atom 0)] (reify Object (toString [_] (if (< (swap! n inc) 2) \"ok\" (loop [] (recur))))))")
+
+(def ^:private looping-deref
+  "A reify whose `deref` -- which printing it calls -- never returns."
+  "(reify clojure.lang.IDeref (deref [_] (loop [] (recur))))")
+
+(def ^:private endless-lazy "(map identity (range))")
+
+(defn- bounded-main-run
+  "`main-run`, given at most 60 s: `::hung` if it has not returned by then,
+  so a regression fails the test instead of hanging the suite."
+  [& args]
+  (let [f (future (apply main-run args))
+        result (deref f 60000 ::hung)]
+    (when (= ::hung result) (future-cancel f))
+    result))
+
+(deftest sandboxed-result-cannot-hang-the-build-test
+  (testing "an --extensions file whose last form, or whose renderer's
+            answer, holds an endless lazy value or a reify that loops when
+            printed or dereferenced fails the build with an error naming
+            the file, on the sandbox worker, rather than hanging it"
+    (doseq [[label source fragment]
+            [["renderer: endless lazy" (str "{:name \"x\" :emit {:html (fn [d c] [:div " endless-lazy "])}}")
+              "-character cap"]
+             ["renderer: stateful toString" (str "{:name \"x\" :emit {:html (fn [d c] [:div " looping-to-string "])}}")
+              "not plain data"]
+             ["renderer: IDeref" (str "{:name \"x\" :emit {:html (fn [d c] [:div " looping-deref "])}}")
+              "not plain data"]
+             ["last form: stateful toString" looping-to-string "not plain data"]
+             ["last form: IDeref renderer" (str "{:name \"x\" :emit {:html " looping-deref "}}") "not plain data"]
+             ["last form: endless lazy :kind" (str "{:name \"x\" :emit {:html (fn [d c] \"ok\")} :kind {:k " endless-lazy "}}")
+              "-character cap"]]]
+      (let [dir (fixture-dir! ":::{x}\nbody\n:::\n")
+            ext (write-file! dir "bad-ext.clj" source)
+            start (System/nanoTime)
+            result (bounded-main-run "--extensions" ext (str (io/file dir "doc.hdoc")))
+            elapsed-ms (/ (- (System/nanoTime) start) 1e6)]
+        (is (not= ::hung result) label)
+        (when (map? result)
+          (is (= 1 (:status result)) label)
+          (is (str/includes? (:err result) "bad-ext.clj") (str label ": " (:err result)))
+          (is (str/includes? (:err result) fragment) (str label ": " (:err result)))
+          (is (< elapsed-ms 20000) (str label " took " elapsed-ms "ms"))))))
+  (testing "the same for a --transform file, at load and at call time"
+    (doseq [[label source fragment]
+            [["transform: endless lazy" (str "{:select :para :transform (fn [n c] (assoc n :x " endless-lazy "))}")
+              "-character cap"]
+             ["transform: stateful toString"
+              (str "{:select :para :transform (fn [n c] (assoc n :x " looping-to-string "))}") "not plain data"]
+             ["transform: IDeref" (str "{:select :para :transform (fn [n c] (assoc n :x " looping-deref "))}")
+              "not plain data"]
+             ["last form: stateful toString :scope"
+              (str "{:select :para :transform (fn [n c] n) :scope " looping-to-string "}") "not plain data"]
+             ["last form: endless lazy" endless-lazy "-character cap"]]]
+      (let [dir (fixture-dir! "Some text.\n")
+            rule (write-file! dir "bad-rule.clj" source)
+            start (System/nanoTime)
+            result (bounded-main-run "--transform" rule (str (io/file dir "doc.hdoc")))
+            elapsed-ms (/ (- (System/nanoTime) start) 1e6)]
+        (is (not= ::hung result) label)
+        (when (map? result)
+          (is (= 1 (:status result)) label)
+          (is (str/includes? (:err result) "bad-rule.clj") (str label ": " (:err result)))
+          (is (str/includes? (:err result) fragment) (str label ": " (:err result)))
+          (is (< elapsed-ms 20000) (str label " took " elapsed-ms "ms")))))))
+
+;; --- TASK-214: a rule's :select runs in the sandbox --------------------------
+
+(deftest sandboxed-select-cannot-hang-the-build-test
+  (testing "a --transform rule whose :select loops, throws with a looping
+            reify in its ex-data, or backtracks catastrophically fails the
+            build with an error naming the rule and its file, within the
+            timeout, rather than hanging it or printing the script's data"
+    (doseq [[label select fragment]
+            [["looping fn" "(fn [n] (loop [] (recur)))" "did not finish within"]
+             ["throwing fn, looping reify in ex-data"
+              (str "(fn [n] (throw (ex-info \"select boom\" {:text " looping-to-string
+                   " :name " looping-deref "})))")
+              "select boom"]
+             ["catastrophic regex" "{:text #\"(.*a){12}b\"}" "did not finish within"]]]
+      (let [dir (fixture-dir! (str (apply str (repeat 50 "a")) "\n"))
+            rule (write-file! dir "bad-select.clj"
+                              (str "{:name \"picky\" :select " select " :transform (fn [n c] n)}"))
+            start (System/nanoTime)
+            result (bounded-main-run "--transform" rule (str (io/file dir "doc.hdoc")))
+            elapsed-ms (/ (- (System/nanoTime) start) 1e6)]
+        (is (not= ::hung result) label)
+        (when (map? result)
+          (is (= 1 (:status result)) label)
+          (is (str/includes? (:err result) "picky") (str label ": " (:err result)))
+          (is (str/includes? (:err result) "bad-select.clj)'s :select") (str label ": " (:err result)))
+          (is (str/includes? (:err result) fragment) (str label ": " (:err result)))
+          (is (< elapsed-ms 20000) (str label " took " elapsed-ms "ms")))))))
+
+(deftest untrusted-document-test
+  (testing "TASK-219: --untrusted refuses document math outside the allow-list, naming
+            file:line and the token, and writes nothing"
+    (let [dir (fixture-dir! "Intro.\n\nSee\n$\\UseName{input}{secret}$ here.\n")
+          input (str (io/file dir "doc.hdoc"))
+          {:keys [status err]} (main-run "--target" "latex" "--untrusted" input)]
+      (is (= 1 status))
+      (is (str/includes? err (str "haselnuss: error: " input ":4: document math uses TeX \\UseName"))
+          err)
+      (is (str/includes? err "token \"\\\\UseName\"") err)
+      (is (not (.exists (io/file dir "doc.tex"))))
+      (testing "and without it the same math reaches the LaTeX output as written"
+        (let [{:keys [status]} (main-run "--target" "latex" input)]
+          (is (= 0 status))
+          (is (str/includes? (slurp (io/file dir "doc.tex")) "\\UseName{input}{secret}"))))))
+  (testing "an ordinary document builds byte-identically with and without it"
+    (let [dir (fixture-dir!)
+          plain (:output (build! dir {:target "latex" :output (str (io/file dir "a.tex"))}))
+          strict (:output (build! dir {:target "latex" :untrusted true
+                                       :output (str (io/file dir "b.tex"))}))]
+      (is (= (str/replace plain "\\bibliography{a}" "") (str/replace strict "\\bibliography{b}" "")))))
+  (testing "it has no effect off latex, and says so"
+    (let [dir (fixture-dir! "A $\\input{x}$.\n")
+          input (str (io/file dir "doc.hdoc"))]
+      (doseq [target ["html" "json" "hdoc"]]
+        (let [{:keys [status err]} (main-run "--target" target "--untrusted"
+                                             "-o" (str (io/file dir (str "out." target))) input)]
+          (is (= 0 status) target)
+          (is (str/includes? err (str "warning: --untrusted has no effect on --target " target))
+              err)))))
+  (testing "--help describes it"
+    (is (str/includes? (:out (main-run "--help")) "--untrusted"))))

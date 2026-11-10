@@ -1,0 +1,7 @@
+[
+  {"id": "ursinus1563",
+   "type": "book",
+   "title": "Catechismus",
+   "author": [{"family": "Ursinus", "given": "Zacharias"}],
+   "issued": {"date-parts": [[1563]]}}
+]

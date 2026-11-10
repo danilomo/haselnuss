@@ -129,7 +129,10 @@
           [status error-type] (outcome #(sidecar/load-extensions [path] {:timeout-ms 200}))
           elapsed (- (System/currentTimeMillis) start)]
       (is (= :threw status))
-      (is (= :haselnuss.sandbox/timeout error-type))
+      ;; Since TASK-211 the worker's copy of the result counts every value
+      ;; against the output cap, so an endless seq of cheap maps can hit
+      ;; that budget before the deadline; either way it stops on the worker.
+      (is (contains? #{:haselnuss.sandbox/timeout :haselnuss.sandbox/oversized-output} error-type))
       (is (< elapsed 2000) "resolves close to the configured bound, not after realizing forever")))
   (testing "regression guard: realizing a lazy seq that itself PRINTS is
             captured the same way any other sandboxed output is (AC #9),
@@ -329,8 +332,20 @@
           path (write-extension! dir "infloop.clj"
                                  "{:name \"x\" :emit {:html (fn [d c] (loop [] (recur)))}}")
           [entry] (sidecar/load-extensions [path] {:timeout-ms 200})
+          ;; TASK-147: the worker is stopped on JDK 17, so its name has to be
+          ;; sampled while it spins, not looked for afterwards.
+          done? (atom false)
+          matches? (fn [n] (and (str/includes? n "haselnuss-sandbox-worker")
+                                (str/includes? n path)))
           start (System/currentTimeMillis)
-          [status error-type message] (outcome #((get-in entry [:emit :html]) {} {}))
+          sampler (future (loop []
+                            (cond
+                              (some matches? (map #(.getName ^Thread %)
+                                                  (.keySet (Thread/getAllStackTraces)))) true
+                              @done? false
+                              :else (do (Thread/sleep 1) (recur)))))
+          [status error-type message] (try (outcome #((get-in entry [:emit :html]) {} {}))
+                                           (finally (reset! done? true)))
           elapsed (- (System/currentTimeMillis) start)]
       (is (= :threw status))
       (is (= :haselnuss.sandbox/timeout error-type))
@@ -341,10 +356,7 @@
                 Thread-N -- named after what it was doing (found by
                 review: debugging a CPU-pegged process via top -H/jstack
                 needs exactly this, and the thread was unnamed before)"
-        (let [names (->> (Thread/getAllStackTraces) .keySet (map #(.getName %)))]
-          (is (some #(and (str/includes? % "haselnuss-sandbox-worker")
-                          (str/includes? % path))
-                    names)))))))
+        (is @sampler)))))
 
 (deftest ac8-oversized-output-refused-test
   (testing "AC #8: a renderer's own returned output, over a small

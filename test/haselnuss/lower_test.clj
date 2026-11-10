@@ -17,10 +17,12 @@
   item, a Table cell, a footnote, and `meta.title`'s own footnote are all
   found and lowered) and that a directive-free document round-trips
   unchanged."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [haselnuss.ast :as ast]
             [haselnuss.lower :as lower]
-            [haselnuss.registry :as registry]))
+            [haselnuss.registry :as registry]
+            [haselnuss.sanitize :as sanitize]))
 
 (def attr
   "A minimal Attr with no `:id` set, per `haselnuss.resolver-test`'s own
@@ -294,3 +296,43 @@
           lowered (lower/lower (doc (para highlight sticky)) :latex {})]
       (is (= [] (get-in lowered [:blocks 0 :inlines 0 :inlines 0 :blocks])))
       (is (= [] (get-in lowered [:blocks 0 :inlines 1 :blocks]))))))
+
+(deftest untrusted-lower-rule-test
+  ;; TASK-215: an untrusted extension's :lower rule output joins the
+  ;; document after haselnuss.sanitize ran, so lowering vets it the way
+  ;; the emitters vet what a renderer hands :render-blocks.
+  (let [d (ast/with-source (directive "evil" nil [(para {:t :math-inline :tex "\\def\\x{1}\\x"})])
+            "doc.hdoc" 2)
+        evil-link {:t :link :target "javascript:alert(1)" :attr (assoc attr :props {"onmouseover" "x"})
+                   :inlines [(str-inline "click")]}
+        lower-with (fn [rule & {:keys [trusted?]}]
+                     (let [warnings (atom [])
+                           out (binding [sanitize/*untrusted-diagnostics* warnings]
+                                 (lower/lower (doc d) :latex
+                                              (registry/register {} {:name "evil" :trusted? trusted?
+                                                                     :lower rule})))]
+                       [(:blocks out) @warnings]))]
+    (testing "a javascript: link and an on* prop are dropped, with warnings naming the directive"
+      (let [[blocks warnings] (lower-with (fn [_ _] [{:t :para :attr attr :inlines [evil-link]}]))]
+        (is (= [{:t :para :attr attr :inlines [(str-inline "click")]}] blocks))
+        (is (= #{:event-handler-attribute :unsafe-url} (set (map :type warnings))))
+        (is (every? #(= "evil" (:directive-name %)) warnings))
+        (is (every? #(= "doc.hdoc:2" (:source %)) warnings))))
+    (testing "TeX outside the allow-list is refused"
+      (try (lower-with (fn [_ _] [{:t :para :attr attr
+                                   :inlines [{:t :math-inline :tex "\\input{/etc/passwd}"}]}]))
+           (is false "expected a refusal")
+           (catch clojure.lang.ExceptionInfo e
+             (is (= ::sanitize/untrusted-tex (:type (ex-data e))))
+             (is (= "\\input" (:token (ex-data e))))
+             (is (str/includes? (ex-message e) "directive \"evil\" (doc.hdoc:2)")))))
+    (testing "the directive's own body, math included, passes through unchanged"
+      (let [[blocks warnings] (lower-with (fn [node _] (:blocks node)))]
+        (is (= (:blocks d) blocks))
+        (is (empty? warnings))))
+    (testing "a trusted extension's :lower output is not touched"
+      (let [rule (fn [_ _] [{:t :para :attr attr
+                             :inlines [evil-link {:t :math-inline :tex "\\input{f}"}]}])
+            [blocks warnings] (lower-with rule :trusted? true)]
+        (is (= (rule nil nil) blocks))
+        (is (empty? warnings))))))

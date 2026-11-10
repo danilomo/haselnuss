@@ -70,8 +70,8 @@
   undefined references. `run`'s own `irrelevant-flag-diagnostics`
   (TASK-108) is the same kind of warning for a different source: a flag
   that cannot affect the chosen target -- `--overlay`/`--extensions` on
-  `--target json`/`hdoc`, `--computed-numbers`/`--fragment` off `latex`,
-  `--no-stylesheet` off `html`, `--trusted-extensions` with no
+  `--target json`/`hdoc`, `--computed-numbers`/`--fragment`/`--untrusted`
+  off `latex`, `--no-stylesheet` off `html`, `--trusted-extensions` with no
   `--extensions` at all -- rather than something the resolver found
   inside the document. An `ex-info` from any pass -- `lower`'s
   `::no-representation` for a directive with no representation and no
@@ -81,6 +81,8 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.walk :as walk]
+            [haselnuss.anchor :as anchor]
+            [haselnuss.book-ref :as book-ref]
             [haselnuss.emit.hdoc :as hdoc]
             [haselnuss.emit.html :as html]
             [haselnuss.emit.latex :as latex]
@@ -90,11 +92,18 @@
             [haselnuss.extensions.sidecar :as sidecar]
             [haselnuss.extensions.small-collapsable :as small-collapsable]
             [haselnuss.json :as json]
+            [haselnuss.library :as library]
+            [haselnuss.library.directory :as directory]
+            [haselnuss.library.filesystem :as fs]
+            [haselnuss.library.generated :as generated]
+            [haselnuss.library.passage :as passage]
+            [haselnuss.library.references :as references]
             [haselnuss.lower :as lower]
             [haselnuss.parser :as parser]
             [haselnuss.registry :as registry]
             [haselnuss.resolver :as resolver]
             [haselnuss.sandbox :as sandbox]
+            [haselnuss.sanitize :as sanitize]
             [haselnuss.transform :as transform])
   (:gen-class))
 
@@ -192,12 +201,17 @@
     (let [attr (:attr directive)
           head (or (:text (get labels (:id attr))) title)]
       [{:t :block-quote
+        ;; TASK-139: a carrier, not a quotation -- the HTML emitter
+        ;; writes a <div> (role=note for an admonition).
+        :container (if (= "admonition" (:name directive)) :note :div)
         ;; The directive's own name joins its classes, so the degraded
         ;; node is still identifiable as what it was -- an admonition
         ;; with no head (see `environment-title`) would otherwise be
         ;; byte-identical to a plain markdown quote, and cross-format
         ;; parity bought by erasing the only marker is not parity worth
         ;; having (TASK-29 review).
+        ;; (`caption`/`key`/`ref` never reach HTML as attributes:
+        ;; see `haselnuss.emit.html/prop-attrs`, TASK-139.)
         :attr (update attr :classes (fnil conj []) (:name directive))
         ;; No head at all when the environment prints none of its own
         ;; (see `environment-title`) -- an invented one is a structural
@@ -250,6 +264,7 @@
                         (if (panel? (first group))
                           (map (fn [row]
                                  {:t :block-quote
+                                  :container :div
                                   :attr {:classes ["subfigure-row"]
                                          ;; The row's own track count,
                                          ;; so a TRAILING partial row
@@ -334,6 +349,7 @@
         :content (if (= 1 (count blocks))
                    (first blocks)
                    {:t :block-quote
+                    :container :div
                     :attr {:classes (if panels? ["subfigures"] []) :props {}}
                     :blocks (vec blocks)})
         :caption (if (seq caption) [{:t :str :text caption}] [])}])))
@@ -464,6 +480,8 @@
   (str/join
    "\n"
    ["Usage: haselnuss [options] INPUT.hdoc"
+    "       haselnuss [options] BOOK-ID"
+    "       haselnuss [--libraries PATH] --list-books LIBRARY"
     ""
     "Converts a Haselnuss document to HTML, LaTeX, its own JSON interchange"
     "representation, or canonical .hdoc source."
@@ -490,6 +508,15 @@
     "                          the host's preamble (see that file's own header)."
     "      --bibliography PATH CSL-JSON bibliography (overrides the document's own"
     "                          meta.bibliography)"
+    "      --libraries PATH    the library directory file (a YAML list of libraries) that"
+    "                          book links @{...}, !quote lines and a BOOK-ID input resolve"
+    "                          against; overrides $HASELNUSS_LIBRARIES and"
+    "                          ~/.config/haselnuss/libraries.yaml (see README \"Libraries"
+    "                          and books\"). No effect on --target json or hdoc, which"
+    "                          resolve no book reference, unless the input is a BOOK-ID"
+    "      --list-books LIBRARY  print the canonical ID and title of every book in"
+    "                          LIBRARY, one per line, tab-separated and sorted by ID,"
+    "                          and exit; takes no input. An unknown library is an error"
     "      --overlay PATH      a .hdoc overlay file patching the base document via"
     "                          prepend/append/describe/highlight/sticky-note directives"
     "                          (repeatable; see README \"Overlays\" and \"Annotations\")."
@@ -499,8 +526,9 @@
     "                          classpath access (repeatable; see README \"Author-defined"
     "                          extensions\"). No effect on --target json or hdoc."
     "      --trusted-extensions  allow every --extensions file loaded this run to emit"
-    "                          verbatim, unescaped output; off by default, and never"
-    "                          settable by the sidecar file itself"
+    "                          verbatim, unescaped output, and lift the filtering of"
+    "                          the elements, attributes, links and TeX it emits; off"
+    "                          by default, and never settable by the sidecar file itself"
     "      --transform PATH    a sidecar .clj file defining rules that select and rewrite"
     "                          nodes of the parsed document before any other pass runs"
     "                          (repeatable; applied in file order, then declaration order"
@@ -514,6 +542,15 @@
     "      --no-stylesheet     html only: omit the default stylesheet the emitter"
     "                          otherwise inlines, for embedding the output in a page"
     "                          that brings its own CSS"
+    "      --untrusted         latex only: hold the document's own TeX -- its math,"
+    "                          image paths, citation keys and attribute values -- to"
+    "                          the allow-list untrusted extension output is held to,"
+    "                          and fail the build at the first string outside it,"
+    "                          naming file:line and the token. Without it, document"
+    "                          math reaches LaTeX as written, trusted; either way"
+    "                          \\href, \\url and \\hyperref are dropped from it, which"
+    "                          stops those links but no other route (see README"
+    "                          \"Converting a document you do not trust\")"
     "  -h, --help              show this help"
     "      --version           show the version of this build and exit"
     ""
@@ -569,6 +606,21 @@
     "names a different division than their own level is emitted as) are printed"
     "to stderr as warnings on the html/latex targets; the build still succeeds."
     ""
+    "A BOOK-ID input -- library:[shelf/...]slug, e.g. reformed:heidelberg -- builds"
+    "that book of the library directory instead of a file. It is taken as a book"
+    "only when no file or folder of that name exists, and the output defaults to"
+    "<slug> with the target's extension in the current directory -- never over an"
+    "existing file there unless --output names it. A book ID that cannot be found,"
+    "an unknown or unavailable library, and no library directory at all are"
+    "errors; --in-place is refused with one."
+    ""
+    "Book references are resolved on the html/latex targets. One that cannot be"
+    "resolved prints ?? (a quote, a ?? placeholder paragraph) and is reported as a"
+    "warning naming the reference as written, the book's canonical ID when known,"
+    "and file:line; so are the library directory's own problems (a library that"
+    "failed to load), once per build. None of them fails the build. A library"
+    "directory file that cannot be read or is not a valid list of libraries does."
+    ""
     "A flag given that has no effect on the chosen target -- each option's own"
     "note above -- is reported the same way, on every target: a warning on"
     "stderr, the build unaffected. So is --trusted-extensions given with no"
@@ -577,13 +629,16 @@
     "Exit codes:"
     "  0  the document was converted and written"
     "  1  the build failed (no representation for the target, a parse error,"
-    "     an unreadable file); nothing was written"
-    "  2  the command line was wrong; this usage text is printed"]))
+    "     a missing or unreadable file, a BOOK-ID or --list-books library that"
+    "     cannot be found, an invalid library directory file); nothing was written"
+    "  2  the command line was wrong; a pointer to --help is printed"]))
 
 (defn- parse-args
   "Parses `args` into `{:input :target :output :computed-numbers
   :bibliography :overlay :extensions :trusted-extensions :transform :help
-  :version :no-stylesheet :fragment :in-place}`, or throws
+  :version :no-stylesheet :fragment :in-place :libraries :list-books
+  :untrusted}`
+  (`:list-books` needs, and takes, no `:input`), or throws
   `ex-info` (`:type ::usage-error`) for
   an unknown flag, a flag missing its value, a target that is not in
   `targets`, or anything other than exactly one positional input.
@@ -632,7 +687,7 @@
           _ (when (and inline-value
                        (contains? #{"--help" "--version" "--computed-numbers"
                                     "--no-stylesheet" "--fragment" "--trusted-extensions"
-                                    "--in-place"}
+                                    "--in-place" "--untrusted"}
                                   arg))
               ;; A value on a flag that takes none must be an error, not
               ;; silently discarded: `--computed-numbers=false` turned
@@ -654,6 +709,12 @@
           ;; to convert something, so neither needs a document.
           (:help opts) opts
           (:version opts) opts
+          ;; TASK-157: a listing converts nothing, so an input given
+          ;; alongside it is a mistake rather than something to ignore.
+          (and (:list-books opts) (:input opts))
+          (throw (ex-info (str "--list-books takes no input; got " (pr-str (:input opts)))
+                          {:type ::usage-error}))
+          (:list-books opts) opts
           (nil? (:input opts)) (throw (ex-info "no input file given" {:type ::usage-error}))
           ;; TASK-101: --in-place's own two refusals are checked BEFORE
           ;; the generic unknown-target check below, both because they
@@ -709,6 +770,18 @@
         (let [[value rest-args] (take-value arg)]
           (recur rest-args (assoc opts :bibliography value) literal?))
 
+        ;; TASK-157 (doc-10, "CLI"): the library directory file, ahead of
+        ;; $HASELNUSS_LIBRARIES and the home config.
+        (and (not literal?) (= "--libraries" arg))
+        (let [[value rest-args] (take-value arg)]
+          (recur rest-args (assoc opts :libraries value) literal?))
+
+        ;; TASK-157: a question about a library, like --help one about the
+        ;; program, so it needs no input (and refuses one, below).
+        (and (not literal?) (= "--list-books" arg))
+        (let [[value rest-args] (take-value arg)]
+          (recur rest-args (assoc opts :list-books value) literal?))
+
         ;; The one repeatable flag (TASK-83.1): every other branch here
         ;; uses `assoc`, since every other option is single-valued, so
         ;; `--overlay a.hdoc --overlay b.hdoc` collects into a vector
@@ -755,6 +828,11 @@
         (and (not literal?) (= "--fragment" arg))
         (recur more (assoc opts :fragment true) literal?)
 
+        ;; TASK-219: hold the document's own TeX to TASK-215's allow-list
+        ;; in the LaTeX build (`run`, `sanitize/vet-untrusted-document`).
+        (and (not literal?) (= "--untrusted" arg))
+        (recur more (assoc opts :untrusted true) literal?)
+
         (and (not literal?) (str/starts-with? arg "-"))
         (throw (ex-info (str "unknown option " (pr-str arg)) {:type ::usage-error}))
 
@@ -792,6 +870,14 @@
         new-name (str (if (str/blank? stripped) base-name stripped)
                       (:extension (targets target)))]
     (if parent (str (io/file parent new-name)) new-name)))
+
+(defn- default-output-path
+  "Where a build of `opts` writes with no `:output`: `derived-output-path`,
+  except for a BOOK-ID input (TASK-157), which `build` gives its own
+  `::default-output` -- `<slug>.<ext>` in the current directory (doc-10,
+  \"CLI\"), not beside the book's file inside the library."
+  [opts]
+  (or (::default-output opts) (derived-output-path (:input opts) (:target opts))))
 
 (defn- output-path
   "The path to write to: `opts`' own `:output` when given, else
@@ -841,7 +927,7 @@
   refuses both -- `run`/`build` are public, so a caller reaching this
   directly gets the same guarantee a caller going through the CLI does,
   the same reason `run` itself re-validates `target` against `targets`."
-  [{:keys [input output target in-place]} bib-path]
+  [{:keys [input output target in-place] :as opts} bib-path]
   (when (and in-place output)
     (throw (ex-info "--in-place cannot be combined with --output: pass one destination, not two"
                     {:type ::usage-error})))
@@ -852,7 +938,7 @@
   (if (= :stdout output)
     :stdout
     (let [file (io/file input)
-          path (if in-place input (or output (derived-output-path input target)))]
+          path (if in-place input (or output (default-output-path opts)))]
       ;; Checked on the FINAL path, whichever branch chose it. Guarding
       ;; only the derived one left `-o victim.hdoc victim.hdoc` destroying
       ;; its own source -- while the message told the user to pass exactly
@@ -867,6 +953,17 @@
         (throw (ex-info (str "refusing to overwrite the bibliography file: " bib-path
                              " -- pass --output to write the converted document elsewhere")
                         {:type ::usage-error})))
+      ;; TASK-157 review: a BOOK-ID build's default output lands in
+      ;; whatever directory the user happens to be in, under a name
+      ;; (`<slug>.<ext>`) they never typed -- `haselnuss lib:apostles
+      ;; --target hdoc` beside their own `apostles.hdoc` replaced it. So an
+      ;; existing file there is never overwritten by default, on any
+      ;; target; naming it with --output says the overwrite is meant.
+      (when (and (nil? output) (::default-output opts) (.exists (io/file path)))
+        (throw (ex-info (str "refusing to overwrite " path ", which already exists, with book "
+                             (::book-ref opts) " -- pass --output " path
+                             " to replace it, or --output elsewhere")
+                        {:type ::book-output-exists :path path})))
       path)))
 
 (defn- bibliography-path
@@ -955,12 +1052,12 @@
      (let [file (io/file path)]
        (when-not (.isFile file)
          (throw (ex-info (str "overlay file not found: " path) {:type ::missing-overlay})))
-       (let [document (parser/parse (slurp file) vocabulary)
+       (let [document (parser/parse (slurp file) (assoc vocabulary :source path))
              {:keys [document warnings]}
              (resolver/expand-includes document
                                        {:base-dir (.getParentFile (.getAbsoluteFile file))
                                         :source-path path
-                                        :load (fn [f] (parser/parse (slurp f) vocabulary))})]
+                                        :load (fn [f] (parser/parse (slurp f) (assoc vocabulary :source (str f))))})]
          (-> acc
              (update :sources conj (:blocks document))
              (update :warnings into warnings)))))
@@ -1078,6 +1175,12 @@
       (conj (irrelevant-flag-diagnostic
              "--extensions" (str "--extensions has no effect on --target " target)))
 
+      ;; TASK-157: neither target resolves a book reference -- but a
+      ;; BOOK-ID input is found through the directory on every target.
+      (and (contains? #{:json :hdoc} emit-target) (:libraries opts) (not (::book opts)))
+      (conj (irrelevant-flag-diagnostic
+             "--libraries" (str "--libraries has no effect on --target " target)))
+
       (and (not= :latex emit-target) (:computed-numbers opts))
       (conj (irrelevant-flag-diagnostic
              "--computed-numbers"
@@ -1091,10 +1194,261 @@
       (conj (irrelevant-flag-diagnostic
              "--no-stylesheet" (str "--no-stylesheet has no effect on --target " target)))
 
+      ;; TASK-219: html math reaches MathJax, which TASK-217 already
+      ;; confines; json and hdoc filter nothing at all.
+      (and (not= :latex emit-target) (:untrusted opts))
+      (conj (irrelevant-flag-diagnostic
+             "--untrusted" (str "--untrusted has no effect on --target " target)))
+
       (and (:trusted-extensions opts) (empty? (:extensions opts)))
       (conj (irrelevant-flag-diagnostic
              "--trusted-extensions"
              "--trusted-extensions grants nothing with no --extensions given")))))
+
+;; --- libraries (TASK-157, doc-10 "CLI") ---------------------------------------
+;;
+;; A build reaches the library directory in one of three ways:
+;;
+;; - lazily, for a document's own book references: `run` hands
+;;   `resolve-document` a `:books` option over `references/directory-loader`,
+;;   which reads the directory file only on the first reference, so a
+;;   document with none never touches it (doc-10: "only a document that
+;;   actually uses a book reference is affected");
+;; - eagerly, for a BOOK-ID input, which `build` has to find before there is
+;;   any file to read (`book-input-opts`); the same directory value is then
+;;   handed to `run`, so the build loads it once;
+;; - eagerly, for `--list-books` (`list-books`).
+;;
+;; `:library-env` and `:library-home` are not command-line options: they
+;; replace the process environment and home folder `directory/
+;; find-directory-file` consults, so a test never reads the real
+;; `$HASELNUSS_LIBRARIES` or `~/.config/haselnuss/libraries.yaml`.
+;;
+;; `:library-directory` (TASK-159) is not a command-line option either: a
+;; LibraryDirectory value used in place of any directory file -- by a
+;; document's book references, a BOOK-ID input and `list-books` alike
+;; (`books-option`, `load-directory!`) -- so a program embedding Haselnuss,
+;; or a test, can work against in-process (`:memory`) libraries through the
+;; same pipeline as the CLI. No directory file is then read -- not a
+;; `--libraries` file, `$HASELNUSS_LIBRARIES` or the home config. A BOOK-ID
+;; input still needs a filesystem book,
+;; since only one has a source file to build.
+
+(defn- parse-kinds
+  "The `:kinds` of the parse vocabulary a build of `emit-target` uses --
+  every kind name of `lexicon` -- or nil when it parses with no vocabulary
+  at all (native-mode LaTeX; see `run`'s own `vocabulary`). The books the
+  build reads parse with the same kinds (`fs/provider`), so a `@fig:x` in
+  a quoted book means what it would in the host."
+  [lexicon emit-target computed-numbers]
+  (when (or (not= emit-target :latex) computed-numbers)
+    (into #{} (map name) (keys lexicon))))
+
+(defn- directory-opts
+  "The `haselnuss.library.directory` options for `opts`: `--libraries` as
+  the explicit `:path`, the injected `:library-env`/`:library-home` when
+  given, and the default provider registry with the `:filesystem` provider
+  rebuilt to parse every book with `kinds` (TASK-153's `fs/provider`)."
+  [opts kinds]
+  (cond-> {:path (:libraries opts)
+           :registry (directory/register-provider directory/default-registry :filesystem
+                                                  (fs/provider {:kinds kinds}))}
+    (contains? opts :library-env) (assoc :env (:library-env opts))
+    (contains? opts :library-home) (assoc :home (:library-home opts))))
+
+(defn- check-libraries-file!
+  "Throws when `--libraries` names a file that does not exist -- typed on
+  the command line, so a hard error up front like a missing `--overlay`,
+  even for a document that turns out to hold no book reference. Reading
+  and validating it stays lazy."
+  [opts]
+  (when (some? (:libraries opts))
+    (directory/find-directory-file {:path (:libraries opts)})))
+
+(def ^:private no-directory-message
+  (str "no library directory was found (pass --libraries, set $" directory/env-var
+       " or create ~/.config/haselnuss/libraries.yaml)"))
+
+(defn- directory-diagnostics
+  "The library directory `dir`'s own load problems (doc-10: a library that
+  failed to load), each `:level :error`, located at its entry."
+  [dir]
+  (if (satisfies? library/LibraryDiagnostics dir) (vec (library/library-diagnostics dir)) []))
+
+(defn- load-directory!
+  "The library directory for `opts`, loaded now, or a hard error when
+  there is none at all. `what` prefixes the message, naming what needed it."
+  [opts kinds what]
+  (or (:library-directory opts)
+      ((references/directory-loader (directory-opts opts kinds)))
+      (throw (ex-info (str what ": " no-directory-message) {:type ::no-library-directory}))))
+
+(defn- find-library!
+  "The Library `lib-name` of `dir`, or a hard error: an unknown library
+  (naming those the directory has), or one that failed to load (the
+  `:unavailable-library` message, whose cause names the directory file
+  and line). `diagnostics` ride along to be printed first."
+  [dir lib-name what diagnostics]
+  (let [lib (library/find-library dir lib-name)
+        fail (fn [error-type message]
+               (throw (ex-info (str what ": " message)
+                               {:type error-type :library lib-name ::diagnostics diagnostics})))]
+    (cond
+      (nil? lib)
+      (let [names (library/library-names dir)]
+        (fail ::unknown-library
+              (str "the library directory has no library " (pr-str lib-name)
+                   (if (seq names) (str " (it has: " (str/join ", " names) ")") " (it has none)"))))
+      (library/diagnostic? lib) (fail ::unavailable-library (:message lib))
+      :else lib)))
+
+(defn- book-id-input
+  "What `book-ref/parse-book-ref` makes of `input` when it is a BOOK-ID
+  input (doc-10, \"CLI\"): no file or folder of that name exists and it
+  parses as a book reference. nil otherwise -- then it is a file path, and
+  `build` reports a missing one as it always has."
+  [input]
+  (when (and (string? input) (not (.exists (io/file input))))
+    (let [parsed (book-ref/parse-book-ref input)]
+      (when-not (book-ref/malformed? parsed) parsed))))
+
+(defn- book-input-opts
+  "`opts` for building the book its `:input` names, `parsed` being that
+  input as a book reference: `:input` becomes the book's entry file, so
+  every pass -- `!include`, the bibliography, file:line positions -- reads
+  the book as it would the file; `::book` carries its BookId (for
+  `resolve-document`'s `:self`) and the loaded directory, and
+  `::default-output` is `<slug>.<ext>` in the current directory.
+
+  Hard errors (doc-10, \"Error handling\"): a passage in the input, no
+  library directory, an unknown or unavailable library, an unknown or
+  ambiguous book, a book that is not a `.hdoc` file (only filesystem books
+  have a file to build), and `--in-place`, which would rewrite a library's
+  book under a name the user never typed. The directory's own load
+  problems are `::directory-diagnostics`, printed once, first."
+  [opts parsed]
+  (let [{:keys [input target in-place]} opts
+        what (str "input " (pr-str input) " (no such file, so read as a book ID)")
+        {:keys [id passage]} parsed
+        {lib-name :library slug :slug} id
+        target-info (targets target)]
+    (when passage
+      (throw (ex-info (str what ": a book ID input names a whole book, not a passage; drop #"
+                           (book-ref/format-passage passage))
+                      {:type ::book-input-error})))
+    (when in-place
+      (throw (ex-info (str "--in-place needs a file input, not a book ID (" input ")")
+                      {:type ::usage-error})))
+    (let [kinds (parse-kinds (registry/numbering-lexicon (build-registry) resolver/default-lexicon)
+                             (:target target-info) (:computed-numbers opts))
+          dir (load-directory! opts kinds what)
+          diagnostics (directory-diagnostics dir)
+          lib (find-library! dir lib-name what diagnostics)
+          book (library/find-book lib slug)
+          fail (fn [message]
+                 (throw (ex-info (str what ": " message)
+                                 {:type ::book-input-error ::diagnostics diagnostics})))]
+      (cond
+        (nil? book) (fail (str "library " (pr-str lib-name) " has no book " (pr-str slug)))
+        (library/diagnostic? book) (fail (:message book))
+        ;; TASK-158: doc-10 builds only a filesystem book from a book ID,
+        ;; since only it has a source file; a generated book's document
+        ;; is the script's data, so say where it comes from.
+        (generated/generated-book? book)
+        (fail (str "book " (book-ref/format-book-id (:id (library/book-entry book)))
+                   " is generated by " (generated/script-path book)
+                   ", so there is no .hdoc source to build; quote it from a document instead"))
+        (not (fs/filesystem-book? book))
+        (fail (str "book " (book-ref/format-book-id (:id (library/book-entry book)))
+                   " is not a .hdoc file, so there is no source to build"))
+        :else
+        (let [current (:id (library/book-entry book))
+              canonical (book-ref/format-book-id current)
+              stale (when (and (seq (:shelf id)) (not= (:shelf id) (:shelf current)))
+                      {:type :stale-shelf
+                       :level :info
+                       :ref input
+                       :canonical canonical
+                       :message (str "book ID " (pr-str input) ": the book is now at " canonical
+                                     "; it still resolves, but its shelf path is stale")})]
+          (assoc opts
+                 :input (str (fs/entry-file book))
+                 ::book {:id current :directory dir}
+                 ::book-ref input
+                 ::directory-diagnostics (cond-> diagnostics stale (conj stale))
+                 ::default-output (str slug (:extension target-info))))))))
+
+(defn- books-option
+  "`resolve-document`'s `:books` for one build of `opts`
+  (`references/books-option`): the BOOK-ID input's already-loaded
+  directory, whose load problems `build` has already reported, or the
+  injected `:library-directory` value, or a lazy loader; a passage context
+  sharing `resolve-opts`, so a book numbers and names its labels with this
+  build's lexicon; and `:self` for a book."
+  [opts kinds resolve-opts]
+  (let [{book-id :id dir :directory} (::book opts)]
+    (references/books-option
+     (cond-> {:directory (or dir
+                             (:library-directory opts)
+                             (references/directory-loader (directory-opts opts kinds)))
+              :directory-reported? (some? dir)
+              :context (passage/context {:resolve-opts resolve-opts})}
+       book-id (assoc :self book-id)))))
+
+(defn- with-books
+  "`resolve-opts` -- the build's own `resolve-document` options -- with
+  `:books`, so quote expansion and link resolution run inside
+  `resolve-document`, and therefore before `sanitize/sanitize-document`
+  sees the URLs they fill in (TASK-156 review). Checks `--libraries` first."
+  [resolve-opts opts kinds]
+  (check-libraries-file! opts)
+  (assoc resolve-opts :books (books-option opts kinds resolve-opts)))
+
+(def ^:private build-only-flags
+  "Every option `parse-args` collects that only means something to a
+  build, keyed by the spelling `--help` gives it -- what `--list-books`
+  (which builds nothing) has no use for."
+  [[:target "--target"] [:output "--output"] [:in-place "--in-place"]
+   [:computed-numbers "--computed-numbers"] [:fragment "--fragment"]
+   [:bibliography "--bibliography"] [:overlay "--overlay"] [:extensions "--extensions"]
+   [:trusted-extensions "--trusted-extensions"] [:transform "--transform"]
+   [:no-stylesheet "--no-stylesheet"] [:untrusted "--untrusted"]])
+
+(defn- list-books-flag-diagnostics
+  "One irrelevant-flag warning (TASK-108's policy) per build option given
+  together with `--list-books`: the listing is unaffected, but a flag the
+  user typed is never silently dropped."
+  [opts]
+  (vec (for [[k flag] build-only-flags
+             :when (some? (get opts k))]
+         (irrelevant-flag-diagnostic flag (str flag " has no effect with --list-books")))))
+
+(defn list-books
+  "`--list-books` (doc-10, \"CLI\"): `{:books [[canonical-id title] ...]
+  :diagnostics [...]}` for the library `lib-name` of `opts`' library
+  directory, sorted by canonical ID, each title as plain text. Reads only
+  front matter. `:diagnostics` are a warning per build-only flag given
+  with it (`list-books-flag-diagnostics`), the directory's own load problems and
+  the library's scan problems (`:duplicate-slug`, `:invalid-book-name`,
+  ...), worth seeing exactly when looking for what to cite. Throws, as a
+  BOOK-ID input does, when there is no directory or no such usable
+  library."
+  [opts lib-name]
+  (let [what (str "--list-books " lib-name)
+        flag-diagnostics (list-books-flag-diagnostics opts)
+        dir (try (load-directory! opts nil what)
+                 (catch clojure.lang.ExceptionInfo e
+                   (throw (ex-info (ex-message e)
+                                   (assoc (ex-data e) ::diagnostics flag-diagnostics) e))))
+        diagnostics (into flag-diagnostics (directory-diagnostics dir))
+        lib (find-library! dir lib-name what diagnostics)]
+    {:books (->> (library/list-books lib)
+                 (map (fn [{:keys [id title]}]
+                        [(book-ref/format-book-id id) (str/join (map anchor/inline-text title))]))
+                 (sort-by first)
+                 vec)
+     :diagnostics (into diagnostics (when (satisfies? library/LibraryDiagnostics lib)
+                                      (library/library-diagnostics lib)))}))
 
 (defn run
   "The pure core (AC #1/#2/#3): parses `source`, resolves it, lowers it
@@ -1207,7 +1561,10 @@
         ;; diagnostic below -- the same "ran first, chronologically"
         ;; ordering `transform-diagnostics` gets for the same reason,
         ;; one step earlier still since this needs no parse at all.
-        flag-diagnostics (irrelevant-flag-diagnostics opts emit-target)
+        ;; TASK-157: a BOOK-ID input's library directory was loaded by
+        ;; `build` before this ran, so its load problems lead even these.
+        flag-diagnostics (into (vec (::directory-diagnostics opts))
+                               (irrelevant-flag-diagnostics opts emit-target))
         ;; Two registries, same extensions: the pre-numbering one only
         ;; supplies directive names and `:kind` fragments, while the
         ;; post-numbering one closes its degradation rules over the real
@@ -1232,7 +1589,7 @@
         ;; where it used to report the parse error -- true on every
         ;; target EXCEPT json/hdoc (TASK-107, just below), which never
         ;; make that report at all.
-        bib-path (bibliography-path opts (:bibliography (parser/front-matter source)))
+        bib-path (bibliography-path opts (:bibliography (parser/front-matter source (when (:input opts) {:source (:input opts)}))))
         ;; TASK-107: required everywhere except the json/hdoc branch
         ;; below, which reads this only for `vocabulary`'s `:cite-keys`
         ;; (never the bibliography's own content) and, per that branch's
@@ -1253,7 +1610,7 @@
         ;; filter applies to HTML, and to LaTeX only under
         ;; --computed-numbers, where the resolver's own answers are what
         ;; gets baked in and an unresolved reference was already a `??`.
-        vocabulary (when (or (not= emit-target :latex) computed-numbers)
+        vocabulary (when-let [kinds (parse-kinds lexicon emit-target computed-numbers)]
                      ;; `:cite-keys` is the empty set, not nil, when there
                      ;; is no bibliography at all: such a document has no
                      ;; bare citation that could resolve, and it is
@@ -1262,9 +1619,9 @@
                      ;; A bracketed `[@key]` is unaffected either way --
                      ;; explicit syntax, and it still warns when it
                      ;; dangles.
-                     {:kinds (into #{} (map name) (keys lexicon))
+                     {:kinds kinds
                       :cite-keys (set (keys bibliography))})
-        document (parser/parse source vocabulary)
+        document (parser/parse source (cond-> vocabulary (:input opts) (assoc :source (:input opts))))
         ;; TASK-103, doc-7 decision 1: the transform pass runs HERE,
         ;; immediately after parsing and before the json/hdoc-vs-resolve
         ;; branch below, so it composes with EVERY target -- including
@@ -1306,7 +1663,11 @@
        :front-matter nil
        :output (case emit-target
                  :json (json/->json (coalesce-prose document))
-                 :hdoc (hdoc/emit-document document))}
+                 ;; `vocabulary` again (TASK-135): the emitter backslash-
+                 ;; escapes an `@word` only if it would re-parse as a
+                 ;; reference, which is the same question the parse above
+                 ;; asked of it.
+                 :hdoc (hdoc/emit-document document vocabulary))}
       (let [;; TASK-83.1. Read here, before `resolve-document` runs, and
             ;; only on this (non-json/hdoc) branch -- an `--overlay`
             ;; combined with `--target json` or `--target hdoc` has no
@@ -1429,7 +1790,8 @@
                                              ;; caught like any other.
                                                    :source-path (:input opts)
                                                    :load (fn [file]
-                                                           (parser/parse (slurp file) vocabulary))}
+                                                           (parser/parse (slurp file)
+                                                                         (assoc vocabulary :source (str file))))}
                                             ;; TASK-83.1. Already read
                                             ;; and include-expanded above
                                             ;; (`load-overlays!`); empty
@@ -1437,7 +1799,11 @@
                                             ;; all, which `apply-overlays`
                                             ;; treats as a no-op.
                                                   :overlay-sources overlay-sources}
-                                           bibliography (assoc :bibliography bibliography)))
+                                           bibliography (assoc :bibliography bibliography)
+                                            ;; TASK-157. Last, so the
+                                            ;; books share every option
+                                            ;; above that they keep.
+                                           true (with-books opts (:kinds vocabulary))))
               (catch clojure.lang.ExceptionInfo e
                 (throw (ex-info (ex-message e)
                                 (assoc (ex-data e)
@@ -1465,6 +1831,35 @@
             diagnostics (into (vec flag-diagnostics)
                               (into (vec transform-diagnostics)
                                     (into (vec overlay-load-warnings) diagnostics)))
+            ;; TASK-136. After the resolver, so overlay-copied `describe`
+            ;; props and bibliography links are already in the tree, and
+            ;; before lowering and every emitter: a javascript:/data: URL
+            ;; or an on* attribute never reaches output. Its diagnostics
+            ;; are warnings like the resolver's.
+            {document :document sanitize-diagnostics :diagnostics}
+            (sanitize/sanitize-document document)
+            diagnostics (into diagnostics sanitize-diagnostics)
+            ;; TASK-219: the LaTeX build splices the document's own TeX
+            ;; as written. `--untrusted` first holds every such string to
+            ;; TASK-215's allow-list, failing the build at the first one
+            ;; outside it; then, flag or not, `\href`/`\url`/`\hyperref` are dropped
+            ;; from math, so `$\href{javascript:...}{x}$` makes no PDF
+            ;; link. Here, on the resolved document, so included files,
+            ;; overlays and a transform's output are covered, and before
+            ;; lowering, so an extension's output is not: that is
+            ;; `--trusted-extensions`' business (TASK-215).
+            {document :document math-link-diagnostics :diagnostics}
+            (if (= :latex emit-target)
+              (do (when (:untrusted opts)
+                    (try
+                      (sanitize/vet-untrusted-document document)
+                      (catch clojure.lang.ExceptionInfo e
+                        (throw (ex-info (ex-message e)
+                                        (assoc (ex-data e) ::diagnostics diagnostics)
+                                        e)))))
+                  (sanitize/neutralise-math-links document))
+              {:document document :diagnostics []})
+            diagnostics (into diagnostics math-link-diagnostics)
         ;; TASK-90. The same sidecar extensions merged into
         ;; `directive-registry` above, merged again onto the labels-aware
         ;; registry `lower`/the emitters actually dispatch through --
@@ -1515,12 +1910,20 @@
         ;; produces a diagnostic of its own (TASK-51): only the LOWERED
         ;; tree shows which references now point at a degraded directive,
         ;; and only this layer knows the target and the mode.
-            lowered (try
-                      (lower/lower document emit-target build-reg)
-                      (catch clojure.lang.ExceptionInfo e
-                        (throw (ex-info (ex-message e)
-                                        (assoc (ex-data e) ::diagnostics diagnostics)
-                                        e))))
+        ;; TASK-215: what lowering and the emitters drop from an untrusted
+        ;; extension's output (an on* or javascript: attribute in its
+        ;; hiccup, an unsafe link in the AST it renders through its ctx
+        ;; callbacks or returns from its :lower rule) is collected here and
+        ;; warned about like the document pass's own.
+            extension-warnings (atom [])
+            lowered (binding [sanitize/*untrusted-diagnostics* extension-warnings]
+                      (try
+                        (lower/lower document emit-target build-reg)
+                        (catch clojure.lang.ExceptionInfo e
+                          (throw (ex-info (ex-message e)
+                                          (assoc (ex-data e) ::diagnostics
+                                                 (into diagnostics @extension-warnings))
+                                          e)))))
             diagnostics (cond-> diagnostics
                           (= :latex emit-target)
                           (-> (into (latex/unanchored-reference-diagnostics
@@ -1565,21 +1968,24 @@
         ;; reported them, because two of these used to be evaluated
         ;; outside the guard).
             {:keys [output preamble front-matter]}
-            (try
-              {:output (case emit-target
-                         :html (html/emit-document lowered
-                                                   (assoc emit-opts
-                                                          :ordered-keys ordered-keys
-                                                          :stylesheet (if (:no-stylesheet opts)
-                                                                        :none
-                                                                        :default)))
-                         :latex (latex/emit-document lowered latex-opts))
-               :preamble (when fragment-latex? (latex/emit-preamble lowered latex-opts))
-               :front-matter (when fragment-latex? (latex/emit-front-matter lowered latex-opts))}
-              (catch clojure.lang.ExceptionInfo e
-                (throw (ex-info (ex-message e)
-                                (assoc (ex-data e) ::diagnostics diagnostics)
-                                e))))
+            (binding [sanitize/*untrusted-diagnostics* extension-warnings]
+              (try
+                {:output (case emit-target
+                           :html (html/emit-document lowered
+                                                     (assoc emit-opts
+                                                            :ordered-keys ordered-keys
+                                                            :stylesheet (if (:no-stylesheet opts)
+                                                                          :none
+                                                                          :default)))
+                           :latex (latex/emit-document lowered latex-opts))
+                 :preamble (when fragment-latex? (latex/emit-preamble lowered latex-opts))
+                 :front-matter (when fragment-latex? (latex/emit-front-matter lowered latex-opts))}
+                (catch clojure.lang.ExceptionInfo e
+                  (throw (ex-info (ex-message e)
+                                  (assoc (ex-data e) ::diagnostics
+                                         (into diagnostics @extension-warnings))
+                                  e)))))
+            diagnostics (into diagnostics @extension-warnings)
         ;; TASK-76/78: the last thing checked is what is actually about to
         ;; be written, so authored and generated text are scanned by one
         ;; pass, once `output`/`front-matter` both exist. The front-matter
@@ -1990,7 +2396,7 @@
         (java.nio.file.Files/deleteIfExists temp)
         (throw e)))))
 
-(defn build
+(defn- build-file
   "`run` over the file named by `opts`' own `:input`, writing the result
   to `output-path`. Returns `{:output-path :diagnostics :bibtex-path
   :preamble-path :output}`, `:output-path` being the keyword `:stdout`
@@ -2066,7 +2472,7 @@
       ;; anything reads the file, so it has no such exception to read
       ;; the wording off; the message is spelled out directly instead.
       (.isDirectory input-file)
-      (throw (ex-info (str "input path is a directory: " input) {:type ::usage-error}))
+      (throw (ex-info (str "input path is a directory: " input) {:type ::input-error}))
       ;; Neither a directory nor a plain file: doesn't exist (the
       ;; ordinary case), or is some other kind of filesystem entry this
       ;; tool has no more specific word for. A file that DOES exist but
@@ -2076,7 +2482,9 @@
       ;; `IOException` ("... (Permission denied)"), left uncaught and
       ;; reported by `main*`'s generic handler instead (AC #3).
       (not (.isFile input-file))
-      (throw (ex-info (str "input file not found: " input) {:type ::usage-error}))))
+      ;; TASK-138: an input problem, not a command-line one -- exit 1
+      ;; like the unreadable-file case, and no usage text.
+      (throw (ex-info (str "input file not found: " input) {:type ::input-error}))))
   (let [opts (assoc opts :base-dir (.getParent (.getAbsoluteFile (io/file input))))
         source (slurp input)
         ;; The same declared-or-overridden bibliography `run` itself
@@ -2084,7 +2492,7 @@
         ;; collision -- see its own docstring. Reading front matter only
         ;; (not the whole document) is what keeps this cheap enough to
         ;; do before the "chosen before converting anything" check below.
-        bib-path (bibliography-path opts (:bibliography (parser/front-matter source)))
+        bib-path (bibliography-path opts (:bibliography (parser/front-matter source (when (:input opts) {:source (:input opts)}))))
         ;; Chosen before converting anything, so a bad destination is
         ;; reported without first doing the whole build's work.
         path (output-path opts bib-path)
@@ -2095,7 +2503,7 @@
         ;; sentinel ("--bib has nowhere to go") -- `derived-output-path`
         ;; gives that name the same way `output-path` itself would have,
         ;; had `--output` not been given at all.
-        nominal-path (if (= :stdout path) (derived-output-path input (:target opts)) path)
+        nominal-path (if (= :stdout path) (default-output-path opts) path)
         native-latex? (and (= :latex (:target (targets (:target opts))))
                            (not (:computed-numbers opts)))
         resource (when native-latex? (bibtex-resource nominal-path))
@@ -2143,7 +2551,12 @@
         diagnostics (cond-> diagnostics
                       bibtex-content
                       (into (latex/untypesettable-character-diagnostics
-                             bibtex-content :bibliography)))
+                             bibtex-content :bibliography))
+                      ;; TASK-219 review: a javascript: URL the .bib
+                      ;; leaves out, which no other pass sees in native
+                      ;; mode, is warned about like a dropped link.
+                      bibtex-content
+                      (into (latex/bibtex-address-diagnostics bibliography ordered-keys)))
         ;; A fragment carrying its own reference list is a warning, not a
         ;; silent success (found by review): LaTeX allows exactly one
         ;; \bibliography per document, so a host template that keeps its
@@ -2236,6 +2649,33 @@
      :front-matter-paths (mapv first front-matter-files)
      :output output}))
 
+(defn build
+  "Builds `opts`' own `:input` and writes the result: `build-file` (whose
+  docstring has the whole contract), after turning a BOOK-ID input
+  (TASK-157, doc-10 \"CLI\": the argument parses as a book reference and
+  no file or folder of that name exists) into its book's own `.hdoc`
+  file, written by default to `<slug>.<ext>` in the current directory --
+  see `book-input-opts`, which also throws the hard errors a book that
+  cannot be found is."
+  [opts]
+  (let [opts (if-let [parsed (book-id-input (:input opts))]
+               (book-input-opts opts parsed)
+               opts)]
+    (try
+      (build-file opts)
+      (catch clojure.lang.ExceptionInfo e
+        ;; A BOOK-ID input's directory problems were found before
+        ;; anything here ran, so they are still worth printing when the
+        ;; build then stops on an error that carries no diagnostics of
+        ;; its own (a missing bibliography, a refused output path).
+        ;; One that does carry them already leads with these: `run`
+        ;; puts them at the head of every list it builds.
+        (if (and (seq (::directory-diagnostics opts)) (nil? (::diagnostics (ex-data e))))
+          (throw (ex-info (ex-message e)
+                          (assoc (ex-data e) ::diagnostics (::directory-diagnostics opts))
+                          e))
+          (throw e))))))
+
 (defn- warn!
   "Prints one resolver diagnostic to stderr as a warning (AC #4)."
   [diagnostic]
@@ -2284,18 +2724,31 @@
   `with-redefs` cannot stub (it is a static method). Without this split
   the stderr wording, the warnings-before-error ordering and the status
   mapping -- all of which AC #4/#5 are literally about -- could only be
-  approximated by asserting on data structures instead."
-  [args]
-  (try
-    (let [opts (parse-args args)]
-      (cond
-        (:help opts) (do (println usage) 0)
-        (:version opts) (do (println (str "haselnuss " @version)) 0)
-        :else
-        (let [{:keys [diagnostics bibtex-path front-matter-paths]
-               written :output-path preamble-file :preamble-path}
-              (build opts)]
-          (run! warn! diagnostics)
+  approximated by asserting on data structures instead.
+
+  `overrides` (TASK-157) is merged over the parsed options: never a
+  command-line option, it is how a test passes `:library-env` and
+  `:library-home` so that it never reads the real `$HASELNUSS_LIBRARIES`
+  or `~/.config/haselnuss/libraries.yaml`."
+  ([args] (main* args nil))
+  ([args overrides]
+   (try
+     (let [opts (merge (parse-args args) overrides)]
+       (cond
+         (:help opts) (do (println usage) 0)
+         (:version opts) (do (println (str "haselnuss " @version)) 0)
+        ;; TASK-157: the listing is the document here, so it goes to
+        ;; stdout; the library's problems go to stderr like any warning.
+         (:list-books opts)
+         (let [{:keys [books diagnostics]} (list-books opts (:list-books opts))]
+           (run! warn! diagnostics)
+           (run! (fn [[id title]] (println (str id "\t" title))) books)
+           0)
+         :else
+         (let [{:keys [diagnostics bibtex-path front-matter-paths]
+                written :output-path preamble-file :preamble-path}
+               (build opts)]
+           (run! warn! diagnostics)
           ;; TASK-100: every "wrote" line goes to stderr, not stdout --
           ;; unconditionally, not only under --output -, since the two
           ;; streams are fixed for the whole process and a line here
@@ -2305,30 +2758,34 @@
           ;; command line, and the one `derived-output-path`'s own
           ;; docstring points at for why a companion refusal does not
           ;; reuse it as a name.
-          (binding [*out* *err*]
-            (println (str "haselnuss: wrote " (if (= :stdout written) "-" written)))
+           (binding [*out* *err*]
+             (println (str "haselnuss: wrote " (if (= :stdout written) "-" written)))
             ;; Reported on its own line, not folded into the one above:
             ;; native-mode LaTeX writes a second file (TASK-42), a
             ;; --fragment build writes its companion preamble (TASK-52),
             ;; and a build that quietly produced a file the user did not
             ;; ask for is exactly the kind of surprise a converter should
             ;; not have.
-            (when bibtex-path (println (str "haselnuss: wrote " bibtex-path)))
-            (when preamble-file (println (str "haselnuss: wrote " preamble-file)))
-            (run! (fn [file] (println (str "haselnuss: wrote " file))) front-matter-paths))
-          0)))
-    (catch clojure.lang.ExceptionInfo e
+             (when bibtex-path (println (str "haselnuss: wrote " bibtex-path)))
+             (when preamble-file (println (str "haselnuss: wrote " preamble-file)))
+             (run! (fn [file] (println (str "haselnuss: wrote " file))) front-matter-paths))
+           0)))
+     (catch clojure.lang.ExceptionInfo e
       ;; Warnings first, then the error that stopped the build -- the
       ;; order `pdflatex` itself reports in, and the order that lets a
       ;; warning explain the error (see `run`).
-      (run! warn! (::diagnostics (ex-data e)))
-      (fail! (ex-message e) (ex-data e))
-      (if (= ::usage-error (:type (ex-data e)))
-        (do (binding [*out* *err*] (println usage)) 2)
-        1))
-    (catch Exception e
-      (fail! (or (ex-message e) (str e)))
-      1)))
+       (run! warn! (::diagnostics (ex-data e)))
+       (fail! (ex-message e) (ex-data e))
+       (if (= ::usage-error (:type (ex-data e)))
+        ;; TASK-138: one pointer line, not the whole usage text,
+        ;; which buried the one line the user needed.
+         (do (binding [*out* *err*]
+               (println "Try 'haselnuss --help' for usage."))
+             2)
+         1))
+     (catch Exception e
+       (fail! (or (ex-message e) (str e)))
+       1))))
 
 (defn -main
   "The process entry point: `main*`, then exit with the status it

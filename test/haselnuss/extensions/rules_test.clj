@@ -19,7 +19,8 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [haselnuss.extensions.rules :as rules]
-            [haselnuss.sandbox :as sandbox])
+            [haselnuss.sandbox :as sandbox]
+            [haselnuss.transform :as transform])
   (:import (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)))
 
@@ -229,7 +230,20 @@
       (is (= :threw status))
       (is (= :haselnuss.sandbox/timeout error-type))
       (is (str/includes? message "200ms"))
-      (is (< elapsed 2000)))))
+      (is (< elapsed 2000))
+      ;; TASK-147: the abandoned worker must not keep spinning (Thread.stop
+      ;; is unsupported from JDK 20, where it is a documented residual).
+      (when (< (.feature (Runtime/version)) 20)
+        (let [alive? (fn []
+                       (some #(and (str/starts-with? (.getName ^Thread %)
+                                                     "haselnuss-sandbox-worker: ")
+                                   (.isAlive ^Thread %))
+                             (keys (Thread/getAllStackTraces))))]
+          (loop [n 0]
+            (when (and (alive?) (< n 50))
+              (Thread/sleep 100)
+              (recur (inc n))))
+          (is (not (alive?))))))))
 
 (deftest ac6-oversized-transform-output-refused-test
   (testing "AC #6: a :transform's own returned value, over a small
@@ -291,3 +305,166 @@
       (rules/load-transforms [def-path] {:ctx ctx})
       (let [[rule] (rules/load-transforms [use-path] {:ctx ctx})]
         (is (= 42 ((:transform rule) minimal-node {})))))))
+
+;; --- TASK-214: a rule's :select runs in the sandbox --------------------------
+
+(def ^:private doc-of-paras
+  "A Document of two paragraphs, `alpha` and `beta`."
+  {:meta {}
+   :blocks [{:t :para :attr {:classes [] :props {}} :inlines [{:t :str :text "alpha"}]}
+            {:t :para :attr {:classes [] :props {}} :inlines [{:t :str :text "beta"}]}]})
+
+(defn- run-rules
+  "Loads `source` as a --transform file and runs it over `document`,
+  returning `[:ok result]` or `[:threw type message data]`, giving up after
+  30 s (`:hung`) so a regression fails instead of hanging the suite."
+  ([source document] (run-rules source document {}))
+  ([source document opts]
+   (let [path (write-rule-file! (scratch-dir!) "rule.clj" source)
+         rules (rules/load-transforms [path] opts)
+         f (future (try [:ok (transform/transform-document document rules)]
+                        (catch Exception e [:threw (:type (ex-data e)) (ex-message e) e])))
+         result (deref f 30000 :hung)]
+     (when (= :hung result) (future-cancel f))
+     result)))
+
+(defn- matched-texts
+  "The text of every paragraph `source`'s rule (which marks what it
+  matches with an `x` class) matched in `doc-of-paras`."
+  [source]
+  (let [[status {:keys [document]} :as result] (run-rules source doc-of-paras)]
+    (is (= :ok status) (pr-str result))
+    (vec (for [b (:blocks document) :when (some #{"x"} (get-in b [:attr :classes]))]
+           (get-in b [:inlines 0 :text])))))
+
+(def ^:private mark-x
+  ":transform (fn [n c] (update-in n [:attr :classes] conj \"x\"))")
+
+(deftest select-fn-runs-in-the-sandbox-test
+  (testing "a :select function's answer decides the match, coerced to a
+            boolean, as before"
+    (is (= ["alpha"] (matched-texts (str "{:select (fn [n] (and (= :para (:t n)) "
+                                         "(some #(= \"alpha\" (:text %)) (:inlines n)))) " mark-x "}"))))
+    (is (= ["alpha" "beta"] (matched-texts (str "{:select (fn [n] (when (= :para (:t n)) 1)) " mark-x "}")))))
+  (testing "it runs with the script's sci context: building an ex-info or a
+            reify inside it works"
+    (is (= ["alpha" "beta"]
+           (matched-texts (str "{:select (fn [n] (and (= :para (:t n)) (some? (ex-info \"x\" {}))"
+                               " (some? (reify Object)))) " mark-x "}")))))
+  (testing "a looping :select fails with the sandbox timeout, naming the rule"
+    (let [start (System/nanoTime)
+          [status error-type message e] (run-rules (str "{:name \"spin\" :select (fn [n] (loop [] (recur))) "
+                                                        mark-x "}")
+                                                   doc-of-paras {:timeout-ms 200})
+          elapsed-ms (/ (- (System/nanoTime) start) 1e6)]
+      (is (= :threw status))
+      (is (= ::sandbox/timeout error-type))
+      (is (str/starts-with? message "spin: spin ("))
+      (is (str/includes? message "'s :select did not finish within 200ms"))
+      (is (= "spin" (:rule (ex-data e))))
+      (is (< elapsed-ms 5000) (str "took " elapsed-ms "ms"))))
+  (testing "a nested selector function (a map value) runs in the sandbox too"
+    (let [[status error-type] (run-rules (str "{:select {:t :para :text (fn [s] (loop [] (recur)))} "
+                                              mark-x "}")
+                                         doc-of-paras {:timeout-ms 200})]
+      (is (= [:threw ::sandbox/timeout] [status error-type])))))
+
+(deftest select-error-is-sanitised-test
+  (testing "a :select that throws an ex-info whose data holds a looping
+            reify fails as a sandbox evaluation error naming the rule, and
+            nothing in the error's cause chain holds script data: printing
+            all of it finishes"
+    (let [[status error-type message e]
+          (run-rules (str "{:name \"thrower\" :select (fn [n] (throw (ex-info \"select boom\" "
+                          "{:text (reify Object (toString [_] (loop [] (recur)))) :line 7}"
+                          " (ex-info \"inner\" {:x (reify clojure.lang.IDeref (deref [_] (loop [] (recur))))}))))"
+                          " " mark-x "}")
+                     doc-of-paras)
+          chain (take-while some? (iterate ex-cause e))
+          printed (future (mapv (comp pr-str ex-data) chain))]
+      (is (= :threw status))
+      (is (= ::sandbox/evaluation-error error-type))
+      (is (str/includes? message "thrower"))
+      (is (str/includes? message "select boom"))
+      (is (not= :hung (deref printed 10000 :hung)) "printing the cause chain's ex-data hung")
+      (is (every? (fn [c] (every? (fn [[k v]] (and (keyword? k)
+                                                   (or (nil? v) (string? v) (number? v) (keyword? v)
+                                                       (boolean? v))))
+                                  (ex-data c)))
+                  chain))
+      (testing "the script's message and scalar data survive, its reify does not"
+        (let [script-error (some #(when (= "select boom" (ex-message %)) %) chain)]
+          (is (some? script-error))
+          (is (= {:line 7} (ex-data script-error)))
+          (is (= "inner" (ex-message (ex-cause script-error))))
+          (is (= {} (ex-data (ex-cause script-error)))))))))
+
+(deftest select-regex-is-bounded-test
+  (testing "a catastrophically backtracking :select regex times out naming
+            the rule, rather than hanging the build"
+    (let [doc {:meta {} :blocks [{:t :para :attr {:classes [] :props {}}
+                                  :inlines [{:t :str :text (apply str (repeat 50 "a"))}]}]}
+          start (System/nanoTime)
+          [status error-type message] (run-rules (str "{:name \"redos\" :select {:text #\"(.*a){12}b\"} "
+                                                      mark-x "}")
+                                                 doc {:timeout-ms 300})
+          elapsed-ms (/ (- (System/nanoTime) start) 1e6)]
+      (is (= :threw status))
+      (is (= ::sandbox/timeout error-type))
+      (is (str/includes? (str message) "redos"))
+      (is (< elapsed-ms 5000) (str "took " elapsed-ms "ms"))))
+  (testing "an ordinary regex selector still matches as before"
+    (is (= ["beta"] (matched-texts (str "{:select {:t :para :text #\"^b\"} " mark-x "}"))))
+    (is (= ["alpha" "beta"] (matched-texts (str "{:select [{:t :para :text #\"^a\"} {:t :para :text \"beta\"}] "
+                                                mark-x "}"))))))
+
+(deftest select-matcher-shape-test
+  (testing "a plain-data selector gets no sandboxed :matcher; one holding a
+            function or regex anywhere does; a :matcher the script supplied
+            itself is dropped"
+    (let [dir (scratch-dir!)
+          path (write-rule-file! dir "shapes.clj"
+                                 (str "[{:select :para :transform (fn [n c] n)}\n"
+                                      " {:select {:t :para :class #{\"a\"}} :transform (fn [n c] n)}\n"
+                                      " {:select :para :matcher (fn [n] (loop [] (recur))) :transform (fn [n c] n)}\n"
+                                      " {:select (fn [n] true) :transform (fn [n c] n)}\n"
+                                      " {:select {:t :para :id #\"^x\"} :transform (fn [n c] n)}\n"
+                                      " {:select [:para {:level (fn [l] true)}] :transform (fn [n c] n)}]"))
+          rules (rules/load-transforms [path])]
+      (is (= [false false false true true true] (mapv #(contains? % :matcher) rules)))
+      (testing "the selector itself is kept as written, naming the rule"
+        (is (= :para (:select (nth rules 2))))
+        (is (fn? (:select (nth rules 3)))))))
+  (testing "the split matcher agrees with matching the whole selector: a map's
+            plain part is an AND with its script part, a vector's an OR"
+    (is (= [] (matched-texts (str "{:select {:t :section :text #\"a\"} " mark-x "}"))))
+    (is (= ["alpha"] (matched-texts (str "{:select {:t :para :text #\"lph\"} " mark-x "}"))))
+    (is (= ["alpha" "beta"] (matched-texts (str "{:select [:para :str (fn [n] (loop [] (recur)))] " mark-x "}")))
+        "a vector's script element is not run once a plain one matched"))
+  (testing "a vector keeps select/matches?'s left-to-right short-circuit: an
+            element after a script one that matched is never reached, and a
+            script element before a plain one runs first"
+    (is (= ["alpha" "beta"] (matched-texts (str "{:select [(fn [_] true) {:prop 3}] " mark-x "}")))
+        "the malformed {:prop 3} is not reached")
+    (let [[status error-type message]
+          (run-rules (str "{:select [(fn [n] (throw (ex-info \"first\" {}))) :para] " mark-x "}")
+                     doc-of-paras)]
+      (is (= [:threw ::sandbox/evaluation-error] [status error-type]))
+      (is (str/includes? (str message) "first")))))
+
+(deftest select-var-refused-test
+  (testing "a sci var anywhere in a :select -- whose printing reads metadata
+            the script controls -- is refused at load, naming the rule and
+            the file, without printing it"
+    (doseq [select ["#'sel" "[:para #'sel]" "{:t :para :text #'sel}"]]
+      (let [path (write-rule-file! (scratch-dir!) "var.clj"
+                                   (str "(defn sel [n] true)\n"
+                                        "(alter-meta! #'sel assoc :name (reify Object (toString [_] (loop [] (recur)))))\n"
+                                        "{:name \"by-var\" :select " select " :transform (fn [n c] n)}"))
+            f (future (outcome #(rules/load-transforms [path])))
+            [status error-type message :as result] (deref f 30000 :hung)]
+        (is (not= :hung result) select)
+        (is (= :threw status) select)
+        (is (= ::rules/malformed-transform-rule error-type) select)
+        (is (str/includes? (str message) "by-var's :select holds a var") select)
+        (is (str/includes? (str message) "var.clj") select)))))

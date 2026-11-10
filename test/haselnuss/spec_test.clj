@@ -37,13 +37,14 @@
 (def ^:private commonmark-sections
   "Section numbers cited from the COMMONMARK specification rather than
   this project's own -- backslash escapes, link reference definitions,
-  link destinations, autolinks. Listed rather than pattern-matched because the two
+  link destinations, autolinks, HTML blocks and raw HTML (TASK-203).
+  Listed rather than pattern-matched because the two
   specifications number their sections in the same shape, and a citation
   of one is indistinguishable from a citation of the other without
   reading the sentence around it. Every one of these appears in a
   sentence that names CommonMark; none of them is a section `SPEC.md`
   has."
-  #{"2.4" "4.7" "6.3" "6.4" "6.5"})
+  #{"2.4" "4.6" "4.7" "6.3" "6.4" "6.5" "6.6"})
 
 (deftest spec-is-in-the-repository-test
   (testing "TASK-62 AC #1: the specification is a file in this

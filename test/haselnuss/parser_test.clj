@@ -373,6 +373,7 @@
     (let [doc (parser/parse "[a link][ref]\n\n[ref]: http://example.com/x \"title\"\n")]
       (is (= [{:t :para
                :inlines [{:t :link :target "http://example.com/x"
+                          :title "title"
                           :inlines [(str-inline "a") space (str-inline "link")]
                           :attr attr}]}]
              (:blocks doc)))
@@ -395,7 +396,8 @@
   (testing "a reference link/image with no matching definition falls back to
             its own literal source text, matching CommonMark (an undefined
             reference is not an error, it is plain text) and flexmark's own
-            HtmlRenderer"
+            HtmlRenderer (its content is still parsed, though: see
+            `undefined-bracket-keeps-inline-nodes-test`)"
     (let [doc (parser/parse "[undefined][nope]\n")]
       (is (= [{:t :para :inlines [(str-inline "[undefined][nope]")]}]
              (:blocks doc)))
@@ -427,6 +429,138 @@
                :attr attr}]
              (:blocks doc)))
       (is (ast/valid? ast/Document doc)))))
+
+(deftest undefined-bracket-keeps-inline-nodes-test
+  (testing "TASK-160 AC #1: inside a `[...]` that is no defined construct,
+            a book ref, cross-ref, citation and inline math each stay their
+            own node, the brackets literal text around them"
+    (doseq [[src inlines]
+            [["[see @{bible:romanos#14:8}]\n"
+              [(str-inline "[see") space {:t :book-ref :ref "bible:romanos#14:8"} (str-inline "]")]]
+             ["[$x^2$]\n"
+              [(str-inline "[") {:t :math-inline :tex "x^2"} (str-inline "]")]]
+             ;; Not a citation group: its second segment has no `@key`
+             ;; (`citation-bracket-content?`), so `@smith2020` is the bare,
+             ;; author-in-text form.
+             ["[@smith2020; @{bible:x}]\n"
+              [(str-inline "[") {:t :cite :items [{:key "smith2020" :mode :author}]}
+               (str-inline ";") space {:t :book-ref :ref "bible:x"} (str-inline "]")]]
+             ["[see @fig:x; and more]\n"
+              [(str-inline "[see") space {:t :cross-ref :label "fig:x"} (str-inline ";")
+               space (str-inline "and") space (str-inline "more]")]]
+             ["[see *this*]\n"
+              [(str-inline "[see") space {:t :emph :inlines [(str-inline "this")]} (str-inline "]")]]
+             ["[$y$][nope]\n"
+              [(str-inline "[") {:t :math-inline :tex "y"} (str-inline "][nope]")]]
+             ["[$y$][]\n"
+              [(str-inline "[") {:t :math-inline :tex "y"} (str-inline "][]")]]
+             ;; flexmark leaves edge spaces out of the children; they stay
+             ;; `:space` nodes, not part of the bracket's word.
+             ["[ foo ]\n" [(str-inline "[") space (str-inline "foo") space (str-inline "]")]]
+             ["[ foo bar ]\n"
+              [(str-inline "[") space (str-inline "foo") space (str-inline "bar") space (str-inline "]")]]
+             ["[ $x$ ]\n" [(str-inline "[") space {:t :math-inline :tex "x"} space (str-inline "]")]]
+             ["[ *a* ]\n"
+              [(str-inline "[") space {:t :emph :inlines [(str-inline "a")]} space (str-inline "]")]]
+             ["[ @{a:b} ]\n" [(str-inline "[") space {:t :book-ref :ref "a:b"} space (str-inline "]")]]
+             ["[$x$ ][nope]\n"
+              [(str-inline "[") {:t :math-inline :tex "x"} space (str-inline "][nope]")]]
+             ;; Prose touching a bracket is one word with it.
+             ["CLC[$i$] and x[$i$]y\n"
+              [(str-inline "CLC[") {:t :math-inline :tex "i"} (str-inline "]") space (str-inline "and")
+               space (str-inline "x[") {:t :math-inline :tex "i"} (str-inline "]y")]]]]
+      (let [doc (parser/parse src)]
+        (is (= [{:t :para :inlines inlines}] (:blocks doc)) src)
+        (is (ast/valid? ast/Document doc) src))))
+  (testing "a bracket of plain text is still one word per run, as before"
+    (is (= [(str-inline "[foo]")] (-> (parser/parse "[foo]\n") :blocks first :inlines)))
+    (is (= [(str-inline "[foo") space (str-inline "bar]")]
+           (-> (parser/parse "[foo bar]\n") :blocks first :inlines)))
+    (is (= [(str-inline "[@fig:x]")] (-> (parser/parse "[\\@fig:x]\n") :blocks first :inlines))
+        "an escaped `@` is still prose"))
+  (testing "an undefined reference with an attribute group keeps its nodes
+            inside the Span that carries the group"
+    (is (= [{:t :span
+             :inlines [(str-inline "[") {:t :math-inline :tex "z"} (str-inline "][nope]")]
+             :attr {:classes ["c"] :props {}}}]
+           (-> (parser/parse "[$z$][nope]{.c}\n") :blocks first :inlines)))
+    (is (= [{:t :span
+             :inlines [(str-inline "[") space {:t :math-inline :tex "z"} space (str-inline "][nope]")]
+             :attr {:classes ["c"] :props {}}}]
+           (-> (parser/parse "[ $z$ ][nope]{.c}\n") :blocks first :inlines))))
+  (testing "a node inside a bracket spanning lines keeps its OWN line, not
+            the line the bracket opens on"
+    (let [inlines (-> (parser/parse "a\n[see\n@fig:x; @{b:c} z]\n" {:source "doc.hdoc"})
+                      :blocks first :inlines)
+          line-of (fn [t] (:line (ast/source (first (filter #(= t (:t %)) inlines)))))]
+      (is (= 3 (line-of :cross-ref)))
+      (is (= 3 (line-of :book-ref)))))
+  (testing "AC #2: defined bracket constructs parse exactly as before"
+    (is (= [{:t :cite :items [{:key "fig:x" :mode :normal :prefix [(str-inline "see")]}]}]
+           (-> (parser/parse "[see @fig:x]\n") :blocks first :inlines))
+        "every segment has an `@key`: a citation group, as sec5.11 says")
+    (is (= [{:t :cite :items [{:key "smith2020" :mode :normal} {:key "doe99" :mode :normal}]}]
+           (-> (parser/parse "[@smith2020; @doe99]\n") :blocks first :inlines)))
+    (is (= [{:t :span :inlines [(str-inline "see") space {:t :math-inline :tex "x"}]
+             :attr {:classes ["c"] :props {}}}]
+           (-> (parser/parse "[see $x$]{.c}\n") :blocks first :inlines)))
+    (is (= [{:t :link :target "http://x" :inlines [{:t :math-inline :tex "x"}] :attr attr}]
+           (-> (parser/parse "[$x$]\n\n[$x$]: http://x\n") :blocks first :inlines)))
+    (is (= [{:t :link :target "u" :inlines [{:t :book-ref :ref "a:b"}] :attr attr}]
+           (-> (parser/parse "[@{a:b}](u)\n") :blocks first :inlines)))))
+
+(deftest undefined-image-ref-keeps-inline-nodes-test
+  (testing "TASK-166 AC #1: an undefined image reference keeps the nodes in
+            its alt text, `![`, `]` and any `[ref]` literal text around them
+            -- the same fallback TASK-160 gave an undefined `[...]`"
+    (doseq [[src inlines]
+            [["![$x$][nope]\n"
+              [(str-inline "![") {:t :math-inline :tex "x"} (str-inline "][nope]")]]
+             ["![a *b*]\n"
+              [(str-inline "![a") space {:t :emph :inlines [(str-inline "b")]} (str-inline "]")]]
+             ["![$y$][]\n"
+              [(str-inline "![") {:t :math-inline :tex "y"} (str-inline "][]")]]
+             ["![@{a:b}]\n"
+              [(str-inline "![") {:t :book-ref :ref "a:b"} (str-inline "]")]]
+             ["![see @fig:x; z]\n"
+              [(str-inline "![see") space {:t :cross-ref :label "fig:x"} (str-inline ";")
+               space (str-inline "z]")]]
+             ;; Plain alt text is one word per run, as before.
+             ["![x][]\n" [(str-inline "![x][]")]]
+             ["![x][nope]\n" [(str-inline "![x][nope]")]]
+             ;; No children at all: the raw span, as before.
+             ["![]\n" [(str-inline "![]")]]
+             ["![][nope]\n" [(str-inline "![][nope]")]]
+             ;; Edge spaces flexmark leaves outside the children stay
+             ;; `:space` nodes.
+             ["![ foo ]\n" [(str-inline "![") space (str-inline "foo") space (str-inline "]")]]
+             ["![ $x$ ][nope]\n"
+              [(str-inline "![") space {:t :math-inline :tex "x"} space (str-inline "][nope]")]]
+             ;; Prose touching the syntax is one word with it.
+             ["x![$i$]y\n"
+              [(str-inline "x![") {:t :math-inline :tex "i"} (str-inline "]y")]]
+             ;; Nested inside an undefined bracket, and inside itself.
+             ["[![$x$]]\n" [(str-inline "[![") {:t :math-inline :tex "x"} (str-inline "]]")]]
+             ["![![$y$]]\n" [(str-inline "![![") {:t :math-inline :tex "y"} (str-inline "]]")]]]]
+      (let [doc (parser/parse src)]
+        (is (= [{:t :para :inlines inlines}] (:blocks doc)) src)
+        (is (ast/valid? ast/Document doc) src))))
+  (testing "a node inside an image reference spanning lines keeps its OWN
+            line, and the line break stays a soft break"
+    (let [inlines (-> (parser/parse "a\n![see\n@fig:x; @{b:c} z]\n" {:source "doc.hdoc"})
+                      :blocks first :inlines)
+          line-of (fn [t] (:line (ast/source (first (filter #(= t (:t %)) inlines)))))]
+      (is (= [:str :soft-break :str :soft-break :cross-ref :str :space :book-ref :space :str]
+             (mapv :t inlines)))
+      (is (= 3 (line-of :cross-ref)))
+      (is (= 3 (line-of :book-ref)))))
+  (testing "AC #2: a defined image reference parses exactly as before"
+    (is (= [{:t :image :src "a.png" :alt "x" :attr attr}]
+           (-> (parser/parse "![$x$][r]\n\n[r]: a.png\n") :blocks first :inlines)))
+    (is (= [{:t :image :src "a.png" :alt "a b" :attr attr}]
+           (-> (parser/parse "![a *b*]\n\n[a *b*]: a.png\n") :blocks first :inlines)))
+    (is (= [{:t :image :src "a.png" :alt "x" :attr attr}]
+           (-> (parser/parse "![x][]\n\n[x]: a.png\n") :blocks first :inlines)))))
 
 (deftest thematic-break-test
   (testing "a thematic break parses to :thematic-break (AC #3)"
@@ -628,6 +762,190 @@
              (:blocks doc)))
       (is (ast/valid? ast/Document doc)))))
 
+(deftest image-ref-attribute-group-test
+  (testing "TASK-169 AC #1: a defined reference-style image -- full,
+            collapsed and shortcut -- followed by an attribute group parses
+            to the same blocks as the inline image it stands for, title
+            included"
+    (doseq [[src inline-src]
+            [["![x][r]{.c}\n\n[r]: a.png\n" "![x](a.png){.c}\n"]
+             ["![x][]{.c}\n\n[x]: a.png\n" "![x](a.png){.c}\n"]
+             ["![x]{.c}\n\n[x]: a.png\n" "![x](a.png){.c}\n"]
+             ["![x][r]{.c k=v}\n\n[r]: a.png \"T\"\n" "![x](a.png \"T\"){.c k=v}\n"]
+             ;; Defined after a paragraph that uses it, mid-sentence.
+             ["a ![x][r]{#i} b\n\n[r]: a.png\n" "a ![x](a.png){#i} b\n"]]]
+      (let [doc (parser/parse src)]
+        (is (= (:blocks (parser/parse inline-src)) (:blocks doc)) src)
+        (is (ast/valid? ast/Document doc) src)))
+    (is (= [{:t :image :src "a.png" :alt "x" :attr {:classes ["c"] :props {}}}]
+           (-> (parser/parse "![x][r]{.c}\n\n[r]: a.png\n") :blocks first :inlines))))
+  (testing "a lone id-bearing reference image is promoted to a figure the
+            same way an inline one is -- id and classes on the figure, and
+            the caption keeping the alt text's markup"
+    (doseq [[src inline-src]
+            [["![*x* $y$][r]{#fig:a .c w=1}\n\n[r]: a.png\n" "![*x* $y$](a.png){#fig:a .c w=1}\n"]
+             ["![As in @fig:b]{#fig:a}\n\n[As in @fig:b]: a.png\n" "![As in @fig:b](a.png){#fig:a}\n"]
+             ["![x][]{#fig:a}\n\n[x]: a.png\n" "![x](a.png){#fig:a}\n"]]]
+      (let [doc (parser/parse src)]
+        (is (= :figure (:t (first (:blocks doc)))) src)
+        (is (= (:blocks (parser/parse inline-src)) (:blocks doc)) src)
+        (is (ast/valid? ast/Document doc) src)))
+    (is (= [{:t :emph :inlines [(str-inline "x")]} space {:t :math-inline :tex "y"}]
+           (-> (parser/parse "![*x* $y$][r]{#fig:a}\n\n[r]: a.png\n") :blocks first :caption))))
+  (testing "AC #2: an undefined image reference followed by an attribute
+            group keeps TASK-166's inline nodes, wrapped in a Span carrying
+            the group -- as an undefined `[a][nope]{.c}` is"
+    (doseq [[src inlines]
+            [["![x][nope]{.c}\n" [(str-inline "![x][nope]")]]
+             ["![$x$][]{.c}\n" [(str-inline "![") {:t :math-inline :tex "x"} (str-inline "][]")]]
+             ["![x]{.c}\n" [(str-inline "![x]")]]
+             ["![ $z$ ][nope]{.c}\n"
+              [(str-inline "![") space {:t :math-inline :tex "z"} space (str-inline "][nope]")]]]]
+      (let [doc (parser/parse src)]
+        (is (= [{:t :para :inlines [{:t :span :inlines inlines :attr {:classes ["c"] :props {}}}]}]
+               (:blocks doc))
+            src)
+        (is (ast/valid? ast/Document doc) src)))
+    (is (= [{:t :para :inlines [{:t :span :inlines [(str-inline "![x][nope]")]
+                                 :attr {:id "fig:a" :classes [] :props {}}}]}]
+           (:blocks (parser/parse "![x][nope]{#fig:a}\n")))
+        "an id on an undefined one goes on the Span: there is no image to promote"))
+  (testing "the attributed Span for an undefined image or link reference
+            carries the reference's own source line"
+    (doseq [src ["hi\n\n![x][nope]{#a}\n" "hi\n\n[x][nope]{#a}\n" "hi\n\n![$x$]{.c}\n"]]
+      (let [span (-> (parser/parse src {:source "doc.hdoc"}) :blocks second :inlines first)]
+        (is (= :span (:t span)) src)
+        (is (= {:file "doc.hdoc" :line 3} (select-keys (ast/source span) [:file :line])) src)))))
+
+(defn- flexmark-attributes-tag
+  "flexmark-ext-attributes' own `AttributeParsing.ATTRIBUTES_TAG`, read
+  reflectively (the class and field are package-private)."
+  ^java.util.regex.Pattern []
+  (let [options (doto (com.vladsch.flexmark.util.data.MutableDataSet.)
+                  (.set com.vladsch.flexmark.parser.Parser/EXTENSIONS
+                        (java.util.List/of (com.vladsch.flexmark.ext.attributes.AttributesExtension/create))))
+        parsing-class (Class/forName "com.vladsch.flexmark.ext.attributes.internal.AttributeParsing")
+        ctor (doto (.getDeclaredConstructor parsing-class
+                                            (into-array Class [com.vladsch.flexmark.ast.util.Parsing]))
+               (.setAccessible true))
+        instance (.newInstance ctor (object-array [(com.vladsch.flexmark.ast.util.Parsing. options)]))
+        field (doto (.getDeclaredField parsing-class "ATTRIBUTES_TAG") (.setAccessible true))]
+    (.get field instance)))
+
+(defn- flexmark-group-at?
+  [^String s i]
+  (let [m (.matcher (flexmark-attributes-tag) s)]
+    (.region m i (.length s))
+    (.lookingAt m)))
+
+(defn- parses-as-group?
+  "True if `src` is refused because some `{` in it was read as an attribute
+  group with nothing to attach to."
+  [src]
+  (try (parser/parse src) false
+       (catch clojure.lang.ExceptionInfo e
+         (contains? #{::parser/unsupported-node ::parser/malformed-attributes} (:type (ex-data e))))))
+
+(defn- brace-indices
+  "Every index of `s` holding a `{`."
+  [^String s]
+  (filter #(= \{ (.charAt s %)) (range (count s))))
+
+(defn- no-mismatches
+  "The message for a fuzz test's single `(is (zero? (count mismatches)))`:
+  how many samples disagreed, and the first few of them. The assertion is
+  on the count, not the collection, so clojure.test's `actual:` line
+  prints a number rather than every mismatching sample."
+  [mismatches]
+  (str (count mismatches) " mismatching samples, first: " (pr-str (take 5 mismatches))))
+
+(deftest attribute-group-at-test
+  (testing "TASK-161: `attribute-group-at?` agrees with flexmark's own
+            pattern, and with what the parser actually does, over a fixed
+            pseudo-random sample of brace-heavy text -- each disagreement
+            collected, the whole sample asserted once (TASK-172)"
+    (let [alphabet ["{" "}" "x" "X" "_" "1" " " "=" "," "'" "\"" "#" "." "-" ":" "\n" "\t" "*" "/"
+                    "<" ">" "`" "\\" "é" "ß" "\f" "\r" " "]
+          rnd (java.util.Random. 161)
+          samples (vec (for [_ (range 3000)]
+                         (str "a {" (apply str (repeatedly (inc (.nextInt rnd 7))
+                                                           #(nth alphabet (.nextInt rnd (count alphabet)))))
+                              " b")))
+          flexmark-mismatches (vec (for [s samples
+                                         i (brace-indices s)
+                                         :when (not= (flexmark-group-at? s i) (parser/attribute-group-at? s i))]
+                                     [s i]))
+          ;; Against the parser itself, where the parser's own stricter
+          ;; check for an attempted group cannot fire first, nothing else
+          ;; (a code span, an escape, inline HTML) claims the text, and no
+          ;; blank line -- `\r\n`, `\r` or `\n` twice, only spaces or tabs
+          ;; between -- splits the paragraph. Atomic groups, so a lone
+          ;; `\r\n` is one line ending, not two.
+          parser-mismatches (vec (for [s samples
+                                       :when (not (re-find #"(?>\r\n|\r|\n)[ \t]*(?>\r\n|\r|\n)|\{[#.]|\{[A-Za-z_][\w-]*=|[`\\<>]" s))
+                                       :when (not= (parses-as-group? (str s "\n"))
+                                                   (boolean (some #(parser/attribute-group-at? s %) (brace-indices s))))]
+                                   s))]
+      (is (zero? (count flexmark-mismatches)) (no-mismatches flexmark-mismatches))
+      (is (zero? (count parser-mismatches)) (no-mismatches parser-mismatches))))
+  (testing "the cases the emitter relies on"
+    (is (parser/attribute-group-at? "a {x} b" 2))
+    (is (parser/attribute-group-at? "{x\ny}" 0) "whitespace runs cross a line break")
+    (is (parser/attribute-group-at? "{ x }" 0))
+    (doseq [s ["{}" "{ }" "{1}" "{x,y}" "{x" "{x*}" "{x\\}" "{{x}"]]
+      (is (not (parser/attribute-group-at? s 0)) s))))
+
+(deftest attribute-group-closes-test
+  (testing "TASK-168: the parser's stackless matcher answers exactly as
+            flexmark's `ATTRIBUTES_TAG` does, over a fixed pseudo-random
+            sample biased toward the pattern's own tokens, quotes, `=` and
+            whitespace -- the places it backtracks. Each disagreement is
+            collected and the whole sample asserted once (TASK-172)"
+    (let [closes? @#'parser/attribute-group-closes?
+          alphabet ["{" "}" "}" "x" "X" "_" "1" " " " " "=" "=" "," "'" "\"" "#" "." "-" ":"
+                    "\n" "\t" "\u000B" "\f" "\r" " " "<" "`" "\\" "é" "\u0000" "\u007F" "😀"]
+          rnd (java.util.Random. 168)
+          samples (for [_ (range 20000)]
+                    (str "{" (apply str (repeatedly (inc (.nextInt rnd 10))
+                                                    #(nth alphabet (.nextInt rnd (count alphabet)))))))
+          mismatches (vec (for [s samples
+                                i (brace-indices s)
+                                :when (not= (flexmark-group-at? s i) (closes? s i))]
+                            [s i]))]
+      (is (zero? (count mismatches)) (no-mismatches mismatches))
+      (doseq [s ["{x}" "{ x }" "{x= y}" "{a= b=c}" "{a b}" "{#i .c k='v }' x}" "{k=\"}\"}"
+                 "{x=}" "{.c\n.d}" "{:a}"]]
+        (is (closes? s 0) s))
+      (doseq [s ["{}" "{ }" "{1}" "{x,y}" "{x" "{{x}" "{a=b=c}" "{#}" "{k='v}" "{x y z"]]
+        (is (not (closes? s 0)) s)))))
+
+(deftest long-run-after-brace-test
+  (let [run (apply str (repeat 20000 " y"))]
+    (testing "TASK-168: a bare `{` before a 20000-word run with no `}` to
+              close it is prose, as flexmark reads a shorter one -- it no
+              longer overflows the stack"
+      (let [[block & more] (:blocks (parser/parse (str "Para {x" run ".\n")))]
+        (is (nil? more))
+        (is (= :para (:t block)))
+        (is (= (str "Para {x" run ".")
+               (apply str (map #(case (:t %) :str (:text %) :space " ") (:inlines block)))))))
+    (testing "TASK-168: a run that a `}` does close is a group too long for
+              flexmark's regex: a located parse error, not a
+              StackOverflowError"
+      (let [src (str "---\ntitle: T\n---\nFirst.\n\nSee\nthe\tset {x" run "} here.\n")
+            e (is (thrown? clojure.lang.ExceptionInfo (parser/parse src {:source "doc.hdoc"})))]
+        (is (= ::parser/attribute-group-too-long (:type (ex-data e))))
+        (is (= 7 (:source-line (ex-data e))))
+        (is (= 9 (:source-column (ex-data e))))
+        (is (str/starts-with? (ex-message e) "doc.hdoc:7:9: attribute group too long"))
+        (is (instance? StackOverflowError (ex-cause e)))))
+    (testing "and inside a citation's prefix, which is parsed again on its
+              own, the error still names the paragraph's line"
+      (let [src (str "First.\n\nText [see {x" run "} @knuth1984].\n")
+            e (is (thrown? clojure.lang.ExceptionInfo (parser/parse src)))]
+        (is (= ::parser/attribute-group-too-long (:type (ex-data e))))
+        (is (= 3 (:source-line (ex-data e))))))))
+
 (deftest malformed-attribute-group-test
   (testing "an unclosed attribute group after a heading raises a parse
             diagnostic rather than silently dropping the attempt (TASK-5
@@ -664,7 +982,76 @@
                          (str-inline "3}") space (str-inline "is") space
                          (str-inline "finite.")]}]
              (:blocks doc)))
-      (is (ast/valid? ast/Document doc)))))
+      (is (ast/valid? ast/Document doc))))
+  (testing "TASK-189: a backslash-escaped `{` is a literal brace, never an
+            attempted group -- closed or not, in a paragraph or a heading,
+            with or without the heading's own group after it"
+    (doseq [[src expected]
+            [["a \\{.c}\n" {:t :para :inlines [(str-inline "a") space (str-inline "{.c}")]}]
+             ["a \\{#x} b\n" {:t :para :inlines [(str-inline "a") space (str-inline "{#x}") space (str-inline "b")]}]
+             ["a \\{k=v}\n" {:t :para :inlines [(str-inline "a") space (str-inline "{k=v}")]}]
+             ["a \\{.c\n" {:t :para :inlines [(str-inline "a") space (str-inline "{.c")]}]
+             ["*x*\\{.c}\n" {:t :para :inlines [{:t :emph :inlines [(str-inline "x")]} (str-inline "{.c}")]}]
+             ["# a \\{.c}\n" {:t :section :level 1 :attr {:classes [] :props {}} :blocks []
+                              :heading [(str-inline "a") space (str-inline "{.c}")]}]
+             ["# a \\{.c\\}\n" {:t :section :level 1 :attr {:classes [] :props {}} :blocks []
+                                :heading [(str-inline "a") space (str-inline "{.c}")]}]
+             ["# a \\{.c} {#id}\n" {:t :section :level 1 :attr {:id "id" :classes [] :props {}} :blocks []
+                                    :heading [(str-inline "a") space (str-inline "{.c}")]}]
+             ["a \\{.c}\n---\n" {:t :section :level 2 :attr {:classes [] :props {}} :blocks []
+                                 :heading [(str-inline "a") space (str-inline "{.c}")]}]]]
+      (is (= [expected] (:blocks (parser/parse src))) (pr-str src))))
+  (testing "TASK-189: only an escaped brace is exempt -- an escaped
+            backslash before a bare brace (`\\\\{.c`) still leaves the
+            brace bare, and is still refused"
+    (doseq [src ["# a \\\\{.c\n" "a \\\\\\\\{#x\n"]]
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse src)) (pr-str src))]
+        (is (= ::parser/malformed-attributes (:type (ex-data e))) (pr-str src))))))
+
+(deftest backslash-in-attribute-token-test
+  (testing "TASK-197: a backslash in an id, a class, or an unquoted value
+            is a located error on every construct a group attaches to --
+            including a bare `{` closed by an escaped `}`, which flexmark
+            reads as a group with the backslash kept in the token"
+    (doseq [[src line] [["# a {.c\\}\n" 1]
+                        ["# a {#x\\}\n" 1]
+                        ["# a {k=v\\}\n" 1]
+                        ["Para.\n\n## a {#sec:a\\b}\n" 3]
+                        ["See [s]{.c\\x}.\n" 1]
+                        ["See [l](u){k=a\\b}.\n" 1]
+                        ["See `c`{#a\\b}.\n" 1]
+                        ["See ==h=={.a\\b}.\n" 1]
+                        ["![cap](a.png){#fig:a\\b}\n" 1]
+                        ["![cap](a.png){#fig:a width=a\\b}\n" 1]
+                        ["| a |\n|---|\n| b |\n: cap {#tbl:a\\b}\n" 4]
+                        ["$$ x $$ {#eq:a\\b}\n" 1]]]
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse src {:source "d.hdoc"})) (pr-str src))]
+        (is (= ::parser/malformed-attributes (:type (ex-data e))) (pr-str src))
+        (is (= line (:source-line (ex-data e))) (pr-str src))
+        (is (str/includes? (ex-message e) "cannot contain a backslash") (pr-str src)))))
+  (testing "a directive header and a one-line `!name{...}` refuse it as a
+            malformed directive, as they refuse any other bad header token,
+            with the token's column"
+    (doseq [[src col] [[":::{note #a\\b}\nx\n:::\n" 10]
+                       [":::{note .c\\}\nx\n:::\n" 10]
+                       [":::{note k=a\\b}\nx\n:::\n" 10]
+                       ["!toc{#a\\b}\n" 6]]]
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse src {:source "d.hdoc"})) (pr-str src))]
+        (is (= ::parser/malformed-directive (:type (ex-data e))) (pr-str src))
+        (is (= 1 (:source-line (ex-data e))) (pr-str src))
+        (is (= col (:source-column (ex-data e))) (pr-str src)))))
+  (testing "a quoted value keeps its backslashes verbatim, on both
+            tokenizers, as before"
+    (doseq [[src get-attr] [["# a {k=\"a\\b\"}\n" (comp :attr first :blocks)]
+                            ["# a {k='a\\b'}\n" (comp :attr first :blocks)]
+                            [":::{note k=\"a\\b\"}\nx\n:::\n" (comp :attr first :blocks)]
+                            [":::{note k='a\\b'}\nx\n:::\n" (comp :attr first :blocks)]
+                            ["$$ x $$ {k=\"a\\b\"}\n" (comp :attr first :blocks)]
+                            ["!toc{k=\"a\\b\"}\n" (comp :attr first :blocks)]]]
+      (is (= {:classes [] :props {"k" "a\\b"}} (get-attr (parser/parse src))) (pr-str src))))
+  (testing "a valid group still parses as before"
+    (is (= {:id "sec:a" :classes ["c"] :props {"k" "v" "w" "x y"}}
+           (:attr (first (:blocks (parser/parse "# a {#sec:a .c k=v w=\"x y\"}\n"))))))))
 
 (deftest unsupported-construct-test
   (testing "a construct this parser does not yet handle raises a clear, catchable error"
@@ -1305,6 +1692,37 @@
       (is (= :para (:t item)))
       (is (= {:t :math-block :tex "a\n  b" :attr attr} math)))))
 
+(deftest math-block-inside-block-quote-test
+  (testing "a display-math block written inside a block quote with `> ` on
+            every line is a MathBlock in that quote, as it already was in a
+            list item, a footnote and a directive. The `> ` the quote puts
+            on the TeX and closing lines used to reach the fence match, so
+            the block stayed prose (TASK-188)"
+    (let [eq {:t :math-block :tex "a\n  b" :attr {:id "eq:q" :classes [] :props {}}}]
+      (is (= [{:t :block-quote :blocks [eq]}]
+             (:blocks (parser/parse "> $$\n> a\n>   b\n> $$ {#eq:q}\n"))))
+      (is (= [{:t :block-quote :blocks [{:t :block-quote :blocks [eq]}]}]
+             (:blocks (parser/parse "> > $$\n> > a\n> >   b\n> > $$ {#eq:q}\n")))
+          "a nested quote's own `> > ` is stripped the same way")
+      (is (= [{:t :block-quote
+               :blocks [{:t :list :ordered false :tight false :attr attr
+                         :items [[{:t :para :inlines [(str-inline "x")]} eq]]}]}]
+             (:blocks (parser/parse "> - x\n>\n>   $$\n>   a\n>     b\n>   $$ {#eq:q}\n")))
+          "a list item inside a quote"))
+    (is (= [{:t :block-quote :blocks [{:t :math-block :tex "x" :attr attr}]}]
+           (:blocks (parser/parse "> $$\n  x\n  $$\n")))
+        "the lazily continued spelling, which already worked, is unchanged"))
+  (testing "the whole paragraph still has to be the block: an unclosed fence
+            in a quote stays prose"
+    (is (= [:para] (mapv :t (:blocks (first (:blocks (parser/parse "> $$\n> x\n"))))))))
+  (testing "a math block in a footnote body and in a directive body, the
+            other containers, is unaffected"
+    (is (= [:para :math-block]
+           (->> (parser/parse "Text[^1].\n\n[^1]: a\n\n    $$\n    x\n    $$\n")
+                :blocks first :inlines (filter #(= :note (:t %))) first :blocks (mapv :t))))
+    (is (= [:math-block]
+           (->> (parser/parse "::: {.note}\n$$\nx\n$$\n:::\n") :blocks first :blocks (mapv :t))))))
+
 (deftest math-block-blank-line-test
   (testing "a display-math block whose TeX contains blank lines is one
             MathBlock, not a fence that ends at the first of them -- a
@@ -1710,6 +2128,42 @@
              (:blocks list-doc)))
       (is (ast/valid? ast/Document list-doc)))))
 
+(deftest bracket-line-under-table-test
+  (testing "TASK-208 AC #1: a line wholly in `[...]` directly under a
+            table -- flexmark's MultiMarkdown caption shape, which the
+            parser used to drop -- is an ordinary paragraph after the
+            table, parsed exactly as it is after a blank line, at the top
+            level, in a block quote and in a list item"
+    (doseq [[open cont] [["" ""] ["> " "> "] ["- " "  "]]
+            line ["[@k]" "[@a; @b]" "[-@k]" "[^1]" "[note]" "  [note]  " "[@k]\nmore" "[x](y)"]
+            :let [table (str open "| A | B |\n" cont "|---|---|\n" cont "| 1 | 2 |\n")
+                  body (str/join "\n" (map #(str cont %) (str/split-lines line)))
+                  note-def (when (str/includes? line "^1") "\n[^1]: n\n")
+                  doc (parser/parse (str table body "\n" note-def))
+                  apart (parser/parse (str table cont "\n" body "\n" note-def))
+                  blocks (fn [d] (let [b (:blocks d)]
+                                   (if (= "" open) b (let [c (first b)]
+                                                       (if (= :list (:t c)) (first (:items c)) (:blocks c))))))]]
+      (is (= (blocks apart) (blocks doc)) (pr-str [open line]))
+      (is (= [:table :para] (mapv :t (blocks doc))) (pr-str [open line]))
+      (is (= [] (:caption (first (blocks doc)))) (pr-str [open line]))
+      (is (ast/valid? ast/Document doc) (pr-str [open line]))))
+  (testing "the citation, footnote and text it holds survive"
+    (let [after (fn [src] (second (:blocks (parser/parse (str "| A |\n|---|\n" src)))))]
+      (is (= {:t :para :inlines [{:t :cite :items [{:key "k" :mode :normal}]}]} (after "[@k]\n")))
+      (is (= :note (:t (first (:inlines (after "[^1]\n\n[^1]: n\n"))))))
+      (is (= {:t :para :inlines [(str-inline "[note]")]} (after "[note]\n")))
+      ;; A head-only table: the line right under the delimiter row.
+      (is (= {:t :para :inlines [{:t :cite :items [{:key "k" :mode :normal}]}]}
+             (second (:blocks (parser/parse "| A |\n|---|\n[@k]\n")))))))
+  (testing "TASK-208 AC #2: a Haselnuss `: caption` line, with or without an
+            attribute group, still captions the table, and a bracket line
+            after a blank line is its own paragraph"
+    (let [doc (parser/parse "| A |\n|---|\n| 1 |\n: Cap. {#tbl:x .c}\n\n[@k]\n")]
+      (is (= [(str-inline "Cap.")] (:caption (first (:blocks doc)))))
+      (is (= {:id "tbl:x" :classes ["c"] :props {}} (:attr (first (:blocks doc)))))
+      (is (= [:table :para] (mapv :t (:blocks doc)))))))
+
 (deftest cross-ref-test
   (testing "SPEC.md's own worked example -- four bare `@prefix:label`
             references in one sentence -- each parses to a CrossRef with
@@ -1753,6 +2207,239 @@
              (:blocks doc)))
       (is (ast/valid? ast/Document doc)))))
 
+(deftest citation-bracket-across-lines-test
+  (testing "TASK-165 AC #1: a hard-wrapped citation group parses to the
+            same Cite as its one-line form, wherever the break falls"
+    (doseq [[wrapped one-line] [["[see\n@smith2020]" "[see @smith2020]"]
+                                ["[@a;\n@b]" "[@a; @b]"]
+                                ["[@a\n; @b]" "[@a; @b]"]
+                                ["[see\n@fig:x]" "[see @fig:x]"]
+                                ["[@a,\np. 4]" "[@a, p. 4]"]
+                                ["[@a\n, p. 4]" "[@a, p. 4]"]
+                                ["[@a;\n-@b, p. 4\n]" "[@a; -@b, p. 4]"]
+                                ["x [see\n@a; @b] y" "x [see @a; @b] y"]]]
+      (testing (pr-str wrapped)
+        (let [inlines (fn [s] (-> (parser/parse (str s "\n")) :blocks first :inlines))]
+          (is (= (inlines one-line) (inlines wrapped)))
+          (is (some #(= :cite (:t %)) (inlines wrapped)))))))
+  (testing "a break inside a prefix or suffix stays a break there"
+    (is (= [{:t :cite :items [{:key "a" :mode :normal
+                               :prefix [(str-inline "see") {:t :soft-break} (str-inline "also")]
+                               :suffix [(str-inline "p.") {:t :soft-break} (str-inline "4")]}]}]
+           (-> (parser/parse "[see\nalso @a, p.\n4]\n") :blocks first :inlines))))
+  (testing "inside a block quote and a list item, whose continuation lines
+            carry a prefix or indentation"
+    (is (= [{:t :block-quote
+             :blocks [{:t :para
+                       :inlines [{:t :cite :items [{:key "a" :mode :normal :prefix [(str-inline "see")]}
+                                                   {:key "b" :mode :normal}]}]}]}]
+           (:blocks (parser/parse "> [see\n> @a; @b]\n"))))
+    (is (= [{:t :cite :items [{:key "a" :mode :normal :prefix [(str-inline "see")]}]}]
+           (-> (parser/parse "- [see\n  @a]\n") :blocks first :items first first :inlines))))
+  (testing "a stray unclosed `[` does not pair with a later link's,
+            footnote marker's or bracket's `]`, on one line or across a
+            break (TASK-165 review)"
+    (doseq [sep ["\n" " "]]
+      (testing (pr-str sep)
+        (let [inlines (fn [s] (-> (parser/parse s) :blocks first :inlines))
+              author {:t :cite :items [{:key "smith2020" :mode :author}]}
+              lead [(str-inline "In") space (str-inline "[0,") space (str-inline "1)") space
+                    (str-inline "it") space (str-inline "holds.") (if (= "\n" sep) {:t :soft-break} space)
+                    (str-inline "As") space author space (str-inline "shows")]]
+          (is (= (conj lead space {:t :link :target "http://x" :inlines [(str-inline "here")] :attr attr}
+                       (str-inline "."))
+                 (inlines (str "In [0, 1) it holds." sep "As @smith2020 shows [here](http://x).\n"))))
+          (is (= (conj lead {:t :note :blocks [{:t :para :inlines [(str-inline "Note.")]}]} (str-inline "."))
+                 (inlines (str "In [0, 1) it holds." sep "As @smith2020 shows[^1].\n\n[^1]: Note.\n"))))
+          (is (= (conj lead space (str-inline "in") space (str-inline "[Fig.") space (str-inline "2]."))
+                 (inlines (str "In [0, 1) it holds." sep "As @smith2020 shows in [Fig. 2].\n"))))))))
+  (testing "a continuation line cut short at the `@`/`;`/`]` is not read as
+            a setext underline or thematic break in the prefix/suffix
+            (TASK-165 review)"
+    (let [items (fn [s] (-> (parser/parse s) :blocks first :inlines first :items))
+          brk {:t :soft-break}]
+      (is (= [{:key "a" :mode :normal :prefix [(str-inline "see") brk (str-inline "---")]}]
+             (items "[see\n--- @a]\n")))
+      (is (= [{:key "a" :mode :normal :prefix [(str-inline "see") brk (str-inline "---")]}]
+             (items "[see\n\\--- @a]\n")))
+      (is (= [{:key "a" :mode :normal :prefix [(str-inline "see") brk (str-inline "___")]}]
+             (items "[see\n___ @a]\n")))
+      (is (= [{:key "a" :mode :normal
+               :suffix [(str-inline "p.") space (str-inline "4") brk (str-inline "-")]}
+              {:key "b" :mode :normal}]
+             (items "[@a, p. 4\n-; @b]\n")))
+      (is (= [{:key "a" :mode :normal
+               :suffix [(str-inline "p.") space (str-inline "4") brk (str-inline "===")]}]
+             (items "[@a, p. 4\n===]\n")))))
+  (testing "a blank line still ends the paragraph, and the bracket with it"
+    (is (= [[(str-inline "[see")]
+            [{:t :cite :items [{:key "a" :mode :author}]} (str-inline ";") space
+             {:t :cite :items [{:key "b" :mode :author}]} (str-inline "]")]]
+           (map :inlines (:blocks (parser/parse "[see\n\n@a; @b]\n"))))))
+  (testing "AC #2: the Cite takes the line of its opening `[`, and every
+            reference after it keeps its own line"
+    (let [doc (parser/parse "---\ntitle: T\n---\n\na [see\n@b]\n@fig:y\n[@c;\n@d] @e\n"
+                            {:source "doc.hdoc"})
+          refs (filter #(#{:cite :cross-ref} (:t %)) (-> doc :blocks first :inlines))]
+      (is (= [[:cite ["b"] 5] [:cross-ref nil 7] [:cite ["c" "d"] 8] [:cite ["e"] 9]]
+             (map (fn [r] [(:t r) (some->> (:items r) (mapv :key)) (:line (ast/source r))]) refs)))
+      (is (every? #(= "doc.hdoc" (:file (ast/source %))) refs)))))
+
+(deftest citation-bracket-code-math-and-block-like-affix-test
+  (let [inlines (fn [s] (-> (parser/parse s) :blocks first :inlines))
+        items (fn [s] (-> (inlines s) first :items))
+        brk {:t :soft-break}]
+    (testing "TASK-167 AC #1: a `]` or `[` inside a code span or inline math
+              is that span's content, so it neither closes the citation group
+              nor ends the search for its `]`"
+      (is (= [(str-inline "a") space
+              {:t :cite :items [{:key "b" :mode :normal
+                                 :prefix [(str-inline "x") space {:t :code :text "code]"} space
+                                          (str-inline "and")]}]}]
+             (inlines "a [x `code]` and @b]\n")))
+      (is (= [{:key "b" :mode :normal
+               :prefix [(str-inline "x") space {:t :math-inline :tex "f]"} space (str-inline "and")]}]
+             (items "[x $f]$ and @b]\n")))
+      (is (= [{:key "b" :mode :normal :prefix [(str-inline "see") space {:t :code :text "a[0]"}]}]
+             (items "[see `a[0]` @b]\n")))
+      (is (= [{:key "b" :mode :normal :prefix [(str-inline "x") space {:t :code :text "a`]"}]}]
+             (items "[x ``a`]`` @b]\n"))
+          "a code span closes only at a backtick run of its own length")
+      (is (= [{:key "a" :mode :normal :suffix [(str-inline "p.") brk {:t :code :text "]"}]}]
+             (items "[@a, p.\n`]`]\n"))
+          "on a wrapped line too")
+      (is (= [{:key "b" :mode :normal :prefix [(str-inline "x") space {:t :math-inline :tex "a]"}]}
+              {:key "c" :mode :normal}]
+             (items "[x $a]$ @b; @c]\n"))))
+    (testing "a backtick run or `$` that opens no span is literal, so a `]`
+              after it still closes the bracket"
+      (doseq [src ["[x `` ` ] @b]\n" "[x $$ ] @b]\n" "[x $ ] @b]\n" "[x $a ] @b]\n"]]
+        (testing (pr-str src)
+          (is (not= :cite (:t (first (inlines src)))))
+          (is (= {:t :cite :items [{:key "b" :mode :author}]}
+                 (last (butlast (inlines src))))))))
+    (testing "AC #2: a prefix or suffix whose first line starts like a block
+              is inline text inside the citation, on one line or wrapped"
+      (doseq [[src expected]
+              [["[# x @a]\n" [{:key "a" :mode :normal :prefix [(str-inline "#") space (str-inline "x")]}]]
+               ["[- x @a]\n" [{:key "a" :mode :normal :prefix [(str-inline "-") space (str-inline "x")]}]]
+               ["[> x @a]\n" [{:key "a" :mode :normal :prefix [(str-inline ">") space (str-inline "x")]}]]
+               ["[+ x @a]\n" [{:key "a" :mode :normal :prefix [(str-inline "+") space (str-inline "x")]}]]
+               ["[1. x @a]\n" [{:key "a" :mode :normal :prefix [(str-inline "1.") space (str-inline "x")]}]]
+               ["[1) x @a]\n" [{:key "a" :mode :normal :prefix [(str-inline "1)") space (str-inline "x")]}]]
+               ["[# *x* @a]\n" [{:key "a" :mode :normal
+                                 :prefix [(str-inline "#") space {:t :emph :inlines [(str-inline "x")]}]}]]
+               ["[# x\nfoo @a]\n" [{:key "a" :mode :normal
+                                    :prefix [(str-inline "#") space (str-inline "x") brk (str-inline "foo")]}]]
+               ["[- x\nfoo @a]\n" [{:key "a" :mode :normal
+                                    :prefix [(str-inline "-") space (str-inline "x") brk (str-inline "foo")]}]]
+               ["[> x\nfoo @a]\n" [{:key "a" :mode :normal
+                                    :prefix [(str-inline ">") space (str-inline "x") brk (str-inline "foo")]}]]
+               ["[1. x\nfoo @a]\n" [{:key "a" :mode :normal
+                                     :prefix [(str-inline "1.") space (str-inline "x") brk (str-inline "foo")]}]]
+               ["[@a, # x]\n" [{:key "a" :mode :normal :suffix [(str-inline "#") space (str-inline "x")]}]]
+               ["[@a, + x\nfoo]\n" [{:key "a" :mode :normal
+                                     :suffix [(str-inline "+") space (str-inline "x") brk (str-inline "foo")]}]]
+               ["[@a, > x\n---]\n" [{:key "a" :mode :normal
+                                     :suffix [(str-inline ">") space (str-inline "x") brk (str-inline "---")]}]]
+               ["[@a;\n2. x @b]\n" [{:key "a" :mode :normal}
+                                    {:key "b" :mode :normal :prefix [(str-inline "2.") space (str-inline "x")]}]]]]
+        (testing (pr-str src)
+          (is (= expected (items src))))))
+    (testing "a fragment that is indented code only for its leading spaces
+              keeps its inline markup (TASK-167 review)"
+      (let [emph-x [{:t :emph :inlines [(str-inline "x")]}]]
+        (is (= [{:key "a" :mode :normal :prefix emph-x}] (items "[    *x* @a]\n")))
+        (is (= [{:key "a" :mode :normal :prefix emph-x}] (items "[\n    *x* @a]\n")))
+        (is (= [{:key "a" :mode :normal} {:key "b" :mode :normal :prefix emph-x}]
+               (-> (parser/parse "- foo [@a;\n      *x* @b]\n")
+                   :blocks first :items first first :inlines last :items)))))
+    (testing "a leading fence run is escaped whole, so it cannot pair with a
+              later backtick run the paragraph read as literal (TASK-167
+              review)"
+      (is (= [{:key "a" :mode :normal
+               :prefix [(str-inline "```") space (str-inline "x") brk (str-inline "foo") space
+                        (str-inline "``")]}]
+             (items "[``` x\nfoo `` @a]\n")))
+      (is (= [{:key "a" :mode :normal :prefix [(str-inline "~~~") space (str-inline "x")]}]
+             (items "[~~~ x @a]\n"))))
+    (testing "TASK-171 AC #1: an affix whose lines look like a table stays
+              inline text, keeping its breaks and its markup"
+      (let [bar (str-inline "|")
+            row [bar space (str-inline "a") space bar]]
+        (doseq [[src expected]
+                [["[| a |\n|---| @c]\n" [{:key "c" :mode :normal :prefix (conj row brk (str-inline "|---|"))}]]
+                 ["[| a |\n| b |\n|---| @c]\n"
+                  [{:key "c" :mode :normal
+                    :prefix (-> row (conj brk bar space (str-inline "b") space bar brk (str-inline "|---|")))}]]
+                 ["[*x* |\n--- | --- @c]\n"
+                  [{:key "c" :mode :normal
+                    :prefix [{:t :emph :inlines [(str-inline "x")]} space bar brk (str-inline "---") space bar
+                             space (str-inline "---")]}]]
+                 ["[| a |\n    | :-: | @c]\n"
+                  [{:key "c" :mode :normal :prefix (conj row brk bar space (str-inline ":-:") space bar)}]]
+                 ["[- a |\n|---| @c]\n"
+                  [{:key "c" :mode :normal
+                    :prefix [(str-inline "-") space (str-inline "a") space bar brk (str-inline "|---|")]}]]
+                 ["[@c, | a |\n|---|]\n" [{:key "c" :mode :normal :suffix (conj row brk (str-inline "|---|"))}]]]]
+          (testing (pr-str src)
+            (is (= expected (items src)))))
+        (testing "with no line escaped to get there, so a code span over the
+                  delimiter row keeps its text (TASK-171 review)"
+          (is (= [{:key "c" :mode :normal
+                   :prefix [bar space (str-inline "a") space {:t :code :text "x\n|---|\ny"}]}]
+                 (-> (parser/parse "foo\n[| a `x\n|---|\ny` @c]\n") :blocks first :inlines last :items))))))
+    (testing "a `;` or `@` inside a code span or inline math neither splits
+              the group nor is taken as a key"
+      (is (= [{:key "c" :mode :normal :prefix [(str-inline "x") space {:t :code :text "a;b"}]}]
+             (items "[x `a;b` @c]\n")))
+      (is (= [{:key "a" :mode :normal :prefix [{:t :code :text "@x"} space (str-inline "y")]}]
+             (items "[`@x` y @a]\n")))
+      (is (= [{:key "c" :mode :normal
+               :prefix [(str-inline "x") space {:t :code :text "a]@b"} space (str-inline "y")]}]
+             (items "[x `a]@b` y @c]\n")))
+      (is (= [{:key "c" :mode :normal :prefix [(str-inline "x") space {:t :math-inline :tex "a;b"}]}
+              {:key "d" :mode :normal}]
+             (items "[x $a;b$ @c; @d]\n")))
+      (is (= [{:key "a" :mode :normal :suffix [{:t :code :text "x;y"}]}]
+             (items "[@a, `x;y`]\n")))
+      (is (= [(str-inline "[") {:t :code :text "@x"} space (str-inline "y]")]
+             (inlines "[`@x` y]\n"))
+          "a bracket whose only `@` is inside a code span is no citation"))
+    (testing "escapes and empty segments split as before"
+      (is (= [{:key "a" :mode :normal}] (items "[@a;]\n")))
+      (is (= [(str-inline "[a") space (str-inline ";") space (str-inline "b") space
+              {:t :cite :items [{:key "c" :mode :author}]} (str-inline "]")]
+             (inlines "[a \\; b @c]\n"))))))
+
+(deftest citation-trailing-blank-segment-test
+  (testing "TASK-207: a whitespace-only last segment after a `;` is dropped
+            as an empty one is, so `[@k; ]` is the citation `[@k;]` is, and
+            `[@k; ](u)` the citation `[@k;](u)` is, followed by `(u)`"
+    (doseq [[src cite] [["[@k; ]\n" {:t :cite :items [{:key "k" :mode :normal}]}]
+                        ["[@k;  \t]\n" {:t :cite :items [{:key "k" :mode :normal}]}]
+                        ["[@k;\n]\n" {:t :cite :items [{:key "k" :mode :normal}]}]
+                        ["[@a; @b; ]\n" {:t :cite :items [{:key "a" :mode :normal} {:key "b" :mode :normal}]}]
+                        ["[@k, p. 1; ]\n" {:t :cite :items [{:key "k" :mode :normal
+                                                             :suffix [(str-inline "p.") space (str-inline "1")]}]}]
+                        ["[-@k; ; ]\n" {:t :cite :items [{:key "k" :mode :year}]}]]]
+      (is (= [cite] (-> (parser/parse src) :blocks first :inlines)) src))
+    (doseq [[blank bare] [["[@k; ](u)\n" "[@k;](u)\n"] ["[@fig:x; ](u)\n" "[@fig:x;](u)\n"]]]
+      (is (= (parser/parse bare) (parser/parse blank)) blank)
+      (is (= [:cite :str] (mapv :t (-> (parser/parse blank) :blocks first :inlines))) blank)))
+  (testing "only a trailing one: a blank segment between two keys still
+            makes the bracket no citation, as an empty one does"
+    (doseq [src ["[@a; ; @b]\n" "[@a;; @b]\n"]]
+      (is (= :str (-> (parser/parse src) :blocks first :inlines first :t)) src)))
+  (testing "a bracket of nothing but `;` and whitespace is still no citation"
+    (doseq [src ["[; ]\n" "[ ]\n" "[ ; ; ]\n"]]
+      (is (every? #{:str :space} (map :t (-> (parser/parse src) :blocks first :inlines))) src)))
+  (testing "`cite-segments` keeps a lone whitespace-only text whole: it has
+            no `;` to cut at"
+    (is (= [" "] (parser/cite-segments " ")))
+    (is (= ["x"] (parser/cite-segments "x; ")))
+    (is (= [] (parser/cite-segments "; ")))))
+
 (deftest citation-author-in-text-test
   (testing "a bare, unbracketed `@key` citation (no colon, sec5.11's
             'author-in-text' form) parses to a Cite node with a single
@@ -1790,8 +2477,10 @@
                          {:t :link :target "http://example.com"
                           :inlines [(str-inline "a") space (str-inline "link")]
                           :attr attr}
-                         (str-inline ",") space (str-inline "[a") space (str-inline "shortcut]")
-                         (str-inline ",") space (str-inline "and") space
+                         ;; `shortcut],` is one word since TASK-160 -- what
+                         ;; the escaped `\[a shortcut\],` re-parses to.
+                         (str-inline ",") space (str-inline "[a") space (str-inline "shortcut],")
+                         space (str-inline "and") space
                          {:t :cite :items [{:key "jones2019" :mode :normal}]}
                          (str-inline ".")]}]
              (:blocks doc)))
@@ -1828,26 +2517,27 @@
             `convert-inline` has no branch for -- review finding #1) or,
             for an empty block, silently dropped the user's literal text
             as `[]` instead of the CiteItem's `:prefix`/`:suffix` (review
-            finding #2); both are fixed by falling back to the raw
-            source text as literal Inlines instead of trusting the
-            mini-parse result blindly."
+            finding #2). Since TASK-167 the fragment's opening marker is
+            escaped and it is parsed again as an ordinary Paragraph, so
+            the trailing space the old literal fallback kept is trimmed
+            like any prefix's."
     (doseq [[source cite-key mode field expected]
             [;; Crash repros (finding #1): a dash immediately before `@`
              ;; (mode :year, prefix "-" alone), a dash-space prefix, a
              ;; dash suffix (with and without a locator after it), and an
              ;; ordered-list marker prefix.
              ["[--@smith04]\n" "smith04" :year :prefix [(str-inline "-")]]
-             ["[- @doe99]\n" "doe99" :normal :prefix [(str-inline "-") space]]
+             ["[- @doe99]\n" "doe99" :normal :prefix [(str-inline "-")]]
              ["[@doe99 -]\n" "doe99" :normal :suffix [(str-inline "-")]]
              ["[@doe99, - foo]\n" "doe99" :normal :suffix
               [(str-inline "-") space (str-inline "foo")]]
-             ["[1. @doe99]\n" "doe99" :normal :prefix [(str-inline "1.") space]]
+             ["[1. @doe99]\n" "doe99" :normal :prefix [(str-inline "1.")]]
              ;; Data-loss repros (finding #2): an empty heading,
              ;; blockquote, fenced-code marker, and thematic break.
-             ["[# @doe99]\n" "doe99" :normal :prefix [(str-inline "#") space]]
-             ["[> @doe99]\n" "doe99" :normal :prefix [(str-inline ">") space]]
-             ["[``` @doe99]\n" "doe99" :normal :prefix [(str-inline "```") space]]
-             ["[*** @doe99]\n" "doe99" :normal :prefix [(str-inline "***") space]]]]
+             ["[# @doe99]\n" "doe99" :normal :prefix [(str-inline "#")]]
+             ["[> @doe99]\n" "doe99" :normal :prefix [(str-inline ">")]]
+             ["[``` @doe99]\n" "doe99" :normal :prefix [(str-inline "```")]]
+             ["[*** @doe99]\n" "doe99" :normal :prefix [(str-inline "***")]]]]
       (testing (str "source " (pr-str source) " never crashes and keeps its literal text")
         (let [doc (parser/parse source)]
           (is (= [{:t :para
@@ -1882,6 +2572,256 @@
     (let [doc (parser/parse "[\\@doe99]\n")]
       (is (= [{:t :para :inlines [(str-inline "[@doe99]")]}] (:blocks doc)))
       (is (ast/valid? ast/Document doc)))))
+
+(deftest citation-bracket-attribute-group-test
+  (let [c-attr {:classes ["c"] :props {}}
+        author (fn [k] {:t :cite :items [{:key k :mode :author}]})
+        inlines-of (fn [src] (-> (parser/parse src) :blocks first :inlines))]
+    (testing "TASK-175 AC #1: a citation-shaped bracket with an attribute
+              group straight after it is a Span (sec5.6), its content
+              parsed in place, and a following `\\{x}` is literal text"
+      (doseq [[src inlines]
+              [["[@doe]{.c}\n" [{:t :span :inlines [(author "doe")] :attr c-attr}]]
+               ["[@doe]{.c}\\{x}\n"
+                [{:t :span :inlines [(author "doe")] :attr c-attr} (str-inline "{x}")]]
+               ["[see @doe, p. 4]{.c}\\{x}\n"
+                [{:t :span
+                  :inlines [(str-inline "see") space (author "doe") (str-inline ",") space
+                            (str-inline "p.") space (str-inline "4")]
+                  :attr c-attr}
+                 (str-inline "{x}")]]
+               ;; What the .hdoc writer makes of an undefined attributed
+               ;; image reference holding a citation (TASK-170).
+               ["[!\\[@doe\\]\\[s\\]]{.c}\\{x}\n"
+                [{:t :span :inlines [(str-inline "![") (author "doe") (str-inline "][s]")] :attr c-attr}
+                 (str-inline "{x}")]]
+               ;; The way to attach a group to a bracketed citation.
+               ["[[@doe]]{.c}\n"
+                [{:t :span :inlines [{:t :cite :items [{:key "doe" :mode :normal}]}] :attr c-attr}]]]]
+        (is (= inlines (inlines-of src)) src)
+        (is (ast/valid? ast/Document (parser/parse src)) src)))
+    (testing "without a group straight after it the bracket is still a
+              citation, and an escaped brace after it is still text"
+      (is (= [{:t :cite :items [{:key "doe" :mode :normal}]} (str-inline "{x}")]
+             (inlines-of "[@doe]\\{x}\n")))
+      (is (= [{:t :cite :items [{:key "doe" :mode :normal}]} space (str-inline "{x}")]
+             (inlines-of "[@doe] \\{x}\n")))
+      (is (= [{:t :cite :items [{:key "doe" :mode :normal}]} (str-inline "{x")]
+             (inlines-of "[@doe]{x\n"))
+          "a `{` that opens no group leaves the citation alone"))
+    (testing "a second group after the first is still an error, as after
+              any other Span"
+      (doseq [src ["[@doe]{.c}{x}\n" "[s]{.c}{x}\n"]]
+        (is (= ::parser/unsupported-node
+               (try (parser/parse src) nil
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+            src)))
+    (testing "a group that ends a heading or a table caption is that
+              block's own, so the bracket before it stays a citation"
+      (let [cite {:t :cite :items [{:key "doe" :mode :normal}]}]
+        (doseq [src ["# See [@doe]{#sec:x}\n" "See [@doe]{#sec:x}\n===\n"]]
+          (is (= [{:t :section :level 1 :heading [(str-inline "See") space cite] :blocks []
+                   :attr (assoc attr :id "sec:x")}]
+                 (:blocks (parser/parse src)))
+              src))
+        (let [table (first (:blocks (parser/parse "| a |\n|---|\n| b |\n: See [@doe]{#tbl:x}\n")))]
+          (is (= [(str-inline "See") space cite] (:caption table)))
+          (is (= "tbl:x" (:id (:attr table)))))
+        (is (= [(str-inline "See") space {:t :span :inlines [(author "doe")] :attr c-attr} space
+                (str-inline "more")]
+               (-> (parser/parse "# See [@doe]{.c} more\n") :blocks first :heading))
+            "one with more heading text after it is the bracket's")))))
+
+(deftest citation-bracket-spaced-attribute-group-test
+  (let [c-attr {:classes ["c"] :props {}}
+        author (fn [k] {:t :cite :items [{:key k :mode :author}]})
+        cite {:t :cite :items [{:key "doe" :mode :normal}]}
+        refused? (fn [src]
+                   (= ::parser/unsupported-node
+                      (try (parser/parse src) nil
+                           (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))]
+    (testing "TASK-184 AC #2: whitespace between a citation-shaped bracket
+              and its group still makes a Span, as `[s] {.c}` is one --
+              flexmark attaches a group across the whitespace before it"
+      (doseq [[src s-src] [["[@doe] {.c}\n" "[s] {.c}\n"]
+                           ["[@doe]\n{.c}\n" "[s]\n{.c}\n"]
+                           ["x [@doe]\t {.c}\n" "x [s]\t {.c}\n"]]]
+        (is (= (-> (parser/parse "[@doe]{.c}\n") :blocks first :inlines last)
+               {:t :span :inlines [(author "doe")] :attr c-attr}
+               (-> (parser/parse src) :blocks first :inlines last))
+            src)
+        (is (= {:t :span :inlines [(str-inline "s")] :attr c-attr}
+               (-> (parser/parse s-src) :blocks first :inlines last))
+            s-src)
+        (is (ast/valid? ast/Document (parser/parse src)) src)))
+    (testing "flexmark drops that whitespace only where the group ends its
+              text, so with more text after it both are refused alike"
+      (doseq [src ["x [@doe] {.c} y\n" "x [s] {.c} y\n" "# See [@doe] {.c} more\n" "# See [s] {.c} more\n"]]
+        (is (refused? src) src)))
+    (testing "a spaced group that ends a heading or a table caption is the
+              block's, as after `[s]`, so the bracket stays a citation"
+      (is (= [{:t :section :level 1 :heading [(str-inline "See") space cite] :blocks []
+               :attr (assoc attr :id "sec:x")}]
+             (:blocks (parser/parse "# See [@doe] {#sec:x}\n"))))
+      (is (= [(str-inline "See") space (str-inline "[s]")]
+             (-> (parser/parse "# See [s] {#sec:x}\n") :blocks first :heading)))
+      (let [table (first (:blocks (parser/parse "| a |\n|---|\n| b |\n: See [@doe] {#tbl:x}\n")))]
+        (is (= [(str-inline "See") space cite] (:caption table)))
+        (is (= "tbl:x" (:id (:attr table))))))))
+
+(deftest attributed-span-in-link-text-test
+  (let [c-attr {:classes ["c"] :props {}}
+        author (fn [k] {:t :cite :items [{:key k :mode :author}]})
+        span (fn [& inlines] {:t :span :inlines (vec inlines) :attr c-attr})
+        link (fn [target & inlines] {:t :link :target target :inlines (vec inlines) :attr attr})
+        inlines-of (fn [src] (-> (parser/parse src) :blocks first :inlines))]
+    (testing "TASK-184 AC #1: an attributed span inside link text -- which
+              flexmark flattens back into the link's text, as a link may
+              not hold a link -- parses to a link containing the span"
+      (doseq [[src inlines]
+              [["[a [s]{.c}](u)\n" [(link "u" (str-inline "a") space (span (str-inline "s")))]]
+               ["[See [@doe]{.c}](u)\n" [(link "u" (str-inline "See") space (span (author "doe")))]]
+               ["[See [@doe] {.c}](u)\n" [(link "u" (str-inline "See") space (span (author "doe")))]]
+               ["[See [[@doe]]{.c}](u)\n"
+                [(link "u" (str-inline "See") space (span {:t :cite :items [{:key "doe" :mode :normal}]}))]]
+               ;; Content flexmark parsed stays parsed, and text either side
+               ;; of the bracket stays one word with it.
+               ["x[a [*s* `c`]{.c}y](u)\n"
+                [(str-inline "x")
+                 (link "u" (str-inline "a") space (span {:t :emph :inlines [(str-inline "s")]} space
+                                                        {:t :code :text "c"})
+                       (str-inline "y"))]]
+               ;; A full reference-style link flattens its text the same way.
+               ["[a [s]{.c}][r]\n\n[r]: v\n" [(link "v" (str-inline "a") space (span (str-inline "s")))]]
+               ;; An undefined `![s]` is the Span it is outside a link.
+               ["[a ![s]{.c}](u)\n" [(link "u" (str-inline "a") space (span (str-inline "![s]")))]]
+               ["[a [!\\[s\\]]{.c}](u)\n" [(link "u" (str-inline "a") space (span (str-inline "![s]")))]]
+               ;; An escaped bracket is text, and an unattributed one stays
+               ;; literal around a span.
+               ["[a \\[x [s]{.c}](u)\n"
+                [(link "u" (str-inline "a") space (str-inline "[x") space (span (str-inline "s")))]]
+               ["[a [x] [s]{.c}](u)\n"
+                [(link "u" (str-inline "a") space (str-inline "[x]") space (span (str-inline "s")))]]]]
+        (is (= inlines (inlines-of src)) src)
+        (is (ast/valid? ast/Document (parser/parse src)) src)))
+    (testing "a span holding a span, which flexmark never forms as a
+              bracket for the same reason, nests"
+      (is (= [{:t :span :inlines [(str-inline "b") space {:t :span :inlines [(str-inline "c")]
+                                                          :attr {:classes ["x"] :props {}}}]
+               :attr {:classes ["y"] :props {}}}]
+             (inlines-of "[b [c]{.x}]{.y}\n")))
+      (is (= [(link "u" (str-inline "a") space
+                    {:t :span :inlines [(str-inline "b") space (span (str-inline "c")) space (str-inline "d")]
+                     :attr {:classes ["y"] :props {}}}
+                    space (str-inline "e"))]
+             (inlines-of "[a [b [c]{.c} d]{.y} e](u)\n"))))
+    (testing "a span holding a link parses (the same mechanism), and a link
+              around that span's bracket is literal text, as CommonMark
+              makes a link around a link"
+      (is (= [(span (str-inline "x") space (link "u" (str-inline "y")) space (str-inline "z"))]
+             (inlines-of "[x [y](u) z]{.c}\n")))
+      (is (= [(str-inline "[") (span (str-inline "x") space (link "v" (str-inline "y"))) (str-inline "](u)")]
+             (inlines-of "[[x [y](v)]{.c}](u)\n")))
+      (is (= [(str-inline "[a") space (span (str-inline "b") space (link "v" (str-inline "y")))
+              (str-inline "](u)")]
+             (inlines-of "[a [b [y](v)]{.c}](u)\n"))))
+    (testing "a regrouped Span carries its own bracket's source line, in link
+              text and nested across lines"
+      (let [doc (parser/parse "p\n\n[a\n[s]{.c}](u)\n\n[b\n[c\nd]{.x}\ne]{.y}\n" {:source "doc.hdoc"})
+            [_ link-para nested-para] (:blocks doc)
+            in-link (-> link-para :inlines first :inlines peek)
+            outer (-> nested-para :inlines first)
+            inner (->> (:inlines outer) (filter #(= :span (:t %))) first)]
+        (is (= [:link :span :span :span] [(-> link-para :inlines first :t) (:t in-link) (:t outer) (:t inner)]))
+        (is (= {:file "doc.hdoc" :line 4} (select-keys (ast/source in-link) [:file :line])))
+        (is (= {:file "doc.hdoc" :line 6} (select-keys (ast/source outer) [:file :line])))
+        (is (= {:file "doc.hdoc" :line 7} (select-keys (ast/source inner) [:file :line])))))
+    (testing "a group no bracket owns is still refused"
+      (doseq [src ["[a [s]{.c}{x}](u)\n" "[a \\[s\\]{.c}](u)\n" "[a s\\]{.c}](u)\n"]]
+        (is (= ::parser/unsupported-node
+               (try (parser/parse src) nil
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+            src)))))
+
+(deftest attributed-span-over-defined-reference-test
+  (let [c-attr {:classes ["c"] :props {}}
+        span (fn [& inlines] {:t :span :inlines (vec inlines) :attr c-attr})
+        link (fn [target & inlines] {:t :link :target target :inlines (vec inlines) :attr attr})
+        inlines-of (fn [src] (-> (parser/parse src) :blocks first :inlines))
+        error-of (fn [src] (try (parser/parse src) nil
+                                (catch Exception e [(class e) (ex-data e)])))]
+    (testing "TASK-190 AC #1/#2: a span in link text over a *defined* label
+              parses to the link holding the span, as it does undefined --
+              glued, spaced or wrapped, in a quote or a table cell"
+      (doseq [defs ["" "[r]: v\n\n"]
+              body ["[a [r]{.c}](u)\n" "[a [r] {.c}](u)\n" "[a [r]\n{.c}](u)\n" "[a [ r ]{.c}](u)\n"]]
+        (let [src (str defs body)]
+          (is (= [(link "u" (str-inline "a") space (span (str-inline "r")))] (inlines-of src)) src)
+          (is (ast/valid? ast/Document (parser/parse src)) src)))
+      (is (= [(link "u" (span (str-inline "r")))] (inlines-of "[r]: v\n\n[[r]{.c}](u)\n")))
+      (is (= [(link "v" (str-inline "a") space (span (str-inline "r")))] (inlines-of "[r]: v\n\n[a [r]{.c}][r]\n")))
+      (is (= [(link "u" (str-inline "a") space
+                    {:t :emph :inlines [(span {:t :emph :inlines [(str-inline "r")]})]})]
+             (inlines-of "[*r*]: v\n\n[a *[*r*]{.c}*](u)\n")))
+      (is (= [(link "u" (str-inline "a") space (span (str-inline "r")))]
+             (-> (parser/parse "[r]: v\n\n> [a [r]\n> {.c}](u)\n") :blocks first :blocks first :inlines)))
+      (is (= [(link "u" (str-inline "x") space (span (str-inline "r")))]
+             (-> (parser/parse "[r]: v\n\n| a |\n|---|\n| [x [r]{.c}](u) |\n")
+                 :blocks first :rows first :cells first :blocks first :inlines))))
+    (testing "the Span carries its bracket's source line"
+      (let [in-link (-> (parser/parse "[r]: v\n\n[a\n[r]{.c}](u)\n" {:source "doc.hdoc"})
+                        :blocks first :inlines first :inlines peek)]
+        (is (= {:file "doc.hdoc" :line 4} (select-keys (ast/source in-link) [:file :line])))))
+    (testing "everything else about a defined label is unchanged: `[r]{.c}`
+              is a Span, `![r]{.c}` and `[x][r]{.c}` keep their target
+              (TASK-169), a heading's trailing group leaves `[r]` a link,
+              and a plain `[r]` in link text still cancels the outer link"
+      (is (= [(span (str-inline "r"))] (inlines-of "[r]: v\n\n[r]{.c}\n")))
+      (is (= [(span (str-inline "r"))] (inlines-of "[r]: v\n\n[r] {.c}\n")))
+      ;; Edge whitespace goes, as flexmark trims it from a LinkRef's text.
+      (is (= [(span (str-inline "r"))] (inlines-of "[r]: v\n\n[ r ]{.c}\n")))
+      (is (= [(link "u" (str-inline "a") space (span (str-inline "r")))]
+             (inlines-of "[r]: v\n\n[a [ r ]{.c}](u)\n")))
+      (is (= [{:t :image :src "v" :alt "r" :attr c-attr}] (inlines-of "[r]: v\n\n![r]{.c}\n")))
+      (is (= [(assoc (link "v" (str-inline "x")) :attr c-attr)] (inlines-of "[r]: v\n\n[x][r]{.c}\n")))
+      (is (= [(link "u" (str-inline "a") space {:t :image :src "v" :alt "r" :attr c-attr})]
+             (inlines-of "[r]: v\n\n[a ![r] {.c}](u)\n")))
+      (let [section (first (:blocks (parser/parse "[r]: v\n\n# See [r] {#sec:x}\n")))]
+        (is (= [(str-inline "See") space (link "v" (str-inline "r"))] (:heading section)))
+        (is (= "sec:x" (:id (:attr section)))))
+      (is (= [(str-inline "[a") space (link "v" (str-inline "r")) (str-inline "](u)")]
+             (inlines-of "[r]: v\n\n[a [r]](u)\n")))
+      (is (= [(str-inline "[a") space (assoc (link "v" (str-inline "x")) :attr c-attr) (str-inline "](u)")]
+             (inlines-of "[r]: v\n\n[a [x][r]{.c}](u)\n"))))
+    (testing "AC #2: a reference link in link text with a spaced group --
+              which flexmark dissolves the outer link around and then fails
+              on -- is a located ex-info, not a raw IllegalStateException"
+      (doseq [src ["[r]: v\n\n[a [x][r] {.c}](u)\n" "[x]: v\n\n[a [x][] {.c}](u)\n"]]
+        (let [[cls data] (error-of src)]
+          (is (= clojure.lang.ExceptionInfo cls) src)
+          (is (= ::parser/unparsable-markup (:type data)) src)
+          (is (= 3 (:source-line data)) src))))
+    (testing "only that flexmark failure is translated: any other
+              IllegalStateException is not taken for a document error"
+      (let [untracked? #'parser/untracked-node-error?]
+        (is (untracked? (IllegalStateException. "Parent node: Link{text=a} of TextBase{text= } is not tracked, some post processor forgot to call tracker.nodeAdded().")))
+        (is (not (untracked? (IllegalStateException. "something else went wrong"))))
+        (is (not (untracked? (IllegalStateException.))))
+        (is (not (untracked? (RuntimeException. "x is not tracked"))))))
+    (testing "a regrouped span in link text loses its edge whitespace as a
+              bracket flexmark forms does -- the same inlines as at top
+              level, defined or not; a line break stays in both"
+      (doseq [defs ["" "[r]: v\n\n"]
+              bracket ["[ r ]" "[ r\n]" "[\nr ]" "[ *r* ]" "[ ]"]]
+        (let [src (str defs "[a " bracket "{.c}](u)\n")
+              expected (-> (inlines-of (str defs bracket "{.c}\n")) first :inlines)]
+          (is (= [(link "u" (str-inline "a") space (apply span expected))] (inlines-of src)) src)))
+      (is (= [(link "u" (str-inline "a") space (span (str-inline "r") {:t :soft-break}))]
+             (inlines-of "[a [ r\n]{.c}](u)\n")))
+      (is (= [{:t :span :inlines [(str-inline "b") space {:t :span :inlines [(str-inline "c")]
+                                                          :attr {:classes ["x"] :props {}}}]
+               :attr {:classes ["y"] :props {}}}]
+             (inlines-of "[ b [ c ]{.x} ]{.y}\n"))))))
 
 (deftest cross-ref-bare-prefix-shape-test
   (testing "a bare `@token` containing a colon whose part before the
@@ -1991,6 +2931,136 @@
       (doseq [opts [{:kinds #{:fig}} {:cite-keys #{:knuth1984}}]]
         (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse "@fig:tree\n" opts)) opts)]
           (is (= ::parser/invalid-parse-option (:type (ex-data e))) opts))))))
+
+(deftest book-ref-test
+  (testing "TASK-152 AC #1: `@{…}` is a :book-ref inline holding the ref
+            exactly as written"
+    (is (= [(str-inline "See") space {:t :book-ref :ref "bible:romanos#14:8"} (str-inline ".")]
+           (:inlines (first (:blocks (parser/parse "See @{bible:romanos#14:8}.\n"))))))
+    (is (= [{:t :book-ref :ref "reformed:confessions/reformed/heidelberg#sec:q1..sec:q3"}]
+           (:inlines (first (:blocks (parser/parse "@{reformed:confessions/reformed/heidelberg#sec:q1..sec:q3}\n")))))))
+  (testing "AC #2: a bare `@reformed:heidelberg` is still a local cross-reference"
+    (is (= [{:t :cross-ref :label "reformed:heidelberg"}]
+           (:inlines (first (:blocks (parser/parse "@reformed:heidelberg\n"))))))
+    (is (= [{:t :cross-ref :label "fig:tree"} space {:t :book-ref :ref "bible:romanos"}]
+           (:inlines (first (:blocks (parser/parse "@fig:tree @{bible:romanos}\n")))))))
+  (testing "it is recognized whatever the vocabularies, which only filter bare tokens"
+    (is (= [{:t :book-ref :ref "bible:romanos"}]
+           (:inlines (first (:blocks (parser/parse "@{bible:romanos}\n" {:kinds #{} :cite-keys #{}})))))))
+  (testing "a malformed ref is NOT a parse error: it is kept as written for
+            the resolver's `malformed-book-ref` warning"
+    (doseq [written ["not a ref" "Bad:Ref" "bible" "bible:romanos#" " bible:x "]]
+      (is (= [{:t :book-ref :ref written}]
+             (:inlines (first (:blocks (parser/parse (str "@{" written "}\n"))))))
+          written)))
+  (testing "it is written with braces even after a word character, unlike a bare token"
+    (is (= [(str-inline "x") {:t :book-ref :ref "a:b"}]
+           (:inlines (first (:blocks (parser/parse "x@{a:b}\n")))))))
+  (testing "what is not a book ref stays literal text"
+    (doseq [[src text] [["@{}\n" "@{}"] ["@{open\n" "@{open"] ["@\\{a:b}\n" "@{a:b}"]]]
+      (is (= [(str-inline text)] (:inlines (first (:blocks (parser/parse src))))) src))
+    (is (= [(str-inline "@{a") {:t :soft-break} (str-inline "b")]
+           (:inlines (first (:blocks (parser/parse "@{a\nb\n")))))
+        "an unclosed one stays text across the line break")
+    (is (= [{:t :code :text "@{a:b}"}]
+           (:inlines (first (:blocks (parser/parse "`@{a:b}`\n")))))))
+  (testing "a `{…}` group right after an `@` that is not a book ref -- an
+            escaped `\\@{x}`, or one spanning a line -- names the right
+            spelling instead of a bare unsupported-construct error"
+    (doseq [src ["a \\@{x} b\n" "a @{a\nb} c\n"]]
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse src)) src)]
+        (is (= ::parser/unsupported-node (:type (ex-data e))) src)
+        (is (str/includes? (ex-message e) "write `@\\{` for a literal `@{`") src))))
+  (testing "its content is never parsed as markup"
+    (is (= [{:t :book-ref :ref "a*b*:_c_"}]
+           (:inlines (first (:blocks (parser/parse "@{a*b*:_c_}\n")))))))
+  (testing "inside an image's alt text it flattens to its spelling"
+    (is (= "see @{bible:x}"
+           (-> (parser/parse "![see @{bible:x}](a.png){#fig:a}\n")
+               :blocks first :content :inlines first :alt)))))
+
+(defn- parse-failure
+  "The ExceptionInfo parsing `src` throws, or nil."
+  [src]
+  (try (parser/parse src) nil (catch clojure.lang.ExceptionInfo e e)))
+
+(deftest orphan-attribute-group-test
+  (testing "TASK-191 AC #1: a group after whitespace mid-text names what it
+            is separated from and says to write it right after that, or to
+            escape the brace -- still the same unsupported-node refusal"
+    (doseq [[src what fix] [["x [s] {.c} y\n" "the `]`" "write it right after the `]`, as in `[text]{.c}`"]
+                            ["x [s]\n{.c} y\n" "the `]`" "write it right after the `]`"]
+                            ["x [@k] {.c} y\n" "the `]`" "write it right after the `]`"]
+                            ["[a [s] {.c} b](u)\n" "the `]`" "write it right after the `]`"]
+                            ["x [r] {.c} y\n\n[r]: u\n" "the `]`" "write it right after the `]`"]
+                            ["[a [r] {.c} b](u)\n\n[r]: u\n" "the `]`" "write it right after the `]`"]
+                            ["x [a](u) {.c} y\n" "the link" "write it right after the link's `)`"]
+                            ["x ![a](u) {.c} y\n" "the image" "write it right after the image's `)`"]
+                            ["x `c` {.c} y\n" "the code span" "write it right after the closing backtick"]
+                            ["x ==h== {.c} y\n" "the highlight" "write it right after the closing `==`"]]]
+      (let [e (parse-failure src)]
+        (is (= ::parser/unsupported-node (:type (ex-data e))) src)
+        (is (= "{.c}" (:text (ex-data e))) src)
+        (is (str/starts-with? (ex-message e) (str "attribute group `{.c}` is separated by whitespace from " what " before it"))
+            src)
+        (is (str/includes? (ex-message e) fix) src)
+        (is (str/ends-with? (ex-message e) "or write `\\{` for a literal `{`") src))))
+  (testing "after whitespace with nothing attachable before it"
+    ;; A `]` that closes nothing a group could take -- a lone one, an
+    ;; escaped one, a footnote marker's -- gets no right-after-the-`]` hint:
+    ;; following it would still be refused.
+    (doseq [src ["x {.c} y\n" "x **b** {.c} y\n" "# H {.c} x\n"
+                 "x ] {.c} y\n" "x \\] {.c} y\n" "x \\\\] {.c} y\n" "x [a\\] {.c} y\n"
+                 "x [^1] {.c} y\n\n[^1]: n\n"]]
+      (let [e (parse-failure src)]
+        (is (= ::parser/unsupported-node (:type (ex-data e))) src)
+        (is (str/starts-with? (ex-message e) "attribute group `{.c}` follows whitespace in the middle of text") src)
+        (is (str/includes? (ex-message e) "write `\\{` for a literal `{`") src))))
+  (testing "the other orphan shapes: straight after unattachable text, a
+            second group, a group opening the text"
+    (doseq [[src message] [["x{.c} y\n" "attribute group `{.c}` follows something it cannot attach to"]
+                           ["x **b**{.c}\n" "attribute group `{.c}` follows something it cannot attach to"]
+                           ["x [s]{.c}{ #d } y\n" "attribute group `{ #d }` follows another group, `{.c}`; one construct takes one group, so merge them into `{.c #d}`"]
+                           ["[a [s]{.c}{.d} b](u)\n" "merge them into `{.c .d}`"]
+                           ["{.c} y\n" "attribute group `{.c}` starts the text, with nothing before it to attach to"]]]
+      (let [e (parse-failure src)]
+        (is (= ::parser/unsupported-node (:type (ex-data e))) src)
+        (is (str/includes? (ex-message e) message) src))))
+  (testing "what already attached still does: no accepted input changes"
+    (is (= [(str-inline "x") {:t :space}
+            {:t :span :inlines [(str-inline "s")] :attr {:classes ["c"] :props {}}}]
+           (:inlines (first (:blocks (parser/parse "x [s] {.c}\n"))))))
+    (is (str/includes? (ex-message (parse-failure "a \\@{x} b\n")) "write `@\\{` for a literal `@{`"))))
+
+(deftest quote-line-test
+  (testing "TASK-152 AC #1: a whole-line `!quote` is a :book-quote Block
+            holding the ref as written, splitting the text around it the
+            way `!include` does"
+    (is (= [{:t :para :inlines [(str-inline "Before.")]}
+            {:t :book-quote :ref "bible:romanos#14:8-9"}
+            {:t :para :inlines [(str-inline "After.")]}]
+           (:blocks (parser/parse "Before.\n!quote bible:romanos#14:8-9\nAfter.\n")))))
+  (testing "it sits in whatever contains it: a section, a directive body"
+    (is (= [{:t :book-quote :ref "a:b"}]
+           (:blocks (first (:blocks (parser/parse "# H {#sec:h}\n\n!quote a:b\n"))))))
+    (is (= [{:t :book-quote :ref "bible:romanos#14:8"}]
+           (:blocks (first (:blocks (parser/parse (str ":::{small-collapsable summary=\"Romanos 14:8\" label=\"(2)\"}\n"
+                                                       "!quote bible:romanos#14:8\n:::\n"))))))))
+  (testing "a malformed ref is kept whole, trailing blanks trimmed, for the resolver to report"
+    (is (= [{:t :book-quote :ref "bible: romanos 14"}]
+           (:blocks (parser/parse "  !quote   bible: romanos 14  \n")))))
+  (testing "shielded by code fences, like `!include`"
+    (is (= [{:t :code-block :text "!quote a:b\n" :attr attr}]
+           (:blocks (parser/parse "```\n!quote a:b\n```\n")))))
+  (testing "a bare `!quote` is a paragraph, and `!quote{…}` a diagnostic: `quote`
+            is reserved as a one-line directive name, like `include`"
+    (is (= [{:t :para :inlines [(str-inline "!quote")]}] (:blocks (parser/parse "!quote\n"))))
+    (let [e (is (thrown? clojure.lang.ExceptionInfo (parser/parse "!quote{ref=a:b}\n")))]
+      (is (= ::parser/malformed-directive (:type (ex-data e))))
+      (is (str/includes? (ex-message e) "!quote <book-ref>"))))
+  (testing "mid-sentence it is prose"
+    (is (= [{:t :para :inlines [(str-inline "see") space (str-inline "!quote") space (str-inline "a:b")]}]
+           (:blocks (parser/parse "see !quote a:b\n"))))))
 
 (deftest include-line-test
   (testing "TASK-38 AC #1: a whole-line !include produces an :include
@@ -2323,6 +3393,38 @@
              (:blocks doc)))
       (is (ast/valid? ast/Document doc)))))
 
+(defn- strike [& inlines]
+  {:t :strike :inlines (vec inlines)})
+
+(deftest strikethrough-test
+  (testing "TASK-137 AC #1: ~~x~~ parses to :strike, with ordinary markup inside"
+    (let [doc (parser/parse "a ~~gone *now*~~ b\n")]
+      (is (= [{:t :para
+               :inlines [(str-inline "a") space
+                         (strike (str-inline "gone") space {:t :emph :inlines [(str-inline "now")]})
+                         space (str-inline "b")]}]
+             (:blocks doc)))
+      (is (ast/valid? ast/Document doc))))
+  (testing "a lone ~, a spaced ~~ and an unclosed ~~ stay literal text"
+    (doseq [src ["a ~ b\n" "~/path\n" "a ~~ b\n" "~~unclosed\n" "\\~~x~~\n"]]
+      (testing (pr-str src)
+        (is (not-any? #(= :strike (:t %))
+                      (tree-seq coll? seq (:blocks (parser/parse src))))))))
+  (testing "a strike inside a table cell parses"
+    (is (ast/valid? ast/Document (parser/parse "| a |\n|---|\n| ~~x~~ |\n")))))
+
+(deftest task-list-items-are-plain-text-test
+  (testing "TASK-137 AC #2 (decision): GFM task-list markers are NOT a
+            construct -- the item is an ordinary list item whose text
+            starts with the literal [ ] / [x]"
+    (let [doc (parser/parse "- [ ] todo\n- [x] done\n")
+          texts (->> (tree-seq coll? seq (:blocks doc))
+                     (filter #(and (map? %) (= :str (:t %))))
+                     (map :text))]
+      (is (ast/valid? ast/Document doc))
+      (is (= [:list] (mapv :t (:blocks doc))))
+      (is (some #(str/includes? % "[") texts)))))
+
 (deftest highlight-nested-markup-test
   (testing "AC #2: emphasis, a link, inline code, inline math, a
             cross-reference and a citation all survive inside a highlight.
@@ -2531,3 +3633,39 @@
       (is (= [{:t :para :inlines [(highlight (str-inline "whole") space (str-inline "line"))]}]
              (:blocks doc)))
       (is (ast/valid? ast/Document doc)))))
+
+(def ^:private windows-twin-source
+  "A document touching every line-based rule: front matter, `!include`,
+  `!quote`, a one-line `!name{}` directive, a fenced directive, a code
+  fence, display math, a table, a list, a block quote and a hard break."
+  (str "---\ntitle: Twin\nauthor: [A, B]\n---\n"
+       "\n# Intro {#sec:a}\n"
+       "\n!include chapters/one.hdoc\n"
+       "\n!quote bible:romanos#14:8\n"
+       "\n!note{.x}\n"
+       "\n:::{note #n1}\nhello [t]{#sp}  \nnext line\n:::\n"
+       "\n```clj\n(+ 1 2)\n  indented\n```\n"
+       "\n$$\nx = 1\n$$ {#eq:one}\n"
+       "\n| a | b |\n|---|---|\n| 1 | 2 |\n"
+       "\n- one\n- two\n\n> quoted\n> more\n"))
+
+(deftest crlf-and-byte-order-mark-test
+  (let [lf (parser/parse windows-twin-source)
+        crlf-source (str/replace windows-twin-source "\n" "\r\n")]
+    (testing "TASK-162 AC #1: CRLF parses to the same document as LF"
+      (is (= lf (parser/parse crlf-source)))
+      (is (= [{:t :str :text "Twin"}] (get-in lf [:meta :title])))
+      (is (= ["A" "B"] (get-in lf [:meta :authors])))
+      (is (= #{:include :book-quote :directive :code-block :math-block :table :list :block-quote}
+             (into #{} (comp (mapcat :blocks) (map :t)) (:blocks lf))))
+      (let [strings (filter string? (tree-seq coll? seq (parser/parse crlf-source)))]
+        (is (some #(str/includes? % "(+ 1 2)") strings) "the walk reaches the code block's text")
+        (is (not-any? #(str/includes? % "\r") strings) "no \\r survives in any string of the AST"))
+      (is (= (parser/front-matter windows-twin-source) (parser/front-matter crlf-source))))
+    (testing "TASK-162 AC #2: a leading BOM is ignored, with LF or CRLF"
+      (is (= lf (parser/parse (str "\uFEFF" windows-twin-source))))
+      (is (= lf (parser/parse (str "\uFEFF" crlf-source))))
+      (is (= (:meta lf) (parser/front-matter (str "\uFEFF" crlf-source)))))
+    (testing "only the leading BOM and only CRLF pairs are normalised"
+      (is (= "a\uFEFFb\rc\n\n" (parser/normalize-source "\uFEFFa\uFEFFb\rc\r\n\r\n")))
+      (is (= "x" (parser/normalize-source "x"))))))

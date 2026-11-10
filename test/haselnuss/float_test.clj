@@ -1,4 +1,4 @@
-(ns haselnuss.float-test
+(ns ^:parallel haselnuss.float-test
   "Fixtures for the captioned, numbered floats a directive can wrap: a
   code listing (TASK-57), an algorithm (TASK-58), and a figure built
   from subfigure panels (TASK-56).
@@ -425,6 +425,9 @@
           html (:output (build! dir {}))
           tex (:output (build! dir {:target "latex"}))]
       (is (= 2 (count (re-seq #"class=\"subfigure-row\"" html))))
+      (is (= 2 (count (re-seq #"<div class=\"subfigure-row\"" html)))
+          "TASK-139: a panel row is a div, not a quotation")
+      (is (not (str/includes? html "<blockquote")))
       (is (= 1 (count (re-seq #"\\\\\n" tex))) "one row break, between panels two and three")
       (is (= 1 (count (re-seq #"\\hfill" tex)))
           "and one within-row separator: three panels two to a row is a full row and a lone one")))
@@ -474,6 +477,15 @@
                                  "::::\n"))
           html (:output (build! dir {}))]
       (is (str/includes? html "<figure id=\"fig:inner\">")))))
+
+(deftest multi-block-float-wrapper-is-not-a-quote-test
+  (testing "TASK-139: a float holding several non-panel blocks is grouped
+            in a div, not announced as a quotation"
+    (let [dir (fixture-dir! (str "# I\n\n:::{figure #fig:two caption=\"Two\"}\n"
+                                 "![](pic.png)\n\nExtra note.\n:::\n"))
+          html (:output (build! dir {}))]
+      (is (str/includes? html "Extra note."))
+      (is (not (str/includes? html "<blockquote"))))))
 
 (deftest single-image-figure-is-unchanged-test
   (testing "AC #5: the figure spelling that existed before this task --

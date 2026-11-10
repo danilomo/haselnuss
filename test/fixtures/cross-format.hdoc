@@ -44,5 +44,7 @@ The measurements are in @tbl:yields.
 | Nitrogen  |   0.8 |
 : Measured yield per parameter {#tbl:yields}
 
+Water yields the most [$y \approx 1.4$, see @tbl:yields; measured].
+
 The result agrees with [@lamport1986] and, taken together, with
 [@knuth1984; @lamport1986].

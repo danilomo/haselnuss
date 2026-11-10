@@ -36,6 +36,7 @@
    :directive {:t :directive :name "theorem" :blocks [] :attr attr
                :fallback {:kind :drop}}
    :include {:t :include :src "chapters/intro.hzn"}
+   :book-quote {:t :book-quote :ref "bible:romanos#14:8-9"}
    :thematic-break {:t :thematic-break}})
 
 (def inlines-by-tag
@@ -57,6 +58,7 @@
    :image {:t :image :src "x.png" :alt "x" :attr attr}
    :span {:t :span :inlines [{:t :str :text "x"}] :attr attr}
    :cross-ref {:t :cross-ref :label "fig:tree" :suppress-prefix true}
+   :book-ref {:t :book-ref :ref "bible:romanos#14:8"}
    :cite {:t :cite :items [{:key "smith2020" :mode :normal}
                            {:key "doe2021" :mode :author
                             :prefix [{:t :str :text "see"}]
@@ -75,14 +77,14 @@
 
 (deftest block-variants-test
   (testing "every Block variant from sec4.3 is constructible and valid"
-    (is (= 11 (count blocks-by-tag)))
+    (is (= 12 (count blocks-by-tag)))
     (doseq [[tag node] blocks-by-tag]
       (testing (str tag)
         (is (ast/valid? ast/Block node) (pr-str (ast/explain ast/Block node)))))))
 
 (deftest inline-variants-test
   (testing "every Inline variant from sec4.4 is constructible and valid"
-    (is (= 20 (count inlines-by-tag)))
+    (is (= 21 (count inlines-by-tag)))
     (doseq [[tag node] inlines-by-tag]
       (testing (str tag)
         (is (ast/valid? ast/Inline node) (pr-str (ast/explain ast/Inline node)))))))
@@ -141,6 +143,47 @@
                                      :blocks [{:t :str :text "x"}]
                                      :attr attr}))
         ":sticky-note's children are Blocks, so an Inline among them is invalid")))
+
+(def resolved-book-ref
+  "A `:book-ref` carrying every optional field resolution fills in."
+  {:t :book-ref :ref "bible:romanos#14:8"
+   :passage {:form :locator :locator "14:8"}
+   :canonical "bible:scripture/nt/romanos#14:8"
+   :text [{:t :str :text "Romanos 14:8"}]
+   :url "https://example.org/romanos#14:8"})
+
+(def resolved-book-quote
+  "A `:book-quote` carrying every optional field quote expansion fills in."
+  {:t :book-quote :ref "reformed:heidelberg#sec:q1..sec:q3"
+   :canonical "reformed:confessions/reformed/heidelberg#sec:q1..sec:q3"
+   :title [{:t :emph :inlines [{:t :str :text "Heidelberg"}]}]
+   :blocks [{:t :para :inlines [{:t :str :text "Q1."}]}]
+   :url "https://example.org/heidelberg.html#sec:q1"})
+
+(deftest book-node-shapes-test
+  (testing "TASK-152 AC #3: the ref as written is the only required field"
+    (is (ast/valid? ast/Inline {:t :book-ref :ref "bible:romanos#14:8"}))
+    (is (ast/valid? ast/Block {:t :book-quote :ref "bible:romanos#14:8-9"}))
+    (is (not (ast/valid? ast/Inline {:t :book-ref})))
+    (is (not (ast/valid? ast/Block {:t :book-quote}))))
+  (testing "a malformed ref is still schema-valid: judging it is the resolver's job"
+    (is (ast/valid? ast/Inline {:t :book-ref :ref "not a ref"}))
+    (is (ast/valid? ast/Block {:t :book-quote :ref "Bad:Ref"})))
+  (testing "every resolved field is optional, and typed"
+    (is (ast/valid? ast/Inline resolved-book-ref) (pr-str (ast/explain ast/Inline resolved-book-ref)))
+    (is (ast/valid? ast/Block resolved-book-quote) (pr-str (ast/explain ast/Block resolved-book-quote)))
+    (doseq [form [{:form :label :label "sec:q1"}
+                  {:form :range :from "sec:q1" :to "sec:q3"}
+                  {:form :locator :locator "14:8-9"}]]
+      (is (ast/valid? ast/Inline (assoc resolved-book-ref :passage form)) (pr-str form)))
+    (is (not (ast/valid? ast/Inline (assoc resolved-book-ref :passage {:form :chapter}))))
+    (testing "each form requires its own fields"
+      (doseq [bad [{:form :range} {:form :range :from "sec:q1"} {:form :label}
+                   {:form :locator} {:form :label :locator "14:8"}]]
+        (is (not (ast/valid? ast/Inline (assoc resolved-book-ref :passage bad))) (pr-str bad))))
+    (is (not (ast/valid? ast/Inline (assoc resolved-book-ref :text "Romanos 14:8")))
+        ":text is Inlines, like the Passage :title it comes from")
+    (is (not (ast/valid? ast/Block (assoc resolved-book-quote :blocks [{:t :str :text "x"}]))))))
 
 (deftest invalid-nodes-rejected-test
   (testing "malli schemas reject malformed nodes"

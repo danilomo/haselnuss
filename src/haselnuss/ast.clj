@@ -126,6 +126,13 @@
     ::block
     ;; sec4.3.
     [:multi {:dispatch (dispatch-by :t)}
+     ;; TASK-194: a parsed Block sequence never holds anything after a
+     ;; Section but another Section of the same or a higher (smaller)
+     ;; level -- the parser folds every later Block into it -- and a
+     ;; Section's own Blocks hold only Sections of a deeper level. Deliberately
+     ;; NOT enforced here: transforms and JSON input build ASTs this
+     ;; schema already accepts, and HTML/LaTeX render them as they stand.
+     ;; Only `haselnuss.emit.hdoc` (no closing line to write) refuses it.
      [:section [:map
                 [:t [:= :section]]
                 [:level :int]
@@ -138,6 +145,7 @@
      [:list [:map
              [:t [:= :list]]
              [:ordered :boolean]
+             [:start {:optional true} :int]
              [:tight :boolean]
              [:items [:vector [:vector [:ref ::block]]]]
              [:attr [:ref ::attr]]]]
@@ -182,6 +190,24 @@
      [:include [:map
                 [:t [:= :include]]
                 [:src :string]]]
+     ;; TASK-152/doc-10 ("AST and parser"): a `!quote <ref>` line, the
+     ;; format's second whole-line block construct beside `!include`.
+     ;; `:ref` is the book reference EXACTLY as written -- never
+     ;; normalized and never validated here, so a malformed one survives
+     ;; to the resolver, which reports it as a located
+     ;; `malformed-book-ref` warning (doc-10, "Error handling"). Every
+     ;; other field is optional and filled only by the resolver's quote
+     ;; expansion (doc-10 step 0b, TASK-154): `:canonical` the source
+     ;; book's canonical reference, `:title` the passage title, `:blocks`
+     ;; the spliced passage, `:url` the source's URL when its library
+     ;; has a template (TASK-155/156: HTML's `cite=`).
+     [:book-quote [:map
+                   [:t [:= :book-quote]]
+                   [:ref :string]
+                   [:canonical {:optional true} :string]
+                   [:title {:optional true} [:vector [:ref ::inline]]]
+                   [:blocks {:optional true} [:vector [:ref ::block]]]
+                   [:url {:optional true} :string]]]
      [:thematic-break [:map
                        [:t [:= :thematic-break]]]]]
 
@@ -224,11 +250,13 @@
      [:link [:map
              [:t [:= :link]]
              [:target :string]
+             [:title {:optional true} :string]
              [:inlines [:vector [:ref ::inline]]]
              [:attr [:ref ::attr]]]]
      [:image [:map
               [:t [:= :image]]
               [:src :string]
+              [:title {:optional true} :string]
               [:alt :string]
               [:attr [:ref ::attr]]]]
      [:span [:map
@@ -250,6 +278,31 @@
                   [:t [:= :cross-ref]]
                   [:label :string]
                   [:suppress-prefix {:optional true} :boolean]]]
+     ;; TASK-152/doc-10 ("AST and parser"): an inline link to a passage
+     ;; of another book, written `@{bible:romanos#14:8}`. The braces are
+     ;; what set it apart from a bare `@prefix:label` `:cross-ref`
+     ;; (sec5.10). `:ref` is the text between them EXACTLY as written,
+     ;; unvalidated, for the same reason as `:book-quote`'s. The rest is
+     ;; optional and filled by resolution (doc-10 step 2, TASK-155):
+     ;; `:passage` the parsed passage in `haselnuss.book-ref`'s own
+     ;; `:form`-tagged shape, `:canonical` the target's canonical
+     ;; reference, `:text` the link text (Inlines, since it is the
+     ;; Passage's `:title`, which is Inlines), `:url` when the library
+     ;; has a URL template.
+     [:book-ref [:map
+                 [:t [:= :book-ref]]
+                 [:ref :string]
+                 ;; Exactly `haselnuss.book-ref`'s three passage shapes.
+                 ;; `dispatch-by` for the same reason `::block` uses it:
+                 ;; JSON hands `:form` over as a string until decoded.
+                 [:passage {:optional true}
+                  [:multi {:dispatch (dispatch-by :form)}
+                   [:label [:map [:form [:= :label]] [:label :string]]]
+                   [:range [:map [:form [:= :range]] [:from :string] [:to :string]]]
+                   [:locator [:map [:form [:= :locator]] [:locator :string]]]]]
+                 [:canonical {:optional true} :string]
+                 [:text {:optional true} [:vector [:ref ::inline]]]
+                 [:url {:optional true} :string]]]
      [:cite [:map
              [:t [:= :cite]]
              [:items [:vector [:ref ::cite-item]]]]]
@@ -420,3 +473,36 @@
                 (map (fn [[path message]]
                        (if (seq path) (str path " " message) message))
                      entries)))))
+
+;; --- Source positions (TASK-143) ---------------------------------------------
+;;
+;; A node's source position is Clojure METADATA, under `::source`, not a
+;; field. Metadata is invisible to `=`, to malli validation and to every
+;; serializer, so a document that does not ask for positions is
+;; byte-identical to one built before they existed (JSON interchange form,
+;; `.hdoc` output, equality-based round trips), with no strip step to forget.
+;; It survives `assoc`/`update`/`assoc-in` -- every way the passes rewrite a
+;; node -- and is lost only where a node is built afresh, which then simply
+;; has no position to report.
+
+(defn with-source
+  "`node` carrying `{:file file :line line}` as its source position, unless
+  `line` is nil. `file` may be nil (parsed without `:source`). `node`s that
+  cannot carry metadata are returned unchanged."
+  [node file line]
+  (if (and line (instance? clojure.lang.IObj node))
+    (vary-meta node assoc ::source (cond-> {:line line} file (assoc :file file)))
+    node))
+
+(defn source
+  "The `{:line n :file path}` (`:file` absent when unknown) recorded on `node`
+  by the parser, or nil."
+  [node]
+  (::source (meta node)))
+
+(defn source-label
+  "`\"path:line\"` for `node`'s source position, or nil when the node has no
+  position or no file name to print it against."
+  [node]
+  (let [{:keys [file line]} (source node)]
+    (when (and file line) (str file ":" line))))

@@ -1,0 +1,143 @@
+---
+title: Catecismo de Heidelberg (1563)
+authors:
+  - Zacarias Ursino
+  - Gaspar Oleviano
+lang: pt-BR
+---
+
+# Sobre este excerto
+
+Este é o primeiro domingo de `examples/catecismo-heidelberg.hdoc`, com uma diferença: em vez de copiar o texto de cada prova bíblica, cada seção `small-collapsable` o cita da biblioteca `bible` com `!quote`. A biblioteca é gerada pelo `shelf.clj` de `test/fixtures/libraries/bible/nt/` a partir de uma amostra em JSON do mesmo texto de Almeida que o exemplo copia, cuja licença não foi verificada (veja o README da biblioteca). O arquivo `libraries.yaml` ao lado deste documento declara a biblioteca e habilita o script com `scripts: true`; ele não é encontrado automaticamente, e por isso é passado na compilação com `--libraries test/fixtures/catechism/libraries.yaml`.
+
+## Domingo 1
+
+### 1. Qual é o seu único fundamento, na vida e na morte?
+
+O meu único fundamento é meu fiel Salvador Jesus Cristo (1). A Ele pertenço, em corpo e alma, na vida e na morte (2), e não pertenço a mim mesmo (3). Com seu precioso sangue Ele pagou (4) por todos os meus pecados e me libertou de todo o domínio do diabo (5). Agora Ele me protege de tal maneira (6) que, sem a vontade do meu Pai do céu, não perderei nem um fio de cabelo (7). Além disto, tudo coopera para o meu bem (8). Por isso, pelo Espírito Santo, Ele também me garante a vida eterna (9) e me torna disposto a viver para Ele, daqui em diante, de todo o coração (10).
+
+**Provas bíblicas**
+
+:::{small-collapsable summary="1 Coríntios 3:23" label="(1)"}
+!quote bible:1-corintios#3:23
+:::
+
+:::{small-collapsable summary="Tito 2:14"}
+!quote bible:tito#2:14
+:::
+
+:::{small-collapsable summary="Romanos 14:8" label="(2)"}
+!quote bible:romanos#14:8
+:::
+
+:::{small-collapsable summary="1 Tessalonicenses 5:9"}
+!quote bible:1-tessalonicenses#5:9
+:::
+
+:::{small-collapsable summary="1 Tessalonicenses 5:10"}
+!quote bible:1-tessalonicenses#5:10
+:::
+
+:::{small-collapsable summary="1 Coríntios 6:19" label="(3)"}
+!quote bible:1-corintios#6:19
+:::
+
+:::{small-collapsable summary="1 Coríntios 6:20"}
+!quote bible:1-corintios#6:20
+:::
+
+:::{small-collapsable summary="1 Pedro 1:18" label="(4)"}
+!quote bible:1-pedro#1:18
+:::
+
+:::{small-collapsable summary="1 Pedro 1:19"}
+!quote bible:1-pedro#1:19
+:::
+
+:::{small-collapsable summary="1 João 1:7"}
+!quote bible:1-joao#1:7
+:::
+
+:::{small-collapsable summary="1 João 2:2"}
+!quote bible:1-joao#2:2
+:::
+
+:::{small-collapsable summary="1 João 2:12"}
+!quote bible:1-joao#2:12
+:::
+
+:::{small-collapsable summary="João 8:34-36" label="(5)"}
+!quote bible:joao#8:34-36
+:::
+
+:::{small-collapsable summary="Hebreus 2:14"}
+!quote bible:hebreus#2:14
+:::
+
+:::{small-collapsable summary="Hebreus 2:15"}
+!quote bible:hebreus#2:15
+:::
+
+:::{small-collapsable summary="1 João 3:8"}
+!quote bible:1-joao#3:8
+:::
+
+:::{small-collapsable summary="João 6:39" label="(6)"}
+!quote bible:joao#6:39
+:::
+
+:::{small-collapsable summary="João 10:27-30"}
+!quote bible:joao#10:27-30
+:::
+
+:::{small-collapsable summary="2 Tessalonicenses 3:3"}
+!quote bible:2-tessalonicenses#3:3
+:::
+
+:::{small-collapsable summary="1 Pedro 1:5"}
+!quote bible:1-pedro#1:5
+:::
+
+:::{small-collapsable summary="Mateus 10:29" label="(7)"}
+!quote bible:mateus#10:29
+:::
+
+:::{small-collapsable summary="Mateus 10:30"}
+!quote bible:mateus#10:30
+:::
+
+:::{small-collapsable summary="Lucas 21:18"}
+!quote bible:lucas#21:18
+:::
+
+:::{small-collapsable summary="Romanos 8:28" label="(8)"}
+!quote bible:romanos#8:28
+:::
+
+:::{small-collapsable summary="Romanos 8:16" label="(9)"}
+!quote bible:romanos#8:16
+:::
+
+:::{small-collapsable summary="2 Coríntios 1:22"}
+!quote bible:2-corintios#1:22
+:::
+
+:::{small-collapsable summary="2 Coríntios 5:5"}
+!quote bible:2-corintios#5:5
+:::
+
+:::{small-collapsable summary="Efésios 1:13"}
+!quote bible:efesios#1:13
+:::
+
+:::{small-collapsable summary="Efésios 1:14"}
+!quote bible:efesios#1:14
+:::
+
+:::{small-collapsable summary="Romanos 8:14" label="(10)"}
+!quote bible:romanos#8:14
+:::
+
+:::{small-collapsable summary="1 João 3:3"}
+!quote bible:1-joao#3:3
+:::

@@ -1,0 +1,7 @@
+# The library directory of the cut-down catechism (TASK-159). A relative
+# path resolves against this file's own folder. `scripts: true` is what
+# lets the Bible library's generated shelf (nt/shelf.clj) run at all.
+- name: bible
+  type: filesystem
+  path: ../libraries/bible
+  scripts: true

@@ -19,14 +19,23 @@
   (:require [clojure.set]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [haselnuss.ast :as ast]
             [haselnuss.emit.html :as html]
             [haselnuss.extensions.collapsable :as collapsable]
             [haselnuss.json :as json]
+            [haselnuss.parser :as parser]
             [haselnuss.registry :as registry]
-            [haselnuss.resolver :as resolver])
+            [haselnuss.resolver :as resolver]
+            [haselnuss.sanitize :as sanitize])
   (:import (java.io StringReader)
            (javax.xml.parsers DocumentBuilderFactory)
            (org.xml.sax InputSource)))
+
+(deftest parsed-strikethrough-renders-test
+  (testing "TASK-137 AC #1: ~~x~~ in source reaches the HTML as <s> (a
+            stylistic strike, see the :strike handler)"
+    (is (str/includes? (html/emit-document (parser/parse "a ~~gone~~ b\n"))
+                       "<s>gone</s>"))))
 
 (defn- body-of
   "The `<body>` content of an emitted document.
@@ -480,13 +489,195 @@
   (testing "the same validation accepts every real element name this
             codebase's own vocabulary needs, including a hyphenated
             custom element -- the fix rejects a malformed tag, not
-            hiccup elements in general"
-    (let [reg (registry/register {} {:name "widget"
+            hiccup elements in general. Trusted, since TASK-215 holds an
+            untrusted renderer to an element allow-list without custom
+            elements (untrusted-extension-output-test)"
+    (let [reg (registry/register {} {:name "widget" :trusted? true
                                      :emit {:html (registry/renderer-v2
                                                    (fn [_d _ctx] [:my-widget {:class "x"} "hi"]))}})
           d {:t :directive :name "widget" :attr empty-attr :blocks []}
           out (body-of (html/emit-document {:meta {} :blocks [d]} {:registry reg}))]
       (is (= "<my-widget class=\"x\">hi</my-widget>" out)))))
+
+(deftest forged-rendered-test
+  ;; TASK-213: `assoc` on a record keeps its type, so a renderer handed a
+  ;; `Rendered` by :render-blocks could rewrite its :html and have it
+  ;; spliced verbatim -- [:raw ...] without the trust gate.
+  (let [d {:t :directive :name "widget" :attr empty-attr
+           :blocks [(para (str-inline "body"))]}
+        emit (fn [renderer & {:keys [trusted?]}]
+               (html/emit-document {:meta {} :blocks [d d]}
+                                   {:registry (registry/register
+                                               {} {:name "widget" :trusted? trusted?
+                                                   :emit {:html (registry/renderer-v2 renderer)}})}))
+        refusal (fn [renderer]
+                  (try (emit renderer) [:no-throw]
+                       (catch clojure.lang.ExceptionInfo e
+                         [(:type (ex-data e)) (:directive-name (ex-data e)) (ex-message e)])))
+        stash (atom nil)
+        forgeries {"assoc" (fn [_d ctx] (assoc ((:render-blocks ctx) []) :html "<script>x</script>"))
+                   "merge, nested in a fragment" (fn [_d ctx]
+                                                   (list (merge ((:render-inlines ctx) [])
+                                                                {:html "<script>x</script>"})))
+                   "into, nested in an element" (fn [_d ctx]
+                                                  [:div {} (into ((:render-blocks ctx) [])
+                                                                 {:html "<script>x</script>"})])
+                   "constructed" (fn [_d _ctx] (html/->Rendered "<script>x</script>"))
+                   "kept from another call" (fn [directive ctx]
+                                              (or @stash
+                                                  (reset! stash ((:render-blocks ctx)
+                                                                 (:blocks directive)))))}]
+    (doseq [[label renderer] forgeries]
+      (testing (str "an untrusted renderer's Rendered that is not the very instance a
+                     ctx callback issued in this call is refused, naming the directive: " label)
+        (let [[error-type directive-name message] (refusal renderer)]
+          (is (= ::html/forged-rendered error-type))
+          (is (= "widget" directive-name))
+          (is (str/includes? (str message) "\"widget\""))
+          (is (str/includes? (str message) "not :trusted")))))
+    (testing "the source position the parser recorded is named"
+      (let [d' (ast/with-source d "doc.hdoc" 7)]
+        (try (html/emit-document {:meta {} :blocks [d']}
+                                 {:registry (registry/register
+                                             {} {:name "widget"
+                                                 :emit {:html (registry/renderer-v2
+                                                               (get forgeries "assoc"))}})})
+             (is false "expected a refusal")
+             (catch clojure.lang.ExceptionInfo e
+               (is (= "doc.hdoc:7" (:source (ex-data e))))
+               (is (str/includes? (ex-message e) "(doc.hdoc:7)"))))))
+    (testing "the callback's own result, unchanged, anywhere in the returned data, still renders"
+      (is (= "<section><p>body</p><p>body</p></section><section><p>body</p><p>body</p></section>"
+             (body-of (emit (fn [directive ctx]
+                              (let [r ((:render-blocks ctx) (:blocks directive))]
+                                [:section {} r (list r)])))))))
+    (testing "a trusted registration may still return any Rendered, as it may [:raw ...]"
+      (is (= "<script>x</script><script>x</script>"
+             (body-of (emit (get forgeries "assoc") :trusted? true)))))))
+
+(deftest rendered-first-child-test
+  ;; TASK-216: a `Rendered` is a record, so a map; in an element's second
+  ;; position it used to be read as the attrs map -- `<div html="&lt;p&gt;...">`.
+  (let [d {:t :directive :name "widget" :attr empty-attr
+           :blocks [(para (str-inline "body"))]}
+        emit (fn [renderer & {:keys [trusted?]}]
+               (body-of (html/emit-document
+                         {:meta {} :blocks [d]}
+                         {:registry (registry/register
+                                     {} {:name "widget" :trusted? trusted?
+                                         :emit {:html (registry/renderer-v2 renderer)}})})))
+        refusal (fn [renderer]
+                  (try (emit renderer) [:no-throw]
+                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))]
+    (doseq [trusted? [false true]]
+      (testing (str "a callback's Rendered as an element's first child is that child, trusted? " trusted?)
+        (is (= "<div><p>body</p></div>"
+               (emit (fn [directive ctx] [:div ((:render-blocks ctx) (:blocks directive))])
+                     :trusted? trusted?)))
+        (is (= "<div><span>body</span>!</div>"
+               (emit (fn [directive ctx]
+                       [:div [:span ((:render-inlines ctx) (:inlines (first (:blocks directive))))] "!"])
+                     :trusted? trusted?)))
+        (is (= "<div class=\"w\"><p>body</p></div>"
+               (emit (fn [directive ctx] [:div {:class "w"} ((:render-blocks ctx) (:blocks directive))])
+                     :trusted? trusted?))
+            "a plain attrs map is still the attrs")))
+    (testing "a forged Rendered as the first child is refused, as anywhere else"
+      (doseq [forge [(fn [_d ctx] [:div (assoc ((:render-blocks ctx) []) :html "<script>x</script>")])
+                     (fn [_d ctx] [:div (into ((:render-blocks ctx) []) {:html "<script>x</script>"})])
+                     (fn [_d _ctx] [:div (html/->Rendered "<script>x</script>")])]]
+        (is (= ::html/forged-rendered (refusal forge)))))
+    (testing "and spliced for a trusted registration, as anywhere else"
+      (is (= "<div><script>x</script></div>"
+             (emit (fn [_d ctx] [:div (assoc ((:render-blocks ctx) []) :html "<script>x</script>")])
+                   :trusted? true))))))
+
+(deftest untrusted-extension-output-test
+  ;; TASK-215: the TASK-213 reviewer's reproductions. An untrusted
+  ;; renderer's hiccup is held to a tag allow-list and the document
+  ;; pass's attribute rules, and the AST it hands its ctx callbacks goes
+  ;; through haselnuss.sanitize first.
+  (let [d (ast/with-source {:t :directive :name "widget" :attr empty-attr
+                            :blocks [(para (str-inline "body")
+                                           {:t :math-inline :tex "\\def\\x{1}\\x"})]}
+            "doc.hdoc" 3)
+        emit (fn [renderer & {:keys [trusted?]}]
+               (let [warnings (atom [])
+                     out (binding [sanitize/*untrusted-diagnostics* warnings]
+                           (html/emit-document
+                            {:meta {} :blocks [d]}
+                            {:registry (registry/register
+                                        {} {:name "widget" :trusted? trusted?
+                                            :emit {:html (registry/renderer-v2 renderer)}})}))]
+                 [(body-of out) @warnings]))
+        refusal (fn [renderer]
+                  (try (emit renderer) [:no-throw]
+                       (catch clojure.lang.ExceptionInfo e [(ex-data e) (ex-message e)])))
+        evil-link {:t :link :target "javascript:alert(1)"
+                   :attr (assoc empty-attr :props {"onmouseover" "alert(2)"})
+                   :inlines [(str-inline "click")]}]
+    (testing "an element outside the allow-list is refused, naming the directive, its line and the tag"
+      (doseq [tag [:script :SCRIPT :style :iframe :object :embed :link :meta :base :form :input
+                   :svg :math :template :my-widget]]
+        (let [[data message] (refusal (fn [_d _ctx] [:div [tag "x"]]))]
+          (is (= ::html/untrusted-element (:type data)) (str tag))
+          (is (= "widget" (:directive-name data)))
+          (is (= "doc.hdoc:3" (:source data)))
+          (is (str/includes? (str message) (str "<" (name tag) ">"))))))
+    (testing "on* handlers, javascript: URLs and malformed attribute names are dropped with a warning each"
+      (let [[out warnings] (emit (fn [_d _ctx]
+                                   [:div {:class "w" :onClick "alert(0)" :is "x-evil"}
+                                    [:img {:src "pic.png" :onerror "alert(1)" :lowsrc "javascript:x"
+                                           :srcset "ok.png 1x, javascript:alert(2) 2x"}]
+                                    [:a {:href " JaVa\tScript:alert(3)" (keyword "x onmouseover") "y"
+                                         :title "fine"} "go"]
+                                    [:a {:href "https://example.org/" :style "color: red"} "ok"]]))]
+        (is (= (str "<div class=\"w\"><img src=\"pic.png\"></img><a title=\"fine\">go</a>"
+                    "<a href=\"https://example.org/\" style=\"color: red\">ok</a></div>")
+               out))
+        (is (= [:custom-element-attribute :event-handler-attribute :event-handler-attribute
+                :malformed-attribute-name :unsafe-url :unsafe-url :unsafe-url]
+               (sort-by name (map :type warnings))))
+        (is (every? #(str/starts-with? (:message %) "directive \"widget\" (doc.hdoc:3), untrusted")
+                    warnings))
+        (is (every? #(= "widget" (:directive-name %)) warnings))))
+    (testing "a hand-built :link with a javascript: target and an onmouseover prop, via
+              :render-blocks or :render-inlines, renders as its text, with warnings"
+      (let [[out warnings] (emit (fn [_d ctx] ((:render-blocks ctx) [(para evil-link)])))]
+        (is (= "<p>click</p>" out))
+        (is (= #{:event-handler-attribute :unsafe-url} (set (map :type warnings)))))
+      (let [[out warnings] (emit (fn [_d ctx] [:span {} ((:render-inlines ctx) [evil-link])]))]
+        (is (= "<span>click</span>" out))
+        (is (= 2 (count warnings)))))
+    (testing "TeX using a dangerous primitive the document did not author is refused"
+      (let [[data message] (refusal (fn [_d ctx]
+                                      ((:render-inlines ctx)
+                                       [{:t :math-inline :tex "\\input{/etc/passwd}"}])))]
+        (is (= ::sanitize/untrusted-tex (:type data)))
+        (is (= "\\input" (:token data)))
+        (is (str/includes? (str message) "\"widget\" (doc.hdoc:3)"))))
+    (testing "an ordinary renderer is unchanged: allowed tags, its own body rendered through
+              :render-blocks -- the document's own math included, which is trusted"
+      (let [[out warnings] (emit (fn [directive ctx]
+                                   [:details {:class "callout" :id "c1"}
+                                    [:summary "Note"]
+                                    ((:render-blocks ctx) (:blocks directive))]))]
+        (is (= (str "<details id=\"c1\" class=\"callout\"><summary>Note</summary>"
+                    "<p>body<span class=\"math inline\">\\(\\def\\x{1}\\x\\)</span></p></details>")
+               out))
+        (is (empty? warnings))))
+    (testing "--trusted-extensions (a :trusted? registration) lifts all of it"
+      (let [[out warnings] (emit (fn [_d ctx]
+                                   [:div [:script "x"] [:a {:href "javascript:y" :onclick "z"} "a"]
+                                    ((:render-inlines ctx) [evil-link
+                                                            {:t :math-inline :tex "\\input{f}"}])])
+                                 :trusted? true)]
+        (is (str/includes? out "<script>x</script>"))
+        (is (str/includes? out "href=\"javascript:y\""))
+        (is (str/includes? out "onclick=\"z\""))
+        (is (str/includes? out "href=\"javascript:alert(1)\""))
+        (is (str/includes? out "\\input{f}"))
+        (is (empty? warnings))))))
 
 (deftest unsupported-node-test
   (testing "with :thematic-break and :include both claimed by TASK-37
@@ -527,6 +718,26 @@
         (is (str/includes? (ex-message e) "other.hdoc"))
         (is (str/includes? (ex-message e) "it was never expanded"))
         (is (str/includes? (ex-message e) "expand-includes"))))))
+
+(deftest figure-describe-alt-test
+  (testing "TASK-131: a describe-d alt lands on the <img>, never on <figure>"
+    (let [figure {:t :figure
+                  :content {:t :para :inlines [{:t :image :src "pic.png" :alt "a" :attr empty-attr}]}
+                  :caption []
+                  :attr {:id "fig:tree" :classes [] :props {"alt" "Described." "data-x" "1"}}}
+          out (html/emit-document {:meta {} :blocks [figure]})]
+      (is (well-formed? out))
+      (is (str/includes? out "<figure id=\"fig:tree\" data-x=\"1\">"))
+      (is (str/includes? out "<img src=\"pic.png\" alt=\"Described.\"/>"))))
+  (testing "a parent's alt does not reach its panels' own images"
+    (let [panel {:t :figure
+                 :content {:t :para :inlines [{:t :image :src "p.png" :alt "own" :attr empty-attr}]}
+                 :caption [] :attr {:id "fig:p" :classes [] :props {}}}
+          parent {:t :figure :content {:t :block-quote :blocks [panel]} :caption []
+                  :attr {:id "fig:all" :classes [] :props {"alt" "X"}}}
+          out (html/emit-document {:meta {} :blocks [parent]})]
+      (is (str/includes? out "alt=\"own\""))
+      (is (not (str/includes? out "alt=\"X\""))))))
 
 (deftest figure-table-rendering-test
   (testing "AC #1: a Figure with a resolver-computed number (:labels)
@@ -615,14 +826,48 @@
       (is (well-formed? out))
       (is (re-find #"<div id=\"eq:pyth\" class=\"math display highlight\">\\\[a\^2 \+ b\^2 &lt; c\^2\\\]</div>"
                    out))))
-  (testing "AC #2: emit-document always includes the MathJax CDN script
-            tag in <head>, so math renders correctly once opened in a
-            browser -- even a math-free document still gets it (see this
-            namespace's own docstring for why unconditionally)"
-    (let [out (html/emit-document {:meta {} :blocks [(para (str-inline "no math here"))]})]
-      (is (well-formed? out))
-      (is (re-find #"<script id=\"MathJax-script\" async=\"async\" src=\"https://cdn\.jsdelivr\.net/npm/mathjax@3/es5/tex-mml-chtml\.js\"></script>"
-                   out)))))
+  (testing "TASK-130: the MathJax script is emitted only for a document with math"
+    (let [script #"<script id=\"MathJax-script\" async=\"async\" src=\"https://cdn\.jsdelivr\.net/npm/mathjax@3\.2\.2/es5/tex-mml-chtml\.js\"></script>"
+          plain (html/emit-document {:meta {} :blocks [(para (str-inline "no math here"))]})
+          inline (html/emit-document {:meta {} :blocks [(para {:t :math-inline :tex "x"})]})
+          block (html/emit-document {:meta {} :blocks [{:t :math-block :tex "x" :attr {:id nil :classes [] :props {}}}]})
+          forged (html/emit-document {:meta {} :blocks [(para (str-inline "<span class=\"math inline\">"))]})
+          empty-doc (html/emit-document {:meta {} :blocks []})
+          opted-out (html/emit-document {:meta {} :blocks [(para {:t :math-inline :tex "x"})]} {:mathjax false})]
+      (is (well-formed? plain))
+      (is (nil? (re-find script plain)))
+      (is (nil? (re-find #"cdn\.jsdelivr" empty-doc)))
+      (is (nil? (re-find script forged)))
+      (is (re-find script inline))
+      (is (re-find script block))
+      (is (nil? (re-find script opted-out)))))
+  (testing "TASK-217: the MathJax configuration closes every way a
+            document's math could make a link or an attribute, and comes
+            immediately before the CDN script so MathJax reads it"
+    (let [config (str "<script>window.MathJax={"
+                      "loader:{load:['ui/safe']},"
+                      "tex:{packages:{'[-]':['require']},autoload:{html:[],unicode:[]}},"
+                      "options:{safeOptions:{allow:{URLs:'none'}}},"
+                      "startup:{ready:function(){"
+                      "MathJax.startup.defaultReady();"
+                      "var s=MathJax.startup.document.safe;"
+                      "s.filterMethods.filterFontToken=function(_,v){return /^[-\\w ,]*$/.test(v)?v:null;};"
+                      "['fontfamily','fontweight','fontstyle'].forEach(function(a){s.filterAttributes.set(a,'filterFontToken');});"
+                      "}}"
+                      "};</script>")
+          math (html/emit-document
+                {:meta {} :blocks [(para {:t :math-inline :tex "\\href{javascript:alert(1)}{x}"})]})
+          plain (html/emit-document {:meta {} :blocks [(para (str-inline "no math here"))]})
+          opted-out (html/emit-document {:meta {} :blocks [(para {:t :math-inline :tex "x"})]}
+                                        {:mathjax false})]
+      (is (well-formed? math))
+      (is (str/includes? math (str config "<script id=\"MathJax-script\"")))
+      (is (= 1 (count (re-seq #"window\.MathJax=" math))))
+      (testing "-- the math itself is left as written: the browser-side
+                config is what disarms it"
+        (is (str/includes? math "\\(\\href{javascript:alert(1)}{x}\\)")))
+      (is (not (str/includes? plain "window.MathJax")))
+      (is (not (str/includes? opted-out "window.MathJax"))))))
 
 (deftest cross-ref-rendering-test
   (testing "AC #3: a resolved CrossRef (haselnuss.resolver/resolve-cross-
@@ -825,7 +1070,7 @@
   is the existing precedent in this codebase for pinning a schema's
   variant set from a test."
   #{:section :para :list :code-block :math-block :figure :table
-    :block-quote :directive :include :thematic-break})
+    :block-quote :directive :include :book-quote :thematic-break})
 
 (defn- block-fixture
   "A minimal Block of variant `tag`, for `block-coverage-test`'s own
@@ -844,6 +1089,7 @@
     :directive {:t :directive :name "collapsable" :blocks [(para (str-inline "x"))]
                 :attr {:classes [] :props {"summary" "s"}}}
     :include {:t :include :src "other.hdoc"}
+    :book-quote {:t :book-quote :ref "bible:romanos#14:8"}
     :thematic-break {:t :thematic-break}))
 
 (deftest block-coverage-test
@@ -854,7 +1100,7 @@
             cannot quietly go unhandled. :include is the one variant
             that still raises, and it raises its own
             ::unresolved-include (TASK-37 AC #3)"
-    (is (= 11 (count all-block-tags)))
+    (is (= 12 (count all-block-tags)))
     (let [reg (registry/register {} collapsable/extension)]
       (doseq [tag all-block-tags]
         (let [thrown (try
@@ -863,6 +1109,108 @@
                        (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))]
           (is (not= ::html/unsupported-block thrown) (str tag))
           (is (= (when (= :include tag) ::html/unresolved-include) thrown) (str tag)))))))
+
+(deftest book-nodes-unresolved-rendering-test
+  (testing "TASK-152/156: a book node no resolution ran over (the json
+            target's view, or a build with no library directory) shows its
+            ref as written instead of throwing"
+    (let [out (html/emit-document
+               {:meta {} :blocks [(para (str-inline "See ") {:t :book-ref :ref "a & <b>"})
+                                  {:t :book-quote :ref "bible:romanos#14:8-9"}]})]
+      (is (well-formed? out))
+      (is (str/includes? (body-of out) "<p>See <span class=\"book-ref\">a &amp; &lt;b&gt;</span></p>"))
+      (is (str/includes? (body-of out)
+                         "<blockquote class=\"book-quote\"><p>bible:romanos#14:8-9</p></blockquote>"))))
+  (testing "resolved fields, when present, are what is rendered"
+    (let [out (html/emit-document
+               {:meta {} :blocks [(para {:t :book-ref :ref "bible:romanos#14:8"
+                                         :text [(str-inline "Romanos 14:8")]})
+                                  {:t :book-quote :ref "bible:romanos#14:8"
+                                   :blocks [(para (str-inline "Porque"))]}]})]
+      (is (str/includes? (body-of out) "<span class=\"book-ref\">Romanos 14:8</span>"))
+      (is (str/includes? (body-of out) "<blockquote class=\"book-quote\"><p>Porque</p></blockquote>"))
+      (is (not (str/includes? (body-of out) "bible:romanos"))))))
+
+(def ^:private resolved-book-document
+  "A host Section holding both BookRef forms (with and without a URL, the
+  URL needing attribute escaping), a failed link, a resolved BookQuote
+  whose passage has its own level-1 and level-2 headings and a citation,
+  and a failed quote -- the shapes TASK-154/155 resolution produces."
+  {:meta {}
+   :blocks [{:t :section :level 1 :heading [(str-inline "Host")]
+             :attr {:id "sec:host" :classes [] :props {}}
+             :blocks [(para (str-inline "See ")
+                            {:t :book-ref :ref "reformed:heidelberg#sec:q1"
+                             :canonical "reformed:confessions/heidelberg#sec:q1"
+                             :text [(str-inline "Heidelberg & Co, Section 1.1")]
+                             :url "https://example.org/h.html?a=1&b=\"2\"#sec:q1"}
+                            (str-inline ", ")
+                            {:t :book-ref :ref "plain:p" :canonical "plain:p"
+                             :text [(str-inline "P")]}
+                            (str-inline " and ")
+                            {:t :book-ref :ref "nolib:x" :text [(str-inline "??")]})
+                      {:t :book-quote :ref "reformed:heidelberg#sec:comfort"
+                       :canonical "reformed:confessions/heidelberg#sec:comfort"
+                       :title [(str-inline "Heidelberg Catechism, Section 1")]
+                       :url "https://example.org/h.html#sec:comfort"
+                       :blocks [{:t :section :level 1 :heading [(str-inline "Comfort")]
+                                 :attr {:classes [] :props {}}
+                                 :blocks [{:t :section :level 2 :heading [(str-inline "Q1")]
+                                           :attr {:classes [] :props {}}
+                                           :blocks [(para (str-inline "Only comfort ")
+                                                          {:t :cite :items [{:key "k" :mode :normal}]
+                                                           :text [(str-inline "[7]")]})]}]}]}
+                      {:t :book-quote :ref "plain:p" :canonical "plain:p"
+                       :title [(str-inline "P")]
+                       :blocks [(para (str-inline "Unlinked."))]}
+                      {:t :book-quote :ref "nolib:x"
+                       :blocks [(para (str-inline "?? nolib:x"))]}]}]})
+
+(deftest book-nodes-golden-test
+  (testing "TASK-156 AC #1/#4: both BookRef forms, the BookQuote blockquote with
+            data-source and cite, its source line, and the failed placeholders"
+    (let [out (html/emit-document resolved-book-document
+                                  {:bibliography-id "refs" :ordered-keys ["k"]})]
+      (is (well-formed? out))
+      (is (= (str "<section id=\"sec:host\"><h1>Host</h1>"
+                  "<p>See <a class=\"book-ref\" href=\"https://example.org/h.html?a=1&amp;b=&quot;2&quot;#sec:q1\">"
+                  "Heidelberg &amp; Co, Section 1.1</a>, "
+                  "<span class=\"book-ref\">P</span> and "
+                  "<span class=\"book-ref\">??</span></p>"
+                  "<figure class=\"book-quote-figure\">"
+                  "<blockquote class=\"book-quote\" data-source=\"reformed:confessions/heidelberg#sec:comfort\""
+                  " cite=\"https://example.org/h.html#sec:comfort\">"
+                  "<section><h2>Comfort</h2><section><h3>Q1</h3><p>Only comfort [7]</p></section></section>"
+                  "</blockquote>"
+                  "<figcaption>— <cite><a href=\"https://example.org/h.html#sec:comfort\">"
+                  "Heidelberg Catechism, Section 1</a></cite></figcaption></figure>"
+                  "<figure class=\"book-quote-figure\">"
+                  "<blockquote class=\"book-quote\" data-source=\"plain:p\"><p>Unlinked.</p></blockquote>"
+                  "<figcaption>— <cite>P</cite></figcaption></figure>"
+                  "<blockquote class=\"book-quote\"><p>?? nolib:x</p></blockquote>"
+                  "</section>")
+             (body-of out)))
+      (testing "the quoted citation is not linked to the host's bibliography entry for the same key"
+        (is (not (str/includes? out "href=\"#refs-")))))))
+
+(deftest book-quote-heading-levels-test
+  (testing "TASK-156: a quote's shallowest heading sits one level below the host
+            Section around it, whatever level it had in its book"
+    (let [q (fn [level] {:t :book-quote :ref "b:x" :canonical "b:x"
+                         :blocks [{:t :section :level level :heading [(str-inline "Q")]
+                                   :attr {:classes [] :props {}}
+                                   :blocks [{:t :section :level (inc level) :heading [(str-inline "R")]
+                                             :attr {:classes [] :props {}} :blocks []}]}]})
+          host (fn [& blocks] {:t :section :level 2 :heading [(str-inline "H")]
+                               :attr {:classes [] :props {}} :blocks (vec blocks)})
+          body (fn [& blocks] (body-of (html/emit-document {:meta {} :blocks (vec blocks)})))]
+      (is (str/includes? (body (host (q 1))) "<h3>Q</h3><section><h4>R</h4>"))
+      (is (str/includes? (body (host (q 4))) "<h3>Q</h3><section><h4>R</h4>"))
+      (is (str/includes? (body (q 2)) "<h1>Q</h1><section><h2>R</h2>")
+          "at the top of the host, the quote starts at level 1")
+      (testing "a quote inside a quote is placed under the quoted Section around it"
+        (is (str/includes? (body (host (assoc-in (q 1) [:blocks 0 :blocks 0 :blocks] [(q 1)])))
+                           "<h4>R</h4><blockquote class=\"book-quote\" data-source=\"b:x\"><section><h5>Q</h5>"))))))
 
 (deftest include-json-entry-point-test
   (testing "TASK-37 review finding #4: haselnuss.json/json->ast puts an
@@ -887,14 +1235,41 @@
             that existed nowhere in the document"
     (let [document {:meta {}
                     :blocks [{:t :block-quote
+                              :container :div
                               :attr {:id "thm:main" :classes ["theorem"] :props {"lang" "en"}}
                               :blocks [(para (str-inline "Body."))]}
                              (para {:t :cross-ref :label "thm:main"
                                     :target "thm:main" :text "Theorem 1"})]}
           out (html/emit-document document)]
       (is (well-formed? out))
-      (is (re-find #"<blockquote id=\"thm:main\" class=\"theorem\" lang=\"en\">" out))
-      (is (re-find #"<a href=\"#thm:main\">Theorem 1</a>" out)))))
+      (is (re-find #"<div id=\"thm:main\" class=\"theorem\" lang=\"en\">" out))
+      (is (not (re-find #"<blockquote" out)))
+      (is (re-find #"<a href=\"#thm:main\">Theorem 1</a>" out))))
+  (testing "TASK-139: only the in-memory :container marker makes a div --
+            an authored quote whose class happens to be .proof or
+            .admonition is still a quotation"
+    (let [out (html/emit-document
+               {:meta {}
+                :blocks [{:t :block-quote :attr {:classes ["proof"]}
+                          :blocks [(para (str-inline "Said."))]}
+                         {:t :block-quote :container :note :attr {:classes ["admonition"]}
+                          :blocks [(para (str-inline "Careful."))]}]})]
+      (is (str/includes? out "<blockquote class=\"proof\">"))
+      (is (str/includes? out "<div class=\"admonition\" role=\"note\">"))))
+  (testing "TASK-139: directive-internal props (caption, key, ref) are not
+            written as attributes on a block or an inline; real HTML
+            attributes still are"
+    (let [out (html/emit-document
+               {:meta {}
+                :blocks [{:t :block-quote :container :div
+                          :attr {:classes ["theorem"]
+                                 :props {"caption" "T" "key" "k" "lang" "en"}}
+                          :blocks [(para {:t :span
+                                          :attr {:props {"ref" "r" "title" "x"}}
+                                          :inlines [(str-inline "in")]})]}]})]
+      (is (str/includes? out "lang=\"en\""))
+      (is (str/includes? out "title=\"x\""))
+      (is (not (re-find #"caption=|key=|ref=" out))))))
 
 (deftest math-block-number-test
   (testing "TASK-27: a numbered equation prints its own number, so the
