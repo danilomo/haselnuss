@@ -1571,6 +1571,205 @@
           (let [out (hdoc/emit-document document)]
             (is (= document (parser/parse out)) (pr-str context v out))))))))
 
+(defn- thrown-attr-value
+  "The `ex-data` of the `::hdoc/unrepresentable-attr-value` that emitting
+  `document` throws, or nil when it throws anything else or nothing."
+  [document]
+  (try (hdoc/emit-document document) nil
+       (catch clojure.lang.ExceptionInfo e
+         (when (= ::hdoc/unrepresentable-attr-value (:type (ex-data e)))
+           (assoc (ex-data e) :message (ex-message e))))))
+
+(deftest attribute-value-context-refusal-test
+  (let [terminators (code-points 0x0a 0x0d 0x85 0x2028 0x2029)]
+    (testing "TASK-221: a line terminator in a `:::` header, a `!name{...}`
+              line or a display-math group is refused naming the context"
+      (doseq [t (map str terminators)
+              :let [documents (attr-value-contexts {:classes [] :props {"k" (str "a" t "b")}})]
+              [context fragment] [[:fence "`:::` fence header"] [:bang "`!name{...}` line"]
+                                  [:math "display-math closing fence"]]]
+        (let [data (thrown-attr-value (documents context))]
+          (is (some? data) (pr-str context t))
+          (is (str/includes? (str (:message data)) fragment) (pr-str context t (:message data))))))
+    (testing "and in an id, a class or a key, which no quoting reaches"
+      (doseq [attr [{:id "a\nb" :classes [] :props {}}
+                    {:classes [(str "a" (code-points 0x2028))] :props {}}
+                    {:classes [] :props {(str "k" (code-points 0x85)) "v"}}]
+              context [:fence :bang :math]]
+        (is (some? (thrown-attr-value ((attr-value-contexts attr) context))) (pr-str context attr))))
+    (testing "a heading's group refuses `\\n` and `\\r`"
+      (doseq [t ["\n" "\r"]]
+        (let [data (thrown-attr-value (:heading (attr-value-contexts {:classes [] :props {"k" (str "a" t "b")}})))]
+          (is (some? data) (pr-str t))
+          (is (str/includes? (str (:message data)) "heading") (pr-str t)))))
+    (testing "a `}` in a display-math group is refused, however it is quoted"
+      (doseq [attr [{:classes [] :props {"k" "a}b"}} {:classes [] :props {"k" "}"}}]]
+        (let [data (thrown-attr-value (:math (attr-value-contexts attr)))]
+          (is (some? data) (pr-str attr))
+          (is (str/includes? (str (:message data)) "display-math") (pr-str attr)))))
+    (testing "the same values elsewhere keep working: `}` in the other
+              contexts, a line terminator nowhere it was written before"
+      (doseq [context [:heading :span :link :image :fence :bang]]
+        (let [document ((attr-value-contexts {:classes [] :props {"k" "a}b"}}) context)]
+          (is (= document (parser/parse (hdoc/emit-document document))) (pr-str context)))))))
+
+(defn- table-cell-doc
+  "A table document whose one body cell holds `inlines`."
+  [inlines]
+  (let [table (first (:blocks (parser/parse "| h |\n|---|\n| x |\n")))]
+    {:meta {}
+     :blocks [(assoc-in table [:rows 0 :cells 0 :blocks] [(apply para inlines)])]}))
+
+(deftest attribute-group-pipe-in-table-cell-test
+  (testing "TASK-221 AC #2: a `|` inside an attribute group in a table cell
+            is written bare (the row is split group-aware), every other
+            `|` in the cell still escaped"
+    (doseq [[src out] [["| h |\n|---|\n| [b]{k=\"a|b\"} |\n" "| h |\n| --- |\n| [b]{k=a|b} |\n"]
+                       ["| h |\n|---|\n| [b]{.a|b #c|d} |\n" "| h |\n| --- |\n| [b]{#c|d .a|b} |\n"]
+                       ["| h |\n|---|\n| x\\|y [b]{k=\"|\"} |\n" "| h |\n| --- |\n| x\\|y [b]{k=|} |\n"]
+                       ["| h |\n|---|\n| ![i](u.png){k=\"a|b\"} |\n" "| h |\n| --- |\n| ![i](u.png){k=a|b} |\n"]
+                       ["| h |\n|---|\n| [b](u){k=\"a|b\"} |\n" "| h |\n| --- |\n| [b](u){k=a|b} |\n"]
+                       ["| h |\n|---|\n| ==b=={k=\"a|b\"} |\n" "| h |\n| --- |\n| ==b=={k=a|b} |\n"]
+                       ["| h | g |\n|---|---|\n| [b]{k=\"a|b\"} | [c]{k=\"|\"} |\n"
+                        "| h | g |\n| --- | --- |\n| [b]{k=a|b} | [c]{k=|} |\n"]]]
+      (is (= (:blocks (parser/parse src)) (:blocks (parser/parse (emit-src src)))) src)
+      (is (= out (emit-src src)) src)
+      (is (fixed-point? src) src))))
+
+(deftest attribute-group-pipe-in-table-cell-fuzz-test
+  (testing "TASK-221 fuzz: values, ids and classes holding `|` round-trip in
+            every inline that carries a group inside a table cell"
+    (let [pieces ["a" "|" "||" " " "b" "-" "." ":" "\"" "'" "=" "{" "}" "`" "x y"]
+          rng (java.util.Random. 221)
+          gen (fn [] (apply str (repeatedly (inc (.nextInt rng 5)) #(nth pieces (.nextInt rng (count pieces))))))
+          make (fn [kind v]
+                 (let [attr (case kind
+                              :value {:classes [] :props {"k" v}}
+                              :class {:classes [(str/replace v #"[\s\"'=<>{}`]" "_")] :props {}}
+                              :id {:id (str/replace v #"[\s\"'=<>{}`]" "_") :classes [] :props {}})]
+                   (for [inline [{:t :span :inlines [(str-inline "b")] :attr attr}
+                                 {:t :link :target "u" :inlines [(str-inline "b")] :attr attr}
+                                 {:t :image :src "u.png" :alt "b" :attr attr}
+                                 {:t :highlight :inlines [(str-inline "b")] :attr attr}]]
+                     [attr (table-cell-doc [(str-inline "p|q") space inline])])))
+          cases (for [kind [:value :class :id] _ (range 300) c (make kind (gen))] c)]
+      (is (< 1000 (count (filter (fn [[attr _]] (some #(str/includes? (str %) "|") (concat (vals (:props attr)) (:classes attr) [(:id attr)]))) cases)))
+          "enough cases hold a `|` in the group that the fuzz is not vacuous")
+      (doseq [[attr document] cases]
+        (if (some #(and (str/includes? % "\"") (str/includes? % "'")) (vals (:props attr)))
+          (is (some? (thrown-attr-value document)) (pr-str attr))
+          (let [out (hdoc/emit-document document)]
+            (is (= document (parser/parse out)) (pr-str attr out))))))))
+
+(deftest code-span-pipe-in-table-cell-test
+  (testing "TASK-225: a `|` in a code span in a table cell is written bare
+            (the parser splits a row code-span-aware and keeps `\\|` in a
+            span as backslash plus pipe), text outside the span still escaped"
+    (doseq [[src out] [["| h |\n|---|\n| `a|b` |\n" "| h |\n| --- |\n| `a|b` |\n"]
+                       ["| h | i |\n|---|---|\n| `a||b` | `|` |\n" "| h | i |\n| --- | --- |\n| `a||b` | `|` |\n"]
+                       ["| h |\n|---|\n| ``a|`b`` |\n" "| h |\n| --- |\n| ``a|`b`` |\n"]
+                       ["| h |\n|---|\n| `a|{x}` |\n" "| h |\n| --- |\n| `a|{x}` |\n"]
+                       ["| h |\n|---|\n| ` a|b ` |\n" "| h |\n| --- |\n| ` a|b ` |\n"]
+                       ["| h |\n|---|\n| `a\\|b` |\n" "| h |\n| --- |\n| `a\\|b` |\n"]
+                       ["| h |\n|---|\n| x\\|y `a|b` p\\|q |\n" "| h |\n| --- |\n| x\\|y `a|b` p\\|q |\n"]]]
+      (is (= (:blocks (parser/parse src)) (:blocks (parser/parse (emit-src src)))) src)
+      (is (= out (emit-src src)) src)
+      (is (fixed-point? src) src)))
+  (testing "a code span outside a table keeps its pipe as before"
+    (is (= "`a|b`\n" (emit-src "`a|b`\n")))))
+
+(deftest code-span-pipe-in-table-cell-fuzz-test
+  (testing "TASK-225 fuzz: code text over `|`, backticks, braces, spaces and
+            backslashes, beside plain text with pipes, round-trips in a cell"
+    (let [pieces ["a" "|" "||" " " "b" "`" "{" "}" "{x}" "\\" "@" "!" "<" "=" "*" "_" "x y"]
+          rng (java.util.Random. 225)
+          gen (fn [] (apply str (repeatedly (inc (.nextInt rng 6)) #(nth pieces (.nextInt rng (count pieces))))))
+          cases (for [_ (range 3000)
+                      :let [t (gen)]
+                      :when (not (str/blank? t))]
+                  [t (table-cell-doc [(str-inline "p|q") space {:t :code :text t} space (str-inline "r|s")])])
+          emitted (map (fn [[t d]] [t d (try (hdoc/emit-document d) (catch Exception _ nil))]) cases)
+          written (filter (fn [[_ _ out]] out) emitted)]
+      (is (< 500 (count (filter (fn [[t _ out]] (and out (str/includes? t "|"))) written)))
+          "enough cases hold a `|` and were written that the fuzz is not vacuous")
+      (doseq [[t document out] written]
+        (is (= document (parser/parse out)) (pr-str t out))))))
+
+(deftest book-ref-pipe-in-table-cell-test
+  (testing "TASK-227: a `|` in an `@{ref}` in a table cell is written bare (the
+            parser splits a row `@{`-group-aware and keeps `\\|` there as
+            backslash plus pipe); unbalanced `{` in the ref and a stray `{`
+            elsewhere in the cell round-trip too"
+    (doseq [[src out] [["| h | i |\n|---|---|\n| @{| | {x}  |\n" "| h | i |\n| --- | --- |\n| @{| | {x} |\n"]
+                       ["| h | i |\n|---|---|\n| @{a\\|{.c}  |\n" "| h | i |\n| --- | --- |\n| @{a\\|{.c} |\n"]
+                       ["| h | i |\n|---|---|\n| @{a|b} | c |\n" "| h | i |\n| --- | --- |\n| @{a|b} | c |\n"]
+                       ["| h | i |\n|---|---|\n| @{a|b} @{c|d} | x\\|y |\n" "| h | i |\n| --- | --- |\n| @{a|b} @{c|d} | x\\|y |\n"]
+                       ["| h | i |\n|---|---|\n| {x | y |\n" "| h | i |\n| --- | --- |\n| {x | y |\n"]]]
+      (is (= (:blocks (parser/parse src)) (:blocks (parser/parse (emit-src src)))) src)
+      (is (= out (emit-src src)) src)
+      (is (fixed-point? src) src))))
+
+(deftest table-cell-brace-pipe-fuzz-test
+  (testing "TASK-227 fuzz: cell source over pipes, braces, `@{`, backticks and
+            `\\|` either round-trips or is refused with an ex-info"
+    (let [pieces ["a" "|" "||" " " "@{" "{" "}" "`" "\\|" "\\" "{.c}" "[b]" "x" "@" "{x}"]
+          rng (java.util.Random. 227)
+          gen (fn [] (apply str (repeatedly (inc (.nextInt rng 6)) #(nth pieces (.nextInt rng (count pieces))))))
+          docs (for [_ (range 6000)
+                     :let [d (try (parser/parse (str "| h | i |\n|---|---|\n| " (gen) " |\n"))
+                                  (catch Exception _ nil))]
+                     :when (and d (= [:table] (map :t (:blocks d))))]
+                 d)
+          outs (map (fn [d] [d (try (hdoc/emit-document d)
+                                    (catch clojure.lang.ExceptionInfo e e))])
+                    docs)
+          written (filter (comp string? second) outs)]
+      (is (< 2000 (count written)) "enough cases were written that the fuzz is not vacuous")
+      (is (< 40 (count (filter (fn [[d _]] (and (str/includes? (pr-str d) ":book-ref")
+                                                (str/includes? (pr-str d) "|"))) written)))
+          "enough written cases hold a book ref and a pipe")
+      (doseq [[d out] written]
+        (is (= d (parser/parse out)) (pr-str out)))
+      (doseq [[_ e] outs :when (not (string? e))]
+        (is (some? (:type (ex-data e))) (ex-message e))))))
+
+(deftest math-pipe-in-table-cell-test
+  (testing "TASK-230: a `|` in `$..$` in a table cell is written bare (the parser
+            splits a row math-aware and keeps `\\|` there as backslash plus
+            pipe); `!quote a|b` in a cell is just a cell split, and round-trips"
+    (doseq [[src out] [["| h | i |\n|---|---|\n| $a|b$ | z |\n" "| h | i |\n| --- | --- |\n| $a|b$ | z |\n"]
+                       ["| h | i |\n|---|---|\n| $a\\|b$ | z |\n" "| h | i |\n| --- | --- |\n| $a\\|b$ | z |\n"]
+                       ["| h | i |\n|---|---|\n| x $a|b$ y\\|z | $c||d$ |\n" "| h | i |\n| --- | --- |\n| x $a|b$ y\\|z | $c||d$ |\n"]
+                       ["| h | i |\n|---|---|\n| !quote a|b | z |\n" "| h | i |\n| --- | --- |\n| \\!quote a | b | z |\n"]
+                       ["| h | i |\n|---|---|\n| !quote a\\|b | z |\n" "| h | i |\n| --- | --- |\n| \\!quote a\\|b | z |\n"]]]
+      (is (= (:blocks (parser/parse src)) (:blocks (parser/parse (emit-src src)))) src)
+      (is (= out (emit-src src)) src)
+      (is (fixed-point? src) src))))
+
+(deftest table-cell-math-pipe-fuzz-test
+  (testing "TASK-230 fuzz: cell source over `$`, pipes, `\\|`, backticks and
+            `@{` either round-trips or is refused with an ex-info"
+    (let [pieces ["a" "|" "||" " " "$" "$x" "x$" "\\|" "\\" "`" "@{" "{" "}" "b" "$a|b$" "$a\\|b$"]
+          rng (java.util.Random. 230)
+          gen (fn [] (apply str (repeatedly (inc (.nextInt rng 6)) #(nth pieces (.nextInt rng (count pieces))))))
+          docs (for [_ (range 6000)
+                     :let [d (try (parser/parse (str "| h | i |\n|---|---|\n| " (gen) " |\n"))
+                                  (catch Exception _ nil))]
+                     :when (and d (= [:table] (map :t (:blocks d))))]
+                 d)
+          outs (map (fn [d] [d (try (hdoc/emit-document d)
+                                    (catch clojure.lang.ExceptionInfo e e))])
+                    docs)
+          written (filter (comp string? second) outs)]
+      (is (< 2000 (count written)) "enough cases were written that the fuzz is not vacuous")
+      (is (< 40 (count (filter (fn [[d _]] (and (str/includes? (pr-str d) ":math-inline")
+                                                (str/includes? (pr-str d) "|"))) written)))
+          "enough written cases hold inline math and a pipe")
+      (doseq [[d out] written]
+        (is (= d (parser/parse out)) (pr-str out)))
+      (doseq [[_ e] outs :when (not (string? e))]
+        (is (some? (:type (ex-data e))) (ex-message e))))))
+
 (deftest cite-affix-semicolon-test
   (testing "a CiteItem's own :suffix containing a literal `;` (review
             comment #4 on TASK-95) is reported rather than silently
@@ -3637,3 +3836,537 @@
     (let [document (parser/parse "![Cap](f.png \"Tip\"){#fig:f}\n")]
       (is (= "Tip" (-> document :blocks first :content :inlines first :title)))
       (is (= document (parser/parse (hdoc/emit-document document)))))))
+
+(defn- code-para-doc
+  "A document of one paragraph `a <code text> b`, built by hand."
+  [text]
+  {:meta {} :blocks [{:t :para :inlines [(str-inline "a") space {:t :code :text text}]}]})
+
+(defn- refused-code-span
+  "The ex-data when writing `document` is refused as an unrepresentable
+  code span, else nil."
+  [document]
+  (try (hdoc/emit-document document) nil
+       (catch clojure.lang.ExceptionInfo e
+         (let [data (ex-data e)]
+           (when (= ::hdoc/unrepresentable-code-span (:type data)) data)))))
+
+(deftest code-span-edge-backtick-test
+  (testing "TASK-226: a code text starting or ending with a backtick has no
+            spelling (the parser keeps padding verbatim), so it is refused
+            rather than written with a baked-in extra space"
+    (doseq [text ["`x" "x`" "`" "``" "x\n```" "`x\ny" "a`b`"]]
+      (let [data (refused-code-span (code-para-doc text))]
+        (if (or (str/starts-with? text "`") (str/ends-with? text "`"))
+          (is (= text (:text data)) (pr-str text))
+          (is (nil? data) (pr-str text))))))
+  (testing "an internal backtick run and a padded-by-the-author span still round-trip"
+    (doseq [text ["a`b" "a``b" " x " " `x` " "x\ny`z"]]
+      (let [d (code-para-doc text)]
+        (is (= (:blocks d) (:blocks (parser/parse (hdoc/emit-document d)))) (pr-str text))))))
+
+(deftest code-span-continuation-block-start-test
+  (testing "TASK-222 AC #1: a continuation line that would start a block is
+            refused, naming the line, in a paragraph"
+    (doseq [[text line n] [["x\n- y" "- y" 2] ["x\n+ y" "+ y" 2] ["x\n1. y" "1. y" 2]
+                           ["x\n1) y" "1) y" 2] ["x\n* y" "* y" 2] ["x\n# y" "# y" 2]
+                           ["x\n> y" "> y" 2] ["x\n~~~" "~~~" 2] ["x\n  - y" "  - y" 2]
+                           ["x\ny\n- z" "- z" 3] ["x\n- y\nz" "- y" 2]
+                           ["x\n---\ny" "---" 2] ["x\n```\ny" "```" 2] ["x\n- \ny" "- " 2]
+                           ["x\n\ny" "" 2] ["x\n  \ny" "  " 2] ["x\ny\n\n" "" 3]
+                           ["x\n:::{.a}" ":::{.a}" 2] ["x\n::: y" "::: y" 2]
+                           ["x\n<div>" "<div>" 2] ["x\n<p>y" "<p>y" 2] ["x\n<!-- y" "<!-- y" 2]
+                           ["x\n[^1]: y" "[^1]: y" 2] ["x\ny\n  [^n]:" "  [^n]:" 3]]]
+      (testing (pr-str text)
+        (let [data (refused-code-span (code-para-doc text))]
+          (is (some? data))
+          (is (= line (:line data)))
+          (is (= n (:line-number data)))))))
+  (testing "the message names the line"
+    (is (re-find #"line 2 \"- y\""
+                 (try (hdoc/emit-document (code-para-doc "x\n- y"))
+                      (catch clojure.lang.ExceptionInfo e (ex-message e))))))
+  (testing "TASK-222 AC #1: in a figure caption, a heading, a block quote, a
+            list item, a footnote, emphasis and a link"
+    (let [code {:t :code :text "x\n- y"}
+          wrap (fn [& inlines] {:t :para :inlines (vec inlines)})
+          docs [{:meta {} :blocks [{:t :figure
+                                    :content (wrap {:t :image :src "u" :title nil :alt "" :attr empty-attr})
+                                    :caption [code]
+                                    :attr (assoc empty-attr :id "fig:a")}]}
+                {:meta {} :blocks [{:t :block-quote :blocks [(wrap code)]}]}
+                {:meta {} :blocks [(wrap {:t :emph :inlines [code]})]}
+                {:meta {} :blocks [(wrap {:t :link :target {:url "u"} :inlines [code]})]}
+                {:meta {} :blocks [(wrap (str-inline "a") {:t :note :blocks [(wrap code)]})]}]]
+      (doseq [d docs]
+        (is (= "- y" (:line (refused-code-span d))) (pr-str d)))))
+  (testing "TASK-222 AC #2: continuation lines that start no block emit unchanged"
+    (doseq [src ["a `x\n2. y`\n" "a `x\n0. y`\n" "a `x\n-`\n" "a `x\n#`\n" "a `x\n#y`\n"
+                 "a `x\n--- y`\n" "a `x\n---`\n" "a `x\n|---|`\n" "a `x\n    - y`\n"
+                 "a `x\ny\nz`\n" "a `x\n-y`\n" "a `x\n1.y`\n" "a `x\n10. y`\n"
+                 "a `x\n+`\n" "a `x\n`\n" "a `x\n  `\n" "a `x\n\\<div>`\n" "> a `x\n> 2. y`\n" "a `x\n\\- y`\n"]]
+      (testing (pr-str src)
+        (is (= src (emit-src src)))
+        (is (true? (round-trips-from-source? src)))))))
+
+(deftest code-span-trailing-newline-fence-test
+  (testing "TASK-228: a text ending in a newline with a backtick run of two or
+            more would write a 3+ backtick closing fence at line start; it is
+            refused in a paragraph, setext heading, list item and link text"
+    (let [set-code (fn [src text]
+                     (walk/postwalk #(if (= :code (:t %)) (assoc % :text text) %)
+                                    (parser/parse src)))]
+      (doseq [text ["a ``\n" "``\n" "a ```\n" "a``b\nc ``\n"
+                    ;; a blank last line: 0-3 spaces, any tab, or 4+ spaces then a tab
+                    "a ``\n  " " ``\n " "a``\n " "\n``\n  " "a ``\n   " "a ``\n\t" "a ``\n \t"
+                    "a ``\n  \t" "a ``\n    \t" "a ``\n\t\t"]
+              src ["a `x` b\n" "a `x` b\n===\n" "# a `x` b\n" "- a `x` b\n" "[a `x`](u)\n"
+                   "> a `x`\n" "*a `x`*\n"]]
+        (let [d (set-code src text)
+              data (refused-code-span d)]
+          (is (some? data) (pr-str [text src]))
+          (is (= text (:text data)) (pr-str [text src]))))))
+  (testing "a last line of four or more plain spaces is no fence opener and round-trips"
+    (doseq [text ["a ``\n    " "a ``\n      " "x``y\n     "]]
+      (let [d (code-para-doc text)]
+        (is (nil? (refused-code-span d)) (pr-str text))
+        (is (= (:blocks d) (:blocks (parser/parse (hdoc/emit-document d)))) (pr-str text)))))
+  (testing "a trailing newline with at most a single backtick still round-trips"
+    (doseq [text ["a\n" "a `\n" "a`b\n" "a ` b\n" "\n" "a\nb\n" "a `\n  " "a\n   "]]
+      (let [d (code-para-doc text)]
+        (is (nil? (refused-code-span d)) (pr-str text))
+        (is (= (:blocks d) (:blocks (parser/parse (hdoc/emit-document d)))) (pr-str text))))))
+
+(deftest code-span-leading-tab-test
+  (testing "TASK-229: a continuation line starting with a tab (after any
+            spaces) is refused, naming the line, in every context"
+    (let [set-code (fn [src text]
+                     (walk/postwalk #(if (= :code (:t %)) (assoc % :text text) %)
+                                    (parser/parse src)))]
+      (doseq [[text line n] [["a\n\tx" "\tx" 2] ["a\n\t" "\t" 2] ["a\n \t" " \t" 2]
+                             ["a\n  \tx" "  \tx" 2] ["a\n    \tx" "    \tx" 2]
+                             ["a\nb\n\t\tx" "\t\tx" 3] ["a\n\tx\n\ty" "\tx" 2]]
+              src ["a `x` b\n" "a `x` b\n===\n" "# a `x` b\n" "- a `x` b\n" "[a `x`](u)\n"
+                   "> a `x`\n" "*a `x`*\n"]]
+        (let [data (refused-code-span (set-code src text))]
+          (is (some? data) (pr-str [text src]))
+          (is (= line (:line data)) (pr-str [text src]))
+          (is (= n (:line-number data)) (pr-str [text src]))))
+      (is (re-find #"line 2 \"\\tx\""
+                   (try (hdoc/emit-document (code-para-doc "a\n\tx"))
+                        (catch clojure.lang.ExceptionInfo e (ex-message e)))))))
+  (testing "spaces only, and a tab after text, still round-trip"
+    (doseq [text ["a\n  x" "a\n    x" "a\n x" "a\nx\ty" "a\n  x\ty" "a\t\nb" "\ta\nb" "a\n    " "a\n  "]]
+      (let [d (code-para-doc text)]
+        (is (nil? (refused-code-span d)) (pr-str text))
+        (is (= (:blocks d) (:blocks (parser/parse (hdoc/emit-document d)))) (pr-str text))))))
+
+(defn- set-code-text
+  "`src` parsed, with every `:code` text replaced by `text`."
+  [src text]
+  (walk/postwalk #(if (= :code (:t %)) (assoc % :text text) %) (parser/parse src)))
+
+(deftest code-span-carriage-return-test
+  (testing "TASK-231: CR next to a CR or newline is refused everywhere (the
+            parser normalises it), any CR in a heading or table cell"
+    (doseq [text ["a\r\nb" "a\r\rb" "a\n\rb"]
+            src ["a `x` b\n" "# a `x` b\n" "- a `x` b\n" "> a `x`\n" "[a `x`](u)\n" "*`x`*\n"
+                 "| a `x` |\n|---|\n| b |\n"]]
+      (let [data (refused-code-span (set-code-text src text))]
+        (is (true? (:carriage-return data)) (pr-str [text src]))))
+    (doseq [text ["a\rb" "a\r" "\ra"]
+            src ["# a `x` b\n" "| a `x` |\n|---|\n| b |\n"]]
+      (is (true? (:carriage-return (refused-code-span (set-code-text src text)))) (pr-str [text src]))))
+  (testing "a lone CR in a paragraph, list item, quote, footnote, emphasis or
+            link is kept by the parser: a source holding one is emitted and
+            re-parses to the same document (CRLF sources too)"
+    (doseq [src ["a `x\ry` b\n" "`x\ry` b\n" "`\rx` b\n" "- a `x\ry` b\n" "- a\n  - `x\ry` b\n"
+                 "> a `x\ry` b\n" "*a `x\ry`* b\n" "[a `x\ry`](u)\n" "a[^1]\n\n[^1]: a `x\ry`\n"
+                 "a `x\r\ny` b\n" "- a `x\r\ny` b\n" "> a `x\r\ny`\n"
+                 ;; nested containers and a setext heading, each round-tripping on HEAD
+                 "1. a\n   - `x\ry\r  z` b\n" "a[^1]\n\n[^1]: - `x\ry\r  z`\n" "> - `x\ry\r  z`\n"
+                 "`\na\r`\n===\n" "a `\r`\n` b\n===\n"]]
+      (let [d (parser/parse src)]
+        (is (some #(= :code (:t %)) (tree-seq coll? seq d)) (pr-str src))
+        (is (= d (parser/parse (hdoc/emit-document d))) (pr-str src)))))
+  (testing "a lone CR is a line end to the parser, so the line checks see it:
+            each text is refused or re-parses to the same document"
+    (doseq [text ["a\r\t" "\r\t" "a\r \n" " \r\t" "x\r``y" "a\r \nb" "x\r- y" "x\r# y" "x ``\r "]
+            src ["a `x` b\n" "- a `x` b\n" "> a `x` b\n" "*a `x`*\n" "a[^1]\n\n[^1]: a `x`\n"]]
+      (let [d (set-code-text src text)]
+        (or (refused-code-span d)
+            (is (= d (parser/parse (hdoc/emit-document d))) (pr-str [text src]))))))
+  (testing "no-regression sweep (from the HEAD-vs-tree probe): parsed sources
+            holding a CR in a code span, over contexts x texts of up to 3
+            characters from backtick, space, a, LF, CR, tab and CRLF, are
+            written and re-parse equal at least as often as on HEAD (the
+            count below is HEAD's; some HEAD mismatches remain, now refused
+            or still mismatching, which this does not assert on)"
+    (let [alphabet ["`" " " "a" "\n" "\r" "\t" "\r\n"]
+          texts (->> (iterate (fn [xs] (for [x xs a alphabet] (str x a))) [""])
+                     (take 4) (apply concat) (filter #(str/includes? % "\r")))
+          ctxs ["a %s b\n" "- a %s b\n" "1. a\n   - %s b\n" "> - %s b\n" "a[^1]\n\n[^1]: - %s\n" "*a %s* b\n"
+                "[a %s](u)\n" "# a %s b\n" "a %s b\n===\n" "%s\n===\n" "> # a %s\n" "| a %s |\n|---|\n| b |\n"]
+          freq (frequencies
+                (for [c ctxs t texts
+                      :let [s (format c (str "`" t "`"))
+                            d (try (parser/parse s) (catch Exception _ nil))]
+                      :when (some #(= :code (:t %)) (tree-seq coll? seq d))]
+                  (if (refused-code-span d)
+                    :refused
+                    (try (if (= d (parser/parse (hdoc/emit-document d))) :ok (do (println "MISMATCH" (pr-str s)) :bad))
+                         (catch clojure.lang.ExceptionInfo _ :other-refusal)))))]
+      (is (<= 855 (:ok freq 0)) (pr-str freq))))
+  (testing "a code text without one still round-trips"
+    (let [d (code-para-doc "a\nb")]
+      (is (nil? (refused-code-span d)))
+      (is (= (:blocks d) (:blocks (parser/parse (hdoc/emit-document d))))))))
+
+(deftest code-span-opening-fence-at-line-start-test
+  (testing "TASK-231: a multi-line span whose text holds a run of two backticks
+            and whose first line holds none, at the start of a line (first in
+            a paragraph, list item, nested item, quote, heading, or after a
+            soft break), would open a code block: refused"
+    (doseq [text ["a\n``a" "a\n`` " "a\n``a\tb" "\n``a" "a\n``a\n``b" "a\n\n``a" "a\n`` \tb"]
+            src ["`x` b\n" "- `x` b\n" "- a\n  - `x` b\n" "> `x` b\n" "# `x` b\n"
+                 "a\n`x` b\n" "- a\n  b\n  `x` c\n"]]
+      (let [data (refused-code-span (set-code-text src text))]
+        (is (some? data) (pr-str [text src]))
+        (is (or (:opening-fence-line-start data) (:leading-tab data)) (pr-str [text src])))))
+  (testing "elsewhere it is written and round-trips: after other text on the
+            line, in emphasis or link text, or with a backtick on the first line"
+    (doseq [[text src] [["a\n``a" "a `x` b\n"] ["a\n``a" "- a `x` b\n"] ["a\n``a" "- a\n  - b `x` c\n"]
+                        ["a\n``a" "*`x`* b\n"] ["a\n``a" "[`x`](u)\n"]
+                        ["a`\n``b" "- `x` b\n"] ["a``b\nc" "`x` b\n"] ["a``b" "- a\n  - `x` b\n"]
+                        ["a\nb" "- `x` b\n"] ["a\n`b" "- `x` b\n"]]]
+      (let [d (set-code-text src text)]
+        (is (nil? (refused-code-span d)) (pr-str [text src]))
+        (is (= d (parser/parse (hdoc/emit-document d))) (pr-str [text src]))))))
+
+(deftest code-span-continuation-fuzz-test
+  (testing "TASK-231 fuzz (seed 231): over contexts (nested list, quote, heading,
+            line start) and texts with CRs and backtick-pair starts, the
+            writer refuses or round-trips -- neither side vacuous"
+    (let [rng (java.util.Random. 231)
+          pick (fn [xs] (nth xs (.nextInt rng (count xs))))
+          srcs ["a `x` b\n" "`x` b\n" "- a `x` b\n" "- `x` b\n" "- a\n  - `x` b\n" "> `x` b\n"
+                "# `x` b\n" "a\n`x` b\n" "*`x`* b\n" "[`x`](u)\n" "| `x` |\n|---|\n| b |\n"
+                "a[^1]\n\n[^1]: a `x`\n"]
+          starts ["" "``" "`` " "``a" "a``" "a" "a`" " " "\t" "``\t" "- " "x" "# " "> " "---" "``` "]
+          results (doall
+                   (for [_ (range 1500)]
+                     (let [n (inc (.nextInt rng 3))
+                           ;; separators: LF, a lone CR (a line end to the parser), CRLF
+                           text (apply str (pick ["a" "" "a b" "a`"])
+                                       (repeatedly n #(str (pick ["\n" "\r" "\r" "\r\n"]) (pick starts) (pick ["" "y" "z w"]))))
+                           ;; No two-space line after a CR: in a list item or footnote the
+                           ;; container strips its indent from it (hand-built only).
+                           document (set-code-text (pick srcs) text)
+                           refused (refused-code-span document)]
+                       (cond (:carriage-return refused) :refused-cr
+                             (:opening-fence-line-start refused) :refused-fence
+                             refused :refused
+                             :else (let [emitted (try (hdoc/emit-document document) (catch Exception _ nil))]
+                                     ;; nil: refused for another reason (a newline in a table cell)
+                                     (cond (nil? emitted) :refused-other
+                                           (= document (parser/parse emitted))
+                                           (if (re-find #"\r" text) :ok-cr :ok)
+                                           :else (do (println "MISMATCH" (pr-str text) (pr-str emitted)) :bad)))))))
+          freq (frequencies results)]
+      (is (zero? (:bad freq 0)) (pr-str freq))
+      (is (< 10 (:refused-cr freq 0)) (pr-str freq))
+      (is (< 10 (:refused-fence freq 0)) (pr-str freq))
+      (is (< 100 (:ok-cr freq 0)) "lone-CR texts that are written and round-trip")
+      (is (< 50 (:ok freq 0)) (pr-str freq)))))
+
+(defn- has-code? [d]
+  (boolean (some #(and (map? %) (= :code (:t %))) (tree-seq coll? seq d))))
+
+(deftest code-span-line-end-indent-test
+  (testing "TASK-232: a list item or footnote strips its indent from the line
+            after a lone CR as it does after a newline, so the writer indents
+            after a CR too; each parsed source re-parses to the same document"
+    (doseq [src ["- a `x\r\ty` b\n" "- a `x\r    y` b\n" "- a `x\r    y\r  z` b\n"
+                 "1. a\n   - `x\r      y`\n" "- a\n\n  b `x\r    y`\n"
+                 "a[^1]\n\n[^1]: a `x\r        y`\n" "a[^1]\n\n[^1]: a\n\n    b `x\r        y`\n"
+                 ;; CRLF and LF in a footnote whose first block is a list
+                 "a[^1]\n\n[^1]: - `\r\n`\n" "a[^1]\n\n[^1]: - `a\r\nb`\n" "a[^1]\n\n[^1]: - `a\n  b`\n"
+                 "a[^1]\n\n[^1]: 1. `a\n b`\n" "a[^1]\n\n[^1]: - `a\r    b`\n"
+                 ;; a line after a CR in a quote is lazy: no indent added there
+                 "> - `x\r  y`\n" "- > `x\r  y`\n"]]
+      (let [d (parser/parse src)]
+        (is (has-code? d) (pr-str src))
+        (is (= d (parser/parse (hdoc/emit-document d))) (pr-str src)))))
+  (testing "no parsed source that round-trips as a list item, footnote or quote
+            with a code span holding a CR or newline is refused or broken, and
+            (seed 232) the sweep is not vacuous"
+    (let [alphabet ["`" " " "a" "\n" "\r" "\t" "\r\n" "  " "    "]
+          rng (java.util.Random. 232)
+          pick (fn [xs] (nth xs (.nextInt rng (count xs))))
+          ctxs ["- a %s b\n" "1. a\n   - %s b\n" "> - %s b\n" "- > %s\n" "a[^1]\n\n[^1]: a %s\n"
+                "a[^1]\n\n[^1]: - %s\n" "a[^1]\n\n[^1]: 1. a %s\n\n    b\n" "a[^1]\n\n[^1]: a\n\n    - b %s\n"
+                "- a\n\n  b %s\n" "- a\n  - %s b\n" "> a %s\n"]
+          freq (frequencies
+                (for [_ (range 1500)
+                      :let [t (apply str (repeatedly (inc (.nextInt rng 5)) #(pick alphabet)))
+                            s (format (pick ctxs) (str "`" t "`"))
+                            d (try (parser/parse s) (catch Exception _ nil))]
+                      ;; the span itself must hold the line end (a backtick in `t` can end it early)
+                      :when (some #(and (map? %) (= :code (:t %)) (re-find #"[\r\n]" (:text %)))
+                                  (tree-seq coll? seq d))]
+                  (if (refused-code-span d)
+                    :refused
+                    (if (= d (parser/parse (hdoc/emit-document d)))
+                      (if (re-find #"\r" t) :ok-cr :ok)
+                      (do (println "MISMATCH" (pr-str s)) :bad)))))]
+      (is (zero? (:bad freq 0)) (pr-str freq))
+      (is (< 100 (:ok-cr freq 0)) (pr-str freq))
+      (is (< 100 (:ok freq 0)) (pr-str freq))))
+  (testing "an empty code text has no spelling (two backticks are text): refused"
+    (is (true? (:empty (refused-code-span (code-para-doc "")))))
+    (is (true? (:empty (refused-code-span (set-code-text "- a `x` b\n" "")))))))
+
+(deftest code-span-continuation-fuzz-test-222
+  (testing "TASK-222 fuzz (seed 222): over generated multi-line spans the
+            writer either refuses, or writes something that parses back to
+            the very same document -- and neither side is vacuous"
+    (let [rng (java.util.Random. 222)
+          pick (fn [xs] (nth xs (.nextInt rng (count xs))))
+          starts ["" " " "  " "- " "-" "+ " "* " "1. " "1) " "2. " "0. " "# " "#" "> " ">" "~~~" "```"
+                  "---" "===" "***" "|---|" "a" "$$" "    " ":::" "<" "<div>" "<!--" "[^" "[^1]: "
+                  "``" "a ``" "a `" "   " "      "
+                  ;; TASK-229: tabs
+                  "\t" " \t" "    \t" "\t- " "a\t" "\t\t"]
+          results (doall
+                   (for [_ (range 400)]
+                     (let [n (inc (.nextInt rng 3))
+                           ;; TASK-228: some texts end in a newline.
+                           text (str (str/join "\n" (cons "x" (repeatedly n #(str (pick starts) (pick ["" "y" " y" "z w"])))))
+                                     (when (zero? (.nextInt rng 3)) "\n"))
+                           document (code-para-doc text)
+                           refused (refused-code-span document)]
+                       (if refused
+                         (cond (:trailing-newline-fence refused) :refused-trailing
+                               (:leading-tab refused) :refused-tab
+                               :else :refused)
+                         (let [emitted (hdoc/emit-document document)]
+                           (if (= (-> document :blocks first :inlines)
+                                  (some-> emitted parser/parse :blocks first :inlines))
+                             (if (= 1 (count (:blocks (parser/parse emitted)))) :ok :bad)
+                             (do (println "MISMATCH" (pr-str text) (pr-str emitted)) :bad)))))))
+          freq (frequencies results)]
+      (is (zero? (:bad freq 0)) (pr-str freq))
+      (is (< 20 (:refused freq 0)) (pr-str freq))
+      (is (< 5 (:refused-trailing freq 0)) (pr-str freq))
+      (is (< 5 (:refused-tab freq 0)) (pr-str freq))
+      (is (< 20 (:ok freq 0)) (pr-str freq)))))
+
+(deftest at-token-with-underscore-round-trip-test
+  (testing "TASK-223 AC #1: text holding an `@` token that is not a reference
+            is written so the part before an escaped `_` does not read as one"
+    (doseq [[text out] [["@0_é1:1" "\\@0\\_é1:1"]
+                        ["x@a:b_c" "x@a:b\\_c"]
+                        ["@ab_c:d" "\\@ab\\_c:d"]
+                        ;; Unchanged: a reference was already escaped, and
+                        ;; an `@` after a word character is prose.
+                        ["@_x" "\\@\\_x"]
+                        ["me@x_y" "me@x\\_y"]
+                        ["@x_y" "\\@x\\_y"]
+                        ["a_b" "a\\_b"]]]
+      (let [document {:meta {} :blocks [(para (str-inline text))]}]
+        (is (= (str out "\n") (hdoc/emit-document document)) (pr-str text))
+        (is (= (:blocks document) (:blocks (parser/parse (hdoc/emit-document document)))) (pr-str text)))))
+  (testing "in link text and a bracket that is no citation"
+    (doseq [text ["@0_é1:1" "[@ααc1:__:c_cÄ_ß]" "a@0_é1:1"]]
+      (doseq [inline [(str-inline text)
+                      {:t :link :target "u" :attr empty-attr :inlines [(str-inline text)]}]]
+        (let [document {:meta {} :blocks [(para inline)]}]
+          (is (= (:blocks document) (:blocks (parser/parse (hdoc/emit-document document)))) (pr-str text))))))
+  (testing "TASK-223 AC #2 seeded fuzz: text over `@`, `_`, `:`, `-`, letters
+            and digits round-trips, plain and in link text"
+    (let [rng (java.util.Random. 223)
+          alphabet "@@__::-ab09éα*"
+          rand-text (fn [] (apply str (repeatedly (+ 2 (.nextInt rng 9))
+                                                  #(.charAt alphabet (.nextInt rng (count alphabet))))))
+          results (for [text (repeatedly 3000 rand-text)
+                        wrap [identity #(vector {:t :link :target "u" :attr empty-attr :inlines %})]
+                        :let [document {:meta {} :blocks [{:t :para :inlines (vec (wrap [(str-inline text)]))}]}
+                              e (emit-error document)]]
+                    (cond
+                      e :refused
+                      (= (:blocks document) (:blocks (parser/parse (hdoc/emit-document document)))) :ok
+                      :else (do (println "MISMATCH" (pr-str text)) :bad)))
+          freq (frequencies results)
+          hits (count (filter #(re-find #"@[^_]*_" %) (repeatedly 3000 rand-text)))]
+      (is (zero? (:bad freq 0)) (pr-str freq))
+      (is (< 3000 (:ok freq 0)) (pr-str freq))
+      (is (< 500 hits) "enough texts hold an `@` before an `_` that the fuzz is not vacuous"))))
+
+(deftest trailing-tab-and-footnote-code-block-test
+  (testing "TASK-233: a tab before a line end is a :space the parser keeps (trailing
+            spaces it drops), so the writer writes the tab back"
+    (doseq [src ["a `x`\t\nb\n" "a\t\nb\n" "a \t\nb\n" "a\t\t\nb\n" "- a\t\n  b\n" "*a\t\nb*\n"
+                 "a[^1]\n\n[^1]: a\t\n    b\n" "> a\t\n> b\n" "a\t\r\nb\n" "- a `\t\nx`\t\nb\n"]]
+      (let [d (parser/parse src)]
+        (is (= d (parser/parse (hdoc/emit-document d))) (pr-str src))))
+    (is (= "a\t\nb\n" (hdoc/emit-document (parser/parse "a\t\nb\n"))))
+    (is (= "a c\nb\n" (hdoc/emit-document {:meta {} :blocks [{:t :para :inlines [{:t :str :text "a"} {:t :space}
+                                                                                 {:t :str :text "c"} {:t :soft-break}
+                                                                                 {:t :str :text "b"}]}]}))
+        "a :space not directly before a line end stays a space"))
+  (testing "TASK-233: a footnote whose first block is an indented code block"
+    (doseq [src ["a[^1]\n\n[^1]:     - a\n" "a[^1]\n\n[^1]:     code\n" "a[^1]\n\n[^1]:     a\n      b\n"
+                 "a[^1]\n\n[^1]:      - a\n" "a[^1]\n\n[^1]:    - a\n" "a[^1]\n\n[^1]:     a\n\n         b\n"
+                 "a[^1]\n\n[^1]: ```\n     - a\n    ```\n" "a[^1]\n\n[^1]: ```js\n      x\n\n y\n    ```\n"]]
+      (let [d (parser/parse src)]
+        (is (some #(and (map? %) (= :code-block (:t %))) (tree-seq coll? seq d)) (pr-str src))
+        (is (= d (parser/parse (hdoc/emit-document d))) (pr-str src)))))
+  (testing "TASK-233: a footnote-first code block that already round-tripped is
+            written byte-identically (the extra column only for a body line
+            that starts with a space)"
+    (doseq [src ["a[^1]\n\n[^1]: ```\n    x\n    ```\n"
+                 "a[^1]\n\n[^1]: ````\n    x ```\n    y\n    ````\n"
+                 "a[^1]\n\n[^1]: ```js\n    x\n\n    y\n    ```\n"
+                 "a[^1]\n\n[^1]: ```\n    ```\n"
+                 "a[^1]\n\n[^1]: ```\n\n    ```\n"
+                 "a[^1]\n\n[^1]: ```\n    x\n    ```\n\n    b\n"]]
+      (let [d (parser/parse src)]
+        (is (= src (hdoc/emit-document d)) (pr-str src))
+        (is (= d (parser/parse src)) (pr-str src)))))
+  (testing "seeded sweep (seed 233): tab line ends and footnote-first code blocks round-trip, not vacuously"
+    (let [rng (java.util.Random. 233)
+          pick (fn [xs] (nth xs (.nextInt rng (count xs))))
+          ctxs ["%s\n" "- a %s\n" "> a %s\n" "a[^1]\n\n[^1]: a %s\n" "*a %s*\n" "a[^1]\n\n[^1]:     %s\n"
+                "a[^1]\n\n[^1]:      %s\n" "a[^1]\n\n[^1]: ```\n     %s\n    ```\n" "a[^1]\n\n[^1]: x\n\n         %s\n"]
+          alphabet ["a" " " "\t" "\n" "`x`" "*b*" "  " "-"]
+          freq (frequencies
+                (for [_ (range 2500)
+                      :let [t (apply str (repeatedly (inc (.nextInt rng 5)) #(pick alphabet)))
+                            s (format (pick ctxs) t)
+                            d (try (parser/parse s) (catch Exception _ nil))]
+                      :when (and d (not (re-find #"(?m)^ *\t" s)))]
+                  (cond (not= d (parser/parse (hdoc/emit-document d))) (do (println "MISMATCH" (pr-str s)) :bad)
+                        (re-find #"\t\n" s) :ok-tab
+                        (re-find #"\[\^1\]: +(```|\S)" s) :ok-fn
+                        :else :ok)))]
+      (is (zero? (:bad freq 0)) (pr-str freq))
+      (is (< 100 (:ok-tab freq 0)) (pr-str freq))
+      (is (< 100 (:ok-fn freq 0)) (pr-str freq)))))
+
+(deftest footnote-in-list-and-quoted-fence-lines-test
+  (testing "TASK-234: a footnote defined inside a one-item loose list is written there"
+    (doseq [src ["- a[^1]\n\n  [^1]: aa\n" "- a[^1]\n\n  [^1]:     -aa\n" "1. a[^1]\n\n   [^1]: aa\n"
+                 "- a[^1] b[^2]\n\n  [^1]: x\n\n  [^2]: y\n" "> - a[^1]\n>\n>   [^1]: aa\n"
+                 "- a[^1]\n\n  [^1]: x\n\n      code\n"]]
+      (let [d (parser/parse src)]
+        (is (= d (parser/parse (hdoc/emit-document d))) (pr-str src)))))
+  (testing "TASK-234: whitespace-only lines of a fenced block in a quote keep their text"
+    (doseq [src ["> ```\n> \t \t \n> ```" "> ```\n>   \n> ```" "> ```\n> a\n>  \n> b\n> ```"
+                 "> - ```\n>   \t\n>   ```\n"]]
+      (let [d (parser/parse src)]
+        (is (= d (parser/parse (hdoc/emit-document d))) (pr-str src)))))
+  (testing "TASK-234: output that already round-tripped is unchanged"
+    (doseq [src ["- a[^1]\n\n- b\n\n[^1]: aa\n" "> a[^1]\n\n[^1]: aa\n"
+                 "> ```\n> a\n>\n> b\n> ```\n" "> a\n>\n> b\n"]]
+      (let [d (parser/parse src)
+            e (hdoc/emit-document d)]
+        (is (= d (parser/parse e)) (pr-str src))
+        (is (= src e) (pr-str src)))))
+  (testing "TASK-234: a footnote code line of only spaces and tabs has no spelling and is refused"
+    (let [d (parser/parse "a[^1]\n\n[^1]: ```\n\ta    \n    ```\n")]
+      (is (= " \n" (-> d :blocks first :inlines last :blocks first :text)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only spaces or tabs"
+                            (hdoc/emit-document d)))))
+  (testing "seeded sweep (seed 234): none is bad, and the paths are hit"
+    (let [rng (java.util.Random. 234)
+          pick (fn [xs] (nth xs (.nextInt rng (count xs))))
+          ctxs ["- a[^1]\n\n  [^1]: %s\n" "1. a[^1]\n\n   [^1]: %s\n" "> ```\n> %s\n> ```\n"
+                "> - ```\n>   %s\n>   ```\n" "- a[^1]\n\n  [^1]: x\n\n      %s\n"
+                "a[^1]\n\n[^1]: ```\n%s\n    ```\n" "- a[^1]\n\n  [^1]: ```\n      %s\n      ```\n"]
+          alphabet ["a" " " "\t" "\n" "-" "    " "b"]
+          freq (frequencies
+                (for [_ (range 2500)
+                      :let [t (apply str (repeatedly (inc (.nextInt rng 4)) #(pick alphabet)))
+                            s (format (pick ctxs) t)
+                            d (try (parser/parse s) (catch Exception _ nil))
+                            e (when d (try (hdoc/emit-document d) (catch clojure.lang.ExceptionInfo _ ::refused)))]
+                      :when (and d (not (re-find #"\r" s)))]
+                  (cond (= ::refused e) :refused
+                        (not= d (parser/parse e)) (do (println "MISMATCH" (pr-str s)) :bad)
+                        (re-find #"^- a\[\^1\]" s) :ok-list-note
+                        (re-find #"(?m)^> .*[ \t]+$|^>\s*[ \t]\n" s) :ok-quote-ws
+                        :else :ok)))]
+      (is (zero? (:bad freq 0)) (pr-str freq))
+      (is (< 100 (:ok-list-note freq 0)) (pr-str freq))
+      (is (< 20 (:ok-quote-ws freq 0)) (pr-str freq)))))
+
+(deftest footnote-in-nested-list-test
+  (testing "TASK-235: a footnote defined in the outer item of a nested list is written there"
+    (doseq [src ["- - a[^1]\n\n  [^1]: x\n" "- - - a[^1]\n\n  [^1]: x\n" "1. - a[^1]\n\n   [^1]: x\n"
+                 "> - - a[^1]\n>\n>   [^1]: x\n"
+                 "- a[^1] b[^2]\n\n  [^1]: \n\n  [^2]: y\n\n* - \n"
+                 "- a[^1]\n\n  [^1]: x\n\n* b\n"]]
+      (let [d (parser/parse src)
+            e (hdoc/emit-document d)]
+        (is (= d (parser/parse e)) (pr-str src))
+        (is (= src e) (pr-str src)))))
+  (testing "TASK-235: output that already round-tripped is unchanged"
+    (doseq [src ["- - a[^1]\n\n    [^1]: x\n" "- a[^1]\n\n- b\n\n[^1]: x\n" "- - a\n\n- b[^1]\n\n[^1]: x\n"]]
+      (let [d (parser/parse src)
+            e (hdoc/emit-document d)]
+        (is (= d (parser/parse e)) (pr-str src))
+        (is (= src e) (pr-str src))))))
+
+(defn- emphasis-round-trip
+  "`[emitted round-trips?]` for the parsed `src`."
+  [src]
+  (let [d (parser/parse src)
+        e (hdoc/emit-document d)]
+    [e (= d (parser/parse e))]))
+
+(deftest adjacent-and-nested-emphasis-round-trip-test
+  (testing "TASK-237: emphasis that touches another is written with the other delimiter"
+    (doseq [[src expected] [["*e*_e_\n" "*e*_e_\n"]
+                            ["_e_*e*\n" "*e*_e_\n"]
+                            ["*_e_* b\n" "*_e_* b\n"]
+                            ["*@k#_[-_* b\n" "*@k\\#_\\[-_* b\n"]
+                            ["*a*_b_*c*\n" "*a*_b_*c*\n"]
+                            ["__a__**b**\n" "**a**__b__\n"]
+                            ["_*a*_\n" "*_a_*\n"]
+                            ["**_a_**\n" "**_a_**\n"]
+                            ["_e_*e*@k\n" "_e_*e*@k\n"]]]
+      (let [[e ok?] (emphasis-round-trip src)]
+        (is ok? (pr-str src))
+        (is (= expected e) (pr-str src)))))
+  (testing "TASK-237: a spelling that already round-tripped is written as before"
+    (doseq [[src expected] [["***a***\n" "***a***\n"] ["**a**__b__ c\n" "**a**__b__ c\n"]
+                            ["*a **b***\n" "*a **b***\n"] ["**a _b_**\n" "**a *b***\n"]
+                            ["*a* _b_\n" "*a* *b*\n"] ["*a*x\n" "*a*x\n"] ["*a***b**\n" "*a***b**\n"]
+                            ["*1. *e** b\n" "*1. *e** b\n"] ["****c****\n" "****c****\n"]
+                            ["*_a_ b*\n" "**a* b*\n"] ["*b _a_*\n" "*b *a**\n"]
+                            ["*a*~~b~~\n" "*a*~~b~~\n"] ["==a====b==\n" "==a====b==\n"]]]
+      (let [[e ok?] (emphasis-round-trip src)]
+        (is ok? (pr-str src))
+        (is (= expected e) (pr-str src)))))
+  (testing "TASK-237: when no spelling survives the writer refuses instead of writing another document"
+    (let [src "_1*ab*__\n"
+          ex (try (hdoc/emit-document (parser/parse src)) (catch clojure.lang.ExceptionInfo x x))]
+      (is (instance? clojure.lang.ExceptionInfo ex) (pr-str src))
+      (is (= ::hdoc/unrepresentable-emphasis (:type (ex-data ex))))))
+  (testing "TASK-237: seeded sweep (seed 237): every source round-trips or is refused, not vacuously"
+    (let [rng (java.util.Random. 237)
+          toks ["*" "_" "**" "__" "a" "b" "ab" " " "." "x y" "1" "*" "_"]
+          freq (frequencies
+                (for [_ (range 6000)
+                      :let [s (str (apply str (repeatedly (+ 2 (.nextInt rng 10)) #(nth toks (.nextInt rng (count toks))))) "\n")
+                            d (try (parser/parse s) (catch Exception _ nil))
+                            e (when d (try (hdoc/emit-document d)
+                                           (catch clojure.lang.ExceptionInfo x
+                                             (when (= ::hdoc/unrepresentable-emphasis (:type (ex-data x))) ::refused))))]
+                      :when d]
+                  (cond (= ::refused e) :refused
+                        (= d (parser/parse e)) (if (re-find #"_" e) :ok-underscore :ok)
+                        :else (do (println "MISMATCH" (pr-str s) (pr-str e)) :bad))))]
+      (is (zero? (:bad freq 0)) (pr-str freq))
+      (is (< 1000 (:ok freq 0)) (pr-str freq))
+      (is (< 20 (:ok-underscore freq 0)) (pr-str freq)))))

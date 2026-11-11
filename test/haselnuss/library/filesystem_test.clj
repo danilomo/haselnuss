@@ -426,6 +426,30 @@
           (is (re-find #"must be a path" (:message w)) slug)
           (is (= {} (fs/bibliography book)) slug))))))
 
+(deftest invalid-front-matter-field-test
+  (testing "a bad cslStyle, lang or topLevelDivision is a load warning, not a failed book (TASK-224)"
+    (doseq [[slug yaml field] [["csl" "cslStyle: [a]" "cslStyle"]
+                               ["lang" "lang: 42" "lang"]
+                               ["tld" "topLevelDivision: chapters" "topLevelDivision"]]
+            kinds [nil #{"sec"}]]
+      (let [dir (temp-dir)
+            _ (write! dir (str slug ".hdoc")
+                      (str "---\ntitle: Listed\n" yaml "\n---\n\n# A {#sec:a}\n\nx\n"))
+            lib (fs/filesystem-library {:name "l" :path (str dir)} (if kinds {:kinds kinds} {}))
+            book (library/find-book lib slug)
+            document (library/document book)
+            [w & more] (fs/load-warnings book)]
+        (is (= (fm-title "Listed") (:title (first (library/list-books lib)))) slug)
+        ;; a bad `lang` is also (already) a listing diagnostic of its own
+        (when (not= "lang" slug)
+          (is (= [] (library/library-diagnostics lib)) slug))
+        (is (= {:title (fm-title "Listed")} (:meta document)) slug)
+        (is (= [:section] (mapv :t (:blocks document))) slug)
+        (is (nil? more) slug)
+        (is (= :invalid-front-matter-field (:type w)) slug)
+        (is (str/includes? (:message w) (str slug ".hdoc:3: ")) (:message w))
+        (is (str/includes? (:message w) field) slug)))))
+
 (deftest unreadable-shelf-test
   (let [dir (temp-dir)
         _ (write! dir "ok/one.hdoc" "---\ntitle: One\n---\n")

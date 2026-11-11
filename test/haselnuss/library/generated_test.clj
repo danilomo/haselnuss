@@ -187,7 +187,7 @@
       (is (= "bible:scripture/romanos#14:8" (:canonical verse)))
       (is (= "Romanos 14:8" (text-of (:title verse))))
       (is (str/starts-with? (text-of (:inlines (first (:blocks verse))))
-                            "Pois, se vivemos, para o Senhor vivemos"))
+                            "Porque, se vivemos, para o Senhor vivemos"))
       (is (= 3 (count (:blocks verses))) "8:34-36 is three verses"))
     (testing "a label passage and a whole book come from the generated document"
       (is (= "bible:scripture/hebreus#cap:2" (:canonical label)))
@@ -617,7 +617,7 @@
             html (slurp out)]
         (is (= 0 status) err)
         (is (str/includes? html "data-source=\"bible:scripture/romanos#14:8\""))
-        (is (str/includes? html "Pois, se vivemos, para o Senhor vivemos"))))
+        (is (str/includes? html "Porque, se vivemos, para o Senhor vivemos"))))
     (testing "a book ID naming a generated book is refused: it has no .hdoc source"
       (let [{:keys [status err]} (main-run "--libraries" yaml "bible:romanos")]
         (is (not= 0 status))

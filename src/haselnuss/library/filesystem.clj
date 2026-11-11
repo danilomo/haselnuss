@@ -275,7 +275,7 @@
                                           " its first " max-front-matter-chars " characters"))]}
       :else
       (let [fm (parser/front-matter (str parser/front-matter-opening "\n" yaml-text "\n---\n")
-                                    {:source (str file) :omit-non-path-bibliography? true})
+                                    {:source (str file) :omit-invalid-front-matter? true})
             data (yaml/parse-string yaml-text)
             [fields problems] (metadata-fields (if (map? data) data {}))]
         {:fields (cond-> fields
@@ -354,11 +354,34 @@
             ;; host build on it.
             declared (try (:bibliography (parser/front-matter source {:source (str file)}))
                           (catch clojure.lang.ExceptionInfo e
-                            (if (= ::parser/bibliography-not-a-path (:type (ex-data e)))
-                              (:value (ex-data e))
+                            (condp = (:type (ex-data e))
+                              ::parser/bibliography-not-a-path (:value (ex-data e))
+                              ::parser/front-matter-not-a-string
+                              (:bibliography (parser/front-matter
+                                              source {:source (str file) :omit-invalid-front-matter? true}))
+                              ::parser/unknown-top-level-division
+                              (:bibliography (parser/front-matter
+                                              source {:source (str file) :omit-invalid-front-matter? true}))
                               (throw e))))
             [bibliography bib-warnings] (load-bibliography id file declared)
-            vocabulary (cond-> {:omit-non-path-bibliography? true}
+            ;; TASK-224: a `cslStyle`/`lang` that is not a string or an
+            ;; unknown `topLevelDivision` is likewise the parser's located
+            ;; error for a standalone build, one warning here (the first
+            ;; one), and left out of Meta by every parse of the book.
+            fm-warnings (into []
+                              (try (parser/front-matter source {:source (str file)
+                                                                :omit-non-path-bibliography? true})
+                                   nil
+                                   (catch clojure.lang.ExceptionInfo e
+                                     (if (#{::parser/front-matter-not-a-string
+                                            ::parser/unknown-top-level-division}
+                                          (:type (ex-data e)))
+                                       [{:type :invalid-front-matter-field
+                                         :book (canonical id)
+                                         :file (str file)
+                                         :message (str "book " (canonical id) ": " (ex-message e))}]
+                                       (throw e)))))
+            vocabulary (cond-> {:omit-invalid-front-matter? true}
                          kinds (assoc :kinds kinds)
                          (and kinds (empty? bib-warnings)) (assoc :cite-keys (set (keys bibliography))))
             parse-text (fn [text ^File f] (parse text (assoc vocabulary :source (str f))))
@@ -371,7 +394,7 @@
         {:document document
          :warnings (vec warnings)
          :bibliography bibliography
-         :bibliography-warnings bib-warnings})
+         :bibliography-warnings (into bib-warnings fm-warnings)})
       (catch java.io.IOException e
         (fail "cannot be read" (throwable-message e)))
       (catch Throwable t
@@ -650,7 +673,7 @@
   `:parse`, a `(fn [source {:source path}] Document)` used for every file
   a document load reads, entry and includes alike; default
   `haselnuss.parser/parse`. Its opts also carry
-  `:omit-non-path-bibliography? true` (and the vocabulary, with
+  `:omit-invalid-front-matter? true` (and the vocabulary, with
   `:kinds`): a book's bad `bibliography` is a warning, not a failed
   parse. `:open-reader`, a `(fn [File] java.io.Reader)`
   listing reads each entry file's front matter through (default: a UTF-8

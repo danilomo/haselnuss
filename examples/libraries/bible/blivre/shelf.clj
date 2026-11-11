@@ -1,19 +1,21 @@
-;; The generated shelf of the fixture Bible library (TASK-159): one book
-;; per entry of almeida.json, each `{"slug" "title" "verses"}` with its
-;; verses as [chapter verse text] triples. Run in haselnuss.sandbox, so
-;; it reads nothing itself: the host parses almeida.json and passes it in.
+;; The generated shelf of the example Bible library (TASK-159, text replaced in
+;; TASK-212): one book per entry of blivre.json, each `{"slug" "title"
+;; "verses"}` with its verses as [chapter verse text] triples. The text is the
+;; Bíblia Livre (BLIVRE), CC BY 3.0 Brasil; see ../README.md. Run in
+;; haselnuss.sandbox, so it reads nothing itself: the host parses blivre.json
+;; and passes it in.
 ;;
 ;; Locators are `C`, `C:V` or `C:V-W`. A passage of one verse is that
 ;; verse's paragraph; a passage of several numbers each one, `**34** ...`
-;; -- the shape examples/catecismo-heidelberg.hdoc copies by hand.
+;; -- the shape the catechism's proof texts have always had.
 ;;
 ;; `C:V` and `C:V-W` are rejected unless every verse they name is in the
-;; sample. A bare chapter `C` cannot be checked that way, since the sample
-;; does not record how many verses a chapter has: it answers the verses
-;; the sample holds of that chapter, which may be only some of them.
+;; library. A bare chapter `C` cannot be checked that way, since the library
+;; does not record how many verses a chapter has: it answers the verses the
+;; library holds of that chapter, which may be only some of them.
 
 (defn- book-of [data slug]
-  (some (fn [b] (when (= slug (:slug b)) b)) (get data "almeida.json")))
+  (some (fn [b] (when (= slug (:slug b)) b)) (get data "blivre.json")))
 
 (defn- verse-para [text] {:t :para :inlines [{:t :str :text text}]})
 
@@ -28,11 +30,11 @@
    :attr {:id (str "cap:" chapter) :classes [] :props {}}
    :blocks (mapv (fn [[_ v text]] (numbered-verse v text)) verses)})
 
-{:data ["almeida.json"]
+{:data ["blivre.json"]
 
  :books
  (fn [data]
-   (for [{:keys [slug title]} (get data "almeida.json")]
+   (for [{:keys [slug title]} (get data "blivre.json")]
      {:slug slug :title title :lang "pt-BR"}))
 
  :document
@@ -59,10 +61,10 @@
             :message (str title " " locator " is a reversed range: its first verse comes after its last")}
            (empty? found)
            {:type :bad-locator
-            :message (str title " " locator " is not in this sample of the Almeida text")}
+            :message (str title " " locator " is not in this library (a subset of the Bíblia Livre)")}
            (and from (not= (inc (- to from)) (count found)))
            {:type :bad-locator
-            :message (str title " " locator " is only partly in this sample of the Almeida text")}
+            :message (str title " " locator " is only partly in this library (a subset of the Bíblia Livre)")}
            :else
            {:title (str title " " locator)
             :blocks (if (= 1 (count found))

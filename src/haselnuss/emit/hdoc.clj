@@ -419,15 +419,12 @@
     the first place (the same two destination forms are all it has to
     work with).
   - A `:code` (inline code span) whose own text starts or ends with a
-    backtick is a narrow, accepted gap: the standard `fence + padding
-    space` protection this namespace's `render-code-span` otherwise
-    applies works for an INTERNAL backtick run (confirmed at a REPL), but
-    this parser build does not strip the CommonMark-standard padding
-    space back out of a code span's stored text the way the spec
-    describes (confirmed: `` ` a ` `` round-trips to `\" a \"`, not
-    `\"a\"`) -- so a padded edge backtick round-trips with an extra space
-    baked in rather than failing outright. A narrow, stated limitation,
-    not a silent one.
+    backtick has no `.hdoc` spelling: this parser does not strip
+    CommonMark's padding space from a code span's stored text
+    (confirmed: `` ` a ` `` reads back as `\" a \"`), so padding the
+    edge backtick would bake a space in, and unpadded it merges with the
+    fence. `check-code-span-lines!` refuses it (`::unrepresentable-code-span`,
+    TASK-226); parsed sources cannot produce one.
   - `:cross-ref`'s own `:suppress-prefix` and a `:span`/`:block-quote`'s
     own non-default `:attr` (the latter two only ever populated by a
     lowering pass or a hand-built/JSON AST, never by
@@ -519,7 +516,12 @@
     (cond
       (not (contains? always-escaped-chars c)) false
       (not (contains? contextually-escaped-chars c)) true
-      (= c \@) (parser/reference-at? s i ctx)
+      (= c \@) (or (parser/reference-at? s i ctx)
+                   ;; TASK-223: `_` is written `\_`, and a backslash ends
+                   ;; the token, so the part before the first `_` is what
+                   ;; the written text reads as a reference.
+                   (let [u (.indexOf s "_" (int (inc i)))]
+                     (and (pos? u) (parser/reference-at? (subs s 0 u) i ctx))))
       :else (str/blank? (subs s 0 i)))))
 
 (defn- escapes-as-highlight-marker?
@@ -792,6 +794,9 @@
                     ;; TASK-198: resolved by `resolve-at-marks` before here;
                     ;; one that got this far needs no escape.
                     \@ nil
+                    ;; TASK-221: a `|` inside an attribute group in a table
+                    ;; cell; `render-table-cell` reads the mark.
+                    \| (.append sb escape-mark)
                     (when (or (parser/attribute-group-at? plain p)
                               (parser/attribute-attempt-at? plain p))
                       (.append sb \\)))
@@ -1095,9 +1100,34 @@
   "Attr `attr` as a `{#id .class key=val}` attribute-group fragment (AC
   #6), or `\"\"` when `attr` carries none of the three -- the same
   \"nothing to show\" convention `haselnuss.emit.html/attr-attrs` uses."
-  [attr]
-  (let [tokens (attr-tokens attr)]
-    (if (seq tokens) (str "{" (str/join " " tokens) "}") "")))
+  ([attr]
+   (let [tokens (attr-tokens attr)]
+     (if (seq tokens) (str "{" (str/join " " tokens) "}") "")))
+  ([ctx attr]
+   ;; TASK-221: inside a table cell, `render-table-cell` escapes every `|`
+   ;; it finds, but the parser splits a row group-aware and reads `\|`
+   ;; inside a group as a backslash (refused bare, kept when quoted). A
+   ;; `|` in a group is therefore marked, not escaped: `resolve-escape-
+   ;; marks` keeps the mark and `render-table-cell` passes the pipe on.
+   (cond-> (attr-group attr)
+     (::in-table-cell ctx) (str/replace "|" (str escape-mark "|")))))
+
+(def ^:private line-terminators
+  "Every character the header tokenizer's `.` refuses to match, or that
+  ends a line: a group holding one cannot be written on a single line."
+  (re-pattern (str "[\n\r" (char 0x85) (char 0x2028) (char 0x2029) "]")))
+
+(defn- check-group-fits!
+  "Throws `ex-info` (`:type ::unrepresentable-attr-value`, naming
+  `context`) when `text`, an `attr-group` fragment or the line header
+  built around one, matches `bad-re` (TASK-221): `what` describes a
+  character the line it is written on cannot carry. `line-terminators`
+  for the header-tokenizer contexts."
+  [context text bad-re what]
+  (when (re-find bad-re text)
+    (throw (ex-info (str "hdoc cannot write an attribute group holding " what " in " context ": "
+                         (pr-str text))
+                    {:type ::unrepresentable-attr-value :context context :text text}))))
 
 ;; --- Link/image destinations (sec6.3/6.4 of CommonMark) --------------------
 
@@ -1200,27 +1230,137 @@
 (defn- render-code-span
   "Renders inline `Code`'s own `:text` (sec4.4) as a backtick-fenced code
   span: `` `text` ``, with the fence lengthened (`code-fence-for`) past
-  any internal backtick run, and a single padding space added on each
-  side ONLY when `text` itself starts or ends with a backtick (confirmed
-  at a REPL: without it, a backtick directly touching the fence merges
-  into one longer run and the span fails to close at all -- e.g.
-  `` `x` `` with content `` `x`` `` mis-parses as literal text). Not
-  padded merely for starting/ending in a plain space: standard CommonMark
-  has the reader strip exactly one such padding space back off on
-  re-parse, but this parser build does not (confirmed at a REPL:
-  `` ` a ` `` round-trips to `\" a \"`, not `\"a\"`) -- so, for THIS
-  parser, adding a padding space the text does not already need would
-  only bake in an extra one on re-parse (confirmed at a REPL to be the
-  actual cause of a real mismatch before this was narrowed to the
-  backtick-only condition). See this namespace's own docstring for the
-  one narrow gap that remains: a `:text` that itself starts or ends with
-  a backtick still round-trips with one extra space baked in, since the
-  padding IS structurally required there and this parser keeps it."
+  any internal backtick run. Never padded: this parser keeps a code
+  span's content verbatim (confirmed at a REPL: `` ` a ` `` reads back as
+  `\" a \"`, and `` `` `x `` `` as `\" `x \"`), so a padding space would
+  be baked into the text on re-parse. A `text` that starts or ends with a
+  backtick therefore has no spelling at all (a backtick touching a fence
+  merges into one longer run); `check-code-span-lines!` refuses it
+  before this is reached (TASK-226)."
   [text]
-  (let [fence (code-fence-for text)
-        pad? (or (str/starts-with? text "`") (str/ends-with? text "`"))
-        padding (if pad? " " "")]
-    (str fence padding text padding fence)))
+  (let [fence (code-fence-for text)]
+    (str fence text fence)))
+
+;; --- Multi-line code spans (TASK-222) ----------------------------------------
+
+(defn- code-line-block-start?
+  "True if `line`, a continuation line of a multi-line code span (one
+  after a newline in its text), would start a block when written out, so
+  that it breaks the paragraph the span sits in. `last?` marks the span's
+  last line, which the closing fence follows on the same physical line --
+  so a marker must have text after it there (`- y`, not `-`: the line is
+  really `-` + fence), while a line of any other kind (an empty marker, a
+  bare `---`, a backtick fence) is only a hazard when nothing follows.
+  Covers what interrupts a paragraph: a bullet or a `1.`/`1)` ordered
+  marker (`2. y` does not), an ATX heading, a block quote, a tilde fence,
+  a `:::` directive fence, a `<` (HTML block, which the parser rejects)
+  and a `[^` (footnote definition), and for a line ending in a newline a
+  blank or whitespace-only line (it ends the paragraph; as the last line
+  the closing fence is on it, so it is not blank), a thematic break, a
+  setext underline and a backtick fence."
+  [^String line last?]
+  (let [at-start (fn [re] (boolean (re-find (re-pattern (str "^[ \\t]{0,3}" re)) line)))
+        ;; After a list marker: a space and then, on a line the span goes
+        ;; on past, something (an empty item cannot interrupt a paragraph).
+        item (if last? "[ \\t]" "[ \\t]+\\S")]
+    (or (at-start (str "[-+*]" item))
+        (at-start (str "0*1[.)]" item))
+        (at-start (str "#{1,6}" (if last? "[ \\t]" "(?:[ \\t]|$)")))
+        (at-start ">")
+        (at-start "~{3,}")
+        (at-start ":::")
+        (at-start "<")
+        (at-start "\\[\\^")
+        (and (not last?)
+             (or (boolean (re-matches #"[ \t]*" line))
+                 (boolean (re-matches hazard-line-re line))
+                 (boolean (re-matches #"[ \t]{0,3}([*_])(?:[ \t]*\1){2,}[ \t]*" line))
+                 (at-start "`{3,}[^`]*$"))))))
+
+(defn- check-code-span-lines!
+  "Throws `ex-info` (`:type ::unrepresentable-code-span`) naming the line
+  and its number (from 2) when a continuation line of the code span with
+  `text` would start a block (`code-line-block-start?`). Such a line has no
+  `.hdoc` spelling: written out it breaks the paragraph, and a backslash
+  to stop that would be literal code text (TASK-171). Also refused: a
+  text holding a run of two or more backticks whose last line is empty or
+  blank (TASK-228), where the 3+ closing fence would open a code block.
+  Also refused: a continuation line starting with a tab, after any
+  spaces (TASK-229). Also refused (TASK-231): a carriage return next to
+  another CR or a newline (`\\r\\n`, `\\n\\r`, `\\r\\r`: the parser normalises
+  them), and ANY carriage return when `plain-cr-breaks?` (the span is in a
+  table cell (`render-heading` does the same for an ATX heading), where a lone `\\r` is a line ending that
+  re-parses differently). A lone `\\r` elsewhere (paragraph, list item,
+  quote, footnote, emphasis, link) is kept verbatim by the parser, so it
+  is written as is -- `haselnuss.parser` produces such spans from source.
+  Because the parser also treats that lone `\\r` as a line end, every
+  line-based check here splits on `\\r` as well as `\\n`. Also refused when
+  `line-start?` (the span opens a physical line): a multi-line text whose
+  first line holds no backtick and that holds a run of two or more, whose
+  3+ opening fence then reads as a code-block fence (`- ```a` / `  ``a``` b`);
+  a fence the first line's own backtick (or the closing fence) shares a
+  line with is no fence opener. Parsed sources cannot produce most of
+  these, a hand-built `:code` can."
+  [^String text line-start? plain-cr-breaks?]
+  (let [lines (str/split text #"\r|\n" -1)
+        n (count lines)]
+    ;; TASK-232: two backticks are no empty span (the parser reads them as
+    ;; text), so an empty text has no spelling; the parser never produces one.
+    (when (= "" text)
+      (throw (ex-info "hdoc emitter cannot represent a code span with empty text"
+                      {:type ::unrepresentable-code-span :text text :empty true})))
+    (when (or (re-find #"\r[\r\n]|\n\r" text)
+              (and plain-cr-breaks? (str/includes? text "\r")))
+      (throw (ex-info (str "hdoc emitter cannot represent a code span holding this carriage return: "
+                           (pr-str text))
+                      {:type ::unrepresentable-code-span :text text :carriage-return true})))
+    (when (and line-start?
+               (<= 3 (count (code-fence-for text)))
+               (> n 1)
+               (not (str/includes? (first lines) "`")))
+      (throw (ex-info (str "hdoc emitter cannot represent a multi-line code span at the start of a"
+                           " line whose text holds a run of two or more backticks (its opening"
+                           " fence would open a code block): " (pr-str text))
+                      {:type ::unrepresentable-code-span :text text :opening-fence-line-start true})))
+    (when (or (str/starts-with? text "`") (str/ends-with? text "`"))
+      (throw (ex-info (str "hdoc emitter cannot represent a code span whose text starts or ends"
+                           " with a backtick: " (pr-str text))
+                      {:type ::unrepresentable-code-span :text text :edge-backtick true})))
+    ;; TASK-228: a text ending in a newline, or in a newline and then only
+    ;; blanks, puts the closing fence at the start of its line (or after
+    ;; those blanks), and a fence of three or more backticks there (text
+    ;; holding a run of two or more) reads as a code-block fence in any
+    ;; context. Confirmed with the parser: it opens a block after 0-3
+    ;; spaces, after any tab, and after four or more spaces only when a tab
+    ;; follows them; only a last line of four or more plain spaces is safe.
+    ;; Never padded, so no spelling: refused.
+    (when (and (<= 3 (count (code-fence-for text)))
+               (let [last-line (peek lines)]
+                 (and (pos? (dec n))
+                      (re-matches #"[ \t]*" last-line)
+                      (not (re-matches #" {4,}" last-line)))))
+      (throw (ex-info (str "hdoc emitter cannot represent a code span ending in a newline (and"
+                           " then only blanks) whose text holds a run of two or more backticks"
+                           " (its closing fence would start a line as a code-block fence): "
+                           (pr-str text))
+                      {:type ::unrepresentable-code-span :text text :line (peek lines) :line-number n
+                       :trailing-newline-fence true})))
+    (doseq [[i line] (map-indexed vector (rest lines))]
+      (when (code-line-block-start? line (= (inc i) (dec n)))
+        (throw (ex-info (str "hdoc emitter cannot represent a code span whose line "
+                             (+ i 2) " " (pr-str line) " would start a block")
+                        {:type ::unrepresentable-code-span :line line :line-number (+ i 2)
+                         :text text})))
+      ;; TASK-229: a continuation line whose leading whitespace holds a tab
+      ;; (`\tx`, ` \tx`, `    \tx`, or a tab-only last line) does not
+      ;; re-parse to the same text, in any context -- confirmed with the
+      ;; parser; the same lines with spaces only, and a tab after text, are
+      ;; fine. No spelling exists (a code span is never padded or escaped).
+      (when (re-find #"^ *\t" line)
+        (throw (ex-info (str "hdoc emitter cannot represent a code span whose line "
+                             (+ i 2) " " (pr-str line) " starts with a tab")
+                        {:type ::unrepresentable-code-span :line line :line-number (+ i 2)
+                         :text text :leading-tab true}))))))
 
 ;; --- Inline dispatch (TASK-88) ----------------------------------------------
 
@@ -1240,10 +1380,21 @@
   source that produced it -- including the identical-adjacent-delimiter
   case (`***text***`, `:emph` wrapping `:strong`), which round-trips
   correctly precisely because concatenation introduces no separator
-  between the two delimiter runs (confirmed at a REPL)."
-  [ctx inline footnotes open close]
-  (let [[text footnotes'] (render-inlines ctx (:inlines inline) footnotes)]
-    [(str open text close) footnotes']))
+  between the two delimiter runs (confirmed at a REPL).
+
+  \"Safe\" holds only until two delimiter runs of the same character
+  touch: `*e*` then `_e_` as siblings written `*e**e*` reads back as ONE
+  emphasis, `*_e_*` written `**e**` as a strong (TASK-237).
+  `choose-emphasis-delim` (called from `render-inlines`, which knows the
+  neighbours) picks `_` for a node whose `*` spelling would touch a
+  neighbouring or enclosing run, and passes the choice as `::delim`;
+  every spelling that works with `*` is left exactly as it was."
+  [ctx inline footnotes kind]
+  (let [d (or (::delim ctx) "*")
+        mark (case kind :emph d :strong (str d d))
+        [text footnotes'] (render-inlines (assoc ctx ::parent-emphasis {:kind kind :delim d})
+                                          (:inlines inline) footnotes)]
+    [(str mark text mark) footnotes']))
 
 (def ^:private role-span-classes
   "The `.class` `render-role-span` writes for each of the four Inline
@@ -1448,7 +1599,7 @@
           citation? (parser/citation-bracket-at? (str "[" (without-marks marked) "]") 0)
           text (resolve-at-marks marked (fn [plain p] (and citation? (cite-key-marker-at? plain p))))
           destination (render-destination (:target inline))
-          group (attr-group (:attr inline))]
+          group (attr-group ctx (:attr inline))]
       (when citation? (check-link-text-not-citation! inline text))
       [(str "[" text "](" destination (render-title inline) ")" group) footnotes'])))
 
@@ -1487,10 +1638,10 @@
   contains, escaped plain text is the only spelling that reproduces the
   same string both ways -- except for a line break, which `render-alt`
   writes as code."
-  [inline]
+  [ctx inline]
   (let [alt (render-alt (:alt inline))
         destination (render-destination (:src inline))
-        group (attr-group (:attr inline))]
+        group (attr-group ctx (:attr inline))]
     (str "![" alt "](" destination (render-title inline) ")" group)))
 
 (defn- render-span
@@ -1503,7 +1654,7 @@
   re-parse (confirmed at a REPL: `[text]{}` stays literal text)."
   [ctx inline footnotes]
   (let [[text footnotes'] (render-inlines ctx (:inlines inline) footnotes)
-        group (attr-group (:attr inline))]
+        group (attr-group ctx (:attr inline))]
     [(str "[" text "]" group) footnotes']))
 
 (defn- render-flat-prose
@@ -1672,27 +1823,35 @@
         (str "@" (:key (first items))))
     (str "[" (str/join "; " (map (partial render-cite-item ctx) items)) "]")))
 
-(defn- indent-line
-  "`line` after `prefix`, except an empty line stays empty (TASK-180): an
-  indented blank line would be a line of nothing but spaces, which
-  CommonMark reads as the same blank line, so the indent only adds
-  trailing whitespace."
-  [prefix line]
-  (if (= "" line) line (str prefix line)))
+(defn- indent-after-line-ends
+  "`text` with `prefix` inserted at the start of every non-empty line after
+  the first, an empty line staying empty (TASK-180): an indented blank line
+  would be a line of nothing but spaces, which CommonMark reads as the same
+  blank line, so the indent only adds trailing whitespace. A line starts
+  after a newline AND after a lone carriage return (TASK-232): the only CR
+  in rendered text is inside a code span (the parser reads one elsewhere as
+  a soft break), where a list item or footnote strips its own indent from
+  the line after it just as it does after a newline, so the line must carry
+  the prefix to keep the text it had. Not inside a block quote (`cr?`
+  false): the line after a CR there carries no `>`, so it is a lazy
+  continuation that keeps its text as written."
+  [^String prefix ^String text cr?]
+  (str/replace text (if cr? #"(?<=[\r\n])(?=[^\r\n])" #"(?<=\n)(?=[^\r\n])")
+               (java.util.regex.Matcher/quoteReplacement prefix)))
 
 (defn- indent-lines
   "Indents every non-empty physical line of `text` by `width` spaces
-  (`indent-line`) -- shared by `indent-block-continuation` (a footnote
+  (`indent-after-line-ends`) -- shared by `indent-block-continuation` (a footnote
   definition's own fixed 4-space continuation) and
   `render-list-item-blocks` (TASK-97, whose own continuation width is a
   list item's marker width, not a fixed constant)."
-  [width text]
+  [width text cr?]
   (let [prefix (apply str (repeat width \space))]
-    (str/join "\n" (map (partial indent-line prefix) (str/split text #"\n" -1)))))
+    (subs (indent-after-line-ends prefix (str "\n" text) cr?) 1)))
 
 (defn- indent-continuation-lines
   "Indents every non-empty physical line of `text` by `width` spaces
-  (`indent-line`), EXCEPT its own first line -- the shape a container's
+  (`indent-after-line-ends`), EXCEPT its own first line -- the shape a container's
   FIRST Block needs (TASK-97): its first physical line sits directly after the marker that introduced the
   whole span (`\"[^1]: \"`, a list item's own `\"- \"`/`\"1. \"`), which
   lazy continuation covers with no indent of its own, but every physical
@@ -1708,10 +1867,8 @@
   :note's SECOND Block -- this is the same bug, reached through the
   FIRST Block instead once a Block type with its own internal blank line
   became renderable)."
-  [width text]
-  (let [lines (str/split text #"\n" -1)
-        prefix (apply str (repeat width \space))]
-    (str/join "\n" (cons (first lines) (map (partial indent-line prefix) (rest lines))))))
+  [width text cr?]
+  (indent-after-line-ends (apply str (repeat width \space)) text cr?))
 
 (defn- indent-block-continuation
   "Indents every physical line of `text` (a rendered Block, ALWAYS one
@@ -1732,8 +1889,8 @@
   break, tolerates the same four-space indent without turning into a
   nested indented code block, since it only restates the footnote's own
   existing content column rather than adding a further one)."
-  [text]
-  (indent-lines 4 text))
+  [text cr?]
+  (indent-lines 4 text cr?))
 
 (def ^:private unrepresentable-nested-block-types
   "The Block types `check-representable-nested-block!` refuses inside
@@ -1852,6 +2009,18 @@
   [ctx blocks footnotes]
   (run! (partial check-representable-nested-block! "a note") blocks)
   (check-blocks-after-sections! "a note" blocks)
+  ;; TASK-234: a footnote definition reads a line of only spaces and tabs as
+  ;; blank, in any spelling (measured), so a code block directly in a note
+  ;; with such a line has none. The parser yields one only from a leading-tab
+  ;; line such as `[^1]: ```` / TAB `a` + 4 spaces, where it keeps the
+  ;; spaces after the tab's content.
+  (doseq [block blocks
+          :when (= :code-block (:t block))
+          line (str/split (str (:text block)) #"\n" -1)
+          :when (re-matches #"[ \t]+" line)]
+    (throw (ex-info (str "hdoc cannot write a code block with a line of only spaces or tabs in a footnote: "
+                         (pr-str line))
+                    {:type ::unrepresentable-footnote-code-line :line line})))
   (let [alternates (alternate-list-markers blocks)]
     (reduce-kv (fn [[text footnotes] idx block]
                  ;; TASK-173: a footnote body is never a chunk sequence, and
@@ -1859,11 +2028,29 @@
                  ;; TASK-177: a list after a same-kind sibling takes the other marker.
                  ;; TASK-180: a note reached from a tight item's section heading
                  ;; is not that item's content, so its sections are not tight.
-                 (let [ctx (list-marker-ctx (dissoc ctx :chunk-level? ::tight-list-item) (alternates idx))
+                 ;; TASK-232: a list that opens the definition sits on the marker's
+                 ;; line, where flexmark counts its content column one further
+                 ;; (measured: 4 + marker width + 1; a bullet's lines need 7
+                 ;; columns, `1.` 8, not 6 and 7), so its lines take 5, not 4,
+                 ;; after a newline or a lone CR: a code span's line starting
+                 ;; with spaces in it read back with them.
+                 ;; TASK-233: the same one-column shift for a fenced code block
+                 ;; that opens the definition (measured: the fence on the marker's
+                 ;; line strips up to one more leading space from each body line),
+                 ;; so only a line with a leading space needs 5, not 4 (the
+                 ;; others, and the closing fence, keep the usual 4).
+                 (let [first-list? (and (zero? idx) (= :list (:t block)))
+                       first-code? (and (zero? idx) (= :code-block (:t block)))
+                       cr? (not (::no-cr-indent ctx))
+                       ctx (list-marker-ctx (dissoc ctx :chunk-level? ::tight-list-item) (alternates idx))
                        [block-text footnotes'] (render-block ctx block footnotes)
                        piece (if (zero? idx)
-                               (indent-continuation-lines 4 block-text)
-                               (indent-block-continuation block-text))]
+                               (if first-code?
+                                 (str/replace block-text
+                                              (if cr? #"(?<=[\r\n])(?=([^\r\n]))" #"(?<=\n)(?=([^\r\n]))")
+                                              (fn [[_ c]] (if (= " " c) "     " "    ")))
+                                 (indent-continuation-lines (if first-list? 5 4) block-text cr?))
+                               (indent-block-continuation block-text cr?))]
                    [(if (zero? idx) piece (str text "\n\n" piece)) footnotes']))
                ["" footnotes]
                (vec blocks))))
@@ -1961,9 +2148,9 @@
   (let [[text footnotes'] (render-inlines (assoc ctx :in-highlight? true)
                                           (:inlines inline) footnotes)]
     [(if (:in-highlight? ctx)
-       (str "[" text "]" (attr-group (update (:attr inline) :classes
-                                             (fnil conj []) "highlight")))
-       (str "==" (escape-highlight-boundary text) "==" (attr-group (:attr inline))))
+       (str "[" text "]" (attr-group ctx (update (:attr inline) :classes
+                                                 (fnil conj []) "highlight")))
+       (str "==" (escape-highlight-boundary text) "==" (attr-group ctx (:attr inline))))
      footnotes']))
 
 ;; --- Book references (TASK-152, doc-10) --------------------------------------
@@ -1994,10 +2181,15 @@
                     {:type ::unrepresentable-book-ref :t t :ref written}))))
 
 (defn- render-book-ref
-  "`@{ref}`, the ref as written (see this section's comment)."
-  [_ctx inline footnotes]
+  "`@{ref}`, the ref as written (see this section's comment). TASK-227:
+  inside a table cell a `|` in the ref is marked, not escaped (as
+  `attr-group` does): the parser splits a row `@{`-group-aware and keeps
+  `\\|` there as backslash plus pipe, so `@{a|b}` must be written bare."
+  [ctx inline footnotes]
   (check-spellable-book-ref! :book-ref (:ref inline))
-  [(str "@{" (:ref inline) "}") footnotes])
+  [(cond-> (str "@{" (:ref inline) "}")
+     (::in-table-cell ctx) (str/replace "|" (str escape-mark "|")))
+   footnotes])
 
 (defn- render-book-quote
   "`!quote ref`, the ref as written (see this section's comment)."
@@ -2010,27 +2202,46 @@
   footnotes'])` table `render-inline` dispatches through (TASK-88): every
   Inline variant `haselnuss.ast` defines (AC #4)."
   {:str (fn [ctx inline footnotes] [(escape-text (:text inline) ctx) footnotes])
-   :space (fn [_ctx _inline footnotes] [" " footnotes])
+   ;; TASK-233: the parser drops trailing spaces before a line end but keeps
+   ;; a trailing tab as a `:space`, so a `:space` right before a
+   ;; `:soft-break` is written as the tab that made it.
+   :space (fn [ctx _inline footnotes] [(if (::tab-space? ctx) "\t" " ") footnotes])
    :soft-break (fn [_ctx _inline footnotes] ["\n" footnotes])
    ;; A trailing backslash before the line ending (confirmed at a REPL to
    ;; round-trip to :line-break), not two-or-more trailing spaces: no
    ;; invisible whitespace left sitting at the end of a line.
    :line-break (fn [_ctx _inline footnotes] ["\\\n" footnotes])
-   :emph (fn [ctx inline footnotes] (render-wrapped ctx inline footnotes "*" "*"))
-   :strong (fn [ctx inline footnotes] (render-wrapped ctx inline footnotes "**" "**"))
+   :emph (fn [ctx inline footnotes] (render-wrapped ctx inline footnotes :emph))
+   :strong (fn [ctx inline footnotes] (render-wrapped ctx inline footnotes :strong))
    :strike render-strike
    :small-caps render-role-span
    :sub render-role-span
    :sup render-role-span
-   :code (fn [_ctx inline footnotes]
-           [(str/replace (render-code-span (:text inline)) "\n" code-break) footnotes])
+   :code (fn [ctx inline footnotes]
+           (check-code-span-lines! (:text inline) (::code-line-start? ctx)
+                                   ;; A lone CR breaks in a table cell (and in an
+                                   ;; ATX heading, see `render-heading`).
+                                   (boolean (::in-table-cell ctx)))
+           ;; TASK-225: the parser splits a table row code-span-aware and
+           ;; reads `\|` in a span as backslash plus pipe, so a `|` in code
+           ;; text is marked (as `attr-group` does), not escaped:
+           ;; `render-table-cell` passes the marked pipe on bare.
+           (cond-> (str/replace (render-code-span (:text inline)) "\n" code-break)
+             (::in-table-cell ctx) (str/replace "|" (str escape-mark "|"))
+             true (vector footnotes)))
    ;; Raw TeX, verbatim, no escaping: an as-parsed MathInline's own :tex
    ;; is guaranteed to start/end on non-whitespace and never cross a
    ;; newline (haselnuss.parser/inline-math-closing-index's own scan
    ;; rules), so it is always safe to splice directly between $ signs.
-   :math-inline (fn [_ctx inline footnotes] [(str "$" (:tex inline) "$") footnotes])
+   ;; TASK-230: in a table cell a `|` is marked, not escaped: the parser
+   ;; splits a row math-aware and keeps `\|` inside `$..$` as backslash
+   ;; plus pipe (as for a code span and a book ref), so it is written bare.
+   :math-inline (fn [ctx inline footnotes]
+                  [(cond-> (str "$" (:tex inline) "$")
+                     (::in-table-cell ctx) (str/replace "|" (str escape-mark "|")))
+                   footnotes])
    :link render-link
-   :image (fn [_ctx inline footnotes] [(render-image inline) footnotes])
+   :image (fn [ctx inline footnotes] [(render-image ctx inline) footnotes])
    :span render-span
    ;; A parsed :label is always already ref-token-char?'s own alphabet
    ;; (letter/digit/_/-/:), which needs no escaping of its own; a
@@ -2074,7 +2285,73 @@
   [ctx inline footnotes]
   ((get (:inline-handlers ctx) (:t inline) unsupported-inline!) ctx inline footnotes))
 
-(defn- render-inlines
+(defn- choose-emphasis-delim
+  "TASK-237: the delimiter character (`\"*\"` or `\"_\"`) to write the
+  `:emph`/`:strong` at `idx` of `inlines` with, in `::emphasis-mode`
+  `:local` (in `:star` mode, and without a mode, always `*`: the spelling
+  before TASK-237). `*` unless that run would touch another
+  run of the same character and read back as something else. This is a
+  candidate, not a verdict: `render-inlines` re-reads the paragraph it makes
+  and keeps it only if the emphasis nesting survives, because whether runs
+  that touch really fuse depends on what surrounds them (`*1. *e**` reads
+  back fine, `**c*x*` does not). The cases, established against the real
+  parser:
+
+  - a sibling right before it (`prev`, the previous sibling's `{:kind :delim}`
+    when it is an emphasis too): `*a*` `*b*` and `**a**` `**b**` fuse
+    (`*a**b*` is ONE emphasis), an emphasis next to a strong does not
+    (`*a***b**` is fine);
+  - the enclosing emphasis (`::parent-emphasis`) when this is its first or
+    last child: the same kind fuses (`**c**` for an emphasis in an emphasis),
+    except a strong that is the ONLY child of a strong (`****c****` reads back
+    right); a lone emphasis in a strong (`***c***`) reads back as the reverse
+    nesting. An emphasis in a strong at an edge beside other content, and a
+    strong in an emphasis, are fine.
+
+  `_` is the alternative. It cannot open right after an alphanumeric nor
+  close right before one (CommonMark's intraword rule), and between two `_`
+  runs every pairing fuses. With no safe candidate the node keeps `*` and
+  the verification in `render-inlines` refuses the document.
+  `inlines` is the sibling vector and `idx` the node's position in it, `text`
+  what was written before it. When the next sibling is an emphasis of the same
+  kind (which must take the other character) and the sibling after THAT cannot
+  follow a `_` closer, this node takes the `_` instead, so that run is the one
+  that can bear it."
+  [ctx inlines idx prev text]
+  (let [inline (nth inlines idx)
+        next-inline (get inlines (inc idx))
+        n (count inlines)
+        kind (:t inline)
+        parent (::parent-emphasis ctx)
+        first? (zero? idx)
+        last? (= idx (dec n))
+        only? (and first? last?)
+        underscore-blocked-before? (fn [x]
+                                     (or (and (= :str (:t x)) (seq (:text x))
+                                              (Character/isLetterOrDigit (char (first (:text x)))))
+                                         ;; `_` is a citation-key character, so a bare `@key`
+                                         ;; or `@label` right after `_e_` is not read as one
+                                         (contains? #{:cite :cross-ref} (:t x))))
+        conflicts? (fn [d]
+                     (or (and prev (= d (:delim prev)) (or (= kind (:kind prev)) (= d "_")))
+                         (and parent (= d (:delim parent)) (or first? last?)
+                              (if (= d "_")
+                                true
+                                (or (and (= kind (:kind parent))
+                                         (not (and only? (= kind :strong))))
+                                    (and only? (= :strong (:kind parent)) (= kind :emph)))))))
+        alnum? (fn [c] (and c (Character/isLetterOrDigit (char c))))
+        can-use-underscore? (and (not (and (pos? idx) (alnum? (last text))))
+                                 (not (and next-inline (underscore-blocked-before? next-inline))))
+        hand-over? (and next-inline (= kind (:t next-inline))
+                        (when-let [after (get inlines (+ idx 2))] (underscore-blocked-before? after)))]
+    (cond (not= :local (::emphasis-mode ctx)) "*"
+          (and hand-over? can-use-underscore? (not (conflicts? "_"))) "_"
+          (not (conflicts? "*")) "*"
+          (and (not (conflicts? "_")) can-use-underscore?) "_"
+          :else "*")))
+
+(defn- render-inlines-once
   "`render-inline` folded over every Inline in `inlines`, in order,
   concatenating rendered text and threading `footnotes` throughout.
 
@@ -2084,11 +2361,21 @@
   Inline is rendered with `:in-inline?` set, and `render-block` clears
   it, so a footnote's own Blocks resolve their own."
   [ctx inlines footnotes]
-  (let [inlines (cond-> inlines (not (:in-inline? ctx)) replace-nul)
+  (let [inlines (vec (cond-> inlines (not (:in-inline? ctx)) replace-nul))
         [text footnotes']
-        (reduce (fn [[text footnotes line-start?] inline]
-                  (let [[inline-text footnotes'] (render-inline (assoc ctx
+        (reduce (fn [[text footnotes line-start? code-start? prev-emphasis idx] [inline next-inline]]
+                  (let [emphasis? (contains? #{:emph :strong} (:t inline))
+                        delim (when emphasis?
+                                (choose-emphasis-delim ctx inlines idx prev-emphasis text))
+                        [inline-text footnotes'] (render-inline (assoc ctx
+                                                                       ::parent-emphasis nil
+                                                                       ::delim delim
+                                                                       ::tab-space? (and (= :space (:t inline))
+                                                                                         (= :soft-break (:t next-inline)))
                                                                        :line-start? line-start?
+                                                                       ;; TASK-231: a code span opening a
+                                                                       ;; physical line (`check-code-span-lines!`).
+                                                                       ::code-line-start? code-start?
                                                                        :in-inline? true
                                                                        ;; TASK-152: `escapes-as-book-ref-brace?`.
                                                                        :after-at? (str/ends-with? text "@"))
@@ -2100,10 +2387,100 @@
                      (case (:t inline)
                        (:soft-break :line-break) true
                        :space line-start?
-                       false)]))
-                ["" footnotes (:line-start? ctx true)]
-                inlines)]
+                       false)
+                     (case (:t inline)
+                       (:soft-break :line-break) true
+                       :space code-start?
+                       false)
+                     (when emphasis? {:kind (:t inline) :delim delim})
+                     (inc idx)]))
+                ;; An inline nested in another (emphasis, a link) or a table
+                ;; cell follows its opening marker, so it starts no line.
+                ["" footnotes (:line-start? ctx true)
+                 (and (not (:in-inline? ctx)) (not (::in-table-cell ctx)) (:line-start? ctx true))
+                 nil 0]
+                (map vector inlines (concat (rest inlines) [nil])))]
     [(cond-> text (not (:in-inline? ctx)) resolve-escape-marks) footnotes']))
+
+(defn- emphasis-risky?
+  "TASK-237: whether any `:emph`/`:strong` in `inlines` (at any depth) is
+  next to another emphasis or holds one as a direct child, the only places
+  where its delimiter run can touch (or be read against) another's. Cheap and
+  over-approximate by design: `render-inlines` verifies before it believes it,
+  and prose with no emphasis in emphasis, or two emphases in a row, never
+  pays for it."
+  [inlines]
+  (let [em? (fn [x] (and (map? x) (contains? #{:emph :strong} (:t x))))
+        risky-siblings? (fn [xs]
+                          (or (some (fn [[a b]] (and (em? a) (em? b))) (partition 2 1 xs))
+                              (some (fn [x] (and (em? x) (some em? (:inlines x)))) xs)))]
+    ;; every sequence of siblings anywhere in the tree: a block's inlines, an
+    ;; emphasis's children, a citation's prefix and suffix
+    (boolean (some risky-siblings? (filter sequential? (tree-seq coll? seq inlines))))))
+
+(defn- emphasis-skeleton
+  "The emphasis nesting of `x` (inlines, or any tree holding them) alone:
+  `[[:emph [\"text\" [:strong [...]]]]]`, every other node spliced out (what
+  it holds, a link's text or a citation's affixes, kept in place). The words
+  inside an emphasis are kept, any blank as one space (a fusion like `*e**e*`
+  shows in its text too), the text outside every emphasis is not. What
+  `render-inlines` compares a re-read paragraph against: a fused or
+  mis-nested emphasis changes it, a re-spelled link or merged text does not."
+  ([x] (emphasis-skeleton x false))
+  ([x in-emphasis?]
+   (let [merge-text (fn [xs]
+                      (vec (reduce (fn [acc y] (if (and (string? y) (string? (peek acc)))
+                                                 (conj (pop acc) (str (peek acc) y))
+                                                 (conj acc y)))
+                                   [] xs)))]
+     (cond (and (map? x) (contains? #{:emph :strong} (:t x)))
+           [[(:t x) (emphasis-skeleton (:inlines x) true)]]
+           (and (map? x) in-emphasis? (contains? #{:str :space :soft-break} (:t x)))
+           [(case (:t x) :str (:text x) " ")]
+           (map? x) (merge-text (mapcat #(emphasis-skeleton (val %) in-emphasis?) (sort-by (comp str key) x)))
+           (sequential? x) (merge-text (mapcat #(emphasis-skeleton % in-emphasis?) x))
+           :else []))))
+
+(defn- reread-emphasis-skeleton
+  "The `emphasis-skeleton` of what the parser makes of the rendered inline
+  `text` as a one-paragraph document, or nil when it cannot say (it threw,
+  e.g. on a footnote marker with no definition, or the text is not one
+  paragraph)."
+  [text]
+  (try (let [blocks (:blocks (parser/parse (str (escape-line-starts (resolve-escape-marks text)) "\n")))]
+         (when (and (= 1 (count blocks)) (= :para (:t (first blocks))))
+           (emphasis-skeleton (:inlines (first blocks)))))
+       (catch Exception _ nil)))
+
+(defn- render-inlines
+  "`render-inlines-once`, plus TASK-237's care for emphasis that would touch:
+  `*e*` followed by `_e_` is two emphases, but written `*e**e*` it reads back
+  as ONE; an emphasis inside an emphasis at an edge fuses the same way.
+
+  A block's inline source with no such shape (`emphasis-risky?`, nearly
+  all of them) is rendered exactly as before, `*` and `**` throughout. A
+  risky one is rendered twice: the `*` spelling, which stays whenever the
+  parser reads it back with the emphasis nesting it had (so everything that
+  round-tripped before is byte-identical), and otherwise the `:local`
+  spelling of `choose-emphasis-delim`, which alternates in `_`. When neither
+  reads back right it throws `::unrepresentable-emphasis`. Where the parser
+  cannot be asked (`reread-emphasis-skeleton` nil) the `*` spelling stands.
+  Only the outermost call of a block decides; the nested calls follow its
+  `::emphasis-mode`."
+  [ctx inlines footnotes]
+  (if (or (and (:in-inline? ctx) (::emphasis-mode ctx)) (not (emphasis-risky? inlines)))
+    (render-inlines-once (cond-> ctx (not (::emphasis-mode ctx)) (assoc ::emphasis-mode :star)) inlines footnotes)
+    (let [star (render-inlines-once (assoc ctx ::emphasis-mode :star) inlines footnotes)
+          local (render-inlines-once (assoc ctx ::emphasis-mode :local) inlines footnotes)
+          want (emphasis-skeleton inlines)
+          have (reread-emphasis-skeleton (first star))]
+      (cond (or (nil? have) (= want have)) star
+            (and (not= (first star) (first local))
+                 (= want (reread-emphasis-skeleton (first local)))) local
+            :else (throw (ex-info (str "hdoc emitter cannot write this emphasis so that it reads back "
+                                       "with the same nesting: neither `*` nor `_` spelling of the "
+                                       "touching runs survives")
+                                  {:type ::unrepresentable-emphasis :inlines inlines}))))))
 
 ;; --- Block dispatch (TASK-88) ------------------------------------------------
 
@@ -2137,9 +2514,15 @@
   [ctx block footnotes]
   (run! (partial check-representable-nested-block! "a block quote") (:blocks block))
   (check-blocks-after-sections! "a block quote" (:blocks block))
-  (let [[inner footnotes'] (render-blocks ctx (:blocks block) footnotes)
+  (let [[inner footnotes'] (render-blocks (assoc ctx ::no-cr-indent true) (:blocks block) footnotes)
         prefixed (str/join "\n"
-                           (map (fn [line] (if (str/blank? line) ">" (str "> " line)))
+                           ;; TASK-234: a line of only spaces and tabs is a code
+                           ;; line (a fenced block's blank line keeps them), so it
+                           ;; keeps its marker's space and its text; any other
+                           ;; blank line is the bare `>`.
+                           (map (fn [line] (if (and (str/blank? line) (not (re-matches #"[ \t]+" line)))
+                                             ">"
+                                             (str "> " line)))
                                 (str/split inner #"\n" -1)))]
     [prefixed footnotes']))
 
@@ -2233,7 +2616,15 @@
                            (name (:t last-inline)) "'s group would re-parse as the heading's")
                       {:type ::unrepresentable-heading-attr-inline :level level :t (:t last-inline)})))
     (if-not (str/includes? heading-text "\n")
-      (str (apply str (repeat level "#")) " " heading-text (when (seq group) (str " " group)))
+      (str (when-let [c (->> (tree-seq coll? seq (:heading block))
+                             (filter #(and (map? %) (= :code (:t %)) (str/includes? (:text %) "\r")))
+                             first)]
+             ;; TASK-231: an ATX heading ends at a lone CR (a setext one,
+             ;; written when the heading spans lines, keeps it).
+             (throw (ex-info (str "hdoc emitter cannot represent a code span holding a carriage return"
+                                  " in a single-line heading: " (pr-str (:text c)))
+                             {:type ::unrepresentable-code-span :text (:text c) :carriage-return true})))
+           (apply str (repeat level "#")) " " heading-text (when (seq group) (str " " group)))
       (let [underline (or (setext-underlines level)
                           (unrepresentable! (str "holding a line break: "
                                                  "only a level 1 or 2 (setext) heading spans lines")))
@@ -2261,7 +2652,9 @@
   (check-nested-section-levels! block)
   (check-blocks-after-sections! (str "a level-" (:level block) " section") (:blocks block))
   (let [[heading-text footnotes'] (render-inlines ctx (:heading block) footnotes)
-        heading-line (render-heading block heading-text (attr-group (:attr block)))
+        group (attr-group (:attr block))
+        _ (check-group-fits! "a heading's attribute group" group #"[\n\r]" "a line break")
+        heading-line (render-heading block heading-text group)
         tight? (::tight-list-item ctx)
         [body footnotes''] (if tight?
                              (render-tight-section-body ctx block footnotes')
@@ -2369,6 +2762,10 @@
   line, and the contained 4-space indentation is stripped exactly."
   [ctx block footnotes]
   (let [group (attr-group (:attr block))
+        _ (check-group-fits! "a display-math closing fence" group line-terminators "a line terminator")
+        ;; `math-fence-line-re` reads its group as `{[^}]*}`.
+        _ (check-group-fits! "a display-math closing fence"
+                             (if (seq group) (subs group 0 (dec (count group))) "") #"\}" "a `}`")
         tex (:tex block)
         closing (str "$$" (when (seq group) (str " " group)))
         tex-lines (str/split tex #"\n" -1)
@@ -2625,9 +3022,12 @@
   THE CONTRACT this emitter runs under)."
   [ctx block footnotes]
   (if (bang-spellable? block)
-    [(str bang-directive-marker (:name block) (attr-group (:attr block))) footnotes]
+    (let [group (attr-group (:attr block))]
+      (check-group-fits! "a `!name{...}` line" group line-terminators "a line terminator")
+      [(str bang-directive-marker (:name block) group) footnotes])
     (let [_ (check-blocks-after-sections! "a directive" (:blocks block))
           header (directive-header-text (:name block) (:attr block))
+          _ (check-group-fits! "a `:::` fence header" header line-terminators "a line terminator")
           [body footnotes'] (render-blocks ctx (:blocks block) footnotes)
           ;; TASK-173: the body's last chunk ends at the closing fence, so
           ;; a definition for a marker in it is written before that fence.
@@ -2705,7 +3105,10 @@
 (defn- render-table-cell
   "Renders Cell `cell` to `[text footnotes']`: its own single `:para`'s
   Inlines (`check-simple-table-cell!` already confirmed there is exactly
-  one), with every literal `|` backslash-escaped -- the one character
+  one), with every literal `|` backslash-escaped except one inside an
+  attribute group (TASK-221: the parser splits a row group-aware, and
+  reads `\\|` there as a backslash; `attr-group` marks it) or a code span
+  (TASK-225: likewise code-span-aware; the `:code` renderer marks it) -- the one character
   this namespace escapes OUTSIDE `always-escaped-chars`, since it is only
   hazardous inside a table row and nowhere else `escape-text` runs
   (confirmed at a REPL: `\\|` inside a pipe-table cell round-trips to a
@@ -2723,7 +3126,12 @@
               (str "hdoc emitter cannot represent a table cell spanning more than one physical line: "
                    (pr-str (without-marks text)))
               {:type ::unrepresentable-table-cell :cell cell})))
-    [(str/replace text "|" "\\|") footnotes']))
+    ;; TASK-221: a `|` an attribute group marked (`attr-group`) stays bare,
+    ;; since the parser reads a row group-aware; every other one is escaped.
+    [(-> text
+         (str/replace #"(?<!\u0000)\|" "\\\\|")
+         (str/replace (str escape-mark "|") "|"))
+     footnotes']))
 
 (defn- render-table-row
   "Renders Row `row` to `[cell-texts footnotes']`, `render-table-cell`
@@ -3133,6 +3541,7 @@
   (run! (partial check-representable-nested-block! "a list item") blocks)
   (check-blocks-after-sections! "a list item" blocks)
   (let [width (count marker)
+        cr? (not (::no-cr-indent ctx))
         alternates (alternate-list-markers blocks)
         ;; TASK-180: a :section's own Blocks are this item's direct children too.
         ctx (cond-> ctx tight? (assoc ::tight-list-item true))]
@@ -3144,10 +3553,11 @@
                                                      (and tight? (pos? idx)) (tight-continuation-ctx block))
                                                    block footnotes)]
          (cond
-           (zero? idx) [(indent-continuation-lines width block-text) footnotes']
-           (not tight?) [(str text "\n\n" (indent-lines width block-text)) footnotes']
+           (zero? idx) [(indent-continuation-lines width block-text cr?) footnotes']
+           (not tight?) [(str text "\n\n" (indent-lines width block-text cr?)) footnotes']
            :else [(str text "\n" (indent-lines width (close-open-paragraph
-                                                      idx (nth blocks (dec idx)) block block-text nil)))
+                                                      idx (nth blocks (dec idx)) block block-text nil)
+                                               cr?))
                   footnotes'])))
      ["" footnotes]
      (vec blocks))))
@@ -3203,6 +3613,23 @@
                                    [(conj rendered [marker item-text]) footnotes']))
                                [[] footnotes]
                                (vec items))
+        ;; TASK-234: a loose list of one item holding one paragraph has no blank
+        ;; line to be loose by; the parser makes it so only when a footnote
+        ;; definition sits in the item after a blank line. So the definitions of
+        ;; the notes in that paragraph are written there, not at the chunk's end.
+        [rendered footnotes'] (if (and (not tight) (= 1 (count items)) (= 1 (count (first items)))
+                                       ;; TASK-235: or one nested list, whose notes the outer
+                                       ;; item defines the same way.
+                                       (#{:para :list} (:t (ffirst items)))
+                                       (seq (remove :written? (drop (count footnotes) footnotes'))))
+                                (let [[marker item-text] (first rendered)
+                                      mine (remove :written? (drop (count footnotes) footnotes'))
+                                      defs (str/join "\n\n" (map (fn [{:keys [number text]}] (str "[^" number "]: " text)) mine))
+                                      width (count marker)]
+                                  [[[marker (str item-text "\n\n" (indent-lines width defs (not (::no-cr-indent ctx))))]]
+                                   (into (subvec footnotes' 0 (count footnotes))
+                                         (map #(assoc % :written? true)) (drop (count footnotes) footnotes'))])
+                                [rendered footnotes'])
         ;; TASK-179: a bullet item line that reads as a thematic break makes the
         ;; whole list `+ ` (same width, so the item text stands as rendered).
         rendered (if (and (not ordered)
@@ -3266,7 +3693,7 @@
                ;; TASK-192: a footnote's Blocks are not the link text its
                ;; marker sits in (nor, TASK-198, its `@`s bracket content,
                ;; nor, TASK-199, citation text).
-               (dissoc ::in-link-text ::in-table-cell ::at-marks ::in-cite-affix)
+               (dissoc ::in-link-text ::in-table-cell ::at-marks ::in-cite-affix ::emphasis-mode)
                ;; TASK-195: whether this Block is written at column 0 of a
                ;; chunk sequence or inside a container's prefix.
                (assoc ::contained? (not (:chunk-level? ctx))))

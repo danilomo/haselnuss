@@ -3840,8 +3840,14 @@
            nil)
          parsed)
        (catch clojure.lang.ExceptionInfo e
-         (throw (ex-info (ex-message e)
-                         (assoc (ex-data e) :group-text group :token-offset (inc start))
+         (throw (ex-info (if (and (= error-type ::malformed-attributes)
+                                  (= ::malformed-directive (:type (ex-data e))))
+                           ;; A display math group is not a directive header
+                           ;; (TASK-220): `directive-header-token`'s wording
+                           ;; would name the wrong construct.
+                           "malformed attribute group: token is not #id, .class, or key=val"
+                           (ex-message e))
+                         (assoc (ex-data e) :type error-type :group-text group :token-offset (inc start))
                          (ex-cause e))))))
 
 (defn- parse-directive-header
@@ -4603,7 +4609,16 @@
 
                (re-matches math-fence-line-re line)
                (if-let [close-i (math-fence-bounded-close-index lines i n)]
-                 (let [close-line (nth lines close-i)
+                 (let [open-group (second (re-matches math-fence-line-re line))
+                       _ (when open-group
+                           ;; The group belongs on the closing line (sec5.7);
+                           ;; dropping it here would lose it silently (TASK-220).
+                           (at-line (+ base i 1) line
+                                    #(throw (ex-info (str "a display math block's attribute group goes on its "
+                                                          "closing `$$` line, not the opening one: move `"
+                                                          open-group "` there")
+                                                     {:type ::malformed-attributes :text open-group}))))
+                       close-line (nth lines close-i)
                        [_ group] (re-matches math-fence-line-re close-line)
                        tex (str/join "\n" (subvec lines (inc i) close-i))
                        ;; The group is on the CLOSING line, so that is
@@ -4887,29 +4902,16 @@
    "chapter" :chapter
    "part" :part})
 
-(defn- coerce-top-level-division
-  "A front-matter `topLevelDivision` scalar as its Meta keyword
-  (`top-level-divisions`), throwing `ex-info` (`:type
-  ::unknown-top-level-division`) for anything else.
-
-  A hard error, not a warning-and-default, because the default is the
-  thing being overridden: a document that writes `topLevelDivision:
-  chapters` (or `Chapter`, or `book`) and is silently given `:section`
-  loses every `\\chapter` in the output and renumbers every figure in
-  it, with nothing said. This codebase's established convention is that
-  a construct with no representation stops the build naming itself
-  (`haselnuss.lower`'s own `::no-representation`) rather than being
-  quietly dropped; a front-matter value with no meaning is the same
-  case. Only this one key is validated -- an unrecognized *key* is still
-  ignored, since Meta is open by design (sec4.2) and ignoring an unknown
-  key is how a document stays forward-compatible."
-  [v]
-  (let [text (str/trim (str v))]
-    (or (get top-level-divisions text)
-        (throw (ex-info (str "unknown topLevelDivision " (pr-str text)
-                             " (expected one of: "
-                             (str/join ", " (sort (keys top-level-divisions))) ")")
-                        {:type ::unknown-top-level-division :text text})))))
+;; An unknown topLevelDivision is a hard error, not a warning-and-default
+;; (see `front-matter-top-level-division`), because the default is the
+;; thing being overridden: a document that writes `topLevelDivision:
+;; chapters` (or `Chapter`, or `book`) and is silently given `:section`
+;; loses every `\chapter` in the output and renumbers every figure in it,
+;; with nothing said. This codebase's convention is that a construct with
+;; no representation stops the build naming itself
+;; (`haselnuss.lower`'s `::no-representation`); a front-matter value with
+;; no meaning is the same case. An unrecognized *key* is still ignored,
+;; since Meta is open by design (sec4.2).
 
 (defn- yaml-kind
   "How a front-matter author would name the YAML value `data` -- the whole
@@ -5008,6 +5010,53 @@
       (or (nil? v) omit-non-path?) m
       :else (bibliography-not-a-path! yaml-text v source))))
 
+(defn- located-front-matter-error!
+  "Throws `error-type` as the located error for the top-level front-matter key
+  `k` (a string): `:source-line` (and `:source-file` when `source` is
+  given) in the data merged with `extra`, `path:line: ` ahead of
+  `message` when there is a path (TASK-224; same shape as TASK-209's)."
+  [yaml-text k source error-type message extra]
+  (let [line (yaml-key-line yaml-text k)]
+    (throw (ex-info (if source (str source ":" line ": " message) message)
+                    (cond-> (assoc extra :type error-type :source-line line)
+                      source (assoc :source-file source))))))
+
+(defn- front-matter-string
+  "Meta `cond->` step for the front-matter field `k` (a keyword) that must
+  be a string, stored as `meta-key` (TASK-224: `str` used to turn a list
+  into `clojure.lang.LazySeq@...` and a number into `\"42\"`). A string is
+  kept as written; a YAML null leaves the key out; anything else is a
+  located `::front-matter-not-a-string` error, or, with `omit?`, left out
+  of Meta for a caller that reports it itself."
+  [m k meta-key data yaml-text source omit?]
+  (let [v (get data k)]
+    (cond
+      (string? v) (assoc m meta-key v)
+      (or (nil? v) omit?) m
+      :else (located-front-matter-error!
+             yaml-text (name k) source ::front-matter-not-a-string
+             (str "front-matter " (name k) " must be a string, but this one is " (yaml-kind v)
+                  (when (or (number? v) (boolean? v) (inst? v))
+                    "; quote it to use it as a string"))
+             {:key k :value v}))))
+
+(defn- front-matter-top-level-division
+  "Meta `cond->` step for the front-matter `topLevelDivision`: its Meta
+  keyword, or an unknown value's located `::unknown-top-level-division`
+  error (TASK-224: at the key's line, `path:L:`-prefixed), or, with
+  `omit?`, left out of Meta."
+  [m data yaml-text source omit?]
+  (let [v (:topLevelDivision data)
+        text (str/trim (str v))]
+    (cond
+      (get top-level-divisions text) (assoc m :top-level-division (get top-level-divisions text))
+      omit? m
+      :else (located-front-matter-error!
+             yaml-text "topLevelDivision" source ::unknown-top-level-division
+             (str "unknown topLevelDivision " (pr-str text)
+                  " (expected one of: " (str/join ", " (sort (keys top-level-divisions))) ")")
+             {:text text}))))
+
 (defn- parse-front-matter
   "Parses `yaml-text` (the raw front-matter block, or nil if there was
   none) into a `haselnuss.ast` Meta map, mapping exactly the fields AC #1
@@ -5032,8 +5081,8 @@
 
   A `bibliography` that is not a path is `front-matter-bibliography`'s
   located error (TASK-209) unless `omit-non-path-bibliography?`."
-  ([yaml-text] (parse-front-matter yaml-text nil false))
-  ([yaml-text source omit-non-path-bibliography?]
+  ([yaml-text] (parse-front-matter yaml-text nil {}))
+  ([yaml-text source {:keys [omit-non-path-bibliography? omit-invalid-front-matter?]}]
    (if (str/blank? yaml-text)
      {}
      (let [data (try (yaml/parse-string yaml-text)
@@ -5054,11 +5103,14 @@
          (assoc :authors (coerce-authors (or (:authors data) (:author data))))
          (contains? data :date) (assoc :date (coerce-date (:date data)))
          (contains? data :bibliography)
-         (front-matter-bibliography data yaml-text source omit-non-path-bibliography?)
-         (contains? data :cslStyle) (assoc :csl-style (str (:cslStyle data)))
-         (contains? data :lang) (assoc :lang (str (:lang data)))
+         (front-matter-bibliography data yaml-text source
+                                    (or omit-non-path-bibliography? omit-invalid-front-matter?))
+         (contains? data :cslStyle)
+         (front-matter-string :cslStyle :csl-style data yaml-text source omit-invalid-front-matter?)
+         (contains? data :lang)
+         (front-matter-string :lang :lang data yaml-text source omit-invalid-front-matter?)
          (contains? data :topLevelDivision)
-         (assoc :top-level-division (coerce-top-level-division (:topLevelDivision data))))))))
+         (front-matter-top-level-division data yaml-text source omit-invalid-front-matter?))))))
 
 ;; --- Entry point --------------------------------------------------------------
 
@@ -5075,11 +5127,12 @@
 
   `opts` takes `:source` as `parse` does (TASK-144): a YAML error then
   names `path:line:`. It also takes `parse`'s
-  `:omit-non-path-bibliography?`."
+  `:omit-non-path-bibliography?` and `:omit-invalid-front-matter?`."
   ([s] (front-matter s {}))
-  ([s {:keys [source omit-non-path-bibliography?]}]
+  ([s {:keys [source omit-non-path-bibliography? omit-invalid-front-matter?]}]
    (parse-front-matter (first (split-front-matter (normalize-source s))) source
-                       omit-non-path-bibliography?)))
+                       {:omit-non-path-bibliography? omit-non-path-bibliography?
+                        :omit-invalid-front-matter? omit-invalid-front-matter?})))
 
 (defn parse
   "Parses Haselnuss `.hdoc` source `s` into a `haselnuss.ast/Document`.
@@ -5113,7 +5166,11 @@
   `:omit-non-path-bibliography?` is true: then it is left out of Meta, for
   a caller that reports the mistake itself and must still parse the
   document (`haselnuss.library.filesystem`, whose books warn rather than
-  fail a host build).
+  fail a host build). A `cslStyle` or `lang` that is not a string
+  (`::front-matter-not-a-string`) and an unknown `topLevelDivision`
+  (`::unknown-top-level-division`) are located the same way (TASK-224),
+  and `:omit-invalid-front-matter?` leaves those out of Meta too (it
+  implies `:omit-non-path-bibliography?`).
 
   `s` is `normalize-source`d first (TASK-162): CRLF line endings and a
   leading UTF-8 byte-order mark parse exactly as their LF, BOM-less
@@ -5126,7 +5183,7 @@
   caller error, since every path above is expected to always produce a
   conforming Document; this is a safety net, not routine validation."
   ([s] (parse s {}))
-  ([s {:keys [kinds cite-keys source omit-non-path-bibliography?]}]
+  ([s {:keys [kinds cite-keys source omit-non-path-bibliography? omit-invalid-front-matter?]}]
    ;; Both vocabularies are matched against substrings of the source, so
    ;; a set of keywords -- the obvious mistake, since a lexicon is keyed
    ;; by keyword -- would match nothing and silently turn every
@@ -5152,7 +5209,9 @@
        (binding [*body-line-offset* fm-lines]
          (try
            (let [[segments] (parse-directive-region (annotate-fences (str/split body #"\n" -1)) 0 nil nil)
-                 document {:meta (parse-front-matter yaml-text source omit-non-path-bibliography?)
+                 document {:meta (parse-front-matter yaml-text source
+                                                     {:omit-non-path-bibliography? omit-non-path-bibliography?
+                                                      :omit-invalid-front-matter? omit-invalid-front-matter?})
                            :blocks (segments->blocks segments)}]
              (when-not (ast/valid? ast/Document document)
                (throw (ex-info "parser produced an AST that does not conform to haselnuss.ast/Document"

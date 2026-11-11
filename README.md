@@ -995,12 +995,12 @@ no document can:
 Without it the shelf's books are missing and a reference to one says why
 (`scripts-disabled`).
 
-A worked example is committed as a test fixture: `test/fixtures/libraries/bible/` is a
-library whose `nt/shelf.clj` serves a small sample of a Portuguese Almeida text, and
-`test/fixtures/catechism/` holds a cut-down Heidelberg catechism that quotes its proof
-texts from it, with the `libraries.yaml` that enables the script. The sample's licence is
-unverified. Its upstream source withdrew the text for that reason, so do not reuse it; the
-fixture's own README has the details.
+A worked example is committed beside the example documents: `examples/libraries/bible/`
+is a library whose `blivre/shelf.clj` serves a subset of the Bíblia Livre (BLIVRE), a
+Portuguese Bible under CC BY 3.0 Brasil -- exactly the verses
+`examples/catecismo-heidelberg.hdoc` cites -- and that document quotes every proof text
+from it, with `examples/libraries/libraries.yaml` enabling the script. The library's own
+README records the edition, the licence evidence, the attribution and what was changed.
 
 ```
 :::{small-collapsable summary="Romanos 14:8" label="(2)"}
@@ -1008,13 +1008,9 @@ fixture's own README has the details.
 :::
 ```
 
-```
-mkdir -p examples/out
-lein run -- --libraries test/fixtures/catechism/libraries.yaml \
-  test/fixtures/catechism/catecismo-domingo-1.hdoc --output examples/out/catecismo.html
-```
+(see "The Heidelberg catechism example" below for the build command).
 
-Each quote renders as a `<blockquote class="book-quote" data-source="bible:nt/romanos#14:8">`
+Each quote renders as a `<blockquote class="book-quote" data-source="bible:blivre/romanos#14:8">`
 with a "— Romanos 14:8" caption in HTML, and as a `quote` environment closed by that
 source line in LaTeX.
 
@@ -1677,6 +1673,28 @@ with a `.proof` class stays a quote. Props are written as HTML attributes
 this example is for. A native-mode build works too: it delegates the reference list to
 BibTeX, and Haselnuss generates the `.bib` BibTeX needs from the same CSL-JSON the resolver
 reads — see [Bibliographies](#bibliographies).
+
+### The Heidelberg catechism example
+
+`examples/catecismo-heidelberg.hdoc` has about 1,400 Bible proof texts, none of them
+copied into the file: each is a `!quote bible:<book>#<passage>` line, resolved from the
+library in `examples/libraries/` (the Bíblia Livre, CC BY 3.0 Brasil; see that folder's
+`bible/README.md` for edition, licence evidence and attribution). The library needs
+`scripts: true`, which `examples/libraries/libraries.yaml` sets. Build into `out/` as above:
+
+```sh
+cd examples
+java -jar ../target/uberjar/haselnuss.jar catecismo-heidelberg.hdoc \
+  --libraries libraries/libraries.yaml --output out/catecismo-heidelberg.html
+java -jar ../target/uberjar/haselnuss.jar catecismo-heidelberg.hdoc \
+  --libraries libraries/libraries.yaml --target latex --computed-numbers \
+  --output out/catecismo-heidelberg.tex
+pdflatex -output-directory=out out/catecismo-heidelberg.tex   # twice
+pdflatex -output-directory=out out/catecismo-heidelberg.tex
+```
+
+The PDF is about 240 pages. The library folder is whitelisted in `examples/.gitignore`
+(`!libraries/**`), since that file otherwise ignores every subdirectory.
 
 ## Requirements
 

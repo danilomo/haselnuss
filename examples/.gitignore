@@ -30,3 +30,9 @@
 !*.json
 !*.clj
 !catkins.png
+# The example Bible library (TASK-212): a library folder with its own
+# libraries.yaml, shelf.clj, JSON data and README, all sources, so the whole
+# subtree is let back in (the `*` above would otherwise hide every file and
+# subdirectory in it). examples/out/ stays ignored.
+!libraries/
+!libraries/**

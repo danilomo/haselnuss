@@ -1,0 +1,11 @@
+# The library directory of examples/catecismo-heidelberg.hdoc (TASK-159,
+# TASK-212). A relative path resolves against this file's own folder.
+# `scripts: true` is what lets the Bible library's generated shelf
+# (bible/blivre/shelf.clj) run at all.
+#
+#   java -jar target/uberjar/haselnuss.jar examples/catecismo-heidelberg.hdoc \
+#     --libraries examples/libraries/libraries.yaml --output examples/out/catecismo-heidelberg.html
+- name: bible
+  type: filesystem
+  path: bible
+  scripts: true

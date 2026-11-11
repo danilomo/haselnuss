@@ -219,10 +219,7 @@
                ;; ... and its book that quotes (TASK-154)
                "quoting.hdoc"
                ;; test/fixtures/libraries/generated/, beside a generated shelf (TASK-158)
-               "salmos-notas.hdoc"
-               ;; test/fixtures/catechism/, the excerpt that quotes its
-               ;; proof texts with !quote inside small-collapsable (TASK-159)
-               "catecismo-domingo-1.hdoc"}
+               "salmos-notas.hdoc"}
              names)))))
 
 (deftest book-refs-fixture-test

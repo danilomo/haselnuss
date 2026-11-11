@@ -101,6 +101,28 @@
     (doseq [s ["a\n\n- $$ {bare}\n  x\n  $$\n" "a\n\n> $$ {bare}\n> x\n> $$\n"]]
       (is (str/starts-with? (ex-message (parse-error s {:source "d"})) "d:3:6: attribute group `{bare}`")
           (pr-str s))))
+  (testing "TASK-220 AC #1: a top-level opening line's group is refused, located at the group"
+    (doseq [[s expected] [["a\n\n$$ {#e}\nx\n$$\n" "d:3:4: a display math block's attribute group goes on its closing `$$` line"]
+                          ["a\n\n$$ {bare}\nx\n$$\n" "d:3:4: a display math block's attribute group goes on its closing `$$` line"]
+                          ["a\n\n$$ {#e}\nx\n$$ {#f}\n" "d:3:4: "]
+                          ["a\n\n:::{d}\n$$ {#e}\nx\n$$\n:::\n" "d:4:4: "]]
+            s' [s (str/replace s "\n" "\r\n")]]
+      (let [e (parse-error s' {:source "d"})]
+        (is (str/starts-with? (ex-message e) expected) (pr-str s'))
+        (is (str/includes? (ex-message e) "{") (pr-str s')))))
+  (testing "TASK-220 AC #1: an unterminated `$$ {..}` line stays prose, so it keeps the orphan-group error"
+    (is (str/starts-with? (ex-message (parse-error "a\n\n$$ {#e}\nx\n" {:source "d"}))
+                          "d:3:4: attribute group `{#e}`")))
+  (testing "TASK-220 AC #2: a malformed math group is worded as math, not as a directive"
+    (doseq [s ["a\n\n$$ x $$ {a{b}\n" "a\n\n$$ x $$ {é bare}\n" "a\n\n$$\nx\n$$ {a{b}\n" "a\n\n$$\nx\n$$ {é}\n"]]
+      (let [e (parse-error s {:source "d"})]
+        (is (str/includes? (ex-message e) "malformed attribute group: token is not #id, .class, or key=val") (pr-str s))
+        (is (not (str/includes? (ex-message e) "directive")) (pr-str s))))
+    (is (str/starts-with? (ex-message (parse-error "a\n\n$$\nx\n$$ {#a é}\n" {:source "d"}))
+                          "d:5:8: malformed attribute group: token is not"))
+    (testing "a directive header keeps its own wording"
+      (is (str/includes? (ex-message (parse-error "a\n\n:::{é}\n:::\n" {:source "d"}))
+                         "malformed directive header"))))
   (testing "an unterminated fence names the opening line"
     (is (= 3 (:source-line (ex-data (parse-error "a\n\n:::{x}\nzz\n" {:source "d"}))))))
   (testing "TASK-162 AC #4: CRLF and a BOM keep line and column"
@@ -264,6 +286,47 @@
         (is (= 1 status))
         (is (str/includes? err (str (file "bad.hdoc") ":3: front-matter bibliography must be a path"))
             err)))))
+
+(deftest front-matter-scalar-fields-test
+  (testing "an unknown topLevelDivision is located at its key (TASK-224)"
+    (doseq [[source line] [["---\ntopLevelDivision: chapters\n---\n" 2]
+                           ["---\ntitle: T\nlang: de\ntopLevelDivision: book\n---\n" 4]
+                           ["---\ntopLevelDivision:\n---\n" 2]
+                           ["---\ntopLevelDivision: [a]\n---\n" 2]
+                           ["﻿---\r\n# c\r\ntopLevelDivision: Chapter\r\n---\r\n" 3]]
+            :let [e (parse-error source {:source "d.hdoc"})]]
+      (is (= :haselnuss.parser/unknown-top-level-division (:type (ex-data e))) source)
+      (is (= line (:source-line (ex-data e))) source)
+      (is (= "d.hdoc" (:source-file (ex-data e))) source)
+      (is (str/starts-with? (ex-message e) (str "d.hdoc:" line ": unknown topLevelDivision")) source))
+    (let [e (parse-error "---\ntopLevelDivision: x\n---\n" {})]
+      (is (= 2 (:source-line (ex-data e))))
+      (is (not (contains? (ex-data e) :source-file)))
+      (is (str/starts-with? (ex-message e) "unknown topLevelDivision"))))
+  (testing "a non-string cslStyle or lang is a located error saying what it must be"
+    (doseq [[source line field kind] [["---\ncslStyle: [a]\n---\n" 2 "cslStyle" "a list"]
+                                      ["---\nlang: 42\n---\n" 2 "lang" "a number"]
+                                      ["---\ntitle: T\nlang: no\n---\n" 3 "lang" "a boolean"]
+                                      ["---\ncslStyle: {a: b}\n---\n" 2 "cslStyle" "a map"]
+                                      ["---\nlang: de\nlang: [x]\n---\n" 3 "lang" "a list"]]
+            :let [e (parse-error source {:source "d.hdoc"})]]
+      (is (= :haselnuss.parser/front-matter-not-a-string (:type (ex-data e))) source)
+      (is (= line (:source-line (ex-data e))) source)
+      (is (= "d.hdoc" (:source-file (ex-data e))) source)
+      (is (str/starts-with? (ex-message e)
+                            (str "d.hdoc:" line ": front-matter " field " must be a string, but this one is " kind))
+          source)
+      (is (not (str/includes? (ex-message e) "LazySeq")) source))
+    (is (str/ends-with? (ex-message (parse-error "---\nlang: 42\n---\n" {}))
+                        "a number; quote it to use it as a string")))
+  (testing "string values behave as before; null leaves the key out"
+    (is (= {:csl-style "apa" :lang "42"}
+           (parser/front-matter "---\ncslStyle: apa\nlang: '42'\n---\n" {})))
+    (is (= {} (parser/front-matter "---\ncslStyle:\nlang: ~\n---\n" {}))))
+  (testing ":omit-invalid-front-matter? leaves the bad fields (and a bad bibliography) out"
+    (let [source "---\nlang: [x]\ncslStyle: 1\ntopLevelDivision: x\nbibliography: [a]\ntitle: T\n---\n"]
+      (is (= [:title] (keys (parser/front-matter source {:omit-invalid-front-matter? true}))))
+      (is (= [:title] (keys (:meta (parser/parse source {:omit-invalid-front-matter? true}))))))))
 
 (deftest front-matter-not-a-map-test
   (testing "parse: YAML that is not a map is a located error naming what it is (TASK-178)"
