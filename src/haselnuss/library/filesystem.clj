@@ -93,7 +93,9 @@
   (doc-10). The include warnings that pass
   produces (`:unreadable-include`, `:include-cycle`) have no place in a
   Document; `include-warnings` hands them back for the caller to report.
-  Filesystem books are not Locatable in v1.
+  Filesystem books are not Locatable in v1. `source-files` lists every
+  file the load read -- entry file, bibliography and includes -- for the reference
+  graph's `:files` (TASK-240).
 
   The same load reads the book's own bibliography -- the file its front
   matter's `bibliography` names, relative to its entry file, as a
@@ -121,6 +123,8 @@
   both canonical ids (`:books`) and both paths on disk (`:paths`), and
   `find-book` on that slug answers `:ambiguous-book` -- whatever shelf a
   reference wrote, since `find-book` is given the slug alone.
+  `haselnuss.library/listed-books` still hands out both, in listing
+  order, for the reference graph's scan (TASK-241).
 
   ## Failure
 
@@ -144,6 +148,7 @@
             [clojure.string :as str]
             [haselnuss.book-ref :as book-ref]
             [haselnuss.library :as library]
+            [haselnuss.library.digest :as digest]
             [haselnuss.library.generated :as generated]
             [haselnuss.parser :as parser]
             [haselnuss.resolver :as resolver])
@@ -298,8 +303,9 @@
   "`[bibliography warnings]` for the book `id`, whose entry file `file`
   declares `declared`: `{}` and no warning when it declares none, the
   loaded CSL-JSON map when it loads, else `{}` and one
-  `:unreadable-bibliography` warning."
-  [id ^File file declared]
+  `:unreadable-bibliography` warning. `read-text` reads a file's text
+  (`haselnuss.library.digest/reader`)."
+  [id ^File file declared read-text]
   (let [unreadable (fn [shown reason]
                      [{} [{:type :unreadable-bibliography
                            :book (canonical id)
@@ -318,7 +324,7 @@
       :else
       (if-let [bib-file (bibliography-file file declared)]
         (try
-          [(resolver/load-bibliography (str bib-file)) []]
+          [(resolver/parse-bibliography (read-text (str bib-file))) []]
           (catch Throwable t (unreadable (str bib-file) (throwable-message t))))
         [{} []]))))
 
@@ -333,18 +339,34 @@
   would use (`haselnuss.cli`), except that the kinds are the referencing
   build's. A bibliography that cannot be read leaves `:cite-keys` out
   (the parser's shape heuristic) rather than turning every citation into
-  prose. Without `kinds` the parse is the lenient one, no vocabulary."
-  [id ^File file parse kinds]
-  (let [fail (fn [what reason]
+  prose. Without `kinds` the parse is the lenient one, no vocabulary.
+
+  `transform`, when given (`filesystem-library`'s `:transform`), rewrites
+  the entry file's parsed document before its includes are expanded; its
+  diagnostics join the bibliography warnings, each tagged with `:book`
+  and the entry `:file`."
+  [id ^File file parse kinds transform]
+  (let [;; Every file this load reads as part of the book -- the entry file,
+        ;; then each `!include` as it is attempted (a missing one too: the
+        ;; book's output changes when it appears) -- for `source-files`.
+        read-files (volatile! [(str file)])
+        ;; TASK-244: the digest of the bytes each of those reads got, so the
+        ;; reference graph hashes what the book was built from
+        ;; (`source-digests`).
+        digests (volatile! {})
+        read-text (digest/reader digests "UTF-8")
+        fail (fn [what reason]
                {:document {:type :book-failed
                            :book (canonical id)
                            :file (str file)
                            :message (str "book " (canonical id) " (" file ") " what ": " reason)}
                 :warnings []
                 :bibliography {}
-                :bibliography-warnings []})]
+                :bibliography-warnings []
+                :files @read-files
+                :digests @digests})]
     (try
-      (let [source (slurp file :encoding "UTF-8")
+      (let [source (read-text file)
             ;; Parsing the front matter first reports malformed YAML the
             ;; way `parse` would. A `bibliography` that is not a path is
             ;; the parser's own located error (TASK-209); here it is
@@ -363,7 +385,12 @@
                               (:bibliography (parser/front-matter
                                               source {:source (str file) :omit-invalid-front-matter? true}))
                               (throw e))))
-            [bibliography bib-warnings] (load-bibliography id file declared)
+            ;; The bibliography is part of the book too: its citations
+            ;; format from it. Listed even when it cannot be read, as a
+            ;; missing include is, so its appearing changes the book.
+            _ (when-let [bib-file (when (string? declared) (bibliography-file file declared))]
+                (vswap! read-files conj (str bib-file)))
+            [bibliography bib-warnings] (load-bibliography id file declared read-text)
             ;; TASK-224: a `cslStyle`/`lang` that is not a string or an
             ;; unknown `topLevelDivision` is likewise the parser's located
             ;; error for a standalone build, one warning here (the first
@@ -385,16 +412,30 @@
                          kinds (assoc :kinds kinds)
                          (and kinds (empty? bib-warnings)) (assoc :cite-keys (set (keys bibliography))))
             parse-text (fn [text ^File f] (parse text (assoc vocabulary :source (str f))))
-            parse-file (fn [^File f] (parse-text (slurp f :encoding "UTF-8") f))
+            parse-file (fn [^File f]
+                         (vswap! read-files conj (str f))
+                         (parse-text (read-text f) f))
+            ;; TASK-242: `--check --transform` rewrites the entry file's
+            ;; document where a build of the book would -- right after
+            ;; parsing it, before its `!include`s are expanded.
+            {entry-document :document transform-warnings :diagnostics}
+            (if transform
+              (transform (parse-text source file))
+              {:document (parse-text source file) :diagnostics []})
             {:keys [document warnings]}
-            (resolver/expand-includes (parse-text source file)
+            (resolver/expand-includes entry-document
                                       {:base-dir (.getParentFile file)
                                        :source-path (str file)
                                        :load parse-file})]
         {:document document
          :warnings (vec warnings)
          :bibliography bibliography
-         :bibliography-warnings (into bib-warnings fm-warnings)})
+         :bibliography-warnings (-> (vec bib-warnings)
+                                    (into fm-warnings)
+                                    (into (map #(merge {:book (canonical id) :file (str file)} %))
+                                          transform-warnings))
+         :files @read-files
+         :digests @digests})
       (catch java.io.IOException e
         (fail "cannot be read" (throwable-message e)))
       (catch Throwable t
@@ -431,7 +472,9 @@
 (defn load-warnings
   "Every warning loading a filesystem `book` produced: its
   `include-warnings`, then an `:unreadable-bibliography` when the
-  bibliography its front matter declares cannot be read. Loads the
+  bibliography its front matter declares cannot be read, then any
+  invalid front-matter field and, with `:transform`, the transform's own
+  diagnostics. Loads the
   document if it was not loaded yet (the load is cached). Empty for any
   other value."
   [book]
@@ -439,6 +482,31 @@
     (let [{:keys [warnings bibliography-warnings]} @(:loaded book)]
       (into (vec warnings) bibliography-warnings))
     []))
+
+(defn source-files
+  "The paths (strings, as the load made them: absolute, not canonical) of
+  every file a filesystem `book`'s document load read as part of the
+  book: its entry file first, then the bibliography its front matter
+  names (when it names one as a path, whether or not it can be read),
+  then each `!include`d file in the order the expansion reached it -- one
+  that could not be read included, one an include cycle skipped not. Only
+  the entry file's front matter names the bibliography: an included
+  file's front matter is not part of the book. Loads the document if it
+  was not loaded yet (the load is cached); when the load failed, the files
+  it had reached. Empty for any other value."
+  [book]
+  (if (filesystem-book? book) (vec (distinct (:files @(:loaded book)))) []))
+
+(defn source-digests
+  "path -> digest (`haselnuss.library.digest`) of the bytes the document
+  load of a filesystem `book` actually read, keyed by the same path
+  strings as `source-files`; a file it tried and could not read has an
+  `unreadable` digest. TASK-244: the reference graph's `:hash` is taken
+  from these rather than from a second read, so an edit landing during
+  a scan never pairs the new bytes' hash with the old content. Loads the
+  document if it was not loaded yet; `{}` for any other value."
+  [book]
+  (if (filesystem-book? book) (:digests @(:loaded book) {}) {}))
 
 (defn bibliography
   "The CSL-JSON bibliography (as `haselnuss.resolver/load-bibliography`
@@ -453,7 +521,7 @@
 ;; --- scanning ----------------------------------------------------------------
 
 (def ^:private name-rule
-  "the name must be lowercase [a-z0-9-] and start with a letter or digit")
+  "name must be lowercase [a-z0-9-] and start with a letter or digit")
 
 (defn- invalid-book-name
   [lib-name ^File f reason]
@@ -505,14 +573,14 @@
   file `file`, with the `:invalid-front-matter` diagnostics listing it
   found. Front matter that cannot be read at all lists the book under its
   slug; `document` then parses the file itself and reports what it finds."
-  [lib-name shelf slug ^File path ^File file {:keys [parse open-reader kinds]}]
+  [lib-name shelf slug ^File path ^File file {:keys [parse open-reader kinds transform]}]
   (let [id (book-ref/book-id lib-name shelf slug)
         {:keys [fields problems]}
         (try (read-entry-fields file open-reader)
              (catch Throwable t
                {:fields {} :problems [(field-problem nil (throwable-message t))]}))]
     {:book (->FileSystemBook (library/book-entry-value id fields) (str path) file
-                             (delay (load-book id file parse kinds)))
+                             (delay (load-book id file parse kinds transform)))
      :diagnostics (mapv #(invalid-front-matter lib-name id file %) problems)}))
 
 (defn- generated-shelf
@@ -599,12 +667,13 @@
           entries (mapv :entry books)
           index (group-by (comp book-ref/book-key :id :entry) books)]
       {:entries entries
+       :books (vec books)
        :index index
        :tree (library/shelf-tree-of entries)
        :diagnostics (into (vec diagnostics) (duplicate-slugs lib-name index))
        :unusable unusable})
     (catch Throwable t
-      {:entries [] :index {} :tree {} :unusable []
+      {:entries [] :books [] :index {} :tree {} :unusable []
        :diagnostics [{:type :unreadable-shelf
                       :library lib-name
                       :path (str root)
@@ -657,12 +726,20 @@
                                (str/join ", " (map #(str %1 " (" %2 ")") books paths))))))))
 
   library/LibraryDiagnostics
-  (library-diagnostics [_] (:diagnostics @scanned)))
+  (library-diagnostics [_] (:diagnostics @scanned))
+
+  library/ListedBooks
+  (listed-books [_] (:books @scanned)))
 
 (defn library-root
   "The root folder of a filesystem `lib`, as a path string."
   [lib]
   (:root lib))
+
+(defn filesystem-library?
+  "True when `x` is a library this provider built."
+  [x]
+  (instance? FileSystemLibrary x))
 
 (defn filesystem-library
   "A Library over the folder `(:path entry-config)`, named
@@ -686,13 +763,20 @@
   calls into a generated shelf's script (defaults in
   `haselnuss.library.generated/load-shelf`). `:on-script-call`, a
   test seam called before every such call (`haselnuss.library.generated/
-  load-shelf`). `provider` turns these opts into a registry provider.
+  load-shelf`). `:transform`, a `(fn [Document] {:document
+  :diagnostics})` -- `haselnuss.transform/transform-document` over a
+  `--transform` file's rules -- applied to each book's entry document
+  right after it is parsed, before its includes are expanded, as a build
+  of the book applies `--transform` (TASK-242, `--check`); its
+  diagnostics are among the book's `load-warnings`. Default nil, no
+  rewriting: a build never sets it for the books it references.
+  `provider` turns these opts into a registry provider.
 
   The entry config's own `:scripts` (true, false or absent) says whether
   generated shelves run; see the namespace docstring."
   ([entry-config] (filesystem-library entry-config {}))
-  ([entry-config {:keys [parse open-reader kinds timeout-ms output-limit document-output-limit
-                         on-script-call]
+  ([entry-config {:keys [parse open-reader kinds transform timeout-ms output-limit
+                         document-output-limit on-script-call]
                   :or {parse parser/parse open-reader default-open-reader}}]
    (let [lib-name (when (map? entry-config) (:name entry-config))
          path (when (map? entry-config) (:path entry-config))
@@ -710,6 +794,7 @@
                    (not (ifn? open-reader)) ":open-reader must be a fn"
                    (not (or (nil? kinds) (and (set? kinds) (every? string? kinds))))
                    ":kinds must be a set of strings"
+                   (not (or (nil? transform) (ifn? transform))) ":transform must be a fn"
                    (not (or (nil? scripts) (boolean? scripts)))
                    (str "scripts must be true or false, got " (pr-str scripts))
                    :else nil)]
@@ -721,6 +806,7 @@
                             (delay (scan lib-name root {:parse parse
                                                         :open-reader open-reader
                                                         :kinds kinds
+                                                        :transform transform
                                                         :generated {:scripts? (true? scripts)
                                                                     :timeout-ms timeout-ms
                                                                     :output-limit output-limit

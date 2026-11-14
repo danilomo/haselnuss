@@ -87,10 +87,36 @@
   ;; the committed example document, and reading it off the classpath
   ;; keeps that independent of the runner's working directory.
   :profiles {:uberjar {:aot :all}
+             ;; TASK-245: the graph soak and with-book benchmark (doc-11,
+             ;; "GraalVM investigation phase"), `haselnuss.soak` under `dev/`.
+             ;; Its own profile so that neither the shipped uberjar nor
+             ;; `dist/haselnuss` contains it and the CLI grows no flag the spec
+             ;; does not define: `bin/native --soak` builds this profile's
+             ;; uberjar into its own image with the shipped binary's flags, and
+             ;; `bin/soak` runs it.
+             ;;
+             ;; Leiningen (2.12) names the standalone jar from the project
+             ;; merged with :uberjar, so this jar still lands in target/uberjar/
+             ;; beside the shipped one whatever :target-path says; hence its own
+             ;; :uberjar-name. And :auto-clean would wipe that folder first,
+             ;; deleting target/uberjar/haselnuss.jar, hence :auto-clean false.
+             ;; :target-path keeps the soak's AOT classes apart from the
+             ;; shipped build's; `bin/native --soak` deletes it and the soak jar
+             ;; before building, since nothing else cleans them.
+             :soak {:source-paths ["dev"]
+                    :main haselnuss.soak
+                    :target-path "target/soak"
+                    :auto-clean false
+                    :uberjar-name "haselnuss-soak.jar"}
              ;; TASK-147: `haselnuss.test-parallel` runs the tests of `^:parallel`
              ;; namespaces concurrently (they are bound by child pdflatex/lein
              ;; processes, not CPU in this JVM). `lein test` only.
-             :test {:resource-paths ["examples"]
+             ;;
+             ;; TASK-245: `dev/` on the test classpath so `haselnuss.soak-test`
+             ;; can run a few cycles of the soak driver on the JVM, which keeps
+             ;; it from rotting between the (manual, minutes-long) soak runs.
+             :test {:source-paths ["dev"]
+                    :resource-paths ["examples"]
                     :injections [(require 'haselnuss.test-parallel)
                                  ((resolve 'haselnuss.test-parallel/install!))]}
              ;; Leiningen implicitly activates a profile named `:repl` for the

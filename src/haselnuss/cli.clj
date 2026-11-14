@@ -96,6 +96,11 @@
             [haselnuss.library.directory :as directory]
             [haselnuss.library.filesystem :as fs]
             [haselnuss.library.generated :as generated]
+            [haselnuss.library.graph.backlinks :as backlinks]
+            [haselnuss.library.graph.check :as check]
+            [haselnuss.library.graph.registry :as graph-registry]
+            [haselnuss.library.graph.scan :as scan]
+            [haselnuss.library.graph.text :as graph-text]
             [haselnuss.library.passage :as passage]
             [haselnuss.library.references :as references]
             [haselnuss.lower :as lower]
@@ -482,6 +487,8 @@
    ["Usage: haselnuss [options] INPUT.hdoc"
     "       haselnuss [options] BOOK-ID"
     "       haselnuss [--libraries PATH] --list-books LIBRARY"
+    "       haselnuss [--libraries PATH] --check [LIBRARY ...] [--format json]"
+    "       haselnuss [--libraries PATH] --backlinks BOOK-REF [--format json]"
     ""
     "Converts a Haselnuss document to HTML, LaTeX, its own JSON interchange"
     "representation, or canonical .hdoc source."
@@ -517,7 +524,15 @@
     "      --list-books LIBRARY  print the canonical ID and title of every book in"
     "                          LIBRARY, one per line, tab-separated and sorted by ID,"
     "                          and exit; takes no input. An unknown library is an error"
-    "      --overlay PATH      a .hdoc overlay file patching the base document via"
+    "      --check [LIBRARY ...]  report every problem in the named libraries -- every"
+    "                          library of the directory when none is named -- and exit;"
+    "                          takes no input file. See \"--check\" below"
+    "      --backlinks BOOK-REF  list every link and quote, in every library of the"
+    "                          directory, into the book (lib:[shelf/...]slug) or one"
+    "                          of its passages (lib:slug#passage), and exit; takes no"
+    "                          input. See \"--backlinks\" below"
+    "      --format FORMAT     --check and --backlinks only: text (default) or json"
+    "      --overlay PATH     a .hdoc overlay file patching the base document via"
     "                          prepend/append/describe/highlight/sticky-note directives"
     "                          (repeatable; see README \"Overlays\" and \"Annotations\")."
     "                          No effect on --target json or hdoc."
@@ -626,19 +641,109 @@
     "stderr, the build unaffected. So is --trusted-extensions given with no"
     "--extensions at all: the privilege it grants has nothing to apply to."
     ""
+    "--check reads every book of the libraries it checks and resolves it as an"
+    "html build of it would -- with the same --extensions and --transform, which"
+    "it honours like a build; it lowers and emits nothing -- then prints every"
+    "problem found on stdout, one per line, sorted by file then line, and a"
+    "summary:"
+    ""
+    "  path/to/book.hdoc:42: warning: [unknown-label] lib:book#sec:x: book ..."
+    "  3 problems (0 errors, 2 warnings, 1 info) in 14 books"
+    ""
+    "It reports the libraries' own problems (duplicate slugs, invalid book names,"
+    "generated shelves whose scripts are disabled or fail, a library that failed"
+    "to load), each book's own warnings and resolver diagnostics, every book"
+    "reference that does not resolve, quote cycles and quotes nested too deep,"
+    "and stale shelf paths as info. Paths are relative to the current directory"
+    "when the file is inside it; no column is given (the parser records only"
+    "lines). References into libraries not named are still followed, but such a"
+    "library's own problems -- its books' load warnings, its URL template, its"
+    "failure to load -- are reported only when it is checked itself. A quote"
+    "cycle running through a locator passage (#14:8), which only its book"
+    "interprets, is left to a build. Control and format characters in a line's"
+    "text are printed escaped (\\n, \\u001b, \\u202e, ...) and a backslash as \\\\,"
+    "so each problem is one line that reads as what it is."
+    "--format json prints one JSON object instead, {\"version\": 1,"
+    "\"diagnostics\": [...], \"summary\": {...}}, each diagnostic carrying type,"
+    "level, message, file, line, column, ref, canonical, book and library (see"
+    "README \"Checking libraries\"). Build options a check does not use are"
+    "warned about on stderr, as for --list-books."
+    ""
+    "--backlinks reads every book of every library in the directory, as --check"
+    "does (with the same --extensions and --transform), and lists each link"
+    "@{...} and !quote into the book BOOK-REF names -- short (bible:romanos) or"
+    "canonical, resolved to the book's current ID first -- grouped by the"
+    "passage they cite, references to the whole book first, then passages in"
+    "natural order (2:3 before 14:8). With a passage (bible:romanos#14:8) it"
+    "lists only references to exactly that passage as written; 14:8-9 is not"
+    "14:8. Each line gives the citing book with the label of the section it"
+    "sits in, link or quote, and file:line; a reference that names the book but"
+    "does not resolve (an unknown label, say) is listed too, marked dangling:"
+    "<problem>. The book's references to itself follow under self-references:"
+    ""
+    "  bible:blivre/romanos"
+    "    #14:8"
+    "      cat:heidelberg#sec:q1   quote   cat/heidelberg.hdoc:40"
+    "  1 reference from 1 book"
+    ""
+    "Text is escaped as for --check. --format json prints {\"version\": 1,"
+    "\"book\", \"passage\", \"edges\": [...], \"self\": [...], \"summary\": {...}},"
+    "each edge with from, to, kind, status, problem and position (see README"
+    "\"Listing backlinks\"). Finding no reference is a success."
+    ""
     "Exit codes:"
-    "  0  the document was converted and written"
+    "  0  the document was converted and written; --check: no warnings or errors"
+    "     (info notices do not count); --backlinks: the list was printed, even"
+    "     an empty one"
     "  1  the build failed (no representation for the target, a parse error,"
     "     a missing or unreadable file, a BOOK-ID or --list-books library that"
-    "     cannot be found, an invalid library directory file); nothing was written"
-    "  2  the command line was wrong; a pointer to --help is printed"]))
+    "     cannot be found, an invalid library directory file); nothing was written."
+    "     --check: at least one warning or error was found"
+    "  2  the command line was wrong; a pointer to --help is printed. --check:"
+    "     the check could not run (no library directory file, or one that cannot"
+    "     be read or is invalid; unknown library \"x\"; known: a, b; an --extensions"
+    "     or --transform file that cannot be loaded; an input file given: --check"
+    "     takes no input). --backlinks: likewise, and a malformed BOOK-REF or one"
+    "     naming no book (an unknown library or book, a slug two books share)"]))
+
+(defn- check-format!
+  "Throws a usage error unless `--format` is absent, `text` or `json`."
+  [opts]
+  (when-not (contains? #{nil "text" "json"} (:format opts))
+    (throw (ex-info (str "unknown format " (pr-str (:format opts)) " (expected one of: json, text)")
+                    {:type ::usage-error}))))
+
+(defn- parse-backlinks-ref
+  "`haselnuss.book-ref/parse-book-ref` of a `--backlinks` argument (TASK-243),
+  with whitespace around it and inside its passage dropped first -- the
+  passage is matched after the same normalisation
+  (`haselnuss.library.graph/passage-key`), so `bible:romanos#14: 8` asks
+  what `bible:romanos#14:8` asks."
+  [s]
+  (let [[book passage] (str/split (str/trim (str s)) #"#" 2)]
+    (book-ref/parse-book-ref (if (some? passage)
+                               (str book "#" (str/replace passage #"\p{IsWhite_Space}+" ""))
+                               book))))
+
+(defn- malformed-backlinks-message
+  "The message for a `--backlinks` argument `arg` that `parsed` (its
+  `parse-backlinks-ref`) found malformed: the book-ref parser's own reason,
+  naming the argument as typed (trimmed). Built raw: `fail!` escapes
+  it, as every stderr line (TASK-247)."
+  [arg parsed]
+  (let [prefix (str "malformed book reference " (pr-str (:ref parsed)) ": ")
+        message (str (:message parsed))
+        reason (if (str/starts-with? message prefix) (subs message (count prefix)) message)]
+    (str "malformed book reference \"" (str/trim (str arg)) "\": " reason)))
 
 (defn- parse-args
   "Parses `args` into `{:input :target :output :computed-numbers
   :bibliography :overlay :extensions :trusted-extensions :transform :help
   :version :no-stylesheet :fragment :in-place :libraries :list-books
-  :untrusted}`
-  (`:list-books` needs, and takes, no `:input`), or throws
+  :untrusted :check :check-libraries :backlinks :format}`
+  (`:list-books` needs, and takes, no `:input`; nor does `:check`, whose
+  positional arguments become `:check-libraries`, nor `:backlinks`, whose
+  book ref is its value and must not be malformed), or throws
   `ex-info` (`:type ::usage-error`) for
   an unknown flag, a flag missing its value, a target that is not in
   `targets`, or anything other than exactly one positional input.
@@ -687,7 +792,7 @@
           _ (when (and inline-value
                        (contains? #{"--help" "--version" "--computed-numbers"
                                     "--no-stylesheet" "--fragment" "--trusted-extensions"
-                                    "--in-place" "--untrusted"}
+                                    "--in-place" "--untrusted" "--check"}
                                   arg))
               ;; A value on a flag that takes none must be an error, not
               ;; silently discarded: `--computed-numbers=false` turned
@@ -709,6 +814,37 @@
           ;; to convert something, so neither needs a document.
           (:help opts) opts
           (:version opts) opts
+          ;; TASK-242: a check converts nothing either. Its positional
+          ;; arguments are library names, so one that cannot be a library
+          ;; name is an input file given to it.
+          (and (:check opts) (:list-books opts))
+          (throw (ex-info "--check cannot be combined with --list-books" {:type ::usage-error}))
+          ;; TASK-243: one question about libraries per run.
+          (and (:backlinks opts) (or (:check opts) (:list-books opts)))
+          (throw (ex-info (str "--backlinks cannot be combined with "
+                               (if (:check opts) "--check" "--list-books"))
+                          {:type ::usage-error}))
+          (:check opts)
+          (let [libs (into (if (contains? opts :input) [(:input opts)] []) (:check-libraries opts))]
+            (when-let [bad (first (remove library/valid-name? libs))]
+              (throw (ex-info (str "--check takes no input file, only library names; got " (pr-str bad))
+                              {:type ::usage-error})))
+            (check-format! opts)
+            (-> opts (dissoc :input) (assoc :check-libraries libs)))
+          ;; TASK-243: the book is the flag's value, so any positional
+          ;; argument is an input file, which a listing takes none of.
+          (:backlinks opts)
+          (let [parsed (parse-backlinks-ref (:backlinks opts))]
+            (when (contains? opts :input)
+              (throw (ex-info (str "--backlinks takes no input; got \"" (:input opts) "\"")
+                              {:type ::usage-error})))
+            (when (book-ref/malformed? parsed)
+              (throw (ex-info (malformed-backlinks-message (:backlinks opts) parsed)
+                              {:type ::usage-error})))
+            (check-format! opts)
+            opts)
+          (:format opts)
+          (throw (ex-info "--format applies only to --check and --backlinks" {:type ::usage-error}))
           ;; TASK-157: a listing converts nothing, so an input given
           ;; alongside it is a mistake rather than something to ignore.
           (and (:list-books opts) (:input opts))
@@ -782,6 +918,24 @@
         (let [[value rest-args] (take-value arg)]
           (recur rest-args (assoc opts :list-books value) literal?))
 
+        ;; TASK-242: like --list-books, a question about libraries; the
+        ;; library names it takes are the positional arguments (below).
+        (and (not literal?) (= "--check" arg))
+        (recur more (assoc opts :check true) literal?)
+
+        ;; TASK-243: the book whose backlinks to list is the flag's value.
+        (and (not literal?) (= "--backlinks" arg))
+        (let [[value rest-args] (take-value arg)]
+          ;; one book per run: a second one is a mistake, not a replacement
+          (when (contains? opts :backlinks)
+            (throw (ex-info "--backlinks given more than once; it lists the references to one book"
+                            {:type ::usage-error})))
+          (recur rest-args (assoc opts :backlinks value) literal?))
+
+        (and (not literal?) (= "--format" arg))
+        (let [[value rest-args] (take-value arg)]
+          (recur rest-args (assoc opts :format value) literal?))
+
         ;; The one repeatable flag (TASK-83.1): every other branch here
         ;; uses `assoc`, since every other option is single-valued, so
         ;; `--overlay a.hdoc --overlay b.hdoc` collects into a vector
@@ -835,6 +989,13 @@
 
         (and (not literal?) (str/starts-with? arg "-"))
         (throw (ex-info (str "unknown option " (pr-str arg)) {:type ::usage-error}))
+
+        (and (:check opts) (contains? opts :input))
+        (recur more (update opts :check-libraries (fnil conj []) arg) literal?)
+
+        (and (:backlinks opts) (contains? opts :input))
+        (throw (ex-info (str "--backlinks takes no input; got \"" (:input opts) "\"")
+                        {:type ::usage-error}))
 
         (:input opts)
         (throw (ex-info (str "unexpected extra argument " (pr-str arg)
@@ -1248,13 +1409,16 @@
   "The `haselnuss.library.directory` options for `opts`: `--libraries` as
   the explicit `:path`, the injected `:library-env`/`:library-home` when
   given, and the default provider registry with the `:filesystem` provider
-  rebuilt to parse every book with `kinds` (TASK-153's `fs/provider`)."
-  [opts kinds]
-  (cond-> {:path (:libraries opts)
-           :registry (directory/register-provider directory/default-registry :filesystem
-                                                  (fs/provider {:kinds kinds}))}
-    (contains? opts :library-env) (assoc :env (:library-env opts))
-    (contains? opts :library-home) (assoc :home (:library-home opts))))
+  rebuilt to parse every book with `kinds` (TASK-153's `fs/provider`), and
+  with whatever else `fs-opts` gives that provider (`--check --transform`'s
+  `:transform`, TASK-242)."
+  ([opts kinds] (directory-opts opts kinds {}))
+  ([opts kinds fs-opts]
+   (cond-> {:path (:libraries opts)
+            :registry (directory/register-provider directory/default-registry :filesystem
+                                                   (fs/provider (assoc fs-opts :kinds kinds)))}
+     (contains? opts :library-env) (assoc :env (:library-env opts))
+     (contains? opts :library-home) (assoc :home (:library-home opts)))))
 
 (defn- check-libraries-file!
   "Throws when `--libraries` names a file that does not exist -- typed on
@@ -1404,6 +1568,38 @@
   (check-libraries-file! opts)
   (assoc resolve-opts :books (books-option opts kinds resolve-opts)))
 
+(defn- shared-resolve-opts
+  "The `resolver/resolve-document` options a build resolves its document
+  with that do not depend on that one document -- and so the ones every
+  book it references is resolved with too (`passage/context` keeps
+  exactly these). One function for `run` and `check`, so `--check`
+  resolves each book exactly as a build of it would (TASK-242):
+
+  - `:lexicon`, `lexicon` (`registry/numbering-lexicon` over the base
+    registry);
+  - `:directive-registry`, `base-registry` with the `--extensions`
+    sidecar extensions registered (TASK-90): a sidecar directive has to
+    be in it BEFORE resolving, or it is reported as an unknown directive;
+  - `:directive-kinds` (TASK-48): the same table `build-registry`
+    registers, read for the kind each directive numbers as -- so an id
+    prefix naming a different kind is a warning rather than two
+    different numbers in the two targets;
+  - `:front-matter-names`, `front-matter-names` (TASK-54): which
+    directives are front matter is the extension's to say; what the
+    resolver does with that -- number nothing inside them, list none of
+    their sections -- is `body-view`'s;
+  - `:sublabel-names` (TASK-56): which directive is a PANEL of the float
+    above it is the emitter table's to say; what the resolver does with
+    it -- letter it within that float instead of numbering it -- is
+    `number-block`'s. Read off the same table the LaTeX side lays the
+    panels out from, so the two cannot disagree about what a panel is."
+  [base-registry lexicon front-matter-names sidecar-extensions]
+  {:lexicon lexicon
+   :directive-registry (registry/register-all base-registry sidecar-extensions)
+   :directive-kinds (latex/directive-lexicon-kinds)
+   :front-matter-names front-matter-names
+   :sublabel-names (latex/sublabel-directive-names)})
+
 (def ^:private build-only-flags
   "Every option `parse-args` collects that only means something to a
   build, keyed by the spelling `--help` gives it -- what `--list-books`
@@ -1449,6 +1645,210 @@
                  vec)
      :diagnostics (into diagnostics (when (satisfies? library/LibraryDiagnostics lib)
                                       (library/library-diagnostics lib)))}))
+
+;; --- --check (TASK-242, doc-11 "--check") --------------------------------------
+
+(def ^:private scan-flags
+  "The build options `--check` and `--backlinks` use too: their scan
+  resolves each book as a build of it would, so a sidecar directive is no
+  `unknown-directive` and a transformed book is read as transformed
+  (doc-11, Open point 8) -- for `--backlinks`, a reference a transform
+  adds or removes is or is not a backlink, as in the built book."
+  #{:extensions :transform})
+
+(defn- scan-flag-diagnostics
+  "One irrelevant-flag warning (TASK-108's policy) per build option given
+  with `command` (`--check`, `--backlinks`) that a scan has no use for --
+  it emits nothing, so `--trusted-extensions` grants nothing either."
+  [opts command]
+  (vec (for [[k flag] build-only-flags
+             :when (and (not (scan-flags k)) (some? (get opts k)))]
+         (irrelevant-flag-diagnostic flag (str flag " has no effect with " command)))))
+
+(defn- scan-for-report
+  "The library scan `--check` and `--backlinks` share, and the report made
+  from it: `{:report :prepared}`.
+
+  Build parity: the scan resolves every book as an html build of it
+  would (the target-independent reading; LaTeX builds under
+  `--computed-numbers` read the same) -- the same library directory
+  options and parse kinds (`directory-opts`, `parse-kinds`), the same
+  resolver options (`shared-resolve-opts`, with `--extensions`' sidecar
+  directives registered), and with `--transform` each scanned book's
+  entry document rewritten right after parsing, as a build of that book
+  rewrites it. The books a reference reaches are read untransformed, as
+  in a build (`scan/context`'s `:own-directory`). A build's own
+  `--bibliography`/`--overlay` concern one document and do not apply.
+  `:library-directory` (an injected directory value, see the libraries
+  comment above) is scanned as given, so `--transform` cannot reach its
+  books.
+
+  `spec`:
+  - `:command`, the flag, naming what needed the directory;
+  - `:failed-type`, the ex-info `:type` of a command that cannot run
+    (exit 2), and `:flag-diagnostics`, printed before its message;
+  - `:scope`, `scan/scan`'s scope (nil: every library);
+  - `:prepare`, `(fn [dir] prepared)`, run on the loaded directory before
+    the scan (default: none) -- it throws a `:failed-type` ex-info itself
+    to stop the command with diagnostics of its own;
+  - `:report`, `(fn [graph prepared base-dir] report)`, run on the
+    scanned graph; `base-dir` is the working directory paths are shown
+    relative to.
+
+  Throws `:failed-type` when the command cannot run: no library
+  directory, a directory file that cannot be read or is invalid, an
+  `--extensions`/`--transform` file that cannot be loaded, an unknown
+  library name in `:scope` (`unknown library \"x\"; known: a, b`), or the
+  graph backend failing."
+  [opts {:keys [command failed-type flag-diagnostics scope prepare report]}]
+  (let [fail (fn [^Throwable e message]
+               (throw (ex-info message {:type failed-type ::diagnostics flag-diagnostics} e)))
+        backend-failed (fn [^Throwable e]
+                         (fail e (str "the graph backend " graph-registry/default-backend " failed: "
+                                      (or (ex-message e) (.getName (class e))))))]
+    (try
+      (let [base-registry (build-registry)
+            lexicon (registry/numbering-lexicon base-registry resolver/default-lexicon)
+            kinds (parse-kinds lexicon :html false)
+            sandbox-ctx (delay (sandbox/fork))
+            sidecar-extensions (sidecar/load-extensions (:extensions opts)
+                                                        {:trusted? (boolean (:trusted-extensions opts))
+                                                         :ctx sandbox-ctx})
+            transform-rules (rules/load-transforms (:transform opts) {:ctx sandbox-ctx})
+            resolve-opts (shared-resolve-opts base-registry lexicon (set (keys front-matter/blocks))
+                                              sidecar-extensions)
+            dir (load-directory! opts kinds command)
+            prepared (when prepare (prepare dir))
+            own-dir (when (and (seq transform-rules) (nil? (:library-directory opts)))
+                      (references/directory-loader
+                       (directory-opts opts kinds
+                                       {:transform #(transform/transform-document % transform-rules)})))
+            ctx (scan/context (cond-> {:directory dir :resolve-opts resolve-opts}
+                                own-dir (assoc :own-directory own-dir)))
+            base-dir (or (::check-base-dir opts) (System/getProperty "user.dir"))
+            ;; Past loading, nothing a document holds can throw: the scan
+            ;; turns every book and library problem into a diagnostic. An
+            ;; unknown library name is the caller's; anything else is the
+            ;; backend's (doc-11: "a bug, not a document problem").
+            result (try
+                     (report (scan/scan ctx scope) prepared base-dir)
+                     (catch clojure.lang.ExceptionInfo e
+                       (if (= ::scan/unknown-library (:type (ex-data e)))
+                         (fail e (ex-message e))
+                         (backend-failed e)))
+                     (catch Exception e (backend-failed e)))]
+        {:report result :prepared prepared})
+      (catch clojure.lang.ExceptionInfo e
+        (if (= failed-type (:type (ex-data e)))
+          (throw e)
+          (fail e (ex-message e))))
+      (catch Exception e
+        (fail e (or (ex-message e) (str e)))))))
+
+(defn check-libraries
+  "`--check` (doc-11): `{:report :diagnostics}`, `:report` being
+  `haselnuss.library.graph.check/check-report` of a scan of the libraries
+  `lib-names` (every library of the directory when empty;
+  `scan-for-report` has the build parity it keeps) and `:diagnostics` the
+  irrelevant-flag warnings (`scan-flag-diagnostics`).
+
+  Throws `::check-failed` (exit 2) when the check cannot run: no library
+  directory, a directory file that cannot be read or is invalid, an
+  `--extensions`/`--transform` file that cannot be loaded, an unknown
+  library name (`unknown library \"x\"; known: a, b`), or the graph
+  backend failing."
+  [opts lib-names]
+  (let [flag-diagnostics (scan-flag-diagnostics opts "--check")]
+    {:report (:report (scan-for-report
+                       opts
+                       {:command "--check"
+                        :failed-type ::check-failed
+                        :flag-diagnostics flag-diagnostics
+                        :scope (when (seq lib-names) lib-names)
+                        :report (fn [g _ base-dir] (check/check-report g {:base-dir base-dir}))}))
+     :diagnostics flag-diagnostics}))
+
+;; --- --backlinks (TASK-243, doc-11 "--backlinks") ------------------------------
+
+(defn- backlinks-target
+  "The `backlinks-report` target of the `--backlinks` argument `parsed`
+  (`ref-text` as written) in the loaded directory `dir`: `{:target {:id
+  current-canonical-BookId :passage? Passage} :diagnostics [...]}`, the
+  diagnostics being the directory's own load problems and, for an
+  argument whose shelf path is stale, a `:stale-shelf` info -- the book
+  is found by library and slug, as a build finds it, and asked about
+  under its current id (`edges-to` matches a resolved edge only on that).
+  Throws `::backlinks-failed` (exit 2), with those diagnostics, for an
+  unknown or unavailable library and an unknown or ambiguous book: the
+  messages a BOOK-ID input gets. Messages are built raw: `main*` escapes
+  them, once, as it prints them (`err-line!`)."
+  [dir parsed ref-text flag-diagnostics]
+  (let [what (str "--backlinks " ref-text)
+        dir-diagnostics (directory-diagnostics dir)
+        ;; a failure prints the flag warnings too, as the success path does
+        diagnostics (into flag-diagnostics dir-diagnostics)
+        fail (fn [message]
+               (throw (ex-info message {:type ::backlinks-failed ::diagnostics diagnostics})))
+        {:keys [id passage]} parsed
+        {lib-name :library slug :slug} id
+        lib (try (find-library! dir lib-name what diagnostics)
+                 (catch clojure.lang.ExceptionInfo e (fail (ex-message e))))
+        book (library/find-book lib slug)]
+    (cond
+      (nil? book) (fail (str what ": library " (pr-str lib-name) " has no book " (pr-str slug)))
+      (library/diagnostic? book) (fail (str what ": " (:message book)))
+      :else
+      (let [current (:id (library/book-entry book))
+            canonical (book-ref/format-book-id current)
+            stale (when (and (seq (:shelf id)) (not= (:shelf id) (:shelf current)))
+                    {:type :stale-shelf
+                     :level :info
+                     :ref ref-text
+                     :canonical canonical
+                     :message (str "--backlinks \"" ref-text "\": the book is now at " canonical
+                                   "; listing the references to it there")})]
+        {:target (cond-> {:id current} passage (assoc :passage passage))
+         :diagnostics (cond-> dir-diagnostics stale (conj stale))}))))
+
+(defn backlinks
+  "`--backlinks` (doc-11): `{:report :diagnostics}`, `:report` being
+  `haselnuss.library.graph.backlinks/backlinks-report` of a scan of EVERY
+  library of the directory (cross-library references are the main source
+  of backlinks) for the book `ref-text` names, short or canonical, with or
+  without a passage. The book is resolved through the directory to its
+  current canonical id first (`backlinks-target`). `:diagnostics` are the
+  irrelevant-flag warnings (`scan-flag-diagnostics`), the directory's own
+  load problems -- a library that failed to load has no backlinks to
+  list -- and a stale-shelf info for the argument.
+
+  Throws `::backlinks-failed` (exit 2) when it cannot run: a malformed
+  ref, no usable library directory, an unknown library or book, an
+  ambiguous slug, an `--extensions`/`--transform` file that cannot be
+  loaded, or the graph backend failing.
+
+  Messages -- the diagnostics' and the failure's -- are returned raw, as
+  every other command's are: they echo the argument and carry library
+  paths and directory-file text, and `main*` prints each through
+  `err-line!`, which escapes a newline, an ANSI escape or a bidi override
+  in them (TASK-247; TASK-243 escaped them here, for this command only)."
+  [opts ref-text]
+  (let [ref-text (str/trim (str ref-text))
+        flag-diagnostics (scan-flag-diagnostics opts "--backlinks")
+        parsed (parse-backlinks-ref ref-text)]
+    (when (book-ref/malformed? parsed)
+      (throw (ex-info (malformed-backlinks-message ref-text parsed)
+                      {:type ::backlinks-failed ::diagnostics flag-diagnostics})))
+    (let [{:keys [report prepared]}
+          (scan-for-report opts
+                           {:command "--backlinks"
+                            :failed-type ::backlinks-failed
+                            :flag-diagnostics flag-diagnostics
+                            :scope nil
+                            :prepare #(backlinks-target % parsed ref-text flag-diagnostics)
+                            :report (fn [g {:keys [target]} base-dir]
+                                      (backlinks/backlinks-report g target {:base-dir base-dir}))})]
+      {:report report
+       :diagnostics (into flag-diagnostics (:diagnostics prepared))})))
 
 (defn run
   "The pure core (AC #1/#2/#3): parses `source`, resolves it, lowers it
@@ -1714,7 +2114,6 @@
                                 (:extensions opts)
                                 {:trusted? (boolean (:trusted-extensions opts))
                                  :ctx sandbox-ctx})
-            directive-registry (registry/register-all base-registry sidecar-extensions)
             {:keys [document diagnostics labels ordered-keys bibliography-id]}
             ;; TASK-105 review finding: `resolve-document`'s only
             ;; exception-throwing step is `expand-includes`, and once it
@@ -1733,43 +2132,9 @@
             ;; must still reach `main*`".
             (try
               (resolver/resolve-document document
-                                         (cond-> {:lexicon lexicon
-                                                  :directive-registry directive-registry
-                                            ;; TASK-48. The same table
-                                            ;; `build-registry` registers, read
-                                            ;; for the kind each directive
-                                            ;; numbers as -- so an id prefix
-                                            ;; naming a different kind is a
-                                            ;; warning rather than two
-                                            ;; different numbers in the two
-                                            ;; targets.
-                                                  :directive-kinds
-                                                  (latex/directive-lexicon-kinds)
-                                            ;; TASK-54. Which directives
-                                            ;; are front matter is the
-                                            ;; extension's to say; what
-                                            ;; the resolver does with
-                                            ;; that -- number nothing
-                                            ;; inside them, list none of
-                                            ;; their sections -- is
-                                            ;; `body-view`'s.
-                                                  :front-matter-names front-matter-names
-                                            ;; TASK-56. Which directive
-                                            ;; is a PANEL of the float
-                                            ;; above it is the emitter
-                                            ;; table's to say; what the
-                                            ;; resolver does with it --
-                                            ;; letter it within that
-                                            ;; float instead of
-                                            ;; numbering it -- is
-                                            ;; `number-block`'s. Read
-                                            ;; off the same table the
-                                            ;; LaTeX side lays the
-                                            ;; panels out from, so the
-                                            ;; two cannot disagree
-                                            ;; about what a panel is.
-                                                  :sublabel-names
-                                                  (latex/sublabel-directive-names)
+                                         (cond-> (assoc (shared-resolve-opts base-registry lexicon
+                                                                             front-matter-names
+                                                                             sidecar-extensions)
                                             ;; TASK-38. The resolver owns the
                                             ;; splicing, the cycle guard and
                                             ;; the diagnostics; reading and
@@ -1782,23 +2147,23 @@
                                             ;; one, so an `@`-token means the
                                             ;; same thing in a chapter as in
                                             ;; the document that includes it.
-                                                  :includes
-                                                  {:base-dir (:base-dir opts)
+                                                        :includes
+                                                        {:base-dir (:base-dir opts)
                                              ;; Puts the document itself
                                              ;; on the cycle stack, so a
                                              ;; loop back to the root is
                                              ;; caught like any other.
-                                                   :source-path (:input opts)
-                                                   :load (fn [file]
-                                                           (parser/parse (slurp file)
-                                                                         (assoc vocabulary :source (str file))))}
+                                                         :source-path (:input opts)
+                                                         :load (fn [file]
+                                                                 (parser/parse (slurp file)
+                                                                               (assoc vocabulary :source (str file))))}
                                             ;; TASK-83.1. Already read
                                             ;; and include-expanded above
                                             ;; (`load-overlays!`); empty
                                             ;; with no `--overlay` at
                                             ;; all, which `apply-overlays`
                                             ;; treats as a no-op.
-                                                  :overlay-sources overlay-sources}
+                                                        :overlay-sources overlay-sources)
                                            bibliography (assoc :bibliography bibliography)
                                             ;; TASK-157. Last, so the
                                             ;; books share every option
@@ -2676,11 +3041,30 @@
                           e))
           (throw e))))))
 
-(defn- warn!
-  "Prints one resolver diagnostic to stderr as a warning (AC #4)."
-  [diagnostic]
+(defn- err-line!
+  "Prints `line` to stderr as exactly one line, its control and format
+  characters `haselnuss.library.graph.text/escape-controls`ed (TASK-247).
+  Every line the CLI writes to stderr goes through here: a diagnostic's
+  message, a path or an `ex-info`'s text can come from library data -- a
+  `shelf.clj` exception, a reference as written, a file name -- or the
+  command line, and printed raw a newline in it would fake a further
+  `haselnuss: error:` line and an ESC would reach the terminal as an
+  escape sequence. Escapes the line as a whole, after any `pr-str`
+  quoting, so nothing is escaped twice; one without such a character
+  prints exactly as given."
+  [line]
   (binding [*out* *err*]
-    (println (str "haselnuss: warning: " (:message diagnostic)))))
+    (println (graph-text/escape-controls line))))
+
+(defn- warn!
+  "Prints one diagnostic to stderr (AC #4) under its own level when that
+  is `:info` -- a `:stale-shelf` note says so, as `--check` shows it
+  (TASK-247) -- and as a warning otherwise: everything else printed here
+  is something the run went on past, whatever level a `--check` gives it,
+  so `error:` stays the one line saying what stopped it (`fail!`)."
+  [diagnostic]
+  (err-line! (str "haselnuss: " (if (= :info (:level diagnostic)) "info" "warning") ": "
+                  (:message diagnostic))))
 
 (def ^:private error-detail-keys
   "The `ex-data` keys worth showing alongside an unrecoverable error's
@@ -2710,14 +3094,16 @@
   by whatever `error-detail` can pull out of `data` to say where."
   ([message] (fail! message nil))
   ([message data]
-   (binding [*out* *err*]
-     (println (str "haselnuss: error: " message (error-detail data))))))
+   (err-line! (str "haselnuss: error: " message (error-detail data)))))
 
 (defn main*
   "The whole command-line behavior except the process exit itself:
   parses `args`, runs `build`, prints every diagnostic to stderr, and
   *returns* the status code -- 0 on success, `--help` or `--version`, 2
-  for a usage error, 1 for anything else (AC #5).
+  for a usage error, 1 for anything else (AC #5). `--check` (TASK-242,
+  doc-11) returns its report's status instead -- 0, or 1 when it found a
+  warning or error -- and 2 when the check could not run. `--backlinks`
+  (TASK-243) returns 0 whatever it lists, and 2 when it could not run.
 
   Separate from `-main` so a test can assert the real thing: `-main`
   calls `System/exit`, which would kill the test JVM and which
@@ -2742,7 +3128,30 @@
          (:list-books opts)
          (let [{:keys [books diagnostics]} (list-books opts (:list-books opts))]
            (run! warn! diagnostics)
-           (run! (fn [[id title]] (println (str id "\t" title))) books)
+           ;; TASK-247: a title comes from the library (front matter, a
+           ;; shelf.clj), so it is `escape-text`ed as `--check` and
+           ;; `--backlinks` escape what they print: an ESC cannot reach
+           ;; the terminal, and a newline or tab -- the separator -- cannot
+           ;; forge a row or a column. An ID is slug-validated already.
+           (run! (fn [[id title]] (println (str id "\t" (graph-text/escape-text title)))) books)
+           0)
+         ;; TASK-242: the report is the output, so it goes to stdout;
+         ;; warnings about the command line go to stderr. 0 or 1 by what
+         ;; the report found; a check that cannot run is 2 (below).
+         (:check opts)
+         (let [{:keys [report diagnostics]} (check-libraries opts (:check-libraries opts))]
+           (run! warn! diagnostics)
+           (print (if (= "json" (:format opts)) (check/render-json report) (check/render-text report)))
+           (flush)
+           (check/exit-status report))
+         ;; TASK-243: likewise; finding nothing is still a success.
+         (:backlinks opts)
+         (let [{:keys [report diagnostics]} (backlinks opts (:backlinks opts))]
+           (run! warn! diagnostics)
+           (print (if (= "json" (:format opts))
+                    (backlinks/render-json report)
+                    (backlinks/render-text report)))
+           (flush)
            0)
          :else
          (let [{:keys [diagnostics bibtex-path front-matter-paths]
@@ -2758,17 +3167,18 @@
           ;; command line, and the one `derived-output-path`'s own
           ;; docstring points at for why a companion refusal does not
           ;; reuse it as a name.
-           (binding [*out* *err*]
-             (println (str "haselnuss: wrote " (if (= :stdout written) "-" written)))
-            ;; Reported on its own line, not folded into the one above:
-            ;; native-mode LaTeX writes a second file (TASK-42), a
-            ;; --fragment build writes its companion preamble (TASK-52),
-            ;; and a build that quietly produced a file the user did not
-            ;; ask for is exactly the kind of surprise a converter should
-            ;; not have.
-             (when bibtex-path (println (str "haselnuss: wrote " bibtex-path)))
-             (when preamble-file (println (str "haselnuss: wrote " preamble-file)))
-             (run! (fn [file] (println (str "haselnuss: wrote " file))) front-matter-paths))
+           ;; TASK-247: a path can come from a library (a BOOK-ID
+           ;; input's file name), so these are escaped like any line.
+           (err-line! (str "haselnuss: wrote " (if (= :stdout written) "-" written)))
+           ;; Reported on its own line, not folded into the one above:
+           ;; native-mode LaTeX writes a second file (TASK-42), a
+           ;; --fragment build writes its companion preamble (TASK-52),
+           ;; and a build that quietly produced a file the user did not
+           ;; ask for is exactly the kind of surprise a converter should
+           ;; not have.
+           (when bibtex-path (err-line! (str "haselnuss: wrote " bibtex-path)))
+           (when preamble-file (err-line! (str "haselnuss: wrote " preamble-file)))
+           (run! (fn [file] (err-line! (str "haselnuss: wrote " file))) front-matter-paths)
            0)))
      (catch clojure.lang.ExceptionInfo e
       ;; Warnings first, then the error that stopped the build -- the
@@ -2776,12 +3186,15 @@
       ;; warning explain the error (see `run`).
        (run! warn! (::diagnostics (ex-data e)))
        (fail! (ex-message e) (ex-data e))
-       (if (= ::usage-error (:type (ex-data e)))
+       (case (:type (ex-data e))
         ;; TASK-138: one pointer line, not the whole usage text,
         ;; which buried the one line the user needed.
-         (do (binding [*out* *err*]
-               (println "Try 'haselnuss --help' for usage."))
-             2)
+         ::usage-error (do (err-line! "Try 'haselnuss --help' for usage.")
+                           2)
+         ;; TASK-242 (doc-11): 1 is a check's "problems found", so one
+         ;; that cannot run at all is 2.
+         ::check-failed 2
+         ::backlinks-failed 2
          1))
      (catch Exception e
        (fail! (or (ex-message e) (str e)))

@@ -819,6 +819,9 @@
   "name":"haselnuss.library.LibraryDirectory"
 },
 {
+  "name":"haselnuss.library.ListedBooks"
+},
+{
   "name":"haselnuss.library.Locatable"
 },
 {
@@ -829,6 +832,9 @@
 },
 {
   "name":"haselnuss.library.VirtualBook"
+},
+{
+  "name":"haselnuss.library.digest__init"
 },
 {
   "name":"haselnuss.library.directory__init"
@@ -850,6 +856,45 @@
 },
 {
   "name":"haselnuss.library.generated__init"
+},
+{
+  "name":"haselnuss.library.graph.GraphQuery"
+},
+{
+  "name":"haselnuss.library.graph.LibraryIndex"
+},
+{
+  "name":"haselnuss.library.graph.ReferenceGraph"
+},
+{
+  "name":"haselnuss.library.graph.backlinks__init"
+},
+{
+  "name":"haselnuss.library.graph.check__init"
+},
+{
+  "name":"haselnuss.library.graph.libraries.Wrapped"
+},
+{
+  "name":"haselnuss.library.graph.libraries__init"
+},
+{
+  "name":"haselnuss.library.graph.memory_index__init"
+},
+{
+  "name":"haselnuss.library.graph.rebuild__init"
+},
+{
+  "name":"haselnuss.library.graph.registry__init"
+},
+{
+  "name":"haselnuss.library.graph.scan__init"
+},
+{
+  "name":"haselnuss.library.graph.text__init"
+},
+{
+  "name":"haselnuss.library.graph__init"
 },
 {
   "name":"haselnuss.library.memory.MemoryLibrary"
@@ -1150,6 +1195,9 @@
   "name":"java.nio.file.attribute.FileAttribute"
 },
 {
+  "name":"java.security.MessageDigest"
+},
+{
   "name":"java.security.SecureRandomParameters"
 },
 {
@@ -1238,6 +1286,9 @@
 },
 {
   "name":"java.util.concurrent.Callable"
+},
+{
+  "name":"java.util.concurrent.ConcurrentLinkedDeque"
 },
 {
   "name":"java.util.concurrent.FutureTask"

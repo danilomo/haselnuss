@@ -6,8 +6,9 @@
   built in-process. `LibraryDirectory`, `Library` and `Book` are
   required; `Locatable` (a book with locators) and `LibraryDiagnostics`
   (a library that reports scan problems such as `:duplicate-slug`) are
-  optional, and so is `UrlTemplates` (a directory whose entries carry a
-  URL template, TASK-155).
+  optional, and so are `UrlTemplates` (a directory whose entries carry a
+  URL template, TASK-155) and `ListedBooks` (a library that hands out
+  every Book it lists, slug collisions included, TASK-241).
 
   ## Values
 
@@ -129,6 +130,17 @@
   (library-diagnostics [lib]
     "A seq of `{:type :message ...}` diagnostics, empty when there are
     none. Never loads a book's document."))
+
+(defprotocol ListedBooks
+  "Optional: a library that hands out every Book it lists, including the
+  books `find-book` cannot single out because they share a slug (an
+  `:ambiguous-book`). The reference graph's `scan` (TASK-241) scans every
+  listed book, duplicates included, so each gets its own record. A
+  library that does not satisfy it is scanned through `find-book`, and a
+  colliding book then gets only the `:ambiguous-book` diagnostic."
+  (listed-books [lib]
+    "Every Book of the library, one per BookEntry of `list-books` and in
+    the same order. Never loads a book's document."))
 
 (defprotocol UrlTemplates
   "Optional: a library directory whose entries may carry a URL template

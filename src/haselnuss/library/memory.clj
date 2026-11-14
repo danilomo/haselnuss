@@ -23,6 +23,8 @@
   to that slug): both are listed, `library-diagnostics` reports one
   `:duplicate-slug` naming both canonical ids, and `find-book` on that slug
   answers an `:ambiguous-book` diagnostic naming both.
+  `haselnuss.library/listed-books` hands out every book, both included,
+  in listing order (TASK-241).
 
   ## Failure
 
@@ -42,7 +44,7 @@
   [shelved]
   (mapv (comp book-ref/format-book-id :id first) shelved))
 
-(defrecord ^:private MemoryLibrary [lib-name entries index tree diagnostics]
+(defrecord ^:private MemoryLibrary [lib-name entries index tree diagnostics books]
   library/Library
   (library-name [_] lib-name)
   (shelf-tree [_] tree)
@@ -63,7 +65,10 @@
                          " names more than one book: " (str/join ", " ids))}))))
 
   library/LibraryDiagnostics
-  (library-diagnostics [_] diagnostics))
+  (library-diagnostics [_] diagnostics)
+
+  library/ListedBooks
+  (listed-books [_] books))
 
 (defn- duplicate-slugs
   "A `:duplicate-slug` diagnostic for every key of `index` held by more
@@ -152,4 +157,5 @@
                          entries
                          index
                          (library/shelf-tree-of entries)
-                         (vec (duplicate-slugs lib-name index)))))))
+                         (vec (duplicate-slugs lib-name index))
+                         (mapv second built))))))

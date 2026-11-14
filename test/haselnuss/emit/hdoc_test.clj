@@ -3808,6 +3808,125 @@
     (is (= ":::{note}\nx\n:::\n\na[^1] b[^2]\n\n[^1]: n\n\n[^2]: m\n"
            (hdoc/emit-document (parser/parse ":::{note}\nx\n:::\n\na[^1] b[^2]\n\n[^1]: n\n\n[^2]: m\n"))))))
 
+(defn- note-bodies
+  "Every :note's own :blocks in `document`, in document order (a note
+  nested in another note's body comes right after it)."
+  [document]
+  (let [acc (volatile! [])]
+    (walk/prewalk (fn [x] (when (and (map? x) (= :note (:t x))) (vswap! acc conj (:blocks x))) x)
+                  document)
+    @acc))
+
+(defn- canonical-gates
+  "TASK-255 AC #5: for a valid `src`, the canonical `.hdoc` writer's output
+  re-parses, to the same AST and the same note bodies, and emitting that
+  re-parse again gives the same bytes. Returns the first emission."
+  [src]
+  (let [document (parser/parse src)
+        first-out (hdoc/emit-document document)
+        reparsed (try (parser/parse first-out)
+                      (catch clojure.lang.ExceptionInfo e
+                        (is false (str "canonical output does not re-parse: " (ex-message e)
+                                       "\n" first-out))
+                        nil))]
+    (when reparsed
+      (is (= document reparsed) first-out)
+      (is (seq (note-bodies document)) "the case holds a note at all")
+      (is (= (note-bodies document) (note-bodies reparsed)) first-out)
+      (is (= first-out (hdoc/emit-document reparsed)) "second emission is byte-identical"))
+    first-out))
+
+(deftest footnote-canonical-scope-test
+  (testing "TASK-255 AC #1: the external report's minimal case -- a note
+            inside a directive body -- keeps its definition inside the fence"
+    (is (= (str "---\ntopLevelDivision: chapter\n---\n\n"
+                ":::{dedication}\nBefore[^1]\n\n[^1]: Unique note words\n:::\n")
+           (canonical-gates (str "---\ntopLevelDivision: chapter\n---\n\n"
+                                 ":::{dedication}\nBefore[^n]\n\n[^n]: Unique note words\n:::\n")))))
+  (testing "TASK-255 AC #1: notes before and after a figure (directive and
+            standalone-image spellings) and an admonition, each defined
+            on its own side"
+    (doseq [src ["a[^1]\n\n[^1]: before fig\n\n:::{figure #fig:a}\n![Cap](a.png)\n:::\n\nb[^2]\n\n[^2]: after fig\n"
+                 "a[^1]\n\n[^1]: before fig\n\n![Cap](a.png){#fig:a}\n\nb[^2]\n\n[^2]: after fig\n"
+                 (str "---\ntopLevelDivision: chapter\n---\n\n"
+                      "Before[^before].\n\n[^before]: Note belonging to the prose before the admonition.\n\n"
+                      ":::{admonition .note}\nAdvice without a footnote.\n:::\n\n"
+                      "After[^after].\n\n[^after]: Note belonging to the prose after the admonition.\n")]]
+      (testing (pr-str src) (canonical-gates src)))
+    (let [out (canonical-gates (str "a[^1]\n\n[^1]: before\n\n:::{admonition .note}\nx\n:::\n\n"
+                                    "b[^2]\n\n[^2]: after\n"))]
+      (is (= "a[^1]\n\n[^1]: before\n\n:::{admonition .note}\nx\n:::\n\nb[^2]\n\n[^2]: after\n" out))))
+  (testing "TASK-255 AC #2: notes on both sides of a nested directive inside
+            one outer directive, with a marker repeated in the first chunk.
+            Whether the repeat gets its own definition or shares one is the
+            writer's choice; only that the first chunk is self-contained is
+            pinned"
+    (let [out (canonical-gates
+               (str "---\ntopLevelDivision: chapter\n---\n\n"
+                    "::::{dedication}\nFirst[^first], repeated[^first].\n\n"
+                    "[^first]: First note, referenced twice before the nested directive.\n\n"
+                    ":::{admonition .note}\nInside[^inside].\n\n"
+                    "[^inside]: Note owned by the nested admonition body.\n:::\n\n"
+                    "Last[^last].\n\n[^last]: Note owned by the final text chunk of the dedication.\n::::\n"))
+          before (subs out 0 (str/index-of out ":::{admonition"))
+          markers (set (map second (re-seq #"\[\^([^\]]+)\](?!:)" before)))
+          defined (set (map second (re-seq #"(?m)^\[\^([^\]]+)\]:" before)))]
+      (is (str/includes? before "First note, referenced twice before the nested directive.")
+          "the first note's body is written before the nested fence")
+      (is (seq markers))
+      (is (every? defined markers)
+          (str "every marker before the nested fence is defined there: " (pr-str before))))
+    (testing "and a marker repeated across chunks, each chunk defining its own copy"
+      (canonical-gates (str "a[^x] b[^x]\n\n[^x]: same\n\n:::{note}\nc[^y]\n\n[^y]: same\n:::\n\n"
+                            "d[^x]\n\n[^x]: same\n"))))
+  (testing "TASK-255 AC #3: different bodies under one source label in
+            sibling and nested scopes are not substituted for each other"
+    (doseq [[src bodies] [[(str ":::{note}\na[^n]\n\n[^n]: first body\n:::\n\n"
+                                ":::{tip}\nb[^n]\n\n[^n]: second body\n:::\n\nc[^n]\n\n[^n]: third body\n")
+                           ["first" "second" "third"]]
+                          [(str "::::{outer}\na[^n]\n\n[^n]: outer body\n\n"
+                                ":::{inner}\nb[^n]\n\n[^n]: inner body\n:::\n\n"
+                                "c[^n]\n\n[^n]: tail body\n::::\n")
+                           ["outer" "inner" "tail"]]]]
+      (testing (pr-str src)
+        (canonical-gates src)
+        (is (= bodies (map #(-> % first :inlines first :text) (note-bodies (parser/parse src))))
+            "the fixture really does hold distinct bodies (first words), in this order"))))
+  (testing "TASK-255 AC #3: a note whose body holds another note, inside a
+            directive and after it; a multi-paragraph note body in a
+            directive and outside one"
+    (doseq [src [(str ":::{note}\na[^o]\n\n[^o]: outer[^i] text\n\n[^i]: inner\n:::\n\n"
+                      "b[^o]\n\n[^o]: outer2[^i]\n\n[^i]: inner2\n")
+                 (str ":::{note}\na[^m]\n\n[^m]: First para.\n\n    Second para.\n\n    > quoted\n:::\n\n"
+                      "after[^z]\n\n[^z]: one\n\n    two\n")]]
+      (testing (pr-str src) (canonical-gates src))))
+  (testing "TASK-255 AC #4: notes either side of an !include line, at top
+            level and inside a directive; the :include stays unexpanded"
+    (doseq [src ["a[^1]\n\n[^1]: before include\n\n!include x.hdoc\n\nb[^2]\n\n[^2]: after include\n"
+                 ":::{note}\na[^1]\n\n[^1]: before\n\n!include x.hdoc\n\nb[^2]\n\n[^2]: after\n:::\n"]]
+      (testing (pr-str src)
+        (is (str/includes? (canonical-gates src) "\n!include x.hdoc\n"))
+        (is (some #(= {:t :include :src "x.hdoc"} %)
+                  (tree-seq coll? seq (parser/parse src)))))))
+  (testing "TASK-255 AC #6: a plain document with no directive passes the
+            same gates and keeps both note bodies"
+    (let [out (canonical-gates "Para one[^a] and[^b].\n\nPara two[^a].\n\n[^a]: A.\n\n[^b]: B.\n")]
+      (is (str/includes? out "]: A.\n") out)
+      (is (str/includes? out "]: B.\n") out)))
+  (testing "TASK-255 AC #6: undefined and cyclic references still fail to
+            parse -- including a definition the other side of a directive
+            or an include, which is outside its marker's chunk"
+    (doseq [[src error-type] [["a[^nope]\n" ::parser/undefined-footnote]
+                              [":::{note}\na[^1]\n:::\n\n[^1]: n\n" ::parser/undefined-footnote]
+                              ["a[^1]\n\n:::{note}\nx\n:::\n\n[^1]: n\n" ::parser/undefined-footnote]
+                              ["a[^1]\n\n!include x.hdoc\n\n[^1]: n\n" ::parser/undefined-footnote]
+                              ["a[^x]\n\n[^x]: b[^x]\n" ::parser/cyclic-footnote]
+                              ["a[^x]\n\n[^x]: b[^y]\n\n[^y]: c[^x]\n" ::parser/cyclic-footnote]
+                              [":::{note}\na[^x]\n\n[^x]: b[^x]\n:::\n" ::parser/cyclic-footnote]]]
+      (is (= error-type (try (parser/parse src) nil
+                             (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+          (pr-str src)))))
+
 (deftest link-and-image-title-test
   (testing "TASK-140: a title survives parse, the hdoc round trip, HTML and
             JSON -- inline and reference-style, link and image, and with
@@ -4370,3 +4489,73 @@
       (is (zero? (:bad freq 0)) (pr-str freq))
       (is (< 1000 (:ok freq 0)) (pr-str freq))
       (is (< 20 (:ok-underscore freq 0)) (pr-str freq)))))
+
+;; --- TASK-258: one long line emits in linear time ----------------------------
+
+(deftest long-line-emit-time-test
+  (testing "TASK-258: a one-line paragraph of ~136k characters, emphasis and book
+            references throughout, is written back in time linear in its length.
+            Each Inline copied everything written so far (`(str text inline-text)`)
+            and walked it again for its last character (`(last text)`), so this
+            took ~22 s on JDK 17; now ~1 s. No code spans: on JDK 17 flexmark's
+            own backtick matching is quadratic (TASK-253)."
+    (let [src (str (str/join " " (repeat (quot 136000 13) "*a* @{b:x} w")) "\n")
+          doc (parser/parse src)
+          t (System/nanoTime)
+          out (hdoc/emit-document doc)
+          secs (/ (- (System/nanoTime) t) 1e9)]
+      (is (< secs 8.0) (str (count src) " characters on one line took " secs " s to emit"))
+      (testing "and the output is the source itself"
+        (is (= src out)))))
+  (testing "TASK-258: what the emitter reads off the text written so far -- its last
+            character -- still decides `_` (not after a letter or digit) and an
+            escaped `{` after `@` (TASK-152)"
+    (doseq [[src out] [["*a* _b_\n" "*a* *b*\n"] ["x*a*_b_\n" "x*a*_b_\n"]
+                       ["1*a*_b_\n" "1*a*_b_\n"] [". *a*_b_\n" ". *a*_b_\n"]
+                       ["x@\\{b:x}\n" "x@\\{b:x}\n"] ["x@ \\{b:x}\n" "x@ \\{b:x}\n"]]]
+      (is (= out (emit-src src)) (pr-str src)))))
+
+;; --- TASK-261: very many Blocks emit in linear time ---------------------------
+
+(deftest many-blocks-emit-time-test
+  (testing "TASK-261: 20k code blocks (~4.2 MB of source) are written back in
+            time linear in their number. Each Block copied everything written so
+            far (`(str text \"\\n\\n\" block-text)`), so this took ~14 s on JDK 17;
+            now well under a second. Code blocks, because each is cheap to render
+            on its own and large to copy."
+    (let [block (str "```\n" (apply str (repeat 200 "x")) "\n```\n")
+          src (str/join "\n" (repeat 20000 block))
+          doc (parser/parse src)
+          t (System/nanoTime)
+          out (hdoc/emit-document doc)
+          secs (/ (- (System/nanoTime) t) 1e9)]
+      (is (< secs 5.0) (str "20000 code blocks took " secs " s to emit"))
+      (testing "and the output is the source itself"
+        (is (= src out)))))
+  (testing "TASK-261: a footnote of very many Blocks, and a loose list item of very
+            many Blocks, are joined with one builder too, every Block written in
+            order (5000 of each is a correctness check with a bound, not a
+            regression trap: the old joins only became slow well beyond it)"
+    (let [n 5000
+          note-src (str "a[^1]\n\n[^1]: p0\n" (str/join (map #(str "\n    p" % "\n") (range 1 n))))
+          item-src (str "- p0\n" (str/join (map #(str "\n  p" % "\n") (range 1 n))))
+          [note-doc item-doc] (map parser/parse [note-src item-src])
+          t (System/nanoTime)
+          outs (mapv hdoc/emit-document [note-doc item-doc])
+          secs (/ (- (System/nanoTime) t) 1e9)]
+      (is (< secs 5.0) (str n "-block footnote and list item took " secs " s to emit"))
+      (is (= [note-src item-src] outs))))
+  (testing "TASK-261: the builder joins exactly as `join-blocks` folded over the same
+            pieces does -- a blank text so far (nil, empty, whitespace) is REPLACED by
+            the next piece, not appended to -- over every sequence of up to four
+            pieces drawn from nil, \"\", \" \", \"\\n\", \"a\" and \" b\""
+    (let [join-blocks @#'hdoc/join-blocks
+          joiner @#'hdoc/blank-line-joiner
+          pieces [nil "" " " "\n" "a" " b"]
+          seqs (reduce (fn [acc _] (into acc (for [s acc :when (< (count s) 4) p pieces] (conj s p))))
+                       #{[]} (range 4))]
+      (is (= 1555 (count seqs)) "every sequence of length 0-4")
+      (doseq [s seqs]
+        (let [join! (joiner)]
+          (run! join! s)
+          (is (= (reduce join-blocks "" s) (join!)) (pr-str s)))))))

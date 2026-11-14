@@ -1,0 +1,23 @@
+---
+title: Dangling Links
+---
+
+# Links {#sec:links}
+
+A library the directory does not have: @{nolib:anything}.
+
+A slug two books share: @{shared:same}.
+
+A label the book does not have: @{pass:nicene#sec:nope}.
+
+A range whose end comes before its start: @{pass:heidelberg#sec:q3..sec:q1}.
+
+A locator on a book that interprets none: @{pass:nicene#14:8}.
+
+A locator the book rejects: @{bible:romanos#99}.
+
+A shelf path the book has moved from: @{reformed:old/heidelberg}.
+
+A reference into a library that failed to load: @{broken:anything}.
+
+A cross-reference to nothing: @sec:nowhere.

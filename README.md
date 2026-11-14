@@ -891,7 +891,16 @@ unknown directives, id-prefix/role mismatches, and a directive whose id
 prefix names a different kind than the directive itself does (`:::{lemma
 #thm:x}`, which native-mode LaTeX numbers as a lemma and everything else
 as a theorem) — are printed to stderr as warnings and do not stop the
-build.
+build. A note that is only informational, such as a book reference whose shelf path is
+stale, is printed as `haselnuss: info:` instead.
+
+Every line haselnuss prints on stderr — a warning, an error, a `wrote` line — is exactly
+one line: a control or format character in it, which a message can carry from a library
+(a `shelf.clj` exception, a reference as written, a file name) or from the command line,
+is printed escaped as `--check` escapes it (`\n`, `\u001b`, `\u202e`, ...; see "Checking
+libraries"), so it can neither fake a further diagnostic line nor reach the terminal as an
+escape sequence. A backslash is printed as it is, so a message without such a character
+reads exactly as before.
 
 A reference to an id written on an inline node -- an image that shares its
 paragraph with text or another image is an inline image, not a figure; only
@@ -913,6 +922,10 @@ Exit codes, so a `make`-style tool can act on them:
 | 0 | the document was converted and written |
 | 1 | the build failed (no representation for the target, a parse error, a missing or unreadable input file, a book ID or `--list-books` library that cannot be found, an invalid library directory file); nothing was written |
 | 2 | the command line was wrong; the error and a one-line pointer to `--help` are printed |
+
+`--check` has exit codes of its own (0 nothing worse than info, 1 a warning or error
+found, 2 the check could not run); see "Checking libraries" below. So has `--backlinks`
+(0 the list was printed, even an empty one; 2 it could not run); see "Listing backlinks".
 
 ### Libraries and books
 
@@ -1029,7 +1042,9 @@ haselnuss --libraries libs.yaml reformed:heidelberg --target latex   # -> ./heid
 ```
 
 `--list-books <library>` prints the canonical ID and title of every book, one per line,
-tab-separated and sorted by ID. An unknown library is an error, and a build-only flag
+tab-separated and sorted by ID. A title is escaped as `--check` escapes text (see "Checking
+libraries"), so a tab, a newline or an escape sequence in it cannot add a column or a row,
+or reach the terminal. An unknown library is an error, and a build-only flag
 given with it (`--target`, `--output`, ...) is warned about as having no effect.
 
 A **book ID as input** builds that book: the argument is taken as a book ID when it
@@ -1051,6 +1066,207 @@ a name defined twice -- are printed once per build, located at their line in the
 directory file. None of these fails the build: the output is still written and the exit
 code is 0. A directory file that cannot be read, or is not a valid list of libraries,
 does fail it.
+
+#### Checking libraries
+
+A broken reference otherwise only shows when someone builds the book holding it.
+`--check` reads every book of one or more libraries and reports every problem at once:
+
+```
+haselnuss --libraries libs.yaml --check                  # every library of the directory
+haselnuss --libraries libs.yaml --check reformed bible   # only these
+haselnuss --libraries libs.yaml --check --format json    # for CI and tools
+```
+
+It takes no input file. Each book is parsed and resolved exactly as an `html` build of it
+would be -- the same parse vocabulary, numbering and directives, and the same
+`--extensions` and `--transform` files when given (a transform rewrites each checked book,
+never the books it quotes or links to, as in a build) -- but nothing is lowered or
+emitted. It reports:
+
+- the libraries' own problems: `duplicate-slug`, `invalid-book-name`, `scripts-disabled`,
+  `script-failed`, `invalid-generated-book`, a library that failed to load
+  (`unavailable-library`, at its line in the directory file);
+- each book's own warnings: `unreadable-include`, `unreadable-bibliography`, and its
+  resolver diagnostics (dangling `@sec:x`, duplicate ids, unknown directives, ...);
+- every book reference that does not resolve: `unknown-library`, `unknown-book`,
+  `ambiguous-book`, `unknown-label`, `bad-label-range`, `locator-unsupported`,
+  `bad-locator`, `unavailable-library`, ..., and `quote-cycle` and `quote-too-deep` for
+  quotes that nest back into themselves or deeper than 8 levels;
+- `stale-shelf` notes, at info level.
+
+The output is one line per problem, sorted by file then line, and a summary:
+
+```
+reformed/confessions/heidelberg.hdoc:42:1: warning: [unknown-label] bible:romanos#sec:x: book bible:scripture/nt/romanos has no label "sec:x"
+reformed/creeds/apostles.hdoc:7:12: info: [stale-shelf] reformed:old/nicene: the book is now at reformed:creeds/nicene; ...
+2 problems (0 errors, 1 warning, 1 info) in 14 books
+```
+
+A path is relative to the current directory when the file lies inside it, and absolute
+otherwise, so an editor's quickfix list (`vim -q`, Emacs `compilation-mode`) opens it from
+where the command ran. A book reference's problem carries the column of the reference --
+the `@` of an `@{...}`, the `!` of a `!quote` -- in the file it is written in (an
+`!include`d chapter's own), counting characters (code points; a tab is one). Other
+problems, and a reference inside a citation's prefix or suffix (`[see @{...} @key]`), are
+placed on their line only (`file:line:`). A problem with no file at all -- a generated
+book's own resolver diagnostic -- is placed at the book's canonical ID instead. Every
+problem is exactly one line: a control character in a file name, a reference or a
+message (a generated shelf's error text, say) is printed escaped -- `\n`, `\r`, `\t`, or `\uXXXX` for the rest of C0 and C1, DEL,
+U+2028/U+2029 and every format character (bidi overrides and isolates such as U+202E,
+zero-width characters, U+FEFF; `\U+XXXXXX` above U+FFFF) -- and a backslash is doubled
+(`\\`), so a written `\n` stays distinguishable from an escaped newline. So text cannot
+fake another problem line, reach the terminal as an escape sequence, or make a file name
+display differently from the one an editor opens. `--format json` carries the text
+exactly.
+
+Quote cycles and quotes nested too deep are found by following each quote into the passage
+it quotes -- a whole book, a label's block however deeply nested, or a range from the start
+of its first label through the end of its last. A **locator** passage (`#14:8`) is the
+book's own to interpret, so the quotes inside it are not followed: a cycle that runs
+through one (a generated book whose located verses themselves quote) is reported only by a
+build. As in a build, a quote is checked against the books already being quoted -- by
+library and slug, whatever shelf path it writes -- before its passage is resolved, so a
+quote whose passage does not resolve (an unknown label, a bad range) still closes a cycle
+or a chain that is too deep, and is reported for both problems.
+
+With `--transform`, the quotes and labels followed through a quoted book are those of its
+*transformed* copy, while a build quotes it untransformed (the quoted passage itself is
+still resolved untransformed, as in a build). The two agree unless a rule adds, removes or
+moves a `!quote`, or adds, removes or renames a block's label; when one does, the
+`quote-cycle` and `quote-too-deep` problems `--check` reports can differ from what building
+each book prints -- a rule renaming every section's label, say, hides a cycle through a
+quoted section from `--check` that every build still meets. Following the untransformed
+copies would mean reading every book a second time and keeping a second set of quote edges
+and label spans current on every refresh, for rules that rewrite quotes or labels.
+
+Naming libraries limits what is checked, not what is followed: a reference into another
+library is still resolved, so a dangling one is reported on the citing book. But that
+library's own problems -- its books' load warnings, an invalid URL template, its failing
+to load -- show only as far as the citing reference shows them (`book-failed`,
+`unavailable-library`), and fully when that library is checked itself. A cycle or chain of
+quotes through a book outside the named libraries is not followed either.
+
+**Exit codes:** 0 when nothing worse than info was found, 1 when at least one warning or
+error was, and 2 when the check could not run: no library directory, one that cannot be
+read or is invalid, an `--extensions`/`--transform` file that cannot be loaded, an input
+file given (`--check takes no input file, only library names`), or a library the directory
+does not have (`unknown library "x"; known: a, b`). Build options a check does not use
+(`--target`, `--output`, ...) are warned about on stderr as having no effect.
+
+**`--format json`** prints one line (wrapped here for reading), a versioned envelope -- a
+stable contract for CI and for tools:
+
+```json
+{"version":1,
+ "diagnostics":[{"type":"unknown-label","level":"warning",
+                 "message":"book bible:scripture/nt/romanos has no label \"sec:x\"",
+                 "file":"reformed/confessions/heidelberg.hdoc","line":42,"column":1,
+                 "ref":"bible:romanos#sec:x","canonical":"bible:scripture/nt/romanos",
+                 "book":"reformed:confessions/heidelberg","library":"reformed"}],
+ "summary":{"problems":1,"errors":0,"warnings":1,"info":0,"books":14}}
+```
+
+- `version` is 1. It changes only when a field is removed or changes meaning; new fields
+  may be added without changing it, so ignore keys you do not know.
+- Each diagnostic has every key, in this order, `null` when it does not apply: `type`
+  (the problem, as in the text output), `level` (`error`, `warning` or `info`), `message`
+  (without the location and reference the other fields give), `file` and `line` (as in
+  the text output; `null` when the problem has no file), `column` (as in the text output;
+  `null` when it is not known),
+  `ref` (the reference as written), `canonical` (the canonical ID or reference of its
+  target, when known), `book` (the canonical ID of the book the problem was found in;
+  `null` for a library's own problem) and `library`.
+- The diagnostics come in the text output's order; `summary` counts them by level, and
+  `books` is the number of books checked.
+
+#### Listing backlinks
+
+`--backlinks` answers "who links to or quotes this book, or this passage?" across every
+library of the directory -- cross-library references are the main source of backlinks, so
+there is no way to narrow the scope:
+
+```
+haselnuss --libraries libs.yaml --backlinks bible:romanos                 # the whole book
+haselnuss --libraries libs.yaml --backlinks bible:romanos#14:8            # one passage
+haselnuss --libraries libs.yaml --backlinks bible:romanos --format json   # for tools
+```
+
+It takes no input file. Every book is read as `--check` reads it -- the same parse and
+resolve, the same `--extensions` and `--transform` -- and every `@{...}` and `!quote` the
+authors wrote is a reference (the references inside quoted content belong to the quoted
+book). The argument is a book reference, short or canonical; it is resolved through the
+directory to the book's **current** canonical ID first, as a build resolves it, so
+`bible:romanos` and `bible:blivre/romanos` ask the same question. A shelf path the book has
+moved from still finds it, with a `stale-shelf` note on stderr.
+
+Without a passage, every reference into the book is listed, grouped by the passage it
+cites: references to the whole book first, then each passage in natural order (runs of
+digits compare as numbers, so `#2:3` comes before `#14:8`, and verses before labels).
+With a passage, only references to exactly that passage as written are listed, ignoring
+whitespace; overlapping verse ranges do not match (`#14:8-9` is not `#14:8`). Within a
+group the entries are sorted by citing book, then file and line:
+
+```
+bible:blivre/romanos
+  (whole book)
+    reformed:confessions/heidelberg          link    reformed/confessions/heidelberg.hdoc:12
+  #14:8
+    reformed:confessions/heidelberg#sec:q1   quote   reformed/confessions/heidelberg.hdoc:42
+  #sec:x
+    reformed:creeds/apostles                 link    reformed/creeds/apostles.hdoc:9   dangling: unknown-label
+self-references
+  #1:1
+    bible:blivre/romanos                     link    -
+3 references from 2 books; 1 self-reference
+```
+
+Each entry is the citing book's canonical ID with `#label` of the nearest labelled block
+around the reference, the kind (`link` or `quote`), and `file:line` (paths as in `--check`;
+no column; `-` for a generated book's reference, which has no source position). A
+reference that names this book but does not resolve -- an unknown label, a bad locator, a
+slug the library no longer lists -- is listed too, marked `dangling: <problem>`: its
+author clearly meant this book. The book's references to itself are not citations by
+anybody else, so they follow under `self-references` and are not counted in the summary's
+references and books. Text from the libraries is escaped exactly as in `--check`.
+
+**Exit codes:** 0 when the list was printed, even an empty one (`0 references from 0
+books`); 2 when it could not run: a malformed reference (`malformed book reference ...`),
+one naming no book (an unknown library or book, a slug two books share, a library that
+failed to load), no library directory or one that cannot be read or is invalid, an
+`--extensions`/`--transform` file that cannot be loaded, or an input file given. A
+library that failed to load is reported on stderr, since its books' references are
+missing from the list; build options it does not use are warned about as for `--check`.
+
+**`--format json`** prints one line (wrapped here for reading), a versioned envelope -- a
+stable contract, and the report a future `--client --backlinks` and a reader's
+"Referenced by" panel consume:
+
+```json
+{"version":1,"book":"bible:blivre/romanos","passage":null,
+ "edges":[{"from":{"id":"reformed:confessions/heidelberg","passage":"sec:q1"},
+           "to":{"id":"bible:blivre/romanos","written":"bible:romanos#14:8","passage":"14:8"},
+           "kind":"quote","status":"resolved","problem":null,
+           "position":{"file":"reformed/confessions/heidelberg.hdoc","line":42,"column":1}}],
+ "self":[],
+ "summary":{"references":1,"books":1,"self":0}}
+```
+
+- `version` is 1, with the same rule as `--check`'s: it changes only when a field is
+  removed or changes meaning.
+- `book` is the canonical ID asked about; `passage` the passage asked about, or `null`.
+- `edges` are the references from other books and `self` the book's own, each in the text
+  output's order and each with every key, in this order: `from` (`id`, the citing book's
+  canonical ID; `passage`, the label of the nearest labelled block around the reference,
+  or `null`), `to` (`id`, the canonical ID it resolved to -- `null` when only the written
+  reference names the book; `written`, the reference exactly as written; `passage`, the
+  cited passage as written, `null` for the whole book), `kind` (`link` or `quote`),
+  `status` (`resolved` or `dangling`), `problem` (why a dangling reference did not
+  resolve, else `null`) and `position` (`file`, `line`, and `column`, as `--check` gives
+  them, `null` when unknown; `position` itself is `null` when the reference has no source
+  position).
+- `summary` counts `references` (the entries of `edges`), the distinct `books` they come
+  from, and `self`.
 
 ### Overlays
 
@@ -1746,6 +1962,15 @@ compares its output against the jar's and skips when no binary is present.
 `doc-4` records why each flag in `bin/native` is there -- every one of them is
 load-bearing -- and `doc-9` is the story of how the binary came about, including
 what the investigation got wrong on the way.
+
+`bin/soak` measures the reference graph behind `--check` and `--backlinks` in
+the native image: binary size, `--version` startup, `with-book` latency in a
+1,000-book graph, and the heap across 10,000 `refresh` cycles, natively and on
+the JVM. It builds its own image, `dist/haselnuss-soak`, with `bin/native
+--soak`. That image uses the same flags, but its program is the measurement
+driver in `dev/`, which the shipped jar and binary never contain. It runs for
+minutes, so it is not part of the test gate. The results are recorded in doc-11
+("Findings: :memory-index baseline").
 
 ## Test
 

@@ -349,7 +349,7 @@
 ;; exactly what `haselnuss.cli`'s real `:load` (`slurp` then `parser/parse`)
 ;; actually raises for each case.
 
-(defn- locate-warning
+(defn locate-warning
   "Diagnostic `w` placed at `node`'s source position (TASK-143): the position
   the parser recorded (`haselnuss.ast/source`) as `:source-line` and, when
   the document was parsed with a `:source` path, `:source-file`, with
@@ -358,7 +358,8 @@
   by a rule, read from JSON, or parsed without a path for the message)
   leaves `w` as it was. Defined here, ahead of include expansion, because
   that is its first user (TASK-163: an include diagnostic names the
-  `!include` line)."
+  `!include` line). Public so the reference graph's `scan-book` (TASK-240)
+  places a reference's diagnostics exactly as a build does."
   [node w]
   (if-let [{:keys [file line]} (ast/source node)]
     (cond-> (assoc w :source-line line)
@@ -2380,6 +2381,15 @@
 ;; document. Assembling the full, correctly-ordered multi-pass pipeline is
 ;; TASK-25's job, not an individual resolver step's.
 
+(defn parse-bibliography
+  "The bibliography map `load-bibliography` returns, from the CSL-JSON
+  `text` of the file instead of its path: for a caller that has read the
+  bytes itself (`haselnuss.library.filesystem` keeps their digest for the
+  reference graph, TASK-244)."
+  [text]
+  (let [entries (json/read-str text :key-fn keyword)]
+    (into {} (map (fn [entry] [(:id entry) entry])) entries)))
+
 (defn load-bibliography
   "Reads and parses a CSL-JSON bibliography file at `path` (SPEC.md sec7's
   `meta.bibliography`) into a map from citation key (each entry's `\"id\"`)
@@ -2397,8 +2407,7 @@
   reading a `.bib` is still not implemented (see this section's
   top-of-namespace comment)."
   [path]
-  (let [entries (json/read-str (slurp path) :key-fn keyword)]
-    (into {} (map (fn [entry] [(:id entry) entry])) entries)))
+  (parse-bibliography (slurp path)))
 
 (defn- str-inline
   "A plain `:str` Inline node wrapping `s` (sec4.4)."

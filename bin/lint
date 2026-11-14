@@ -20,6 +20,10 @@ status=0
 # rules. haselnuss.repl-config-test is what actually executes that guard code.
 lint_paths=(src project.clj)
 [ -d test ] && lint_paths+=(test)
+# dev/ holds code the gate does not run in full -- the graph soak driver
+# (TASK-245), built into its own native image by `bin/native --soak` -- so it
+# is linted like the rest rather than left to rot between soak runs.
+[ -d dev ] && lint_paths+=(dev)
 
 echo "== clj-kondo =="
 clj-kondo --lint "${lint_paths[@]}"

@@ -1369,6 +1369,26 @@
 (declare render-blocks)
 (declare render-tight-section-body)
 
+(defn- concat-rendered-kv
+  "`[text footnotes']`: `(render idx x footnotes)` -- itself `[piece
+  footnotes']`, the piece carrying whatever separator it needs from the
+  one before -- over every `x` of `xs` with its index, in order, threading
+  `footnotes` and concatenating the pieces.
+
+  One StringBuilder for the whole sequence (TASK-261, as TASK-258 did for
+  a paragraph's inlines): `(str text piece)` per Block copied everything
+  written so far each time, so a footnote or list item of very many Blocks
+  emitted in quadratic time."
+  [render footnotes xs]
+  (let [sb (StringBuilder.)
+        footnotes' (reduce-kv (fn [footnotes idx x]
+                                (let [[piece footnotes'] (render idx x footnotes)]
+                                  (.append sb (str piece))
+                                  footnotes'))
+                              footnotes
+                              (vec xs))]
+    [(str sb) footnotes']))
+
 (defn- render-wrapped
   "Renders `inline`'s own `:inlines` through `render-inlines`, then wraps
   the result between `open` and `close` -- the shared shape behind
@@ -2022,7 +2042,8 @@
                          (pr-str line))
                     {:type ::unrepresentable-footnote-code-line :line line})))
   (let [alternates (alternate-list-markers blocks)]
-    (reduce-kv (fn [[text footnotes] idx block]
+    (concat-rendered-kv
+     (fn [idx block footnotes]
                  ;; TASK-173: a footnote body is never a chunk sequence, and
                  ;; its own number is still reserved (no text) while it renders.
                  ;; TASK-177: a list after a same-kind sibling takes the other marker.
@@ -2039,21 +2060,21 @@
                  ;; line strips up to one more leading space from each body line),
                  ;; so only a line with a leading space needs 5, not 4 (the
                  ;; others, and the closing fence, keep the usual 4).
-                 (let [first-list? (and (zero? idx) (= :list (:t block)))
-                       first-code? (and (zero? idx) (= :code-block (:t block)))
-                       cr? (not (::no-cr-indent ctx))
-                       ctx (list-marker-ctx (dissoc ctx :chunk-level? ::tight-list-item) (alternates idx))
-                       [block-text footnotes'] (render-block ctx block footnotes)
-                       piece (if (zero? idx)
-                               (if first-code?
-                                 (str/replace block-text
-                                              (if cr? #"(?<=[\r\n])(?=([^\r\n]))" #"(?<=\n)(?=([^\r\n]))")
-                                              (fn [[_ c]] (if (= " " c) "     " "    ")))
-                                 (indent-continuation-lines (if first-list? 5 4) block-text cr?))
-                               (indent-block-continuation block-text cr?))]
-                   [(if (zero? idx) piece (str text "\n\n" piece)) footnotes']))
-               ["" footnotes]
-               (vec blocks))))
+       (let [first-list? (and (zero? idx) (= :list (:t block)))
+             first-code? (and (zero? idx) (= :code-block (:t block)))
+             cr? (not (::no-cr-indent ctx))
+             ctx (list-marker-ctx (dissoc ctx :chunk-level? ::tight-list-item) (alternates idx))
+             [block-text footnotes'] (render-block ctx block footnotes)
+             piece (if (zero? idx)
+                     (if first-code?
+                       (str/replace block-text
+                                    (if cr? #"(?<=[\r\n])(?=([^\r\n]))" #"(?<=\n)(?=([^\r\n]))")
+                                    (fn [[_ c]] (if (= " " c) "     " "    ")))
+                       (indent-continuation-lines (if first-list? 5 4) block-text cr?))
+                     (indent-block-continuation block-text cr?))]
+         [(if (zero? idx) piece (str "\n\n" piece)) footnotes']))
+     footnotes
+     blocks)))
 
 (defn- render-note
   "Renders footnote marker `note` (an Inline `:note`, sec4.4/5.12) as
@@ -2080,8 +2101,14 @@
         marker (str "[^" n "]")
         reserved (conj footnotes {:number n :text nil})
         [content footnotes'] (render-note-blocks ctx (:blocks note) reserved)
-        filled (mapv (fn [entry] (if (= n (:number entry)) (assoc entry :text content) entry))
-                     footnotes')]
+        ;; TASK-261: the reservation is entry n-1 of the vector this namespace
+        ;; builds, so fill it in place; walking every footnote for each one
+        ;; made a document of many footnotes quadratic. The walk stays for an
+        ;; accumulator of any other shape.
+        filled (if (and (vector? footnotes') (= n (:number (get footnotes' (dec n)))))
+                 (assoc-in footnotes' [(dec n) :text] content)
+                 (mapv (fn [entry] (if (= n (:number entry)) (assoc entry :text content) entry))
+                       footnotes'))]
     [marker filled]))
 
 (defn- escape-highlight-boundary
@@ -2312,12 +2339,13 @@
   close right before one (CommonMark's intraword rule), and between two `_`
   runs every pairing fuses. With no safe candidate the node keeps `*` and
   the verification in `render-inlines` refuses the document.
-  `inlines` is the sibling vector and `idx` the node's position in it, `text`
-  what was written before it. When the next sibling is an emphasis of the same
-  kind (which must take the other character) and the sibling after THAT cannot
+  `inlines` is the sibling vector and `idx` the node's position in it,
+  `prev-char` the last character written before it (nil when none). When
+  the next sibling is an emphasis of the same kind (which must take the
+  other character) and the sibling after THAT cannot
   follow a `_` closer, this node takes the `_` instead, so that run is the one
   that can bear it."
-  [ctx inlines idx prev text]
+  [ctx inlines idx prev prev-char]
   (let [inline (nth inlines idx)
         next-inline (get inlines (inc idx))
         n (count inlines)
@@ -2341,7 +2369,7 @@
                                          (not (and only? (= kind :strong))))
                                     (and only? (= :strong (:kind parent)) (= kind :emph)))))))
         alnum? (fn [c] (and c (Character/isLetterOrDigit (char c))))
-        can-use-underscore? (and (not (and (pos? idx) (alnum? (last text))))
+        can-use-underscore? (and (not (and (pos? idx) (alnum? prev-char)))
                                  (not (and next-inline (underscore-blocked-before? next-inline))))
         hand-over? (and next-inline (= kind (:t next-inline))
                         (when-let [after (get inlines (+ idx 2))] (underscore-blocked-before? after)))]
@@ -2362,11 +2390,18 @@
   it, so a footnote's own Blocks resolve their own."
   [ctx inlines footnotes]
   (let [inlines (vec (cond-> inlines (not (:in-inline? ctx)) replace-nul))
-        [text footnotes']
-        (reduce (fn [[text footnotes line-start? code-start? prev-emphasis idx] [inline next-inline]]
-                  (let [emphasis? (contains? #{:emph :strong} (:t inline))
+        ;; TASK-258: one StringBuilder, and only its last character looked
+        ;; at, rather than `(str text inline-text)` and `(last text)` per
+        ;; Inline: both walked everything written so far, so a paragraph
+        ;; on one long line took time quadratic in its length.
+        sb (StringBuilder.)
+        [footnotes']
+        (reduce (fn [[footnotes line-start? code-start? prev-emphasis idx] [inline next-inline]]
+                  (let [n (.length sb)
+                        prev-char (when (pos? n) (.charAt sb (dec n)))
+                        emphasis? (contains? #{:emph :strong} (:t inline))
                         delim (when emphasis?
-                                (choose-emphasis-delim ctx inlines idx prev-emphasis text))
+                                (choose-emphasis-delim ctx inlines idx prev-emphasis prev-char))
                         [inline-text footnotes'] (render-inline (assoc ctx
                                                                        ::parent-emphasis nil
                                                                        ::delim delim
@@ -2378,9 +2413,10 @@
                                                                        ::code-line-start? code-start?
                                                                        :in-inline? true
                                                                        ;; TASK-152: `escapes-as-book-ref-brace?`.
-                                                                       :after-at? (str/ends-with? text "@"))
+                                                                       :after-at? (= \@ prev-char))
                                                                 inline footnotes)]
-                    [(str text inline-text) footnotes'
+                    (.append sb (str inline-text))
+                    [footnotes'
                      ;; Whether the NEXT inline can open a physical line
                      ;; (TASK-135): after a break, or while only blanks
                      ;; have been written since the last one.
@@ -2396,10 +2432,11 @@
                      (inc idx)]))
                 ;; An inline nested in another (emphasis, a link) or a table
                 ;; cell follows its opening marker, so it starts no line.
-                ["" footnotes (:line-start? ctx true)
+                [footnotes (:line-start? ctx true)
                  (and (not (:in-inline? ctx)) (not (::in-table-cell ctx)) (:line-start? ctx true))
                  nil 0]
-                (map vector inlines (concat (rest inlines) [nil])))]
+                (map vector inlines (concat (rest inlines) [nil])))
+        text (str sb)]
     [(cond-> text (not (:in-inline? ctx)) resolve-escape-marks) footnotes']))
 
 (defn- emphasis-risky?
@@ -2910,6 +2947,32 @@
   when `text` is still blank."
   [text block-text]
   (if (str/blank? text) block-text (str text "\n\n" block-text)))
+
+(defn- blank-line-joiner
+  "A stateful `join-blocks` over a whole sequence (TASK-261): `(join!
+  block-text)` joins one more piece onto the text so far exactly as
+  `(join-blocks text block-text)` would, and `(join!)` returns that text.
+
+  `join-blocks` itself copies the text so far for every piece, which made
+  `render-blocks` quadratic in the number of Blocks (80k paragraphs took
+  ~12 s). While the text is still blank -- the only state in which
+  `join-blocks` REPLACES it rather than appending to it -- it is kept as
+  the last piece itself (nil and whitespace included, as `join-blocks`
+  returns them); the first non-blank piece starts one StringBuilder that
+  every later piece is appended to after a blank line, and text holding
+  a non-blank character never becomes blank again."
+  []
+  (let [blank-text (volatile! "")
+        sb (volatile! nil)]
+    (fn
+      ([] (if-let [^StringBuilder b @sb] (str b) @blank-text))
+      ([block-text]
+       (if-let [^StringBuilder b @sb]
+         (.append (.append b "\n\n") (str block-text))
+         (if (str/blank? block-text)
+           (vreset! blank-text block-text)
+           (vreset! sb (StringBuilder. (str block-text)))))
+       nil))))
 
 (defn- flush-footnote-definitions
   "`[defs footnotes']`: `defs` the `[^n]: text` definitions for every
@@ -3498,8 +3561,8 @@
   [ctx section footnotes]
   (let [blocks (:blocks section)
         alternates (alternate-list-markers blocks)]
-    (reduce-kv
-     (fn [[text footnotes] idx block]
+    (concat-rendered-kv
+     (fn [idx block footnotes]
        (when (pos? idx)
          (check-tight-list-item-continuation! idx (nth blocks (dec idx)) block (:level section)))
        (let [[block-text footnotes'] (render-block (cond-> (list-marker-ctx ctx (alternates idx))
@@ -3507,11 +3570,11 @@
                                                    block footnotes)]
          [(if (zero? idx)
             block-text
-            (str text "\n" (close-open-paragraph idx (nth blocks (dec idx)) block block-text
-                                                 (:level section))))
+            (str "\n" (close-open-paragraph idx (nth blocks (dec idx)) block block-text
+                                            (:level section))))
           footnotes']))
-     ["" footnotes]
-     (vec blocks))))
+     footnotes
+     blocks)))
 
 (defn- render-list-item-blocks
   "Renders one list item's own `blocks` (a vector, sec4.3's `:items`
@@ -3545,8 +3608,8 @@
         alternates (alternate-list-markers blocks)
         ;; TASK-180: a :section's own Blocks are this item's direct children too.
         ctx (cond-> ctx tight? (assoc ::tight-list-item true))]
-    (reduce-kv
-     (fn [[text footnotes] idx block]
+    (concat-rendered-kv
+     (fn [idx block footnotes]
        (when (and tight? (pos? idx))
          (check-tight-list-item-continuation! idx (nth blocks (dec idx)) block))
        (let [[block-text footnotes'] (render-block (cond-> (list-marker-ctx ctx (alternates idx))
@@ -3554,13 +3617,23 @@
                                                    block footnotes)]
          (cond
            (zero? idx) [(indent-continuation-lines width block-text cr?) footnotes']
-           (not tight?) [(str text "\n\n" (indent-lines width block-text cr?)) footnotes']
-           :else [(str text "\n" (indent-lines width (close-open-paragraph
-                                                      idx (nth blocks (dec idx)) block block-text nil)
-                                               cr?))
+           (not tight?) [(str "\n\n" (indent-lines width block-text cr?)) footnotes']
+           :else [(str "\n" (indent-lines width (close-open-paragraph
+                                                 idx (nth blocks (dec idx)) block block-text nil)
+                                          cr?))
                   footnotes'])))
-     ["" footnotes]
-     (vec blocks))))
+     footnotes
+     blocks)))
+
+(defn- notes-added
+  "The entries of footnote accumulator `footnotes'` past the first `(count
+  footnotes)` -- the notes reserved since `footnotes`. A `subvec` of a
+  vector (TASK-261: `drop` walked every earlier footnote, once per
+  one-item loose list), `drop` of anything else."
+  [footnotes footnotes']
+  (if (and (vector? footnotes') (<= (count footnotes) (count footnotes')))
+    (subvec footnotes' (count footnotes))
+    (drop (count footnotes) footnotes')))
 
 (defn- render-list
   "Renders List `block` (sec4.3: `:ordered`/`:tight`/`:items`) as a bullet
@@ -3621,14 +3694,14 @@
                                        ;; TASK-235: or one nested list, whose notes the outer
                                        ;; item defines the same way.
                                        (#{:para :list} (:t (ffirst items)))
-                                       (seq (remove :written? (drop (count footnotes) footnotes'))))
+                                       (seq (remove :written? (notes-added footnotes footnotes'))))
                                 (let [[marker item-text] (first rendered)
-                                      mine (remove :written? (drop (count footnotes) footnotes'))
+                                      mine (remove :written? (notes-added footnotes footnotes'))
                                       defs (str/join "\n\n" (map (fn [{:keys [number text]}] (str "[^" number "]: " text)) mine))
                                       width (count marker)]
                                   [[[marker (str item-text "\n\n" (indent-lines width defs (not (::no-cr-indent ctx))))]]
                                    (into (subvec footnotes' 0 (count footnotes))
-                                         (map #(assoc % :written? true)) (drop (count footnotes) footnotes'))])
+                                         (map #(assoc % :written? true)) (notes-added footnotes footnotes'))])
                                 [rendered footnotes'])
         ;; TASK-179: a bullet item line that reads as a thematic break makes the
         ;; whole list `+ ` (same width, so the item text stands as rendered).
@@ -3718,15 +3791,19 @@
   A `:list` directly after a sibling list of its own kind is written with
   the other marker (`alternate-list-markers`, TASK-177)."
   [ctx blocks footnotes]
-  (reduce (fn [[text footnotes] [block alternate?]]
-            (let [[defs footnotes] (if (chunk-boundary? ctx block)
-                                     (flush-footnote-definitions footnotes)
-                                     [nil footnotes])
-                  text (cond-> text defs (join-blocks defs))
-                  [block-text footnotes'] (render-block (list-marker-ctx ctx alternate?) block footnotes)]
-              [(join-blocks text block-text) footnotes']))
-          ["" footnotes]
-          (map vector blocks (alternate-list-markers blocks))))
+  (let [join! (blank-line-joiner)
+        footnotes' (reduce (fn [footnotes [block alternate?]]
+                             (let [[defs footnotes] (if (chunk-boundary? ctx block)
+                                                      (flush-footnote-definitions footnotes)
+                                                      [nil footnotes])
+                                   _ (when defs (join! defs))
+                                   [block-text footnotes'] (render-block (list-marker-ctx ctx alternate?)
+                                                                         block footnotes)]
+                               (join! block-text)
+                               footnotes'))
+                           footnotes
+                           (map vector blocks (alternate-list-markers blocks)))]
+    [(join!) footnotes']))
 
 ;; --- Front matter (sec5.2) ---------------------------------------------------
 

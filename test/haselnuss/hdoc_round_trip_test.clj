@@ -219,7 +219,11 @@
                ;; ... and its book that quotes (TASK-154)
                "quoting.hdoc"
                ;; test/fixtures/libraries/generated/, beside a generated shelf (TASK-158)
-               "salmos-notas.hdoc"}
+               "salmos-notas.hdoc"
+               ;; test/fixtures/libraries/check/, the problems --check reports (TASK-242)
+               "links.hdoc" "cycle-a.hdoc" "cycle-b.hdoc" "deep-01.hdoc" "deep-02.hdoc"
+               "deep-03.hdoc" "deep-04.hdoc" "deep-05.hdoc" "deep-06.hdoc" "deep-07.hdoc"
+               "deep-08.hdoc" "deep-09.hdoc" "deep-10.hdoc"}
              names)))))
 
 (deftest book-refs-fixture-test

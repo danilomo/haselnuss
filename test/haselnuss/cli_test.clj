@@ -3782,7 +3782,7 @@
                            "!quote lib:nicene#sec:gone\n\n"
                            "!quote broken:y\n"))
           {:keys [status err]} (main-run "--libraries" (yaml-path libs) (str doc))
-          lines (filter #(str/starts-with? % "haselnuss: warning: ") (str/split-lines err))
+          lines (filter #(re-find #"^haselnuss: (warning|info): " %) (str/split-lines err))
           ref-lines (filter #(str/includes? % "book reference ") lines)
           line-of (fn [written] (filter #(str/includes? % (str "book reference " (pr-str written))) ref-lines))]
       (is (= 0 status) err)
@@ -3791,8 +3791,11 @@
                               (remove #(str/includes? % "book reference ") lines))))
           err)
       (is (= 7 (count ref-lines)) err)
+      ;; TASK-247: the stale shelf path is an info, printed as one
       (doseq [l ref-lines]
-        (is (str/starts-with? l (str "haselnuss: warning: " doc ":")) l))
+        (is (str/starts-with? l (str "haselnuss: " (if (str/includes? l "\"lib:old/nicene\"") "info" "warning")
+                                     ": " doc ":"))
+            l))
       (is (str/includes? (first (line-of "lib:nicene#sec:nope")) (str doc ":3: ")))
       (is (str/includes? (first (line-of "lib:nicene#sec:nope")) "lib:creeds/nicene"))
       (is (str/includes? (first (line-of "lib:nicene#sec:gone")) (str doc ":7: ")))

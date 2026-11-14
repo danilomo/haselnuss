@@ -116,6 +116,7 @@
             [haselnuss.ast :as ast]
             [haselnuss.book-ref :as book-ref]
             [haselnuss.library :as library]
+            [haselnuss.library.digest :as digest]
             [haselnuss.sandbox :as sandbox]
             [haselnuss.walk :as walk]
             [sci.core :as sci]
@@ -263,11 +264,12 @@
                         locate (assoc :locate locate))}))))
 
 (defn- load-script
-  "`{:spec map}` for the shelf's script, or `{:failure diagnostic}`."
+  "`{:spec map :digest d}` for the shelf's script (`d` the digest of the
+  bytes read, `haselnuss.library.digest`), or `{:failure diagnostic}`."
   [{:keys [script] :as shelf}]
   (let [path (str script)]
     (try
-      (let [source (slurp script :encoding "UTF-8")
+      (let [[source script-digest] (digest/read-text script "UTF-8")
             _ (notify! shelf :load)
             ctx (:ctx shelf)
             checked (sandbox/sci-call!
@@ -279,7 +281,7 @@
                      :spec)]
         (if-let [problem (::problem checked)]
           {:failure (diagnostic :script-failed shelf problem)}
-          {:spec (::spec checked)}))
+          {:spec (::spec checked) :digest script-digest}))
       (catch java.io.IOException e
         {:failure (diagnostic :script-failed shelf
                               (str "cannot read the script: " (throwable-message e)))})
@@ -289,16 +291,19 @@
 ;; --- data ----------------------------------------------------------------------
 
 (defn- parse-data
-  "The value of the data file `file`, written `written`, parsed by its
-  extension. Throws on an unsupported extension or a parse error."
+  "`[value digest]`: the value of the data file `file`, written `written`,
+  parsed by its extension, and the digest of the bytes read
+  (`haselnuss.library.digest`). Throws on an unsupported extension or a
+  parse error."
   [^File file ^String written]
-  (let [text (slurp file :encoding "UTF-8")
+  (let [[text file-digest] (digest/read-text file "UTF-8")
         lower (str/lower-case written)]
-    (cond
-      (str/ends-with? lower ".json") (json/read-str text :key-fn keyword)
-      (or (str/ends-with? lower ".yaml") (str/ends-with? lower ".yml")) (yaml/parse-string text)
-      (str/ends-with? lower ".edn") (edn/read-string text)
-      :else (throw (ex-info "the host reads only .json, .yaml, .yml and .edn data files" {})))))
+    [(cond
+       (str/ends-with? lower ".json") (json/read-str text :key-fn keyword)
+       (or (str/ends-with? lower ".yaml") (str/ends-with? lower ".yml")) (yaml/parse-string text)
+       (str/ends-with? lower ".edn") (edn/read-string text)
+       :else (throw (ex-info "the host reads only .json, .yaml, .yml and .edn data files" {})))
+     file-digest]))
 
 (defn- data-file
   "The File the `:data` path `written` names in the shelf folder `dir`, or
@@ -320,8 +325,9 @@
     (catch Exception e (str "it is not a usable path: " (throwable-message e)))))
 
 (defn- read-data
-  "`{:data {written value}}` for the spec's `:data`, or `{:failure
-  diagnostic}` for the first path that is refused or cannot be read."
+  "`{:data {written value} :files [canonical-path] :digests {canonical-path
+  digest}}` for the spec's `:data`, or `{:failure diagnostic}` for the
+  first path that is refused or cannot be read."
   [{:keys [dir] :as shelf} paths]
   (reduce (fn [acc written]
             (let [found (data-file dir written)
@@ -332,9 +338,13 @@
                                                         :data written)}))]
               (if (string? found)
                 (fail found)
-                (try (assoc-in acc [:data written] (parse-data found written))
+                (try (let [[value file-digest] (parse-data found written)]
+                       (-> acc
+                           (assoc-in [:data written] value)
+                           (update :files conj (str found))
+                           (update :digests digest/record (str found) file-digest)))
                      (catch Throwable t (fail (str "cannot read it: " (throwable-message t))))))))
-          {:data {}}
+          {:data {} :files [] :digests {}}
           paths))
 
 ;; --- books -------------------------------------------------------------------
@@ -441,6 +451,24 @@
   [book]
   (when (generated-book? book) (:path book)))
 
+(defn data-files
+  "The canonical paths (strings) of the `:data` files the script that
+  generated `book` was handed, in its `:data` order -- with
+  `script-path`, every file the book's document depends on (the reference
+  graph's `:files`, TASK-240). nil for any other value."
+  [book]
+  (when (generated-book? book) (::data-files book)))
+
+(defn file-digests
+  "path -> digest (`haselnuss.library.digest`) of the bytes the shelf load
+  read for `book`'s `script-path` and `data-files`, keyed by those same
+  path strings: what the reference graph's `:hash` is taken from
+  (TASK-244), so an edit landing after the shelf was loaded never pairs
+  its hash with the content the books were generated from. `{}` for any
+  other value."
+  [book]
+  (if (generated-book? book) (::digests book {}) {}))
+
 (defn- book-of
   "`{:book Book}` for the `:books` item `item`, or `{:diagnostic ...}`."
   [{:keys [lib-name shelf script spec] :as shelf-ctx} item]
@@ -459,10 +487,12 @@
                                    :book (canonical id))}
           (let [entry (library/book-entry-value id fields)
                 loaded (delay (generate-document shelf-ctx id slug))]
-            {:book (if (:locate spec)
-                     (->LocatableGeneratedBook entry (str script) loaded
-                                               #(locate-passage shelf-ctx id slug %))
-                     (->GeneratedBook entry (str script) loaded))}))))))
+            {:book (assoc (if (:locate spec)
+                            (->LocatableGeneratedBook entry (str script) loaded
+                                                      #(locate-passage shelf-ctx id slug %))
+                            (->GeneratedBook entry (str script) loaded))
+                          ::data-files (vec (:data-files shelf-ctx))
+                          ::digests (:digests shelf-ctx {}))}))))))
 
 (defn- list-books
   "`{:books :diagnostics}` from the script's `:books`, or `{:failure ...}`."
@@ -520,13 +550,15 @@
                              script-file-name ", which is not run: the library's entry in the"
                              " library directory does not say scripts: true")))
       (let [shelf-ctx (assoc shelf-ctx :ctx (sandbox/fork))
-            {:keys [spec failure]} (load-script shelf-ctx)]
+            {:keys [spec failure] script-digest :digest} (load-script shelf-ctx)]
         (if failure
           (fail failure)
-          (let [{:keys [data failure]} (read-data shelf-ctx (:data spec))]
+          (let [{:keys [data files failure digests]} (read-data shelf-ctx (:data spec))]
             (if failure
               (fail failure)
-              (let [listed (list-books (assoc shelf-ctx :spec spec :data data))]
+              (let [listed (list-books (assoc shelf-ctx :spec spec :data data :data-files files
+                                              :digests (digest/record digests (str (:script shelf-ctx))
+                                                                      script-digest)))]
                 (if-let [failure (:failure listed)]
                   (fail failure)
                   (assoc listed :failure nil))))))))))

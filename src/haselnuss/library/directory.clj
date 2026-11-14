@@ -89,7 +89,8 @@
             [haselnuss.library :as library]
             [haselnuss.library.filesystem :as filesystem]
             [haselnuss.library.memory :as memory]
-            [haselnuss.library.url :as url])
+            [haselnuss.library.url :as url]
+            [haselnuss.parser :as parser])
   (:import (java.io File IOException)))
 
 ;; --- registry ----------------------------------------------------------------
@@ -189,7 +190,7 @@
        (catch org.yaml.snakeyaml.error.MarkedYAMLException e
          (let [mark (or (.getProblemMark e) (.getContextMark e))]
            (throw (invalid file (if mark (inc (.getLine mark)) 1)
-                           (str "invalid YAML: " (ex-message e)) e))))
+                           (str "invalid YAML: " (parser/yaml-error-message e 1)) e))))
        (catch RuntimeException e
          (throw (invalid file 1 (str "invalid YAML: "
                                      (or (ex-message e) (.getName (class e))))

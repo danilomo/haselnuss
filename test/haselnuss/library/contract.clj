@@ -205,8 +205,14 @@
         (is (nil? (library/find-book library nil)))
         (is (nil? (library/find-book library 42))))
 
+      (when (satisfies? library/ListedBooks library)
+        (testing "listed-books hands out one Book per listed entry, in order, colliding slugs included"
+          (let [books (library/listed-books library)]
+            (is (every? #(satisfies? library/Book %) books))
+            (is (= (vec entries) (mapv library/book-entry books))))))
+
       (when document-loads
-        (testing "listing, shelf-tree, diagnostics, find-book and book-entry load no document"
+        (testing "listing, shelf-tree, diagnostics, find-book, listed-books and book-entry load no document"
           (is (= loads-before (loads)))))
 
       (testing "document yields a valid Haselnuss Document, the same value each lookup"

@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# The reference-graph soak and the :memory-index baseline (TASK-245; doc-11,
+# "GraalVM investigation phase" and its pass criteria). Not part of the gate:
+# it needs its own native build (bin/native --soak, minutes) and the soak
+# itself runs for minutes, so it is run by hand and its numbers recorded in
+# doc-11 ("Findings: :memory-index baseline"). TASK-246 repeats it for a
+# DataScript backend.
+#
+#   bin/soak [--no-build] [--cycles N]
+#
+# Measures, in this order:
+#   1. binary size of dist/haselnuss (the shipped image) and dist/haselnuss-soak;
+#   2. `dist/haselnuss --version` wall time, median of 51 runs (hyperfine when
+#      installed, else a loop over `date +%s%N`);
+#   3. with-book of one book in a 1,000-book graph, 10,000 updates, native
+#      image then JVM (`haselnuss.soak with-book`);
+#   4. the refresh soak, N cycles (default 10,000), native image then JVM
+#      (`haselnuss.soak refresh test/fixtures/libraries`).
+# Exits 1 when any measurement reports FAIL. The JVM runs use `java` from
+# PATH, which is the JDK `lein test` uses, not GraalVM's.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+build=1
+cycles=10000
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-build) build=0; shift ;;
+    --cycles) cycles="${2:?--cycles needs a count}"; shift 2 ;;
+    *) echo "usage: bin/soak [--no-build] [--cycles N]" >&2; exit 2 ;;
+  esac
+done
+
+soak_bin=dist/haselnuss-soak
+soak_jar=target/uberjar/haselnuss-soak.jar
+GRAALVM_HOME="${GRAALVM_HOME:-$HOME/.sdkman/candidates/java/21.0.2-graalce}"
+
+if [ "$build" -eq 1 ]; then
+  bin/native --soak || exit 1
+fi
+if [ ! -x "$soak_bin" ]; then
+  echo "bin/soak: no $soak_bin; run without --no-build" >&2
+  exit 1
+fi
+# `lein uberjar` (haselnuss.uberjar-test runs it) cleans target/uberjar/, so
+# the soak jar may be gone after a `lein test` even when the image is not.
+if [ ! -f "$soak_jar" ]; then
+  rm -rf target/soak   # :auto-clean is off for :soak (project.clj)
+  lein with-profile +soak uberjar >/dev/null || exit 1
+fi
+
+status=0
+run() {
+  echo "\$ $*"
+  "$@" || status=1
+}
+
+echo "== machine =="
+echo "date:    $(date -u +%Y-%m-%dT%H:%MZ)"
+echo "commit:  $(git rev-parse --short HEAD)$(git diff --quiet || echo ' (+ working-tree changes)')"
+echo "cpu:     $(lscpu 2>/dev/null | sed -n 's/^Model name: *//p') ($(nproc) threads)"
+echo "memory:  $(free -g 2>/dev/null | awk '/^Mem:/ {print $2 " GB"}')"
+echo "kernel:  $(uname -sr)"
+echo "graalvm: $("$GRAALVM_HOME/bin/native-image" --version 2>&1 | head -n 1)"
+echo "jvm:     $(java -version 2>&1 | head -n 1)"
+
+echo
+echo "== binary size =="
+for f in dist/haselnuss "$soak_bin"; do
+  if [ -f "$f" ]; then
+    echo "$f: $(stat -c %s "$f") bytes ($(du -h "$f" | cut -f1))"
+  else
+    echo "$f: not built"
+  fi
+done
+
+echo
+echo "== startup: dist/haselnuss --version =="
+if [ ! -x dist/haselnuss ]; then
+  echo "not built (bin/native)"
+elif command -v hyperfine >/dev/null 2>&1; then
+  hyperfine --warmup 5 --runs 51 'dist/haselnuss --version'
+else
+  for _ in 1 2 3 4 5; do dist/haselnuss --version >/dev/null; done
+  times=()
+  for _ in $(seq 51); do
+    t0=$(date +%s%N)
+    dist/haselnuss --version >/dev/null
+    t1=$(date +%s%N)
+    times+=("$(( (t1 - t0) / 1000 ))")
+  done
+  sorted=$(printf '%s\n' "${times[@]}" | sort -n)
+  echo "51 runs after 5 warm-up runs (loop over date +%s%N, hyperfine not installed):"
+  echo "  median $(echo "$sorted" | sed -n 26p) us, min $(echo "$sorted" | head -n 1) us, max $(echo "$sorted" | tail -n 1) us"
+fi
+
+echo
+echo "== with-book: one book in a 1,000-book graph =="
+run "$soak_bin" with-book 1000 10000
+echo
+run java -jar "$soak_jar" with-book 1000 10000
+
+echo
+echo "== refresh soak: $cycles cycles =="
+run "$soak_bin" refresh test/fixtures/libraries "$cycles" 10
+echo
+run java -jar "$soak_jar" refresh test/fixtures/libraries "$cycles" 10
+
+echo
+if [ "$status" -eq 0 ]; then echo "bin/soak: all PASS"; else echo "bin/soak: FAIL"; fi
+exit "$status"

@@ -1687,3 +1687,58 @@
     (let [once (emit-body (para (sticky-note (annotation-attr) (para (str-inline "x")))))
           twice (emit-body (para (sticky-note (annotation-attr) (para (str-inline "x")))))]
       (is (= once twice) "two identical documents emit identically"))))
+
+;; --- TASK-258: one long line emits in linear time ----------------------------
+
+(deftest long-line-emit-time-test
+  (testing "TASK-258: a one-line paragraph of ~400k characters, emphasis and book
+            references throughout, renders in time linear in its length. Each
+            Inline copied the paragraph's HTML so far (`(str html inline-html)`),
+            so this took ~25 s on JDK 17; now well under a second. No code spans:
+            on JDK 17 flexmark's own backtick matching is quadratic (TASK-253)."
+    (let [unit "*a* @{b:x} w"
+          k (quot 400000 (inc (count unit)))
+          doc (parser/parse (str (str/join " " (repeat k unit)) "\n"))
+          t (System/nanoTime)
+          out (html/emit-document doc)
+          secs (/ (- (System/nanoTime) t) 1e9)]
+      (is (< secs 5.0) (str (* k (inc (count unit))) " characters on one line took " secs " s to emit"))
+      (testing "and every inline is rendered, in order"
+        (is (= (str "<p>" (str/join " " (repeat k "<em>a</em> <span class=\"book-ref\">b:x</span> w")) "</p>")
+               (str/trim (body-of out))))))))
+
+;; --- TASK-261: very many Blocks emit in linear time ---------------------------
+
+(deftest many-blocks-emit-time-test
+  (testing "TASK-261: 20k code blocks (~4.2 MB of source) render in time linear in
+            their number. Each Block copied the HTML so far (`(str html
+            block-html)`), so this took ~15 s on JDK 17; now well under a second.
+            Code blocks, because each is cheap to render and large to copy."
+    (let [x200 (apply str (repeat 200 "x"))
+          doc (parser/parse (str/join "\n" (repeat 20000 (str "```\n" x200 "\n```\n"))))
+          t (System/nanoTime)
+          out (html/emit-document doc)
+          secs (/ (- (System/nanoTime) t) 1e9)]
+      (is (< secs 5.0) (str "20000 code blocks took " secs " s to emit"))
+      (testing "and every block is rendered, in order"
+        (is (= (apply str (repeat 20000 (str "<pre><code>" x200 "\n</code></pre>")))
+               (str/trim (body-of out)))))))
+  (testing "TASK-261: 20k footnotes and 20k list items render in linear time too,
+            and table rows are joined in order. Each footnote walked every footnote
+            before it to fill in its own entry, and the items and rows were joined
+            like the Blocks (~17 s for the footnotes alone on JDK 17). Only 2000
+            rows: reading a table is itself quadratic in flexmark."
+    (let [n 20000
+          notes (parser/parse (str/join (map #(str "p[^" % "]\n\n[^" % "]: n" % "\n\n") (range n))))
+          items (parser/parse (str/join (map #(str "- i" % "\n") (range n))))
+          rows (parser/parse (str "| a |\n|---|\n" (str/join (map #(str "| r" % " |\n") (range 2000)))))
+          t (System/nanoTime)
+          [notes-out items-out rows-out] (mapv html/emit-document [notes items rows])
+          secs (/ (- (System/nanoTime) t) 1e9)]
+      (is (< secs 5.0) (str n " footnotes, list items and table rows took " secs " s to emit"))
+      (is (= (map #(str "<li id=\"fn" (inc %) "\"><p>n" % "</p>") (range n))
+             (re-seq #"<li id=\"fn\d+\"><p>n\d+</p>" (body-of notes-out)))
+          "every footnote's own text, in its own numbered entry")
+      (is (= (map #(str "<li>i" % "</li>") (range n)) (re-seq #"<li>i\d+</li>" (body-of items-out))))
+      (is (= (map #(str "<tr><td><p>r" % "</p></td></tr>") (range 2000))
+             (re-seq #"<tr><td><p>r\d+</p></td></tr>" (body-of rows-out)))))))

@@ -4,8 +4,36 @@
 # minutes. See doc-4 for why each flag below is here -- every one of them was
 # arrived at by a build failing without it, and removing any one reintroduces a
 # specific, documented failure.
+#
+# `bin/native --soak` (TASK-245) builds dist/haselnuss-soak instead: the
+# graph soak and with-book benchmark (`haselnuss.soak`, under dev/, run by
+# bin/soak) from the `:soak` profile's uberjar. It goes through the very same
+# staging and native-image invocation below, so it measures the image the
+# shipped flags produce; only the jar it starts from and the output name
+# differ. The shipped binary is unchanged by it and never contains the soak.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+case "${1:-}" in
+  "")
+    uberjar=(lein uberjar)
+    jar=target/uberjar/haselnuss.jar
+    out=dist/haselnuss
+    ;;
+  --soak)
+    # The :soak profile turns :auto-clean off (it would delete the shipped
+    # target/uberjar/haselnuss.jar; see project.clj), so clean its own output
+    # here: no stale AOT class can reach the soak image.
+    rm -rf target/soak target/uberjar/haselnuss-soak.jar
+    uberjar=(lein with-profile +soak uberjar)
+    jar=target/uberjar/haselnuss-soak.jar
+    out=dist/haselnuss-soak
+    ;;
+  *)
+    echo "usage: bin/native [--soak]" >&2
+    exit 2
+    ;;
+esac
 
 # GraalVM is looked up rather than assumed to be the default JDK, deliberately:
 # the project's own `lein test`/`lein uberjar` should keep running on whatever
@@ -24,16 +52,15 @@ export PATH="$JAVA_HOME/bin:$PATH"
 # deletes the whole target/ tree before every jar/uberjar build, so a binary
 # kept there did not survive `lein test` -- haselnuss.uberjar-test shells out
 # to `lein uberjar` on every run. dist/ is gitignored and Leiningen never
-# touches it.
-out=dist/haselnuss
-staged=dist/haselnuss-staged.jar
+# touches it. ($out is set above.)
+staged="$out-staged.jar"
 
 mkdir -p dist
 
 echo "== uberjar =="
 # Built under GraalVM itself, so the class files native-image consumes come
 # from the same JDK that reads them.
-lein uberjar || exit 1
+"${uberjar[@]}" || exit 1
 
 echo
 echo "== staging jar (stripping Clojure sources) =="
@@ -53,7 +80,7 @@ echo "== staging jar (stripping Clojure sources) =="
 # Removing the sources leaves RT no fallback to get wrong. Done to a staged
 # copy rather than via :uberjar-exclusions so the *shipped* jar keeps its
 # sources; nothing about the published artifact changes for JVM users.
-cp target/uberjar/haselnuss.jar "$staged" || exit 1
+cp "$jar" "$staged" || exit 1
 zip -q -d "$staged" '*.clj' '*.cljc' '*.cljs' || exit 1
 
 echo
@@ -84,6 +111,10 @@ rm -f "$staged"
 if [ "$status" -eq 0 ]; then
   echo
   echo "built $out ($(du -h "$out" | cut -f1))"
-  echo "verify it with: lein test haselnuss.native-test"
+  if [ "$out" = dist/haselnuss ]; then
+    echo "verify it with: lein test haselnuss.native-test"
+  else
+    echo "run it with: bin/soak --no-build"
+  fi
 fi
 exit "$status"

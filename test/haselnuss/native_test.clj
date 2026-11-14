@@ -24,7 +24,8 @@
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]])
+            [clojure.test :refer [deftest is testing]]
+            [haselnuss.cli :as cli])
   (:import (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)))
 
@@ -221,3 +222,68 @@
               (is (= (:exit jvm) (:exit native)) (pr-str args))
               (is (= (:out jvm) (:out native)) (pr-str args))
               (is (= (:err jvm) (:err native)) (pr-str args)))))))))
+
+(defn- run-main
+  "`args` through `haselnuss.cli/main*` in this JVM, as `{:exit :out
+  :err}` -- the JVM side of `native-check-backlinks-test`.
+
+  In-process rather than `run-jar`: each case below is a whole library
+  scan, and a cold `java -jar` per case would add a JVM start (and an
+  unwarmed scan) to every one of them. `main*` is everything `-main` does
+  short of `System/exit`, and the jar `haselnuss.uberjar-test` rebuilds
+  on every run is these same sources. The overrides keep the real
+  `$HASELNUSS_LIBRARIES` and home config out of it, which the binary
+  never reads either: every case passes `--libraries`. Paths in the
+  reports are shown relative to this JVM's working directory, which is
+  the binary's too (`shell/sh` inherits it)."
+  [& args]
+  (let [err (java.io.StringWriter.)
+        out (java.io.StringWriter.)
+        status (binding [*err* err *out* out]
+                 (cli/main* args {:library-env {}
+                                  :library-home "/nonexistent/haselnuss-native-test-home"
+                                  :haselnuss.cli/check-base-dir (System/getProperty "user.dir")}))]
+    {:exit status :out (str out) :err (str err)}))
+
+(def ^:private fixture-libraries
+  "The fixture libraries' directory file (TASK-242): every problem
+  `--check` reports, and the cross-library edges `--backlinks` lists."
+  "test/fixtures/libraries/libraries.yaml")
+
+(deftest native-check-backlinks-test
+  (if-not (binary-present?)
+    (testing "no native binary built -- skipping (see this namespace's docstring)"
+      (is true "native-image is opt-in; absence of a binary is not a failure"))
+    (testing "TASK-245 (doc-11, \"GraalVM investigation phase\"): --check and
+              --backlinks print byte for byte what the JVM prints, on stdout
+              and stderr, with the same exit code -- the scan, its sandboxed
+              shelf scripts and both renderers all run inside the image"
+      (let [clean-yaml (str (io/file (library-fixture-dir!) "libraries.yaml"))]
+        (doseq [[expected-exit args]
+                [;; the planted problems: 1
+                 [1 ["--libraries" fixture-libraries "--check"]]
+                 [1 ["--libraries" fixture-libraries "--check" "--format" "json"]]
+                 [1 ["--libraries" fixture-libraries "--check" "pass" "shared"]]
+                 ;; a clean library: 0
+                 [0 ["--libraries" clean-yaml "--check"]]
+                 [0 ["--libraries" clean-yaml "--check" "--format" "json"]]
+                 ;; cannot run: 2, and a usage error is 2 as well
+                 [2 ["--libraries" fixture-libraries "--check" "nosuch"]]
+                 [2 ["--libraries" fixture-libraries "--check" "nosuch" "--format" "json"]]
+                 [2 ["--libraries" fixture-libraries "--check" "x.hdoc"]]
+                 ;; grouped by passage, cross-library and dangling edges, the
+                 ;; broken library's warning on stderr
+                 [0 ["--libraries" fixture-libraries "--backlinks" "pass:nicene"]]
+                 [0 ["--libraries" fixture-libraries "--backlinks" "pass:nicene" "--format" "json"]]
+                 [0 ["--libraries" fixture-libraries "--backlinks" "pass:nicene#sec:creed"]]
+                 [2 ["--libraries" fixture-libraries "--backlinks" "bible:"]]
+                 [2 ["--libraries" fixture-libraries "--backlinks" "bible:" "--format" "json"]]
+                 [2 ["--libraries" fixture-libraries "--backlinks" "pass:nowhere"]]]]
+          (let [native (apply run-binary args)
+                jvm (apply run-main args)]
+            (is (= expected-exit (:exit jvm)) (str (pr-str args) " " (:err jvm)))
+            (is (= (:exit jvm) (:exit native)) (pr-str args))
+            (is (= (:out jvm) (:out native)) (pr-str args))
+            (is (= (:err jvm) (:err native)) (pr-str args))
+            (is (not (str/blank? (str (:out native) (:err native))))
+                (str (pr-str args) ": the comparison must not be between two empty outputs"))))))))

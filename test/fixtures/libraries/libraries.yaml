@@ -1,0 +1,25 @@
+# The fixture libraries as one library directory (TASK-242): what
+# haselnuss.check-test runs --check over. `bible-off` is the generated
+# library with its scripts left disabled; `broken` fails to load.
+- name: reformed
+  type: filesystem
+  path: reformed
+- name: pass
+  type: filesystem
+  path: passages
+- name: shared
+  type: filesystem
+  path: shared
+- name: bible
+  type: filesystem
+  path: generated
+  scripts: true
+- name: bible-off
+  type: filesystem
+  path: generated
+- name: check
+  type: filesystem
+  path: check
+  scripts: true
+- name: broken
+  type: nope

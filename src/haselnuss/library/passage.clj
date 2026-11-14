@@ -203,8 +203,9 @@
    :message (str "book " (canonical id) " " what ": " (throwable-message t))})
 
 (defn- load-resolved
-  "The resolved form of `book` -- `{:document :labels :ids}` -- or the
-  diagnostic it failed with. Queues the book's load warnings on `ctx`."
+  "The resolved form of `book` -- `{:document :labels :ids :diagnostics
+  :load-warnings}` -- or the diagnostic it failed with. Queues the book's
+  load warnings on `ctx`."
   [ctx book id]
   (let [document (try (library/document book)
                       (catch Throwable t (book-failed id "failed to produce its document" t)))]
@@ -221,15 +222,65 @@
           result
           {:document (:document result)
            :labels (:labels result)
-           :ids (id-index (:document result))})))))
+           :ids (id-index (:document result))
+           :diagnostics (vec (:diagnostics result))
+           :load-warnings warnings})))))
+
+(defn book-source
+  "Where `book` comes from, to tell two books with one id apart (TASK-250):
+  a filesystem book's path on disk, nil for any other book. Two books
+  with one id and one source share a cache entry, so the reference
+  graph's scan records them as one book (`haselnuss.library.graph.scan`)."
+  [book]
+  (when (fs/filesystem-book? book) (fs/book-path book)))
+
+(defn- cache-entry
+  "The entry of `ctx`'s cache under `k`, `{:id :source :loaded delay}`,
+  made for `book` (whose id is `id`) when there is none yet."
+  [ctx book id k]
+  (let [state (swap! (:state ctx) update-in [:books k]
+                     #(or % {:id id
+                             :source (book-source book)
+                             :loaded (delay (load-resolved ctx book id))}))]
+    (get-in state [:books k])))
 
 (defn- resolved
-  "`book`'s resolved form from `ctx`'s cache, loading it on first use."
+  "`book`'s resolved form from `ctx`'s cache, loading it on first use.
+  Keyed by `book-ref/book-key`, so a book is the same book whatever shelf
+  it is reached by."
   [ctx book id]
-  (let [k (book-ref/book-key id)
-        state (swap! (:state ctx) update-in [:books k]
-                     #(or % (delay (load-resolved ctx book id))))]
-    @(get-in state [:books k])))
+  @(:loaded (cache-entry ctx book id (book-ref/book-key id))))
+
+(defn resolved-book
+  "`book`'s resolved form, from `ctx`'s cache -- the one `resolve-passage`
+  reads, so a book is loaded and resolved once per context however it is
+  reached -- loading it on first use: `{:document :labels :ids
+  :diagnostics :load-warnings}`, `:document` and `:labels` being
+  `haselnuss.resolver/resolve-document`'s (run without `:books`, so the
+  book's own quotes and links are left as parsed), `:ids` the block-id
+  index (`{:blocks {id path} :elsewhere {...}}`), `:diagnostics`
+  `resolve-document`'s and `:load-warnings` the book's own load warnings
+  (also queued once for `take-book-diagnostics!`). Or the diagnostic the
+  book failed with -- what its `document` answered instead, or a
+  `:book-failed` when resolving threw. For the reference graph's
+  `scan-book` (TASK-240).
+
+  A scan reads every listed book, including two that share a slug (a
+  `:duplicate-slug`), which no reference can reach (`find-book` answers
+  `:ambiguous-book`). So when the book-key's entry was made for another
+  canonical id, `book` gets an entry of its own, keyed by its id, rather
+  than the other book's document (TASK-241). Two filesystem books can
+  even share the canonical id (`x.hdoc` beside `x/book.hdoc`), so the
+  entry must also have been made for `book`'s own path on disk; one made
+  for the other file gives `book` an entry keyed by id and path
+  (TASK-250)."
+  [book ctx]
+  (let [id (:id (library/book-entry book))
+        source (book-source book)
+        entry (cache-entry ctx book id (book-ref/book-key id))]
+    (if (and (= id (:id entry)) (= source (:source entry)))
+      @(:loaded entry)
+      @(:loaded (cache-entry ctx book id [::exact id source])))))
 
 ;; --- titles ------------------------------------------------------------------
 

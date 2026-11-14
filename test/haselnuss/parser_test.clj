@@ -1653,6 +1653,31 @@
              (:blocks doc)))
       (is (ast/valid? ast/Document doc)))))
 
+(deftest many-math-blocks-parse-time-test
+  (testing "TASK-261: 3000 display math blocks parse in time linear in their
+            number. Each `$$` opener searched for its scan boundary before its
+            closer, and with no block marker after any blank line there is no
+            boundary, so every opener walked the rest of the document: ~70 s on
+            JDK 17, now a fraction of a second."
+    (let [n 3000
+          t (System/nanoTime)
+          doc (parser/parse (str/join "\n" (map #(str "$$\nx_{" % "}\n$$\n\np" % "\n") (range n))))
+          secs (/ (- (System/nanoTime) t) 1e9)]
+      (is (< secs 5.0) (str n " display math blocks took " secs " s to parse"))
+      (is (= (mapcat (fn [i] [{:t :math-block :tex (str "x_{" i "}") :attr attr}
+                              {:t :para :inlines [(str-inline (str "p" i))]}])
+                     (range n))
+             (:blocks doc)))))
+  (testing "TASK-261: the bound still holds where the closer is found first -- a
+            stray opener before a blank line and a heading stays text, and a closer
+            after a blank line followed by more TeX still closes"
+    (is (= [{:t :para :inlines [(str-inline "$$")]}
+            {:t :section :level 1 :heading [(str-inline "H")] :attr attr
+             :blocks [{:t :math-block :tex "y" :attr attr}]}]
+           (:blocks (parser/parse "$$\n\n# H\n\n$$\ny\n$$\n"))))
+    (is (= [{:t :math-block :tex "a\n\nb" :attr attr}]
+           (:blocks (parser/parse "$$\na\n\nb\n$$\n"))))))
+
 (deftest math-block-inside-list-item-test
   (testing "a display-math block indented inside a list item stays in that
             item: ONE list, both items numbered in one sequence, each

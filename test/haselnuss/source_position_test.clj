@@ -50,18 +50,20 @@
 (deftest parser-records-positions-test
   (let [doc (parser/parse source {:source "a.hdoc"})
         at (fn [pred] (ast/source (find-node doc pred)))]
-    (is (= {:file "a.hdoc" :line 5} (at #(and (= :section (:t %)) (= "sec:a" (get-in % [:attr :id]))))))
-    (is (= {:file "a.hdoc" :line 7} (at #(= "sec:nope" (:label %)))))
-    (is (= {:file "a.hdoc" :line 7} (at #(= :cite (:t %)))))
-    (is (= {:file "a.hdoc" :line 9} (at #(= :figure (:t %)))))
+    ;; TASK-248: a node converted from flexmark records its column too; a
+    ;; directive and a math block, cut out by the line scanner, do not.
+    (is (= {:file "a.hdoc" :line 5 :column 1} (at #(and (= :section (:t %)) (= "sec:a" (get-in % [:attr :id]))))))
+    (is (= {:file "a.hdoc" :line 7 :column 13} (at #(= "sec:nope" (:label %)))))
+    (is (= {:file "a.hdoc" :line 7 :column 27} (at #(= :cite (:t %)))))
+    (is (= {:file "a.hdoc" :line 9 :column 1} (at #(= :figure (:t %)))))
     (is (= {:file "a.hdoc" :line 11} (at #(= :directive (:t %)))))
-    (is (= {:file "a.hdoc" :line 12} (at #(= :span (:t %)))))
+    (is (= {:file "a.hdoc" :line 12 :column 7} (at #(= :span (:t %)))))
     (is (= {:file "a.hdoc" :line 15} (at #(= :math-block (:t %)))))
-    (is (= {:file "a.hdoc" :line 17} (at #(= :table (:t %)))))
-    (testing "a cross-reference in a table caption is placed on the caption's own line"
-      (is (= {:file "a.hdoc" :line 20} (at #(= "fig:zzz" (:label %)))))))
+    (is (= {:file "a.hdoc" :line 17 :column 1} (at #(= :table (:t %)))))
+    (testing "a cross-reference in a table caption is placed on the caption's own line, at its column there"
+      (is (= {:file "a.hdoc" :line 20 :column 7} (at #(= "fig:zzz" (:label %)))))))
   (testing "without :source the line is recorded, the file is not"
-    (is (= {:line 5} (ast/source (first (:blocks (parser/parse source))))))))
+    (is (= {:line 5 :column 1} (ast/source (first (:blocks (parser/parse source))))))))
 
 (deftest crlf-and-bom-positions-test
   (testing "TASK-162 AC #4: CRLF line endings and a BOM leave every node on its LF line"
@@ -87,9 +89,10 @@
                    ":::\n")                                 ; 11
           doc (parser/parse src {:source "b.hdoc"})
           at (fn [pred] (ast/source (find-node doc pred)))]
-      (is (= {:file "b.hdoc" :line 6} (at #(= :book-ref (:t %)))))
-      (is (= {:file "b.hdoc" :line 8} (at #(= "bible:romanos#14:8-9" (:ref %)))))
-      (is (= {:file "b.hdoc" :line 10} (at #(= "Bad:Ref" (:ref %)))))
+      ;; TASK-248: and their column, the `@`'s or the `!`'s
+      (is (= {:file "b.hdoc" :line 6 :column 8} (at #(= :book-ref (:t %)))))
+      (is (= {:file "b.hdoc" :line 8 :column 1} (at #(= "bible:romanos#14:8-9" (:ref %)))))
+      (is (= {:file "b.hdoc" :line 10 :column 1} (at #(= "Bad:Ref" (:ref %)))))
       (testing "and the positions stay invisible to equality and JSON"
         (is (= doc (parser/parse src)))
         (is (= doc (json/json->ast (json/->json doc))))))))
@@ -231,6 +234,20 @@
       (is (= 7 (:source-line w)))
       (is (not (contains? w :source-file))))))
 
+(deftest citation-fragment-warnings-test
+  (testing "TASK-252: a reference in a citation's prefix or suffix is placed on its own
+            line, at its column, so its warning names it -- it used to name no place"
+    (let [doc (parser/parse "Text [@ghost, see\n  @sec:gone] and [@ghost, cf. @sec:none].\n"
+                            {:source "a.hdoc"})
+          {:keys [diagnostics]} (resolver/resolve-document doc {:bibliography {}})
+          crossrefs (filter #(= :dangling-cross-ref (:type %)) diagnostics)
+          node (fn [label] (find-node doc #(= label (:label %))))]
+      (is (= {:file "a.hdoc" :line 2 :column 3} (ast/source (node "sec:gone"))))
+      (is (= {:file "a.hdoc" :line 2 :column 31} (ast/source (node "sec:none"))))
+      (is (= [["sec:gone" 2] ["sec:none" 2]] (mapv (juxt :label :source-line) crossrefs)))
+      (is (every? #(str/starts-with? (:message %) "a.hdoc:2: dangling cross-reference: ") crossrefs)
+          (pr-str (map :message crossrefs))))))
+
 (deftest included-file-warning-test
   (let [dir (temp-dir)
         file (fn [n] (str (io/file dir n)))]
@@ -275,7 +292,7 @@
           {:keys [diagnostics]} (resolver/resolve-document out)
           w (first (filter #(= :dangling-cross-ref (:type %)) diagnostics))]
       (is (= "d.hdoc:3: dangling cross-reference: no target with id \"fig:late\"" (:message w)))
-      (is (= {:file "d.hdoc" :line 1} (ast/source (first (:blocks out))))))))
+      (is (= {:file "d.hdoc" :line 1 :column 1} (ast/source (first (:blocks out))))))))
 
 (deftest cli-prints-position-test
   (let [dir (temp-dir)
@@ -295,4 +312,120 @@
           walker {:table walk/table :scope walk/every-ref-kind
                   :rewrite-fn (fn [_ node] [node])}
           [out] (walk/rewrite walker ::ast/document doc)]
-      (is (= {:file "d" :line 1} (ast/source (first (:blocks out))))))))
+      (is (= {:file "d" :line 1 :column 1} (ast/source (first (:blocks out))))))))
+
+;; --- TASK-253: one long line parses in linear time ---------------------------
+
+(deftest long-line-parse-time-test
+  (testing "TASK-253: a one-line paragraph full of references, citations, inline math
+            and emphasis parses in time linear in its length. Each `$`, `@` and `[`
+            converted the whole paragraph to a String, and each node's column was
+            counted from its line's start, so ~68k characters took ~9 s; now ~0.2 s.
+            No code spans: on JDK 17 flexmark's own backtick matching copies the
+            paragraph per code span (`Matcher.toMatchResult`), which JDK 20+ no
+            longer does."
+    (let [timed (fn [unit]
+                  (let [line (apply str (repeat (quot 68000 (count unit)) unit))
+                        t (System/nanoTime)
+                        doc (parser/parse (str line "\n"))]
+                    [line doc (/ (- (System/nanoTime) t) 1e9)]))
+          [line doc secs] (timed "*a* $x$ @fig:k [@k] @k @{b:x} w ")
+          last-ref (last (filter #(= "b:x" (:ref %)) (nodes (:blocks doc))))]
+      (is (< secs 5.0) (str (count line) " characters on one line took " secs " s"))
+      (testing "and the last book reference is still placed at its column"
+        (is (= {:line 1 :column (inc (str/last-index-of line "@{b:x}"))} (ast/source last-ref))))
+      (testing "an unclosed `$` (a price) searched the rest of its line for a close
+                each time: ~68k characters took ~25 s"
+        (let [[line doc secs] (timed "$5 w ")]
+          (is (< secs 5.0) (str (count line) " characters of prices took " secs " s"))
+          (is (not-any? #(= :math-inline (:t %)) (nodes (:blocks doc))))))
+      (testing "a `@{` with no `}` searched the rest of the paragraph for one each time"
+        (let [[line doc secs] (timed "@{a w ")]
+          (is (< secs 5.0) (str (count line) " characters of `@{` took " secs " s"))
+          (is (not-any? #(= :book-ref (:t %)) (nodes (:blocks doc)))))))))
+
+(defn- old-book-ref-end
+  "`haselnuss.parser/book-ref-end` before TASK-253, the oracle for its fuzz."
+  [^String s i]
+  (let [n (.length s)
+        open (inc i)]
+    (when (and (< (inc open) n) (= \@ (.charAt s i)) (= \{ (.charAt s open)))
+      (let [close (.indexOf s "}" (int (inc open)))]
+        (when (pos? close)
+          (let [content (subs s (inc open) close)]
+            (when-not (or (str/blank? content) (str/includes? content "\n") (str/includes? content "\r"))
+              (inc close))))))))
+
+(deftest inline-scan-tables-fuzz-test
+  (testing "TASK-253: the per-paragraph tables `$` and `@{` look their close up in give
+            the answer the old per-character scans gave, at every index of seeded
+            random text made of the characters those scans test"
+    (let [rnd (java.util.Random. 253)
+          alphabet ["$" "$" "@" "{" "@{" "}" " " "\t" "\n" "\r" "5" "a"]
+          closing @#'haselnuss.parser/inline-math-closing-index
+          closing-at @#'haselnuss.parser/inline-math-closing-index-at
+          math-stops @#'haselnuss.parser/inline-math-stops
+          book-ref-end @#'haselnuss.parser/book-ref-end
+          book-stops @#'haselnuss.parser/book-ref-stops
+          math-closes (atom 0)
+          book-refs (atom 0)]
+      (dotimes [_ 2000]
+        (let [s (apply str (repeatedly (.nextInt rnd 30) #(nth alphabet (.nextInt rnd (count alphabet)))))
+              n (count s)
+              ms (math-stops s)
+              bs (delay (book-stops s))]
+          (doseq [i (range n)]
+            (when (= \$ (.charAt s i))
+              (let [expected (closing s i n)]
+                (when expected (swap! math-closes inc))
+                (is (= expected (closing-at s ms i)) (pr-str s i))))
+            (let [expected (old-book-ref-end s i)]
+              (when expected (swap! book-refs inc))
+              (is (= expected (book-ref-end s i (fn [] @bs))) (pr-str s i))))))
+      (testing "not vacuous"
+        (is (< 1000 @math-closes) (str @math-closes " math closes"))
+        (is (< 100 @book-refs) (str @book-refs " book references"))))))
+
+(deftest surrogate-pair-columns-fuzz-test
+  (testing "TASK-253: a column counted from the document's surrogate pairs, rather than
+            code point by code point along the line, is the column TASK-248 counted:
+            seeded fuzz over lines mixing surrogate pairs, lone surrogates, tabs and
+            accented letters in paragraphs and quotes"
+    (let [rnd (java.util.Random. 253)
+          pick (fn [xs] (nth xs (.nextInt rnd (count xs))))
+          filler ["a" "bc" "😀" "𝔸" "é" "\t" "\uD800" "\uDC00" " " "x😀y" "*e*"]
+          checked (atom 0)
+          after-pair (atom 0)]
+      (dotimes [_ 150]
+        (let [n (atom 0)
+              line (fn [prefix]
+                     (let [sb (StringBuilder. ^String prefix)]
+                       (.append sb "w")
+                       (dotimes [_ (inc (.nextInt rnd 8))]
+                         (.append sb ^String (pick filler))
+                         (when (zero? (.nextInt rnd 3))
+                           (.append sb (str " @fig:r" (swap! n inc) " "))))
+                       (str sb)))
+              ;; 1-3 paragraphs of 1-3 lines, every second one a quote,
+              ;; separated by blank lines
+              text-lines (vec (apply concat
+                                     (interpose [""]
+                                                (for [p (range (inc (.nextInt rnd 3)))]
+                                                  (vec (for [_ (range (inc (.nextInt rnd 3)))]
+                                                         (line (if (odd? p) "> " ""))))))))
+              expected (into {} (for [[i l] (map-indexed vector text-lines)
+                                      [_ label] (re-seq #" @(fig:r\d+)" l)
+                                      :let [at (inc (str/index-of l (str " @" label " ")))]]
+                                  [label {:line (inc i) :column (inc (Character/codePointCount ^String l 0 (int at)))
+                                          :pair? (some #(Character/isHighSurrogate (.charAt ^String l (int %))) (range at))}]))
+              doc (parser/parse (str (str/join "\n" text-lines) "\n"))
+              found (into {} (for [node (nodes (:blocks doc)) :when (= :cross-ref (:t node))]
+                               [(:label node) (ast/source node)]))]
+          (is (= (set (keys expected)) (set (keys found))) (pr-str text-lines))
+          (doseq [[label {:keys [line column pair?]}] expected]
+            (swap! checked inc)
+            (when pair? (swap! after-pair inc))
+            (is (= {:line line :column column} (get found label)) (pr-str label text-lines)))))
+      (testing "not vacuous: many references sit after a surrogate on their line"
+        (is (< 300 @checked) (str @checked " references checked"))
+        (is (< 100 @after-pair) (str @after-pair " after a surrogate"))))))

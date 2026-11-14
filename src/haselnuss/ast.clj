@@ -486,17 +486,23 @@
 ;; has no position to report.
 
 (defn with-source
-  "`node` carrying `{:file file :line line}` as its source position, unless
-  `line` is nil. `file` may be nil (parsed without `:source`). `node`s that
-  cannot carry metadata are returned unchanged."
-  [node file line]
-  (if (and line (instance? clojure.lang.IObj node))
-    (vary-meta node assoc ::source (cond-> {:line line} file (assoc :file file)))
-    node))
+  "`node` carrying `{:file file :line line :column column}` as its source
+  position, unless `line` is nil. `file` may be nil (parsed without
+  `:source`), and `column` -- the 1-based column, in code points, a tab
+  counting one (TASK-248) -- is left out when nil or not given. `node`s
+  that cannot carry metadata are returned unchanged."
+  ([node file line] (with-source node file line nil))
+  ([node file line column]
+   (if (and line (instance? clojure.lang.IObj node))
+     (vary-meta node assoc ::source (cond-> {:line line}
+                                      file (assoc :file file)
+                                      (pos-int? column) (assoc :column column)))
+     node)))
 
 (defn source
-  "The `{:line n :file path}` (`:file` absent when unknown) recorded on `node`
-  by the parser, or nil."
+  "The `{:line n :file path :column c}` (`:file` absent when unknown,
+  `:column` absent when the parser could not place the node on its line)
+  recorded on `node` by the parser, or nil."
   [node]
   (::source (meta node)))
 

@@ -392,6 +392,25 @@
 
 (declare render-inlines)
 
+(defn- concat-rendered
+  "`[html footnotes']`: `(render x footnotes)` -- itself `[piece
+  footnotes']` -- over every `x` in `xs`, in order, threading `footnotes`
+  and concatenating the pieces (a nil piece as \"\", as `str` has it).
+
+  One StringBuilder for the whole sequence (TASK-261, as TASK-258 did for
+  a paragraph's inlines): `(str html piece)` per element copied everything
+  written so far each time, so a document of 80k paragraphs -- or a list
+  of 80k items, a table of 80k rows -- took tens of seconds to emit."
+  [render footnotes xs]
+  (let [sb (StringBuilder.)
+        footnotes' (reduce (fn [footnotes x]
+                             (let [[piece footnotes'] (render x footnotes)]
+                               (.append sb (str piece))
+                               footnotes'))
+                           footnotes
+                           xs)]
+    [(str sb) footnotes']))
+
 (defn- render-wrapped
   "Renders `inline`'s own `:inlines` through `render-inlines`, then wraps
   the result between `open` and `close` tag fragments -- the shared shape
@@ -417,8 +436,14 @@
         marker (str "<sup id=\"fnref" n "\"><a href=\"#fn" n "\">" n "</a></sup>")
         reserved (conj footnotes {:number n :html nil})
         [content-html footnotes'] (render-blocks ctx (:blocks note) reserved)
-        filled (mapv (fn [entry] (if (= n (:number entry)) (assoc entry :html content-html) entry))
-                     footnotes')]
+        ;; TASK-261: the reservation is entry n-1 of the vector this namespace
+        ;; builds, so fill it in place; walking every footnote for each one
+        ;; made a document of many footnotes quadratic. The walk stays for an
+        ;; accumulator of any other shape.
+        filled (if (and (vector? footnotes') (= n (:number (get footnotes' (dec n)))))
+                 (assoc-in footnotes' [(dec n) :html] content-html)
+                 (mapv (fn [entry] (if (= n (:number entry)) (assoc entry :html content-html) entry))
+                       footnotes'))]
     [marker filled]))
 
 (defn- balloon-blocks
@@ -443,17 +468,18 @@
   paragraph. Lossy, and deliberately: the words survive and the document
   around them stays intact, which is the better of the two failures."
   [ctx blocks footnotes]
-  (reduce (fn [[html footnotes'] block]
-            (let [[inner footnotes'']
-                  (case (:t block)
-                    :para (render-inlines ctx (:inlines block) footnotes')
-                    :block-quote (balloon-blocks ctx (:blocks block) footnotes')
-                    :list (balloon-blocks ctx (apply concat (:items block)) footnotes')
-                    :code-block [(str "<code>" (escape-html (:text block)) "</code>") footnotes']
-                    [(escape-html (select/flatten-text block)) footnotes'])]
-              [(str html "<span>" inner "</span>") footnotes'']))
-          ["" footnotes]
-          blocks))
+  (concat-rendered
+   (fn [block footnotes']
+     (let [[inner footnotes'']
+           (case (:t block)
+             :para (render-inlines ctx (:inlines block) footnotes')
+             :block-quote (balloon-blocks ctx (:blocks block) footnotes')
+             :list (balloon-blocks ctx (apply concat (:items block)) footnotes')
+             :code-block [(str "<code>" (escape-html (:text block)) "</code>") footnotes']
+             [(escape-html (select/flatten-text block)) footnotes'])]
+       [(str "<span>" inner "</span>") footnotes'']))
+   footnotes
+   blocks))
 
 (defn- render-sticky-note
   "Renders a `:sticky-note` (sec4.4) as an inline disclosure whose body is
@@ -661,13 +687,13 @@
 
 (defn- render-inlines
   "`render-inline` folded over every Inline in `inlines`, in order,
-  concatenating rendered HTML and threading `footnotes` throughout."
+  concatenating rendered HTML and threading `footnotes` throughout.
+
+  One StringBuilder for the whole sequence (TASK-258): `(str html
+  inline-html)` per Inline copied everything written so far each time, so
+  a paragraph on one ~136k-character line took seconds to emit."
   [ctx inlines footnotes]
-  (reduce (fn [[html footnotes] inline]
-            (let [[inline-html footnotes'] (render-inline ctx inline footnotes)]
-              [(str html inline-html) footnotes']))
-          ["" footnotes]
-          inlines))
+  (concat-rendered #(render-inline ctx %1 %2) footnotes inlines))
 
 (defn- heading-tag
   "The `hN` tag name for Section `level`, clamped to HTML5's own `h1`-`h6`
@@ -745,14 +771,12 @@
   when `tight`, every other Block (or any Block at all in a loose list)
   through the ordinary `render-blocks` path for that one Block."
   [ctx tight item-blocks footnotes]
-  (reduce (fn [[html footnotes] block]
-            (let [[block-html footnotes']
-                  (if (and tight (= :para (:t block)))
-                    (render-inlines ctx (:inlines block) footnotes)
-                    (render-blocks ctx [block] footnotes))]
-              [(str html block-html) footnotes']))
-          ["" footnotes]
-          item-blocks))
+  (concat-rendered (fn [block footnotes]
+                     (if (and tight (= :para (:t block)))
+                       (render-inlines ctx (:inlines block) footnotes)
+                       (render-blocks ctx [block] footnotes)))
+                   footnotes
+                   item-blocks))
 
 (defn- render-list
   "Renders List `block` (sec4.3: `:ordered`/`:tight`/`:items`/`:attr`) as
@@ -773,12 +797,12 @@
         prefix (:li-id-prefix ctx)
         item-ctx (dissoc ctx :li-id-prefix)
         [items-html footnotes']
-        (reduce (fn [[html footnotes] [i item-blocks]]
-                  (let [[item-html footnotes'] (render-list-item item-ctx tight item-blocks footnotes)
-                        li-open (str "<li" (when prefix (str " id=\"" (escape-html prefix) "-" (inc i) "\"")) ">")]
-                    [(str html li-open item-html "</li>") footnotes']))
-                ["" footnotes]
-                (map-indexed vector items))]
+        (concat-rendered (fn [[i item-blocks] footnotes]
+                           (let [[item-html footnotes'] (render-list-item item-ctx tight item-blocks footnotes)
+                                 li-open (str "<li" (when prefix (str " id=\"" (escape-html prefix) "-" (inc i) "\"")) ">")]
+                             [(str li-open item-html "</li>") footnotes']))
+                         footnotes
+                         (map-indexed vector items))]
     [(str "<" tag (when (and ordered start (not= 1 start)) (str " start=\"" start "\""))
           (attr-attrs attr) ">" items-html "</" tag ">") footnotes']))
 
@@ -965,12 +989,13 @@
   cell's effective column-based alignment (`cell-align`) still lines up
   with `colspec` correctly even after an earlier spanning cell."
   [ctx tag colspec row footnotes]
-  (let [[html footnotes' _col-index]
-        (reduce (fn [[html footnotes col-index] cell]
-                  (let [[cell-html footnotes'] (render-cell ctx tag colspec col-index cell footnotes)]
-                    [(str html cell-html) footnotes' (+ col-index (or (:span cell) 1))]))
-                ["" footnotes 0]
-                (:cells row))]
+  (let [cells (:cells row)
+        col-indexes (reductions + 0 (map #(or (:span %) 1) cells))
+        [html footnotes']
+        (concat-rendered (fn [[col-index cell] footnotes]
+                           (render-cell ctx tag colspec col-index cell footnotes))
+                         footnotes
+                         (map vector col-indexes cells))]
     [(str "<tr>" html "</tr>") footnotes']))
 
 (defn- render-table
@@ -985,11 +1010,9 @@
   (let [[caption-text footnotes'] (render-caption ctx (:id attr) caption footnotes)
         [head-html footnotes''] (render-row ctx "th" colspec head footnotes')
         [rows-html footnotes''']
-        (reduce (fn [[html footnotes] row]
-                  (let [[row-html footnotes'] (render-row ctx "td" colspec row footnotes)]
-                    [(str html row-html) footnotes']))
-                ["" footnotes'']
-                rows)]
+        (concat-rendered (fn [row footnotes] (render-row ctx "td" colspec row footnotes))
+                         footnotes''
+                         rows)]
     [(str "<table" (attr-attrs attr) ">"
           (when caption-text (str "<caption>" caption-text "</caption>"))
           (render-colgroup colspec)
@@ -1016,25 +1039,26 @@
   number and the heading are one target rather than two."
   [ctx entries footnotes]
   (let [[html footnotes']
-        (reduce (fn [[html footnotes] {:keys [id number heading children]}]
-                  (let [[heading-html fs'] (render-inlines ctx (derived-lists/entry-inlines heading)
-                                                           footnotes)
-                        [children-html fs''] (if (seq children)
-                                               (render-toc-entries ctx children fs')
-                                               ["" fs'])
-                        body (str (when number
-                                    (str "<span class=\"toc-number\">"
-                                         (escape-html number) "</span> "))
-                                  heading-html)]
-                    [(str html "<li>"
-                          (if id
-                            (str "<a href=\"#" (escape-html id) "\">" body "</a>")
-                            body)
-                          children-html
-                          "</li>")
-                     fs'']))
-                ["" footnotes]
-                entries)]
+        (concat-rendered
+         (fn [{:keys [id number heading children]} footnotes]
+           (let [[heading-html fs'] (render-inlines ctx (derived-lists/entry-inlines heading)
+                                                    footnotes)
+                 [children-html fs''] (if (seq children)
+                                        (render-toc-entries ctx children fs')
+                                        ["" fs'])
+                 body (str (when number
+                             (str "<span class=\"toc-number\">"
+                                  (escape-html number) "</span> "))
+                           heading-html)]
+             [(str "<li>"
+                   (if id
+                     (str "<a href=\"#" (escape-html id) "\">" body "</a>")
+                     body)
+                   children-html
+                   "</li>")
+              fs'']))
+         footnotes
+         entries)]
     [(str "<ol>" html "</ol>") footnotes']))
 
 (defn- render-float-list-entries
@@ -1049,19 +1073,20 @@
   to show."
   [ctx entries footnotes]
   (let [[html footnotes']
-        (reduce (fn [[html footnotes] {:keys [id text caption]}]
-                  (let [[caption-html fs'] (render-inlines ctx (derived-lists/entry-inlines caption)
-                                                           footnotes)
-                        body (str (escape-html text)
-                                  (when (seq caption) (str ": " caption-html)))]
-                    [(str html "<li>"
-                          (if id
-                            (str "<a href=\"#" (escape-html id) "\">" body "</a>")
-                            body)
-                          "</li>")
-                     fs']))
-                ["" footnotes]
-                entries)]
+        (concat-rendered
+         (fn [{:keys [id text caption]} footnotes]
+           (let [[caption-html fs'] (render-inlines ctx (derived-lists/entry-inlines caption)
+                                                    footnotes)
+                 body (str (escape-html text)
+                           (when (seq caption) (str ": " caption-html)))]
+             [(str "<li>"
+                   (if id
+                     (str "<a href=\"#" (escape-html id) "\">" body "</a>")
+                     body)
+                   "</li>")
+              fs']))
+         footnotes
+         entries)]
     [(str "<ol>" html "</ol>") footnotes']))
 
 (defn- render-derived-list
@@ -1733,11 +1758,7 @@
   "`render-block` folded over every Block in `blocks`, in order,
   concatenating rendered HTML and threading `footnotes` throughout."
   [ctx blocks footnotes]
-  (reduce (fn [[html footnotes] block]
-            (let [[block-html footnotes'] (render-block ctx block footnotes)]
-              [(str html block-html) footnotes']))
-          ["" footnotes]
-          blocks))
+  (concat-rendered #(render-block ctx %1 %2) footnotes blocks))
 
 (defn- render-front-matter-block
   "Renders one front-matter directive `block` (TASK-54; see
@@ -1839,11 +1860,7 @@
   "`render-front-matter-block` over every front-matter directive in
   `blocks`, in document order, to `[html footnotes']`."
   [ctx blocks footnotes]
-  (reduce (fn [[html footnotes] block]
-            (let [[block-html footnotes'] (render-front-matter-block ctx block footnotes)]
-              [(str html block-html) footnotes']))
-          ["" footnotes]
-          blocks))
+  (concat-rendered #(render-front-matter-block ctx %1 %2) footnotes blocks))
 
 (declare plain-text)
 

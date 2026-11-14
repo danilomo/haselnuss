@@ -182,7 +182,8 @@
            (com.vladsch.flexmark.util.data MutableDataSet NullableDataKey)
            (com.vladsch.flexmark.util.sequence BasedSequence Escaping)
            (java.time ZoneOffset)
-           (java.util Date)))
+           (java.util Date)
+           (org.yaml.snakeyaml.error Mark MarkedYAMLException)))
 
 (def ^:private default-attr
   "The Attr value for any node this parser produces with no attribute
@@ -296,6 +297,86 @@
       j
       :else (recur (inc j)))))
 
+(def ^:private ^NullableDataKey input-cache-key
+  "The document data key `input-cache` keeps its `object-array` under."
+  (NullableDataKey. "haselnuss.parser/input-cache"))
+
+(defn- input-cache
+  "What the inline extensions derive from `input`, an inline parser's whole
+  input (one paragraph's text), from flexmark `document`: an `object-array`
+  of the input itself, its String, and the slots `input-derived` fills.
+  The `$`, `@` and `[` extensions are offered every one of their trigger
+  characters in the paragraph, and each needs the text as a String;
+  converting it afresh on every call made a paragraph's inline parse
+  quadratic in its length (TASK-253: a 136k character line took over half
+  a minute). The input object stays the same for the whole paragraph and
+  is immutable, so what was derived from it is kept in the document's data
+  and reused while the input is the same object. Held per document, so it
+  goes with the document and is never shared between threads."
+  ^objects [^Document document ^BasedSequence input]
+  (let [^objects cached (.get input-cache-key document)]
+    (if (and cached (identical? input (aget cached 0)))
+      cached
+      (let [fresh (object-array [input (.toString input) nil nil])]
+        (.set input-cache-key document fresh)
+        fresh))))
+
+(defn- input-string
+  "The String of inline parser input `input` (see `input-cache`)."
+  ^String [^Document document ^BasedSequence input]
+  (aget (input-cache document input) 1))
+
+(def ^:private math-stops-slot
+  "`input-cache` slot of `inline-math-stops`."
+  2)
+
+(def ^:private book-ref-stops-slot
+  "`input-cache` slot of `book-ref-stops`."
+  3)
+
+(defn- input-derived
+  "`(f s)` for the String `s` of inline parser input `input`, computed once
+  per input and kept in `input-cache` slot `slot`."
+  [^Document document ^BasedSequence input slot f]
+  (let [^objects cached (input-cache document input)
+        slot (int slot)]
+    (or (aget cached slot)
+        (let [v (f (aget cached 1))]
+          (aset cached slot v)
+          v))))
+
+(defn- inline-math-stops
+  "An `int-array` of `(inc (count s))` entries: entry `i` is the first index
+  `j >= i` of `s` that holds a line break or a `$` that
+  `inline-math-closing-index` would accept as a close (its predecessor not
+  whitespace, no digit after it), or `(count s)` when there is none. Built
+  backwards in one pass, so a paragraph full of unclosed `$` -- `$5 w $5 w`
+  -- is not scanned to its line's end once per `$` (TASK-253). Index 0 is
+  never a close: a close is searched for from one past an opener."
+  ^ints [^String s]
+  (let [n (.length s)
+        stops (int-array (inc n))]
+    (aset stops n n)
+    (loop [j (dec n)]
+      (when (>= j 0)
+        (let [c (.charAt s j)
+              stop? (or (= c \newline)
+                        (and (= c \$)
+                             (pos? j)
+                             (not (Character/isWhitespace (.charAt s (dec j))))
+                             (or (>= (inc j) n) (not (Character/isDigit (.charAt s (inc j)))))))]
+          (aset stops j (int (if stop? j (aget stops (inc j)))))
+          (recur (dec j)))))
+    stops))
+
+(defn- inline-math-closing-index-at
+  "`(inline-math-closing-index s open-index (count s))`, looked up in
+  `stops`, the `inline-math-stops` of `s`."
+  [^String s ^ints stops open-index]
+  (let [j (aget stops (int (inc (long open-index))))]
+    (when (and (< j (.length s)) (= \$ (.charAt s j)))
+      j)))
+
 (defn- parse-inline-math!
   "This file's `InlineParserExtension/parse` for the `$` trigger character
   (see `inline-math-extension-factory`): true if it consumed something at
@@ -304,7 +385,7 @@
   handling for the `$` at that position (sec5.7 AC #1/#4)."
   [^LightInlineParser p]
   (let [^BasedSequence input (.getInput p)
-        s (.toString input)
+        s (input-string (.getDocument p) input)
         n (.length input)
         i (.getIndex p)]
     (cond
@@ -327,7 +408,8 @@
       false
 
       :else
-      (if-let [close (inline-math-closing-index s i n)]
+      (if-let [close (inline-math-closing-index-at
+                      s (input-derived (.getDocument p) input math-stops-slot inline-math-stops) i)]
         (do (.appendNode p (math-inline-node (.subSequence input (int i) (int (inc close)))
                                              (.subSequence input (int i) (int (inc i)))
                                              (.subSequence input (int (inc i)) (int close))
@@ -616,7 +698,8 @@
 (def ^:private ^:dynamic *line-base*
   "The FILE line number (1-based) of line 0 of the flexmark document being
   converted, or nil when its lines cannot be placed in the file (a
-  citation's own prefix/suffix, parsed on its own). A flexmark node's file
+  citation prefix/suffix re-parsed without a `locate`, see
+  `mini-parse-inlines`). A flexmark node's file
   line is `*line-base*` plus its `.getLineNumber` (TASK-143)."
   nil)
 
@@ -625,6 +708,16 @@
   being converted, computed once per document so that locating a node is a
   binary search rather than flexmark's `Node.getLineNumber`, which walks
   the text up to the node on every call (TASK-143)."
+  nil)
+
+(def ^:private ^:dynamic *offset-column*
+  "nil when every line of the flexmark document being converted is a line
+  of the file as written, so a node's column on its line there is its
+  file column (TASK-248). A document re-parsed from text cut out of the
+  file (a table caption, `table-caption-and-attr`), whose lines lost a
+  marker or a container prefix, binds instead a function from an offset
+  of its own text to the FILE column of that character, or nil when the
+  character is not one of the file's."
   nil)
 
 (defn- line-starts
@@ -638,21 +731,98 @@
   ^longs [^com.vladsch.flexmark.util.ast.Document document]
   (line-starts (.getChars document)))
 
+(defn- offset-line
+  "The 0-based line of offset `offset` of a text whose line start offsets
+  are `starts`."
+  [^longs starts offset]
+  (let [idx (java.util.Arrays/binarySearch starts (long offset))]
+    (if (neg? idx) (- (- idx) 2) idx)))
+
 (defn- node-line
   "The 0-based line of flexmark `node` within the document whose
   `*line-starts*` is bound."
   [^com.vladsch.flexmark.util.ast.Node node]
-  (let [starts ^longs *line-starts*
-        idx (java.util.Arrays/binarySearch starts (long (.getStartOffset node)))]
-    (if (neg? idx) (- (- idx) 2) idx)))
+  (offset-line *line-starts* (.getStartOffset node)))
+
+;; A node's column is counted in code points from the start of its line
+;; (TASK-248). Counting them afresh for every node made a document with one
+;; long line quadratic in its length -- every reference, emphasis or span
+;; on a 136k character line walked the line from its start (TASK-253). A
+;; code point is one char except a surrogate pair, which is two, so the
+;; column is the char distance less the pairs in between, and the pairs
+;; are found once per document.
+
+(def ^:private ^:dynamic *surrogate-pairs*
+  "nil, or `[text pairs]` for the flexmark document whose `*line-starts*`
+  are bound: `text` is its source, the base sequence of its nodes' chars,
+  and `pairs` its `surrogate-pair-ends`. `offset-column-fn` uses `pairs`
+  only for that very `text`, and counts code points as before for any
+  other."
+  nil)
+
+(defn- surrogate-pair-ends
+  "The ascending `long-array` of every index `k` of `text` holding a low
+  surrogate right after a high one at `k - 1`: the second char of each
+  surrogate pair, one code point spread over two chars."
+  ^longs [^CharSequence text]
+  (let [n (.length text)]
+    (long-array (for [k (range 1 n)
+                      :when (and (Character/isLowSurrogate (.charAt text k))
+                                 (Character/isHighSurrogate (.charAt text (dec k))))]
+                  k))))
+
+(defn- doc-surrogate-pairs
+  "`*surrogate-pairs*` for flexmark `document`."
+  [^com.vladsch.flexmark.util.ast.Document document]
+  (let [text (.getChars document)]
+    [text (surrogate-pair-ends text)]))
+
+(defn- code-point-column
+  "1 plus `(Character/codePointCount text line-start offset)`, from the
+  `surrogate-pair-ends` `pairs` of `text` instead of its chars: the pairs
+  wholly inside `[line-start, offset)` are those ending at `k` with
+  `line-start < k < offset`, each two chars but one code point. A pair
+  cut by either end counts its one char there as one code point, as
+  `codePointCount` does."
+  [^longs pairs line-start offset]
+  (let [below (fn [x]
+                (let [idx (java.util.Arrays/binarySearch pairs (long x))]
+                  (if (neg? idx) (- (inc idx)) idx)))]
+    (inc (- (- (long offset) (long line-start))
+            (- (long (below offset)) (long (below (inc (long line-start)))))))))
+
+(defn- offset-column-fn
+  "A function from an offset of `text` -- the source of the flexmark
+  document whose `*line-starts*` (and `*offset-column*`) are bound now
+  -- to the 1-based FILE column of that character, counted in code
+  points (a tab is one), or nil when it is not placed in the file
+  (TASK-248). Captures the bindings, so it can place a document re-parsed
+  from this one's text."
+  [^CharSequence text]
+  (or *offset-column*
+      (let [starts ^longs *line-starts*
+            [pairs-text pairs] *surrogate-pairs*
+            pairs (when (identical? pairs-text text) pairs)]
+        (fn [offset]
+          (let [line-start (aget starts (int (offset-line starts offset)))]
+            (if pairs
+              (code-point-column pairs line-start offset)
+              (inc (Character/codePointCount text (int line-start) (int offset)))))))))
+
+(defn- node-file-column
+  "The 1-based FILE column of flexmark `node`'s first character, or nil
+  (`offset-column-fn`)."
+  [^com.vladsch.flexmark.util.ast.Node node]
+  ((offset-column-fn (.getBaseSequence (.getChars node))) (.getStartOffset node)))
 
 (defn- at-node
   "`n` (an AST node) carrying the source position of flexmark `node`
-  (TASK-143, see `haselnuss.ast/with-source`), or `n` unchanged when this
-  conversion has no `*line-base*`."
+  (TASK-143, see `haselnuss.ast/with-source`) -- its line and, where it
+  is known, its column (TASK-248, `node-file-column`) -- or `n` unchanged
+  when this conversion has no `*line-base*`."
   [^com.vladsch.flexmark.util.ast.Node node n]
   (if *line-base*
-    (ast/with-source n *source-file* (+ *line-base* (node-line node)))
+    (ast/with-source n *source-file* (+ *line-base* (node-line node)) (node-file-column node))
     n))
 
 (defn- cross-ref-prefix-shape?
@@ -710,16 +880,40 @@
 (defn- book-ref-end
   "The end index (exclusive, just past the `}`) of a `@{ref}` book
   reference whose `@` is at index `i` of `s`, or nil when there is none
-  there (see the BOOK REFERENCES comment above for the rule)."
-  [^String s i]
+  there (see the BOOK REFERENCES comment above for the rule).
+
+  `stops` is a no-argument function giving the `book-ref-stops` of `s`,
+  called only when there is a `@{` at `i`. The first `}`, `\\n` or `\\r`
+  after the `{` must be a `}`: a line break before the first `}` would be
+  inside the ref. Looking it up there, and testing the ref for blankness
+  only up to its first non-blank character, keeps a line full of `@{`
+  with no `}` linear (TASK-253): finding the `}` used to scan to the end
+  of the paragraph for each one."
+  [^String s i stops]
   (let [n (.length s)
         open (inc i)]
     (when (and (< (inc open) n) (= \@ (.charAt s i)) (= \{ (.charAt s open)))
-      (let [close (.indexOf s "}" (int (inc open)))]
-        (when (pos? close)
-          (let [content (subs s (inc open) close)]
-            (when-not (or (str/blank? content) (str/includes? content "\n") (str/includes? content "\r"))
-              (inc close))))))))
+      (let [close (aget ^ints (stops) (int (inc open)))]
+        (when (and (< close n) (= \} (.charAt s close)))
+          (when (loop [k (inc open)]
+                  (and (< k close)
+                       (or (not (Character/isWhitespace (.charAt s k)))
+                           (recur (inc k)))))
+            (inc close)))))))
+
+(defn- book-ref-stops
+  "An `int-array` of `(inc (count s))` entries: entry `i` is the first index
+  `j >= i` of `s` holding `}`, `\\n` or `\\r`, or `(count s)` when there is
+  none (see `book-ref-end`)."
+  ^ints [^String s]
+  (let [n (.length s)
+        stops (int-array (inc n))]
+    (aset stops n n)
+    (loop [j (dec n)]
+      (when (>= j 0)
+        (aset stops j (int (if (#{\} \newline \return} (.charAt s j)) j (aget stops (inc j)))))
+        (recur (dec j))))
+    stops))
 
 (defn- book-ref-node
   "A fresh synthetic Node for a `@{ref}` book reference: `whole-span` runs
@@ -769,12 +963,12 @@
   nothing from either of the other two."
   [^LightInlineParser p]
   (let [^BasedSequence input (.getInput p)
-        s (.toString input)
+        s (input-string (.getDocument p) input)
         n (.length input)
         i (.getIndex p)
         start (inc i)
         end (ref-token-end s start n)]
-    (if-let [book-end (book-ref-end s i)]
+    (if-let [book-end (book-ref-end s i #(input-derived (.getDocument p) input book-ref-stops-slot book-ref-stops))]
       (do (.appendNode p (book-ref-node (.subSequence input (int i) (int book-end))))
           (.setIndex p (int book-end))
           true)
@@ -913,6 +1107,21 @@
         :else (let [e (long (inline-span-end-index s j n))]
                 (recur e (if (= e (inc j)) (conj! acc j) acc)))))))
 
+(defn- cite-segment-spans
+  "`[start end]` within `inner` of each segment `cite-segments` returns,
+  in order -- where each one sits, so that a reference in a segment's
+  prefix or suffix can be placed in the file (TASK-252)."
+  [^String inner]
+  (let [cuts (filterv #(= \; (.charAt inner (int %))) (top-level-indices inner))
+        spans (mapv vector (cons 0 (map inc cuts)) (conj cuts (count inner)))
+        text (fn [[start end]] (subs inner start end))]
+    (loop [spans spans]
+      (if (and (seq spans)
+               (or (= "" (text (peek spans)))
+                   (and (> (count spans) 1) (str/blank? (text (peek spans))))))
+        (recur (pop spans))
+        spans))))
+
 (defn cite-segments
   "The `;`-separated segments of a citation bracket's raw inner text
   `inner` (sec5.11), split only at a `;` in `top-level-indices` -- one
@@ -927,15 +1136,7 @@
   `haselnuss.emit.hdoc` must know exactly which `;` this split would cut
   at."
   [^String inner]
-  (let [cuts (filterv #(= \; (.charAt inner (int %))) (top-level-indices inner))
-        starts (cons 0 (map inc cuts))
-        ends (conj cuts (count inner))
-        segments (mapv #(subs inner %1 %2) starts ends)]
-    (loop [segments segments]
-      (if (or (= "" (peek segments))
-              (and (> (count segments) 1) (str/blank? (peek segments))))
-        (recur (pop segments))
-        segments))))
+  (mapv (fn [[start end]] (subs inner start end)) (cite-segment-spans inner)))
 
 (defn- cite-key-index
   "`[at key-end]` for the first `@key` citation-key marker (sec5.11) in
@@ -1096,7 +1297,7 @@
   too (TASK-175) -- see `attributed-bracket?`."
   [^LightInlineParser p]
   (let [^BasedSequence input (.getInput p)
-        s (.toString input)
+        s (input-string (.getDocument p) input)
         n (.length input)
         i (.getIndex p)]
     (if-let [close (cite-bracket-close-index s i n)]
@@ -1205,7 +1406,7 @@
          (and opener (not (.isImage opener)) (not (.isBracketAfter opener))
               (< -1 close (.length input)) (= \] (.charAt input close))
               (defined-reference document bracket)
-              (attributed-bracket? ip (.toString input) close)))))))
+              (attributed-bracket? ip (input-string document input) close)))))))
 
 (defn- trim-edge-text!
   "Trims the leading whitespace of `node`'s first child and the trailing
@@ -2599,6 +2800,48 @@
         (str (str/join (repeat run (str "\\" (first s)))) (subs s run)))
       s)))
 
+(defn- fragment-source-offsets
+  "An `int-array` giving, for each character of `parsed`, the offset in
+  `s` of the character it is, or -1 for a backslash `guard-last-line` or
+  `guard-first-line` inserted (TASK-252). `parsed` is `s` from offset
+  `start` on with only backslashes inserted, so matching each of its
+  characters to the next equal one of `s` places every character other
+  than a backslash exactly -- an inserted backslash right before a
+  written one may take that one's offset, which no reference starts at."
+  ^ints [^String s start ^String parsed]
+  (let [n (count parsed)
+        m (count s)
+        offsets (int-array n -1)]
+    (loop [i 0 j (long start)]
+      (when (< i n)
+        (if (and (< j m) (= (.charAt parsed (int i)) (.charAt s (int j))))
+          (do (aset offsets i (int j)) (recur (inc i) (inc j)))
+          (recur (inc i) j))))
+    offsets))
+
+(defn- fragment-placement
+  "`[line-base offset-column line-starts]` -- the `*line-base*`,
+  `*offset-column*` and `*line-starts*` to convert flexmark `mini-doc`
+  with, a citation fragment `s` re-parsed from offset `start` on (see
+  `mini-parse-inlines`), placed in the file by `locate` (TASK-252) -- or
+  nil when none of its characters is placed. A fragment keeps every line
+  break it had in the paragraph, so its line `k` is file line
+  `line-base + k`; the inserted backslashes and the indent padding of a
+  quote or list continuation line have no column."
+  [^String s start ^Document mini-doc locate]
+  (let [text (str (.getChars mini-doc))
+        n (count text)
+        offsets (fragment-source-offsets s start text)
+        at (fn [i]
+             (when (< -1 i n)
+               (let [j (aget offsets (int i))]
+                 (when-not (neg? j) (locate j)))))
+        starts (line-starts text)
+        line-base (some (fn [i] (when-let [[line] (at i)] (- line (offset-line starts i))))
+                        (range n))]
+    (when line-base
+      [line-base (fn [offset] (second (at offset))) starts])))
+
 (defn- mini-parse-inlines
   "Parses freestanding text `s` (a citation segment's own prefix/locator/
   suffix text, sec5.11) as its own independent flexmark mini-document and
@@ -2665,21 +2908,35 @@
   hold a `|` and start the paragraph, which the fragment's first line
   does even where the paragraph's did not (`[| a |\\n|---| @c]`, TASK-171).
   So the fragment is parsed with `fragment-parser`, which has no tables
-  at all -- a fragment of a paragraph never is one."
-  [^String s]
+  at all -- a fragment of a paragraph never is one.
+
+  `locate`, when given, places `s` in the file: a function from an offset
+  of `s` to `[line column]` of that character there (`column` nil when it
+  has none), or nil when the character is not one of the file's. With it,
+  a reference in the fragment carries its file position (TASK-252, see
+  `fragment-placement`); without it, or when this conversion has no
+  `*line-base*`, it carries none."
+  [^String s locate]
   (when-not (str/blank? s)
     (let [^String guarded (guard-last-line s)
           ^String trimmed (str/triml guarded)
+           ;; Where `trimmed` starts in `s`: `guard-last-line` inserts a
+           ;; backslash, never whitespace, so it is `s`'s own indent.
+          indent (- (count s) (count (str/triml s)))
           parse (fn ^Document [^String text] (.parse fragment-parser text))
           para-first? (fn [^Document d] (instance? Paragraph (first (.getChildren d))))
-          ^Document mini-doc (or (some #(let [d (parse %)] (when (para-first? d) d))
-                                       [guarded trimmed])
-                                 (parse (guard-first-line trimmed)))
+          [^Document mini-doc start] (or (some (fn [[text start]]
+                                                 (let [d (parse text)] (when (para-first? d) [d start])))
+                                               [[guarded 0] [trimmed indent]])
+                                         [(parse (guard-first-line trimmed)) indent])
           mini-para (first (.getChildren mini-doc))]
       (if (instance? Paragraph mini-para)
-        ;; No position: these lines are numbered from the citation's own
-        ;; text, not from the file (TASK-143).
-        (binding [*line-base* nil] (convert-inlines mini-doc #{} mini-para))
+        (let [[line-base offset-column starts] (when (and locate *line-base*)
+                                                 (fragment-placement s start mini-doc locate))]
+          (binding [*line-base* line-base
+                    *offset-column* offset-column
+                    *line-starts* starts]
+            (convert-inlines mini-doc #{} mini-para)))
         (text->inlines (unescape-backslashes s))))))
 
 (defn- strip-leading-comma
@@ -2821,11 +3078,21 @@
   the segment had a suppress-author `-` immediately before its `@`,
   `:normal` otherwise (a bare, author-in-text Cite -- sec5.11's other
   mode -- is a wholly different, unbracketed construct, see
-  `cite-author-node`, and never reaches this function at all)."
-  [seg]
+  `cite-author-node`, and never reaches this function at all).
+
+  `locate`, from an offset of `seg` to its file position or nil (see
+  `mini-parse-inlines`), places the prefix and suffix (TASK-252); nil
+  places neither."
+  [^String seg locate]
   (let [[prefix dash cite-key suffix] (citation-segment-parts seg)
-        prefix-inlines (mini-parse-inlines prefix)
-        suffix-inlines (mini-parse-inlines (strip-leading-comma suffix))]
+        suffix-text (strip-leading-comma suffix)
+        ;; Where the suffix text starts in `seg`: it is the segment's tail
+        ;; with leading whitespace and one comma (and the whitespace after
+        ;; it) gone, and with trailing whitespace trimmed.
+        suffix-start (- (count (str/trimr seg)) (count suffix-text))
+        prefix-inlines (mini-parse-inlines prefix locate)
+        suffix-inlines (mini-parse-inlines suffix-text
+                                           (when locate #(locate (+ suffix-start (long %)))))]
     (cond-> {:key cite-key :mode (if dash :year :normal)}
       prefix-inlines (assoc :prefix prefix-inlines)
       suffix-inlines (assoc :suffix suffix-inlines))))
@@ -2833,10 +3100,30 @@
 (defn- cite-bracket-node->cite
   "The `:cite` Inline (AC #2) for a `cite-bracket-node`: one CiteItem (see
   `citation-segment->item`) per `;`-separated segment of its raw inner
-  text (`cite-segments`), in source order."
+  text (`cite-segments`), in source order.
+
+  A reference in a prefix or suffix is placed in the file through the
+  bracket's own text (TASK-252): `.getIndexOffset` takes an offset of it
+  to the converted document's, -1 for the padding flexmark puts in place
+  of a quote's or list item's continuation-line indent, and that
+  document's `*line-base*`/`*line-starts*`/`offset-column-fn` take it on
+  to a file line and column, as `at-node` does for a node."
   [^DelimitedNodeImpl node]
-  {:t :cite
-   :items (mapv citation-segment->item (cite-segments (.toString (.getText node))))})
+  (let [^BasedSequence text (.getText node)
+        inner (.toString text)
+        locate (when *line-base*
+                 (let [column (offset-column-fn (.getBaseSequence text))
+                       starts *line-starts*
+                       line-base (long *line-base*)]
+                   (fn [i]
+                     (let [offset (.getIndexOffset text (int i))]
+                       (when-not (neg? offset)
+                         [(+ line-base (long (offset-line starts offset))) (column offset)])))))]
+    {:t :cite
+     :items (mapv (fn [[start end]]
+                    (citation-segment->item (subs inner start end)
+                                            (when locate #(locate (+ (long start) (long %))))))
+                  (cite-segment-spans inner))}))
 
 (declare convert-inline)
 
@@ -3199,6 +3486,22 @@
        (= (inc (.getEndLineNumber table)) (.getStartLineNumber ^Node candidate))
        (boolean (re-find table-caption-re (.toString (.getContentChars ^Paragraph candidate))))))
 
+(defn- caption-offset-column
+  "`*offset-column*` for a caption re-parsed from `content` (a caption
+  paragraph's `.getContentChars`, of the document whose `*line-starts*`
+  is bound now) with its first `marker` characters stripped (TASK-248):
+  offset `i` of the re-parsed text is `content`'s character `i + marker`,
+  traced back to its offset in that document -- or to none, for the
+  padding flexmark puts in place of a continuation line's indent."
+  [^BasedSequence content marker]
+  (let [n (.length content)
+        column (offset-column-fn (.getBaseSequence content))]
+    (fn [offset]
+      (let [i (+ (long offset) (long marker))]
+        (when (< i n)
+          (let [base-offset (.getIndexOffset content (int i))]
+            (when-not (neg? base-offset) (column base-offset))))))))
+
 (defn- table-caption-and-attr
   "`[caption attr]` for a qualifying caption Paragraph `para` (see
   `table-caption-paragraph?`): strips the leading `table-caption-re` marker
@@ -3218,14 +3521,20 @@
   `[ref]: url` definitions within the caption's own single line, not the
   whole document."
   [^Paragraph para]
-  (let [stripped (str/replace-first (.toString (.getContentChars para)) table-caption-re "")
+  (let [content-chars (.getContentChars para)
+        content (.toString content-chars)
+        stripped (str/replace-first content table-caption-re "")
         ^Document mini-doc (binding [*caption-parse* true] (.parse cm-parser stripped))
         mini-para (first (.getChildren mini-doc))]
     (if mini-para
       (let [[attr children] (pop-trailing-attr-group mini-para)]
         ;; The caption is parsed on its own, so its line 0 is the line the
-        ;; caption paragraph starts on (TASK-143).
+        ;; caption paragraph starts on (TASK-143); its columns are traced
+        ;; back through `content` (TASK-248).
         [(binding [*line-base* (some-> *line-base* (+ (.getLineNumber para)))
+                   *offset-column* (when *line-base*
+                                     (caption-offset-column content-chars
+                                                            (- (count content) (count stripped))))
                    *line-starts* (when *line-base* (doc-line-starts mini-doc))]
            (convert-children mini-doc #{} children))
          attr])
@@ -4217,7 +4526,7 @@
   of `{:type :text :lines [...]}` /
   `{:type :directive :name .. :attr .. :segments [...]}` /
   `{:type :include :src .. :line ..}` (TASK-38, TASK-163) /
-  `{:type :quote :ref .. :line ..}` (TASK-152) entries in source
+  `{:type :quote :ref .. :line .. :column ..}` (TASK-152) entries in source
   order, and `next-i` is the index of the line right after this level's own
   closing fence (irrelevant at the top level, where there is none to
   consume). A `:directive` entry comes from either of sec5.5's two
@@ -4297,7 +4606,11 @@
               (if-let [written (and (not shielded?) (quote-line line))]
                 ;; TASK-152: splits the text around it exactly as
                 ;; `!include` does.
-                (recur (inc i) (conj (flush-text segments) {:type :quote :ref written :line (inc i)}) [])
+                ;; `:column` is the `!`'s (TASK-248): `quote-line-re`
+                ;; allows only spaces before it.
+                (recur (inc i) (conj (flush-text segments) {:type :quote :ref written :line (inc i)
+                                                            :column (inc (str/index-of line "!"))})
+                       [])
                 (if-let [[dname attr] (and (not shielded?) (at-line (inc i) line #(bang-directive-line line)))]
                   ;; TASK-114: a one-line body-less directive. Its
                   ;; `:segments` is empty by construction (this form has no
@@ -4447,13 +4760,17 @@
   from directive-fence detection) so both agree on exactly the same
   block's extent."
   [lines i n]
-  (let [boundary (or (->> (range (inc i) n)
-                          (filter #(math-scan-boundary? lines % n))
-                          first)
-                     n)]
-    (->> (range (inc i) boundary)
-         (filter #(re-matches math-fence-line-re (nth lines %)))
-         first)))
+  ;; One forward pass that stops at whichever comes first, the closer or the
+  ;; boundary (TASK-261). Finding the boundary first scanned to the next one
+  ;; even when the closer was the very next line, and a document whose blank
+  ;; lines are never followed by a block marker has no boundary at all, so
+  ;; every opener walked the rest of the document: 2000 `$$` blocks took 16 s
+  ;; to parse. Same answer: a boundary line is blank and a fence line is not.
+  (loop [j (inc i)]
+    (cond (>= j n) nil
+          (math-scan-boundary? lines j n) nil
+          (re-matches math-fence-line-re (nth lines j)) j
+          :else (recur (inc j)))))
 
 (defn- dedent
   "`lines` with the whitespace every CONTINUATION line shares stripped off
@@ -4696,7 +5013,8 @@
     ;; inside it too: an attribute group can fail there (TASK-168).
     :text (try (let [fm-doc (parse-chunk-text (str/join "\n" (:lines math-chunk)))]
                  (binding [*line-base* (+ *body-line-offset* (:start math-chunk 0) 1)
-                           *line-starts* (doc-line-starts fm-doc)]
+                           *line-starts* (doc-line-starts fm-doc)
+                           *surrogate-pairs* (doc-surrogate-pairs fm-doc)]
                    (vec (block-items fm-doc #{} fm-doc))))
                (catch clojure.lang.ExceptionInfo e
                  (throw (located e (chunk-body-line math-chunk (ex-data e)) (:chunk-column (ex-data e))))))
@@ -4726,7 +5044,7 @@
     ;; TASK-152: the ref as written; the resolver's quote expansion
     ;; (doc-10 step 0b) fills in the rest.
     :quote [(ast/with-source {:t :book-quote :ref (:ref segment)}
-              *source-file* (+ *body-line-offset* (:line segment)))]
+              *source-file* (+ *body-line-offset* (:line segment)) (:column segment))]
     :directive [(ast/with-source {:t :directive
                                   :name (:name segment)
                                   :attr (:attr segment)
@@ -5057,6 +5375,24 @@
                   " (expected one of: " (str/join ", " (sort (keys top-level-divisions))) ")")
              {:text text}))))
 
+(defn yaml-error-message
+  "snakeyaml's error `e` as one line: its context and problem, each with
+  the line and column of its mark, a line
+  being the mark's (0-based) line plus `line-offset` -- where the YAML
+  starts in the file the message names. snakeyaml's own message instead
+  quotes each mark's source line with a `^` under the column, several
+  lines that every stderr line now escapes into one long one (TASK-247)
+  and that the line and column say anyway. Its own message when it
+  carries neither a context nor a problem. Shared with
+  `haselnuss.library.directory` for a `libraries.yaml`."
+  [^MarkedYAMLException e line-offset]
+  (let [at (fn [^Mark m] (when m (str " (line " (+ (.getLine m) (long line-offset))
+                                      ", column " (inc (.getColumn m)) ")")))
+        context (when-let [c (.getContext e)] (str c (at (.getContextMark e))))
+        problem (when-let [p (.getProblem e)] (str p (at (.getProblemMark e))))
+        parts (remove str/blank? [context problem])]
+    (if (seq parts) (str/join ": " parts) (ex-message e))))
+
 (defn- parse-front-matter
   "Parses `yaml-text` (the raw front-matter block, or nil if there was
   none) into a `haselnuss.ast` Meta map, mapping exactly the fields AC #1
@@ -5088,9 +5424,11 @@
      (let [data (try (yaml/parse-string yaml-text)
                      (catch org.yaml.snakeyaml.error.MarkedYAMLException e
                        (let [mark (or (.getProblemMark e) (.getContextMark e))
-                             line (when mark (+ (.getLine mark) 2))]
+                             line (when mark (+ (.getLine mark) 2))
+                             ;; the YAML starts on the line after the opening ---
+                             message (yaml-error-message e 2)]
                          (if line
-                           (throw (ex-info (if source (str source ":" line ": " (ex-message e)) (ex-message e))
+                           (throw (ex-info (if source (str source ":" line ": " message) message)
                                            (cond-> {:type ::malformed-front-matter :source-line line}
                                              source (assoc :source-file source))
                                            e))
