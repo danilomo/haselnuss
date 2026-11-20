@@ -16,7 +16,8 @@
             [haselnuss.library.graph.registry :as registry]
             [haselnuss.library.graph.scan :as scan]
             [haselnuss.library.memory :as memory]
-            [haselnuss.parser :as parser])
+            [haselnuss.parser :as parser]
+            [haselnuss.synth :as synth])
   (:import (java.io File)
            (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)))
@@ -180,7 +181,7 @@
        "!quote lib:gen#1:1\n\n"
        "!include _parts/shared-ch.hdoc\n"))
 
-(deftest each-book-parsed-once-and-each-script-run-once-test
+(deftest each-book-parsed-once-per-reading-and-each-script-run-once-test
   (let [root (temp-dir)
         _ (do (write! root "s/shelf.clj" shelf-script)
               (write! root "target.hdoc" "# A {#sec:a}\n\nA quotes @{lib:gen}.\n\n!quote lib:gen2\n")
@@ -202,10 +203,20 @@
       (is (every? #(= :resolved (:status %)) edges) (pr-str (remove #(= :resolved (:status %)) edges)))
       (is (<= 15 (count (filter #(= (book-ref/book-id "lib" "target") (:id (:to %))) edges))))
       (is (<= 15 (count (filter #(= "gen" (:slug (:id (:to %)))) edges)))))
-    (testing "each book's entry file is parsed exactly once, however often it is quoted or linked"
-      (is (= (into {} (map (fn [f] [(canonical (io/file root f)) 1]))
-                   (into ["target.hdoc"] (map #(str "h" % ".hdoc")) (range 1 6)))
-             (dissoc (frequencies @parses) (canonical (io/file root "_parts/shared-ch.hdoc"))))))
+    (testing "each book's entry file is parsed once for its own record and, when something
+              refers to it, once more for all the references, however many (TASK-279).
+              Or once in all: when a reference has started loading the target before its
+              own scan begins, `scan-book` scans it from that shared load
+              (`passage/cached?`), as its docstring says -- which happens depends on how
+              the scan's threads are scheduled (TASK-302)"
+      (let [target (canonical (io/file root "target.hdoc"))
+            counts (dissoc (frequencies @parses) (canonical (io/file root "_parts/shared-ch.hdoc")))]
+        (is (contains? #{1 2} (get counts target)) (pr-str counts))
+        (is (= (into {} (map (fn [f] [(canonical (io/file root f)) 1])) (map #(str "h" % ".hdoc") (range 1 6)))
+               (dissoc counts target)))))
+    (testing "the directory keeps the documents of referenced books only (TASK-279)"
+      (is (realized? (:loaded (library/find-book lib "target"))))
+      (is (not-any? #(realized? (:loaded (library/find-book lib (str "h" %)))) (range 1 6))))
     (testing "a chapter is part of each book that includes it, so it is parsed once per including book"
       (is (= 5 (get (frequencies @parses) (canonical (io/file root "_parts/shared-ch.hdoc"))))))
     (testing "the shelf script loads and lists once, each :document runs once"
@@ -427,6 +438,88 @@
           before (scan-it)]
       (write! root "one.hdoc" "One, citing @{l:one}.\n")
       (is (not= before (scan-it))))))
+
+(deftest ^:slow scan-on-many-threads-test
+  (testing "TASK-279: books scanned on several threads give the graph one thread gives"
+    (let [synth-root (temp-dir)
+          _ (synth/generate! (str synth-root) {:books 200})
+          scan-it (fn [make-ctx threads] (view (scan/scan (make-ctx) nil {:threads threads})))
+          cases [["the fixture libraries" #(scan/context {:directory (fixture-directory)})]
+                 ["200 synthetic books (hub, quote chains, links)"
+                  #(scan/context {:directory-opts {:path (str (io/file synth-root "libraries.yaml"))
+                                                   :env {}}})]]
+          graphs (vec (for [[what make-ctx] cases]
+                        (let [one (scan-it make-ctx 1)]
+                          (testing what
+                            (doseq [threads [2 8]]
+                              (is (= one (scan-it make-ctx threads)) (str threads " threads"))))
+                          one)))]
+      (testing "and not vacuously: references and quotes across books"
+        (let [g (peek graphs)
+              edges (mapcat val (:edges g))]
+          (is (= 200 (count (:books g))))
+          ;; 69 resolved, 8 of them quotes
+          (is (< 50 (count (filter #(= :resolved (:status %)) edges))))
+          (is (<= 6 (count (filter #(= :quote (:kind %)) edges)))))))))
+
+(deftest own-record-never-newer-than-the-references-test
+  (testing "TASK-279 review: b.hdoc is edited after a.hdoc's quote read it and before b's
+            own scan; b's record must come from the read the quote used, so the next
+            refresh sees b changed and brings a up to date"
+    (let [root (temp-dir)
+          lib-of #(fs/filesystem-library {:name "lib" :path (str root)})
+          a (book-ref/book-id "lib" "a")
+          b (book-ref/book-id "lib" "b")
+          _ (write! root "a.hdoc" "# A\n\n!quote lib:b\n")
+          _ (write! root "b.hdoc" "# B\n\nOld text.\n")
+          lib (lib-of)
+          edits (atom 0)
+          g (scan/scan (scan/context {:directory (library/library-directory [lib])
+                                      :on-scan-book (fn [id]
+                                                      (when (= b id)
+                                                        (swap! edits inc)
+                                                        (write! root "b.hdoc" "# B\n\nNew text.\n")))})
+                       nil {:threads 1})
+          fresh (fn [] (scan/scan (scan/context {:directory (library/library-directory [(lib-of)])})
+                                  nil {:threads 1}))
+          old (do (write! root "b.hdoc" "# B\n\nOld text.\n") (fresh))
+          edited (do (write! root "b.hdoc" "# B\n\nNew text.\n") (fresh))
+          record (fn [g id] (get (graph/indexed-books g) id))]
+      (is (= 1 @edits) "the edit landed during the scan, after a's quote read b")
+      (is (= (:hash (record old b)) (:hash (record g b))) "b's record is the old text's, as a's quote is")
+      (is (= (graph/edges-from old a) (graph/edges-from g a)))
+      (is (not= (:hash (record edited b)) (:hash (record g b))))
+      (is (re-find #"\"Old\"" (pr-str (library/document (library/find-book lib "b"))))
+          "what the site would quote is the old text too")
+      (testing "so a refresh with b's file brings both up to date"
+        (let [{g2 :graph} (scan/refresh (scan/context {:directory (library/library-directory [(lib-of)])})
+                                        g [(str (io/file root "b.hdoc"))])]
+          (is (= (view edited) (view g2))))))))
+
+(deftest machine-errors-are-not-saved-as-book-failures-test
+  (testing "TASK-279 review: running out of memory stops the scan instead of becoming a
+            :book-failed record that a saved state would keep; a document nested too
+            deeply stays that book's failure"
+    (let [root (temp-dir)
+          _ (write! root "a.hdoc" "# A\n\nText.\n")
+          _ (write! root "b.hdoc" "# B\n\nSee @{lib:a}.\n")
+          scan-with (fn [^Throwable thrown threads]
+                      (let [lib (fs/filesystem-library
+                                 {:name "lib" :path (str root)}
+                                 {:parse (fn [text opts]
+                                           (if (str/ends-with? (str (:source opts)) "a.hdoc")
+                                             (throw thrown)
+                                             (parser/parse text opts)))})]
+                        (scan/scan (scan/context {:directory (library/library-directory [lib])})
+                                   nil {:threads threads})))]
+      (doseq [threads [1 4]]
+        (is (thrown? OutOfMemoryError (scan-with (OutOfMemoryError. "test") threads)) (str threads " threads"))
+        (let [g (scan-with (StackOverflowError.) threads)
+              a (get (graph/indexed-books g) (book-ref/book-id "lib" "a"))]
+          (is (= [:book-failed] (mapv :type (:diagnostics a))) (str threads " threads"))
+          (is (re-find #"StackOverflowError" (:message (first (:diagnostics a)))))
+          (is (= :dangling (:status (first (graph/edges-from g (book-ref/book-id "lib" "b")))))
+              "the citing book's reference into it dangles, as before"))))))
 
 ;; --- build parity seam --------------------------------------------------------------
 

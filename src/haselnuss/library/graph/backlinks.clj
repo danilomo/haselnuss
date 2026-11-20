@@ -20,6 +20,12 @@
   (`haselnuss.library.graph/passage-key`). Dangling edges that still name
   the book -- an unknown label, a bad locator, a book the library does not
   list under that slug -- are included: their author meant this book.
+  Derived edges (`haselnuss.library.graph/derived?`, TASK-287) are not:
+  a reference inside a passage another book's `locate` built, which a
+  book quoting that passage records only as a dependency. Its author
+  is that `locate`, not the quoting book -- as a reference inside a
+  passage read from a document is the quoted book's, and lists that
+  book, never the quoter.
 
   Each edge becomes one entry, the doc-11 edge shape with BookIds as
   canonical strings and passages as written:
@@ -191,7 +197,7 @@
   ([g target] (backlinks-report g target {}))
   ([g target {:keys [base-dir]}]
    (let [{:keys [id passage]} (graph/parse-target target)
-         edges (graph/edges-to g target)
+         edges (remove graph/derived? (graph/edges-to g target))
          {self true others false} (group-by #(boolean (self-edge? id %)) edges)
          others (sort-entries (map #(entry % base-dir) others))
          self (sort-entries (map #(entry % base-dir) self))]

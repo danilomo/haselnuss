@@ -316,7 +316,7 @@
 
 ;; --- TASK-253: one long line parses in linear time ---------------------------
 
-(deftest long-line-parse-time-test
+(deftest ^:timing long-line-parse-time-test
   (testing "TASK-253: a one-line paragraph full of references, citations, inline math
             and emphasis parses in time linear in its length. Each `$`, `@` and `[`
             converted the whole paragraph to a String, and each node's column was

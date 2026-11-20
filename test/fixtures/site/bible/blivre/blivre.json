@@ -1,0 +1,48 @@
+[
+  {"slug": "genesis", "title": "Gênesis", "verses": [
+    [3,1,"Porém a serpente era astuta, mais que todos os animais do campo que o SENHOR Deus havia feito. E ela disse à mulher: Deus vos disse: Não comais de toda árvore do jardim?"],
+    [3,2,"E a mulher respondeu à serpente: Do fruto das árvores do jardim podemos comer;"],
+    [3,3,"mas do fruto da árvore que está no meio do jardim, Deus disse: Não comereis dele, nem o tocareis, para que não morrais."],
+    [3,4,"Então a serpente disse à mulher: Não morrereis;"],
+    [3,5,"Mas Deus sabe que no dia que comerdes dele, vossos olhos serão abertos, e sereis como deuses, sabendo o bem e o mal."],
+    [3,6,"E a mulher viu que a árvore era boa para se comer, agradável aos olhos, e árvore desejável para se obter conhecimento. E ela tomou de seu fruto, e comeu; e deu também ao seu marido com ela, e ele comeu."],
+    [3,7,"E foram abertos os olhos de ambos, e conheceram que estavam nus. Então coseram folhas de figueira, e fizeram para si aventais."],
+    [3,8,"E ouviram a voz do SENHOR Deus, que passeava no jardim à brisa do dia; e o homem e sua mulher esconderam-se da presença do SENHOR Deus entre as árvores do jardim."],
+    [3,9,"E o SENHOR Deus chamou ao homem, e lhe disse: “Onde estás?"],
+    [3,10,"E ele respondeu: “Ouvi tua voz no jardim, e tive medo, porque estava nu; e me escondi”."],
+    [3,11,"E disse-lhe: “Quem te ensinou que estavas nu? Comeste da árvore de que te mandei que não comesses?”"],
+    [3,12,"E o homem respondeu: “A mulher que me deste por companheira me deu da árvore, e eu comi”."],
+    [3,13,"Então o SENHOR Deus disse à mulher: “Por que fizeste isto?” E a mulher disse: “A serpente me enganou, e comi”."],
+    [3,14,"E o SENHOR Deus disse à serpente: “Porque fizeste isto, maldita serás entre todos os animais selvagens e entre todos os animais do campo; sobre teu ventre andarás, e pó comerás todos os dias da tua vida."],
+    [3,15,"E porei inimizade entre ti e a mulher, e entre tua descendência e a descendência dela; esta te ferirá a cabeça, e tu lhe ferirás o calcanhar”."],
+    [3,16,"E para a mulher disse: “Multiplicarei grandemente as tuas dores e teus sofrimentos de parto; com dor darás à luz filhos; e o teu desejo será para o teu marido, e ele te dominará”."],
+    [3,17,"E ao homem disse: “Porque deste ouvidos à voz de tua mulher, e comeste da árvore de que te mandei dizendo, ‘Não comerás dela’, maldita será a terra por causa de ti; com dor comerás dela todos os dias da tua vida;"],
+    [3,18,"Espinhos e cardos te produzirá, e comerás erva do campo."],
+    [3,19,"No suor do teu rosto comerás o pão até que voltes à terra, porque dela foste tomado; porque pó és, e ao pó voltarás”."],
+    [3,20,"E chamou o homem o nome de sua mulher, Eva; porquanto ela era mãe de todos o viventes."],
+    [3,21,"E o SENHOR Deus fez ao homem e à sua mulher túnicas de peles, e os vestiu."],
+    [3,22,"E disse o SENHOR Deus: Eis que o homem é como um de Nos sabendo o bem e o mal; agora, pois, para que não estenda sua mão, e tome também da árvore da vida, e coma, e viva para sempre:"],
+    [3,23,"E tirou-o o SENHOR do jardim de Éden, para que lavrasse a terra de que foi tomado."],
+    [3,24,"Lançou, pois, fora ao homem, e pôs ao oriente do jardim de Éden querubins, e uma espada acesa que se revolvia a todos os lados, para guardar o caminho da árvore da vida."]
+  ]},
+  {"slug": "mateus", "title": "Mateus", "verses": [
+    [9,12,"Porém Jesus, ouvindo, respondeu -lhes: “Os que têm saúde não necessitam de médico, mas sim, os que estão doentes."],
+    [10,29,"Não se vendem dois pardais por uma pequena moeda? Mas nem um deles cairá em terra sem o consentimento de vosso Pai."],
+    [10,30,"E até os cabelos de vossas cabeças estão todos contados."]
+  ]},
+  {"slug": "joao", "title": "João", "verses": [
+    [10,27,"Minhas ovelhas ouvem a minha voz, e eu as conheço, e elas me seguem."],
+    [10,28,"E eu lhes dou a vida eterna, e nunca perecerão, e ninguém as arrebatará de minha mão."],
+    [10,29,"Meu Pai, que as deu para mim, é maior que todos; e ninguém as pode arrebatar da mão do meu Pai."],
+    [10,30,"Eu e o Pai somos um”."],
+    [17,3,"E esta é a vida eterna: que conheçam a ti, o único Deus verdadeiro, e a Jesus Cristo, a quem tu enviaste."]
+  ]},
+  {"slug": "romanos", "title": "Romanos", "verses": [
+    [3,10,"como está escrito: Não há justo, nem um sequer."],
+    [8,28,"E sabemos que todas as coisas juntamente contribuem para o bem daqueles que amam a Deus, dos que são chamados segundo o seu propósito."],
+    [14,8,"Porque, se vivemos, para o Senhor vivemos; e se morremos, para o Senhor morremos. Portanto, quer vivamos, quer morramos, do Senhor somos."]
+  ]},
+  {"slug": "1-corintios", "title": "1 Coríntios", "verses": [
+    [3,23,"Mas vós sois de Cristo; e Cristo, de Deus."]
+  ]}
+]

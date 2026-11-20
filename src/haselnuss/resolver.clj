@@ -251,6 +251,30 @@
                                                                 ::ast/inline)))))))
             node (walk/fields-holding ::ast/inline node ::ast/cite-item))))
 
+(defn- inline-blocks-into
+  "`inline-blocks`' own walk, conj!-ing every Block it finds onto the
+  transient vector `acc` -- eagerly, rather than as the nested lazy
+  `mapcat`/`concat` it was: this runs for every Para of every pass built
+  on `block-children`, and on a document of tens of thousands of
+  paragraphs the lazy sequences were most of what resolving it cost
+  (TASK-263). Same order: an Inline's own Block fields, then its nested
+  Inlines, then its CiteItems' `:prefix`/`:suffix`."
+  [acc inlines]
+  (reduce
+   (fn [acc inline]
+     (let [fields (walk/fields-holding-by-kind ::ast/inline inline)]
+       (as-> acc acc
+         (reduce (fn [acc field] (reduce conj! acc (get inline field)))
+                 acc (get fields ::ast/block))
+         (reduce (fn [acc field] (inline-blocks-into acc (get inline field)))
+                 acc (get fields ::ast/inline))
+         (reduce (fn [acc field]
+                   (reduce (fn [acc item] (inline-blocks-into acc (cite-item-inlines item)))
+                           acc (get inline field)))
+                 acc (get fields ::ast/cite-item)))))
+   acc
+   inlines))
+
 (defn- inline-blocks
   "Every Block reachable from `inlines` through an Inline that carries
   them -- a footnote `:note`, and since TASK-116 a `:sticky-note` --
@@ -267,15 +291,7 @@
   highlight got no number at all, and no diagnostic, while the identical
   document written with `*emph*` numbered fine."
   [inlines]
-  (mapcat
-   (fn [inline]
-     (concat
-      (mapcat #(get inline %) (walk/fields-holding ::ast/inline inline ::ast/block))
-      (mapcat #(inline-blocks (get inline %))
-              (walk/fields-holding ::ast/inline inline ::ast/inline))
-      (mapcat (fn [field] (mapcat #(inline-blocks (cite-item-inlines %)) (get inline field)))
-              (walk/fields-holding ::ast/inline inline ::ast/cite-item))))
-   inlines))
+  (persistent! (inline-blocks-into (transient []) inlines)))
 
 (defn- block-children
   "The Block's nested Blocks, one case per Block variant that can contain
@@ -3403,15 +3419,23 @@
                                  :next (get entries (inc i)))))
            entries))))
 
+(defn- pre-order-blocks-into
+  "`pre-order-blocks`' own walk, conj!-ing onto the transient vector `acc`."
+  [acc block]
+  (reduce pre-order-blocks-into (conj! acc block) (block-children block)))
+
 (defn- pre-order-blocks
   "Every Block reachable from `block`: itself, then its own nested Blocks
   (`block-children`) recursively, in pre-order -- the same document-order
   walk `number-block` uses to visit every labeled node, reused here to
   find every Figure/Table anywhere in `document` (including one nested
   inside a footnote, list item, block quote, directive, or table cell,
-  mirroring TASK-11's own \"every labeled node\" framing)."
+  mirroring TASK-11's own \"every labeled node\" framing).
+
+  Built eagerly into one vector (TASK-263) rather than as a lazy
+  `cons`/`mapcat` per Block: see `inline-blocks-into`."
   [block]
-  (cons block (mapcat pre-order-blocks (block-children block))))
+  (persistent! (pre-order-blocks-into (transient []) block)))
 
 (defn- numbered-blocks-of-type
   "`[block entry]` pairs, in document order, for every `node-type`-typed
@@ -3745,25 +3769,24 @@
   reported separately, by `unnumbered-section-diagnostics` -- see there
   for why that condition is broader than a role mismatch and must be
   checked on its own rather than folded in here."
-  [document lexicon]
+  [blocks lexicon]
   (into []
-        (comp (mapcat pre-order-blocks)
-              (keep (fn [block]
-                      (let [id (get-in block [:attr :id])
-                            kind (id->kind id)
-                            expected (:node-types (get lexicon kind))]
-                        (when (and expected (not (contains? expected (:t block))))
-                          {:type :kind-role-mismatch
-                           :id id
-                           :kind kind
-                           :node-type (:t block)
-                           :expected expected
-                           :message (str "id \"" id "\" has kind " kind
-                                         ", which labels "
-                                         (str/join "/" (sort (map name expected)))
-                                         " nodes, but this node is a "
-                                         (name (:t block)))})))))
-        (:blocks document)))
+        (keep (fn [block]
+                (let [id (get-in block [:attr :id])
+                      kind (id->kind id)
+                      expected (:node-types (get lexicon kind))]
+                  (when (and expected (not (contains? expected (:t block))))
+                    {:type :kind-role-mismatch
+                     :id id
+                     :kind kind
+                     :node-type (:t block)
+                     :expected expected
+                     :message (str "id \"" id "\" has kind " kind
+                                   ", which labels "
+                                   (str/join "/" (sort (map name expected)))
+                                   " nodes, but this node is a "
+                                   (name (:t block)))}))))
+        blocks))
 
 (defn- directive-kind-diagnostics
   "One `{:type :directive-kind-mismatch :name :id :kind :expected-kind
@@ -3821,10 +3844,9 @@
   Directives, *and* it is numbered as a section here and as a lemma in
   native LaTeX. Neither is visible from the other, and their remedies
   differ."
-  [document directive-kinds lexicon]
+  [blocks directive-kinds lexicon]
   (into []
-        (comp (mapcat pre-order-blocks)
-              (filter #(= :directive (:t %)))
+        (comp (filter #(= :directive (:t %)))
               (keep (fn [directive]
                       (let [id (get-in directive [:attr :id])
                             kind (id->kind id)
@@ -3841,7 +3863,7 @@
                                          " here, but native-mode LaTeX numbers it with the "
                                          (:name directive) " environment's own counter, so one"
                                          " node gets two different numbers")})))))
-        (:blocks document)))
+        blocks))
 
 (defn- unnumbered-section-diagnostics
   "One `{:type :unnumbered-section-id :id :kind :message}` diagnostic
@@ -3885,24 +3907,33 @@
   documents an unlabeled Section as intentionally transparent for
   nesting, which is a choice an author makes by omitting the id. This is
   for an author who *did* give the Section an id and would reasonably
-  expect it to number."
-  [document lexicon]
+  expect it to number.
+
+  Nor is a Section that says so (TASK-284): the prop `numbered=false`
+  (`{#cap:3 numbered=false}`) declares the id a pure anchor -- a link
+  target for a generated page such as a Bible chapter -- and the lost
+  level is the intent, not a surprise. It is an explicit, per-section
+  opt-out rather than a recognised prefix, so a mistyped or `:global`
+  kind still warns unless the author has said otherwise. The prop only
+  silences this diagnostic; numbering is untouched (a section with a
+  non-section-scoped id was never numbered, and a `sec:` one stays so)."
+  [blocks lexicon]
   (into []
-        (comp (mapcat pre-order-blocks)
-              (keep (fn [block]
-                      (let [id (get-in block [:attr :id])
-                            kind (id->kind id)]
-                        (when (and (= :section (:t block))
-                                   id
-                                   (not= :section-scoped (:counter (get lexicon kind))))
-                          {:type :unnumbered-section-id
-                           :id id
-                           :kind kind
-                           :message (str "section id \"" id "\" does not resolve to a"
-                                         " section-scoped numbering kind, so this section is"
-                                         " not numbered and its children's numbers skip a"
-                                         " level")})))))
-        (:blocks document)))
+        (keep (fn [block]
+                (let [id (get-in block [:attr :id])
+                      kind (id->kind id)]
+                  (when (and (= :section (:t block))
+                             id
+                             (not= :section-scoped (:counter (get lexicon kind)))
+                             (not= "false" (get-in block [:attr :props "numbered"])))
+                    {:type :unnumbered-section-id
+                     :id id
+                     :kind kind
+                     :message (str "section id \"" id "\" does not resolve to a"
+                                   " section-scoped numbering kind, so this section is"
+                                   " not numbered and its children's numbers skip a"
+                                   " level")}))))
+        blocks))
 
 (defn- compact-block-suffix
   "The portion of a `haselnuss.walk/fold`-computed path AFTER a known
@@ -4038,6 +4069,21 @@
   [path block]
   (walk/fold (id-locations-block-walker (count path)) [] ::ast/block block path))
 
+(defn- carries-id?
+  "Whether any map anywhere inside `x` -- through every map value and
+  every collection element, whatever the schema says the field is -- has
+  an `attr.id`. False means `id-locations-in-block`/`-in-inlines` would
+  find nothing in `x`, since every pair they return is some reachable
+  node's own `attr.id`; true only means they have to look. A paragraph
+  with no id anywhere in it -- nearly all of them -- is skipped this way
+  without building the paths and locations a full walk does (TASK-263)."
+  [x]
+  (cond
+    (map? x) (or (some? (get-in x [:attr :id]))
+                 (reduce-kv (fn [_ _ v] (if (carries-id? v) (reduced true) false)) false x))
+    (coll? x) (reduce (fn [_ v] (if (carries-id? v) (reduced true) false)) false x)
+    :else false))
+
 (defn- id-locations-in-document
   "Every `[id location]` pair (see `id-locations-in-block`/`id-locations-
   in-inline`) for every id anywhere in `document`: `(:title (:meta
@@ -4046,9 +4092,10 @@
   inclusion of `meta.title` in their walks), then every top-level Block in
   `document`'s own `:blocks`, in document order."
   [document]
-  (into (id-locations-in-inlines [:title] (get-in document [:meta :title]))
-        (mapcat (fn [i block] (id-locations-in-block [i] block))
-                (range) (:blocks document))))
+  (let [title (get-in document [:meta :title])]
+    (into (if (carries-id? title) (id-locations-in-inlines [:title] title) [])
+          (mapcat (fn [i block] (when (carries-id? block) (id-locations-in-block [i] block)))
+                  (range) (:blocks document)))))
 
 (defn- location-label
   "How `duplicate-id-diagnostics` names one node: its type, then `at
@@ -4059,16 +4106,19 @@
 
 (defn- duplicate-id-diagnostics
   "One `{:type :duplicate-id :id :locations :message}` diagnostic (AC #1)
-  per id used by 2+ nodes anywhere in `document` -- Block-level or
+  per id used by 2+ nodes anywhere in a document -- Block-level or
   Inline-level (a Link/Image/Span's own `attr.id`) alike, per this
   section's top-of-namespace comment -- in first-occurrence document
   order; `:locations` names every node using that id (see
   `id-locations-in-block`/`id-locations-in-inline`), not just the first
   two, so a three-or-more-way collision is reported in full rather than
-  only partially."
-  [document]
-  (let [pairs (id-locations-in-document document)
-        by-id (group-by first pairs)
+  only partially.
+
+  Takes that document's `(id-locations-in-document document)` rather
+  than the document itself (TASK-263): `resolve-document` computes it
+  once, for this and for `disambiguate-duplicate-ids` both."
+  [pairs]
+  (let [by-id (group-by first pairs)
         first-seen (distinct (map first pairs))]
     (into []
           (keep (fn [id]
@@ -4089,10 +4139,9 @@
   what `directive-registry` accepts), one per occurrence -- not
   deduplicated by name, mirroring `resolve-cross-ref`/`resolve-cite-node`'s
   own per-occurrence warning convention."
-  [document directive-registry]
+  [blocks directive-registry]
   (into []
-        (comp (mapcat pre-order-blocks)
-              (filter #(= :directive (:t %)))
+        (comp (filter #(= :directive (:t %)))
               (remove #(contains? directive-registry (:name %)))
               (map (fn [directive]
                      {:type :unknown-directive
@@ -4100,7 +4149,7 @@
                       :id (get-in directive [:attr :id])
                       :message (str "unknown directive \"" (:name directive)
                                     "\": not registered in the extension registry")})))
-        (:blocks document)))
+        blocks))
 
 (def ^:private division-kinds
   "The built-in kinds that name a sectioning DIVISION (TASK-53, extended
@@ -4145,35 +4194,34 @@
   and level 2 expects `:ch` (both shifted down the one extra division),
   in a chapter-only document level 1 still expects `:ch`, and every other
   level in either shape expects `:sec`."
-  [document]
+  [document blocks]
   (let [chapters? (chaptered? document)
         parts? (parted? document)]
     (into []
-          (comp (mapcat pre-order-blocks)
-                (keep (fn [block]
-                        (let [kind (id->kind (get-in block [:attr :id]))
-                              level (:level block)
-                              expected (cond
-                                         (and parts? (= 1 level)) :part
-                                         (and parts? (= 2 level)) :ch
-                                         (and chapters? (= 1 level)) :ch
-                                         :else :sec)]
-                          (when (and (= :section (:t block))
-                                     (contains? division-kinds kind)
-                                     (not= kind expected))
-                            {:type :division-kind-mismatch
-                             :id (get-in block [:attr :id])
-                             :kind kind
-                             :expected-kind expected
-                             :level (:level block)
-                             :message (str "section id \"" (get-in block [:attr :id])
-                                           "\" names the " kind " division, but a level-"
-                                           (:level block) " heading in this document is"
-                                           " emitted as \\" (division-kinds expected)
-                                           ": a native-mode LaTeX reference to it is named"
-                                           " after the sectioning command, so it would print"
-                                           " one word where HTML prints the other")})))))
-          (:blocks document))))
+          (keep (fn [block]
+                  (let [kind (id->kind (get-in block [:attr :id]))
+                        level (:level block)
+                        expected (cond
+                                   (and parts? (= 1 level)) :part
+                                   (and parts? (= 2 level)) :ch
+                                   (and chapters? (= 1 level)) :ch
+                                   :else :sec)]
+                    (when (and (= :section (:t block))
+                               (contains? division-kinds kind)
+                               (not= kind expected))
+                      {:type :division-kind-mismatch
+                       :id (get-in block [:attr :id])
+                       :kind kind
+                       :expected-kind expected
+                       :level (:level block)
+                       :message (str "section id \"" (get-in block [:attr :id])
+                                     "\" names the " kind " division, but a level-"
+                                     (:level block) " heading in this document is"
+                                     " emitted as \\" (division-kinds expected)
+                                     ": a native-mode LaTeX reference to it is named"
+                                     " after the sectioning command, so it would print"
+                                     " one word where HTML prints the other")}))))
+          blocks)))
 
 (defn- front-matter-diagnostics
   "Two `{:type :front-matter-not-numbered|:front-matter-section ...}`
@@ -4225,6 +4273,21 @@
                      (mapcat pre-order-blocks (:blocks block))))))))
         (:blocks document)))
 
+(defn- block-diagnostics
+  "Every `structural-diagnostics` diagnostic but the duplicate ids, in
+  that function's own order. Each check reads the same pre-order Block
+  sequence, so it is walked once here and shared (TASK-263) rather than
+  re-walked per check; `resolve-document`, which reports duplicate ids
+  from the document as authored instead, calls this directly."
+  [document directive-registry lexicon directive-kinds front-matter-names]
+  (let [blocks (into [] (mapcat pre-order-blocks) (:blocks document))]
+    (-> (unknown-directive-diagnostics blocks directive-registry)
+        (into (kind-role-diagnostics blocks lexicon))
+        (into (directive-kind-diagnostics blocks directive-kinds lexicon))
+        (into (unnumbered-section-diagnostics blocks lexicon))
+        (into (division-kind-diagnostics document blocks))
+        (into (front-matter-diagnostics document front-matter-names lexicon)))))
+
 (defn structural-diagnostics
   "The structural-diagnostics pass (SPEC.md sec9 step 5's remaining half --
   dangling refs/cites are already collected by `resolve-cross-refs`/
@@ -4262,13 +4325,8 @@
   ([document directive-registry lexicon directive-kinds]
    (structural-diagnostics document directive-registry lexicon directive-kinds #{}))
   ([document directive-registry lexicon directive-kinds front-matter-names]
-   (-> (duplicate-id-diagnostics document)
-       (into (unknown-directive-diagnostics document directive-registry))
-       (into (kind-role-diagnostics document lexicon))
-       (into (directive-kind-diagnostics document directive-kinds lexicon))
-       (into (unnumbered-section-diagnostics document lexicon))
-       (into (division-kind-diagnostics document))
-       (into (front-matter-diagnostics document front-matter-names lexicon)))))
+   (into (duplicate-id-diagnostics (id-locations-in-document document))
+         (block-diagnostics document directive-registry lexicon directive-kinds front-matter-names))))
 
 (defn- disambiguate-duplicate-ids
   "Gives every LATER node that reuses an id its own unique id (TASK-133),
@@ -4283,10 +4341,13 @@
   A generated name an author already used (a document with `fig:x` twice
   AND a node written `fig:x-dup2`) is skipped: the next free n is taken
   instead (TASK-146), so the rename never creates a collision that nothing
-  reports."
-  [document]
+  reports.
+
+  `id-locations` is `(id-locations-in-document document)`, which
+  `resolve-document` has already computed (TASK-263)."
+  [document id-locations]
   (let [seen (volatile! {})
-        taken (into #{} (map first) (id-locations-in-document document))
+        taken (into #{} (map first) id-locations)
         walker {:table walk/table :scope cross-ref-scope
                 :rewrite-fn (fn [_ref-kind node]
                               (if-let [id (get-in node [:attr :id])]
@@ -4419,7 +4480,11 @@
          ;; numbers -- inherits that from here rather than each
          ;; re-deciding it.
          authored document
-         document (disambiguate-duplicate-ids document)
+         ;; Every id of the document as authored, with its location:
+         ;; computed once, for both the renaming and the duplicate-id
+         ;; report below (TASK-263).
+         authored-ids (id-locations-in-document authored)
+         document (disambiguate-duplicate-ids document authored-ids)
          labels (number-document document lexicon front-matter-names sublabel-names)
          ;; Cross-references and citations, by contrast, run over the
          ;; WHOLE document: an abstract may cite, and may refer to a
@@ -4457,10 +4522,9 @@
          ;; Duplicates are reported against the document as authored
          ;; (`disambiguate-duplicate-ids` has renamed them in `cr-doc`);
          ;; every other structural check runs on the resolved document.
-         diagnostics (into (duplicate-id-diagnostics authored)
-                           (remove #(= :duplicate-id (:type %)))
-                           (structural-diagnostics cr-doc directive-registry lexicon directive-kinds
-                                                   front-matter-names))]
+         diagnostics (into (duplicate-id-diagnostics authored-ids)
+                           (block-diagnostics cr-doc directive-registry lexicon directive-kinds
+                                              front-matter-names))]
      {:document cr-doc
       ;; Warning order follows the passes, which now run citations
       ;; first (TASK-64) -- a reader tracing a build reads them in the

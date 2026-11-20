@@ -13,8 +13,8 @@
   `haselnuss.library/document` run through `haselnuss.resolver/
   resolve-document` with the build's own resolver options -- keyed by
   `haselnuss.book-ref/book-key`, so a book is loaded and resolved once per
-  build however many passages are taken from it. A locator never needs
-  the document and never touches the cache.
+  build however many passages are taken from it. A locator needs the
+  document only when the book's `locate` answers an `:anchor` (below).
 
   ## What a passage resolves to
 
@@ -35,7 +35,14 @@
     word, else \"..., <from> – <to>\".
   - `{:form :locator}`: the book's own `locate` when it satisfies
     `haselnuss.library/Locatable`, normalised by `haselnuss.library/
-    passage-value` (so `:ref` is always canonical).
+    passage-value` (so `:ref` is always canonical). Its `:anchor`, the
+    id of the element the locator lands on (TASK-269), is kept only when
+    the book's resolved document has an element with that id -- a block
+    or any other node (`id-index`) -- and dropped otherwise, also when
+    the document fails: so the anchor a passage carries is always one
+    the book's page has, and a `--build-site` link to it never names a
+    missing one (it lands on the top of the page instead). The scan's
+    edge digest covers it (`haselnuss.library.graph.scan/with-digests`).
 
   Only BLOCK ids are labels: a passage is blocks. The blocks are the
   resolved document's, so a cross-reference inside them already carries
@@ -130,6 +137,12 @@
     :resolve-fn (or resolve-fn resolver/resolve-document)
     :state (atom {:books {} :pending []})}))
 
+(defn empty-like
+  "A new passage context with `ctx`'s resolver options and resolve fn, and
+  nothing cached yet."
+  [ctx]
+  (context (select-keys ctx [:resolve-opts :resolve-fn])))
+
 (defn take-book-diagnostics!
   "The book-level warnings (see the namespace docstring) produced since
   the last call, in the order the books were loaded; each is returned by
@@ -208,6 +221,10 @@
   load warnings on `ctx`."
   [ctx book id]
   (let [document (try (library/document book)
+                      (catch StackOverflowError t (book-failed id "failed to produce its document" t))
+                      ;; TASK-279: running out of memory says nothing about
+                      ;; the book, and this answer is cached and saved
+                      (catch VirtualMachineError t (throw t))
                       (catch Throwable t (book-failed id "failed to produce its document" t)))]
     (if (library/diagnostic? document)
       document
@@ -217,6 +234,8 @@
             _ (swap! (:state ctx) update :pending into warnings)
             result (try ((:resolve-fn ctx) document
                                            (assoc (:resolve-opts ctx) :bibliography bibliography))
+                        (catch StackOverflowError t (book-failed id "failed to resolve" t))
+                        (catch VirtualMachineError t (throw t))
                         (catch Throwable t (book-failed id "failed to resolve" t)))]
         (if (library/diagnostic? result)
           result
@@ -250,6 +269,15 @@
   it is reached by."
   [ctx book id]
   @(:loaded (cache-entry ctx book id (book-ref/book-key id))))
+
+(defn cached?
+  "True when `ctx` already has the entry `resolved-book` would answer
+  `book` from -- some reader has started to load it in this context
+  (TASK-279: the scan reads such a book's own record from that load)."
+  [ctx book]
+  (let [id (:id (library/book-entry book))
+        entry (get-in @(:state ctx) [:books (book-ref/book-key id)])]
+    (boolean (and entry (= id (:id entry)) (= (book-source book) (:source entry))))))
 
 (defn resolved-book
   "`book`'s resolved form, from `ctx`'s cache -- the one `resolve-passage`
@@ -374,8 +402,24 @@
            :blocks (subvec (get-in document (pop from-path))
                            (peek from-path) (inc (peek to-path)))})))))
 
+(defn- has-id?
+  "True when `loaded`, a book's resolved form (or the diagnostic it failed
+  with), has a node whose id is `id`."
+  [loaded id]
+  (and (not (library/diagnostic? loaded))
+       (or (contains? (get-in loaded [:ids :blocks]) id)
+           (contains? (get-in loaded [:ids :elsewhere]) id))))
+
+(defn- checked-anchor
+  "`value`, a locator's Passage, without its `:anchor` unless the book's
+  resolved document has that id (see the namespace docstring)."
+  [ctx book id value]
+  (if (and (:anchor value) (not (has-id? (resolved ctx book id) (:anchor value))))
+    (dissoc value :anchor)
+    value))
+
 (defn- locate-passage
-  [book id passage]
+  [ctx book id passage]
   (let [locator (:locator passage)]
     (if (satisfies? library/Locatable book)
       (let [result (try (library/locate book locator)
@@ -387,7 +431,7 @@
             value (library/passage-value id locator result)]
         (if (library/diagnostic? value)
           (merge (failure id passage (:type value) (:message value) {}) value)
-          value))
+          (checked-anchor ctx book id value)))
       (failure id passage :locator-unsupported
                (str "book " (canonical id) " does not interpret locators, so "
                     (pr-str locator) " cannot be resolved; refer to a label (kind:label) instead")
@@ -416,7 +460,7 @@
   (let [entry (library/book-entry book)
         id (:id entry)]
     (if (= :locator (:form passage))
-      (locate-passage book id passage)
+      (locate-passage ctx book id passage)
       (let [loaded (resolved ctx book id)]
         (if (library/diagnostic? loaded)
           (merge (failure id passage (:type loaded) (:message loaded) {}) loaded)

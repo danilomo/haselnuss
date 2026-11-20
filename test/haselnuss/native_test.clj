@@ -1,5 +1,10 @@
-(ns haselnuss.native-test
+(ns ^:slow ^:shares-target haselnuss.native-test
   "Fixtures for the GraalVM native binary (TASK-126).
+
+  `^:shares-target` (TASK-302): the differential tests read
+  `target/uberjar/haselnuss.jar`, which `haselnuss.uberjar-test` deletes
+  and rebuilds, so `bin/test` runs the two in one shard. `^:slow`: outside
+  the fast gate.
 
   The reason this namespace exists at all is that `lein test` only ever
   runs on the JVM, so it structurally cannot see any of the ways a
@@ -26,7 +31,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [haselnuss.cli :as cli])
-  (:import (java.nio.file Files)
+  (:import (java.nio.file Files LinkOption)
            (java.nio.file.attribute FileAttribute)))
 
 (def ^:private binary-path
@@ -287,3 +292,162 @@
             (is (= (:err jvm) (:err native)) (pr-str args))
             (is (not (str/blank? (str (:out native) (:err native))))
                 (str (pr-str args) ": the comparison must not be between two empty outputs"))))))))
+
+(defn- http
+  "`[status body]` of one request to `url` (a `java.net.http` client:
+  this JVM's, not the binary's); a `body` is sent as
+  `Content-Type: application/json`."
+  [method url body]
+  (let [client (java.net.http.HttpClient/newHttpClient)
+        req (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
+                (.method method (if body
+                                  (java.net.http.HttpRequest$BodyPublishers/ofString body)
+                                  (java.net.http.HttpRequest$BodyPublishers/noBody)))
+                (cond-> body (.header "Content-Type" "application/json"))
+                (.build))
+        resp (.send client req (java.net.http.HttpResponse$BodyHandlers/ofString))]
+    [(.statusCode resp) (.body resp)]))
+
+(defn- site-tree
+  "`{relative-path bytes-as-vector}` of every file under the built site
+  `dir` outside `.haselnuss/`: the build's own state there carries a
+  random generation id, so it differs between any two builds."
+  [dir]
+  (let [root (.toPath (io/file dir))]
+    (into (sorted-map)
+          (for [^java.io.File f (file-seq (io/file dir))
+                :when (.isFile f)
+                :let [rel (str (.relativize root (.toPath f)))]
+                :when (not (str/starts-with? rel ".haselnuss"))]
+            [rel (vec (Files/readAllBytes (.toPath f)))]))))
+
+(def ^:private site-libraries
+  "The site fixture set (TASK-264) both `--build-site` runs below build."
+  "test/fixtures/site/libraries.yaml")
+
+(deftest native-build-site-test
+  (if-not (binary-present?)
+    (testing "no native binary built -- skipping (see this namespace's docstring)"
+      (is true "native-image is opt-in; absence of a binary is not a failure"))
+    (testing "TASK-278: --build-site runs from the binary -- the library scan, the
+              Bible shelf script in the sandbox, every emitter, the app files read
+              from the image's resources -- and writes what the JVM writes"
+      (let [tmp (str (Files/createTempDirectory "haselnuss-native-build-site"
+                                                (make-array FileAttribute 0)))
+            native-site (str (io/file tmp "native"))
+            jvm-site (str (io/file tmp "jvm"))
+            native (run-binary "--libraries" site-libraries "--build-site" native-site)
+            jvm (run-main "--libraries" site-libraries "--build-site" jvm-site)
+            native-tree (site-tree native-site)]
+        ;; 1: the fixture set carries two planted warnings
+        (is (= 1 (:exit jvm)) (:err jvm))
+        (is (= (:exit jvm) (:exit native)) (:err native))
+        ;; the progress lines and the summary go to stderr
+        (is (= (:out jvm) (:out native)))
+        (is (= (:err jvm) (:err native)) "the same books rebuilt, the same warnings")
+        (is (str/includes? (:err native) "9 of 11 books rebuilt") (:err native))
+        (is (contains? native-tree "app.js") "the app files come from the image's resources")
+        (is (contains? native-tree "icon-512.png"))
+        (is (contains? native-tree "catalog/index.json"))
+        (is (some #(str/starts-with? % "books/bible/") (keys native-tree))
+            "the generated (shelf-script) books were built")
+        (is (= (keys (site-tree jvm-site)) (keys native-tree)) "the same files")
+        (is (= (site-tree jvm-site) native-tree) "and every one byte for byte")
+        (testing "a second run reads the saved state back (EDN in the image) and
+                  rebuilds nothing"
+          (let [again (run-binary "--libraries" site-libraries "--build-site" native-site)]
+            (is (= 1 (:exit again)) (:err again))
+            (is (str/includes? (:err again) "0 of 11 books rebuilt, 9 up to date") (:err again))
+            (is (= native-tree (site-tree native-site)))))
+        (testing "TASK-296: the binary and the jar each know their build identity, so a
+                  run after a settled build answers from the record -- which leaves
+                  it as it is -- and prints what the long way printed; the other one
+                  goes the long way"
+          (doseq [[what run other] (if (jar-present?)
+                                     [["the binary" run-binary run-jar] ["the jar" run-jar run-binary]]
+                                     [["the binary" run-binary run-main]])]
+            (let [site (str (io/file tmp (str "unchanged-" (if (= run run-binary) "native" "jar"))))
+                  build #(run "--libraries" site-libraries "--build-site" site)
+                  record (io/file site ".haselnuss" "unchanged")
+                  stamp #(when (.isFile record)
+                           [(Files/getLastModifiedTime (.toPath record) (make-array LinkOption 0))
+                            (Files/getAttribute (.toPath record) "unix:ino" (make-array LinkOption 0))])
+                  _ (build)
+                  _ (Thread/sleep 2100)                 ; past the racy window of every folder
+                  settled (build)                       ; the long way, which saves the record
+                  saved (stamp)
+                  hit (build)]
+              (is (some? saved) (str what ": a record is saved\n" (:err settled)))
+              (is (= saved (stamp)) (str what ": the next run answers from it and leaves it"))
+              (is (= (:err settled) (:err hit)) what)
+              (is (= (:exit settled) (:exit hit)) what)
+              (let [other-run (other "--libraries" site-libraries "--build-site" site)]
+                (is (not= saved (stamp)) (str what ": another build takes the long way and saves its own"))
+                (is (= (:err settled) (:err other-run)))))))))))
+
+(deftest native-heap-defaults-test
+  (if-not (binary-present?)
+    (testing "no native binary built -- skipping (see this namespace's docstring)"
+      (is true "native-image is opt-in; absence of a binary is not a failure"))
+    (testing "TASK-278: bin/native bakes in a 128 MB young generation (-R:MaxNewSize),
+              which keeps a plain `--serve` under 512 MB across catalog reloads;
+              the maximum heap stays the image's default, which a large
+              --build-site needs"
+      (let [{:keys [exit out err]} (run-binary "-XX:+VerboseGC" "--version")]
+        (is (= 0 exit) err)
+        (is (str/starts-with? out "haselnuss "))
+        (is (str/includes? err "Maximum young generation size: 128M") err))
+      (testing "and -XX:MaxNewSize given to the binary still overrides it"
+        (let [{:keys [err]} (run-binary "-XX:+VerboseGC" "-XX:MaxNewSize=64m" "--version")]
+          (is (str/includes? err "Maximum young generation size: 64M") err))))))
+
+(deftest ^:timing native-serve-test
+  (if-not (binary-present?)
+    (testing "no native binary built -- skipping (see this namespace's docstring)"
+      (is true "native-image is opt-in; absence of a binary is not a failure"))
+    (testing "TASK-273: --serve runs from the binary -- the JDK HTTP server, the
+              static files, the readers API and the in-memory search -- over a
+              site the binary built itself (TASK-278)"
+      (let [site (str (io/file (str (Files/createTempDirectory "haselnuss-native-serve"
+                                                               (make-array FileAttribute 0)))
+                               "site"))
+            _ (is (contains? #{0 1} (:exit (run-binary "--libraries" site-libraries
+                                                       "--build-site" site))))
+            command ^java.util.List (vector (.getAbsolutePath (io/file binary-path)) "--serve" site "--port" "0")
+            proc (.start (doto (ProcessBuilder. command)
+                           (.redirectOutput java.lang.ProcessBuilder$Redirect/DISCARD)))]
+        (try
+          (let [line (.readLine ^java.io.BufferedReader (io/reader (.getErrorStream proc)))
+                base (second (re-find #" at (http://\S+/) " (str line)))]
+            (is base (str "the serving line: " line))
+            (when base
+              (is (= 200 (first (http "GET" base nil))))
+              (is (= 200 (first (http "GET" (str base "app.js") nil))))
+              (let [[status body] (http "GET" (str base "books/bible/blivre/romanos/") nil)]
+                (is (= 200 status) "a book page the binary built")
+                (is (str/includes? (str body) "<title>Romanos")))
+              (is (= 200 (first (http "GET" (str base "books/bible/blivre/romanos/backlinks.json") nil))))
+              (is (= 404 (first (http "GET" (str base ".haselnuss/lock") nil))))
+              (is (= 404 (first (http "GET" (str base "%2e%2e/%2e%2e/etc/passwd") nil))))
+              (is (= [201 "{\"id\":\"ana\",\"name\":\"Ana\"}"] (http "POST" (str base "api/readers") "{\"name\":\"Ana\"}")))
+              (is (= 200 (first (http "PUT" (str base "api/readers/ana/positions/bible:blivre/romanos")
+                                      "{\"savedAt\":\"2026-11-13T21:04:11Z\",\"percent\":3}"))))
+              (is (str/includes? (second (http "GET" (str base "api/readers/ana/positions") nil)) "2026-11-13T21:04:11Z"))
+              (is (str/includes? (second (http "GET" (str base "api/search?q=romanos") nil)) "\"title\":\"Romanos\""))
+              (testing "TCP_NODELAY reaches the image (sun.net.httpserver.ServerConfig is
+                        initialized at run time): kept-alive requests do not each
+                        wait ~40 ms on a delayed ACK"
+                (let [client (-> (java.net.http.HttpClient/newBuilder)
+                                 (.version java.net.http.HttpClient$Version/HTTP_1_1)
+                                 (.build))
+                      req (.build (java.net.http.HttpRequest/newBuilder (java.net.URI/create (str base "app.js"))))
+                      fetch #(.statusCode (.send client req (java.net.http.HttpResponse$BodyHandlers/ofString)))
+                      _ (fetch)
+                      start (System/nanoTime)
+                      statuses (vec (repeatedly 60 fetch))
+                      seconds (/ (- (System/nanoTime) start) 1e9)]
+                  (is (every? #{200} statuses))
+                  (is (< seconds 1.5) (str "60 kept-alive requests took " seconds " s"))))))
+          (finally
+            (.destroy proc)
+            (.waitFor proc)))))))

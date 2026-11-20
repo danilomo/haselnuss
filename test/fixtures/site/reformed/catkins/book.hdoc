@@ -1,0 +1,22 @@
+---
+title: Catkins
+lang: en
+---
+
+# Two kinds of flower {#sec:flowers}
+
+A hazel carries its male and female flowers on the same branch, as
+@fig:catkins shows. The image sits beside this book's file, which is why the
+book is a folder (`catkins/book.hdoc`) rather than a single file.
+
+![Male catkins and female flowers on the same branch in
+February.](catkins.png){#fig:catkins}
+
+# Counting flowers {#sec:counting}
+
+A branch with $m$ male catkins and $f$ female flowers sets at most $f$ nuts.
+The share of female flowers, @eq:share, is what a grower watches:
+
+$$
+s = \frac{f}{m + f}, \qquad 0 \le s \le 1
+$$ {#eq:share}

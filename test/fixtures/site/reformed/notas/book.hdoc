@@ -1,0 +1,9 @@
+---
+title: Notas (folder)
+lang: pt-BR
+---
+
+# Notas {#sec:notas}
+
+This book and `notas.hdoc` beside its folder share one canonical id,
+`reformed:notas`, so no reference can reach either.

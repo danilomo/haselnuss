@@ -652,7 +652,7 @@
         (is (= by-builds (quote-problems-by-check yaml)) (pr-str slots))))
     {:deep @deep-hits :cycle @cycle-hits :both @both-hits}))
 
-(deftest dense-quote-parity-fuzz-test
+(deftest ^:slow dense-quote-parity-fuzz-test
   (testing "seeded (254): dense libraries report under --check exactly the quote-cycles
             and quote-too-deeps building every book prints (`dense-quote-parity-fuzz`)"
     (let [{:keys [deep] cycles :cycle} (dense-quote-parity-fuzz 254 20 0.015)]
@@ -750,7 +750,7 @@
                                    (apply str (for [v (range width)] (format "!quote lib:l%db%d\n\n" (inc l) v)))
                                    "Text.\n"))]))))
 
-(deftest dense-quote-timing-test
+(deftest ^:timing dense-quote-timing-test
   (testing "TASK-254: quote-too-deep detection does not walk every path of a densely
             quoting library -- 8 layers of 6 books, each quoting every book of the next
             (6^7 paths down from a top book), took over 9 minutes"
@@ -772,7 +772,7 @@
                                            " -> lib:l6b0 -> lib:l7b0 -> lib:l8b0"))
             (:out r10))))))
 
-(deftest dense-cyclic-timing-test
+(deftest ^:timing dense-cyclic-timing-test
   (testing "TASK-257: nine books each quoting every other. Every quote closes a cycle,
             and none is too deep -- a chain of nine quotes above one needs nine books
             besides the one it names, one more than there are -- which the search for a
@@ -931,7 +931,7 @@
         n (.getName f)]
     (if (= "book.hdoc" n) (.getName (.getParentFile f)) (str/replace n #"\.hdoc$" ""))))
 
-(deftest duplicate-slug-parity-fuzz-test
+(deftest ^:slow duplicate-slug-parity-fuzz-test
   (testing "seeded (259): libraries with duplicated slugs report under --check exactly the
             problems building every book prints -- a duplicated slug's books by path"
     (let [rng (java.util.Random. 259)

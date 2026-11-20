@@ -1310,6 +1310,20 @@
              (map :type (resolver/structural-diagnostics doc #{} lexicon))))
       (is (= "1" (get-in (resolver/number-document doc lexicon) ["fig:inner" :number]))
           "the level really is dropped, so the diagnostic is describing a real effect")))
+  (testing "TASK-284: numbered=false marks the id a pure anchor and silences
+            the warning -- for an unknown prefix and a :global one alike --
+            without numbering the section or changing its children's
+            numbers; any other value, or a bare id, still warns"
+    (let [anchor-section (fn [id v blocks]
+                           (assoc-in (section id blocks) [:attr :props "numbered"] v))
+          doc {:meta {} :blocks [(anchor-section "cap:1" "false" [(figure "fig:inner")])
+                                 (anchor-section "thm:x" "false" [])
+                                 (anchor-section "cap:2" "true" [])
+                                 (section "cap:3" [])]}
+          diagnostics (resolver/structural-diagnostics doc)]
+      (is (= ["cap:2" "cap:3"] (map :id (filter #(= :unnumbered-section-id (:type %)) diagnostics))))
+      (is (nil? (get-in (resolver/number-document doc) ["cap:1" :number])))
+      (is (= "1" (get-in (resolver/number-document doc) ["fig:inner" :number])))))
   (testing "an id-less section is NOT reported -- an unlabeled section is
             documented as intentionally transparent for nesting, which is
             a choice made by omitting the id"

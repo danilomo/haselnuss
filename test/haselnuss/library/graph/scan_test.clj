@@ -116,9 +116,10 @@ B.
 
 (defn- edge-view
   "An edge without its `:from :id` and `:from :order` (pinned on their
-  own, `outline-test`), for readable comparisons."
+  own, `outline-test`) and its `:digest` (pinned in `edges-test`), for
+  readable comparisons."
   [edge]
-  (update edge :from dissoc :id :order))
+  (-> edge (update :from dissoc :id :order) (dissoc :digest)))
 
 (def ^:private target-id (book-ref/book-id "mem" ["new"] "target"))
 
@@ -164,6 +165,19 @@ B.
                :kind :quote :status :dangling :problem :quote-cycle :position (at 23 1)}]
              ;; the chapter's position is pinned below
              (update (mapv edge-view (:edges record)) 1 dissoc :position)))
+      (testing "every resolved edge, and only a resolved one, has a :digest of what its page shows (TASK-267)"
+        (let [edges (:edges record)
+              digest-of (fn [kind written]
+                          (some #(when (and (= kind (:kind %)) (= written (:written (:to %)))) (:digest %))
+                                edges))]
+          (is (every? #(= (= :resolved (:status %)) (string? (:digest %))) edges))
+          (is (every? #(re-matches #"[0-9a-f]{16}" %) (keep :digest edges)))
+          (is (= (digest-of :link "mem:target#sec:a") (digest-of :link "mem:old/target#sec:a"))
+              "a stale shelf path shows the same canonical reference and title")
+          (is (not= (digest-of :link "mem:target#sec:a") (digest-of :link "mem:target#sec:b"))
+              "another label, another title")
+          (is (not= (digest-of :link "mem:target#sec:a") (digest-of :quote "mem:target#sec:a"))
+              "a quote's digest covers the blocks too")))
       (testing "an included chapter's reference keeps the chapter's own file, line and column (AC #3; TASK-248)"
         (let [{:keys [line file column]} (:position (second (:edges record)))]
           (is (= 3 line))
@@ -303,6 +317,105 @@ As @smith2020 said.
            (scan/canonical-form (with-meta {:b 1 :a [#{"y" "x"}]} {:line 3}))))
     (is (= (scan/canonical-form (into {} (map (fn [i] [(keyword (str "k" i)) i])) (range 40)))
            (scan/canonical-form (into {} (map (fn [i] [(keyword (str "k" i)) i])) (reverse (range 40))))))))
+
+;; --- canonical-form against its first version (TASK-279) ------------------------
+
+(defn- reference-canonical-form
+  "`canonical-form` as first written (TASK-244): a string per node. Saved
+  states hold hashes of this text, so the fast one must give it exactly."
+  [x]
+  (letfn [(form [x]
+            (cond
+              (map? x) (str "{" (str/join " " (sort (map (fn [[k v]] (str (form k) " " (form v))) x))) "}")
+              (set? x) (str "#{" (str/join " " (sort (map form x))) "}")
+              (sequential? x) (str "[" (str/join " " (map form x)) "]")
+              :else (binding [*print-meta* false *print-length* nil *print-level* nil
+                              *print-namespace-maps* false]
+                      (pr-str x))))]
+    (form x)))
+
+(def ^:private fuzz-chars
+  "Characters `pr-str` escapes, control characters that sort below the
+  space between a map key and its value, the space itself, and plain
+  ones."
+  [\a \b \z \A \0 \- \: \/ \. \space \newline \tab \return \" \\ \formfeed \backspace
+   \u0001 \u001f \u00e9 \u4e2d])
+
+(defn- fuzz-text [^Random rnd]
+  (apply str (repeatedly (.nextInt rnd 5) #(nth fuzz-chars (.nextInt rnd (count fuzz-chars))))))
+
+(defn- fuzz-leaf [^Random rnd]
+  (case (.nextInt rnd 12)
+    0 (fuzz-text rnd)
+    1 (keyword (str "k" (fuzz-text rnd)))
+    2 (keyword (str "n" (.nextInt rnd 3)) (str "k" (.nextInt rnd 3)))
+    3 (long (- (.nextInt rnd 2000) 1000))
+    4 (/ (.nextInt rnd 50) (inc (.nextInt rnd 7)))
+    5 (* 0.5 (.nextInt rnd 9))
+    6 (bigint (.nextInt rnd 9))
+    7 (.nextBoolean rnd)
+    8 nil
+    9 (nth fuzz-chars (.nextInt rnd (count fuzz-chars)))
+    10 (symbol (str "s" (fuzz-text rnd)))
+    11 (int (.nextInt rnd 9))))
+
+(defn- fuzz-value
+  "A random value `depth` levels deep at most: AST-like maps (keyword
+  keys, some of them prefixes of others with a space after the prefix),
+  maps with any keys, sets, vectors, lists, lazy sequences, metadata."
+  [^Random rnd depth]
+  (if (or (zero? depth) (< (.nextInt rnd 10) 3))
+    (fuzz-leaf rnd)
+    (let [n (.nextInt rnd 5)
+          v (case (.nextInt rnd 6)
+              0 (into {} (repeatedly n #(vector (keyword (nth ["t" "c" "attr" "a" "a b" "a\u0001" "id"]
+                                                              (.nextInt rnd 7)))
+                                                (fuzz-value rnd (dec depth)))))
+              1 (into {} (repeatedly n #(vector (fuzz-value rnd (dec depth)) (fuzz-value rnd (dec depth)))))
+              2 (into #{} (repeatedly n #(fuzz-value rnd (dec depth))))
+              3 (vec (repeatedly n #(fuzz-value rnd (dec depth))))
+              4 (apply list (repeatedly n #(fuzz-value rnd (dec depth))))
+              5 (map identity (vec (repeatedly n #(fuzz-value rnd (dec depth))))))]
+      (if (and (instance? clojure.lang.IObj v) (.nextBoolean rnd))
+        (with-meta v {:line (.nextInt rnd 9)})
+        v))))
+
+(defn- prefix-keyed-maps
+  "How many maps in `x` have two keys one of whose texts is a prefix of
+  the other's: the case `canonical-form` must print values to order."
+  [x]
+  (cond
+    (map? x) (let [texts (map (comp #(str % " ") reference-canonical-form) (keys x))]
+               (+ (if (some (fn [a] (some #(and (not= a %) (str/starts-with? % a)) texts)) texts) 1 0)
+                  (reduce + 0 (map prefix-keyed-maps (concat (keys x) (vals x))))))
+    (or (set? x) (sequential? x)) (reduce + 0 (map prefix-keyed-maps x))
+    :else 0))
+
+(deftest canonical-form-matches-its-first-version-test
+  (testing "seeded fuzz (seed 279): the same text as the string-per-node version"
+    (let [rnd (Random. 279)
+          values (vec (repeatedly 3000 #(fuzz-value rnd 5)))
+          differing (remove #(= (reference-canonical-form %) (scan/canonical-form %)) values)]
+      (is (empty? differing) (pr-str (take 3 differing)))
+      (is (every? #(= (scan/canonical-form %)
+                      (binding [*print-readably* nil *print-length* 2 *print-level* 1 *print-meta* true]
+                        (scan/canonical-form %)))
+                  values)
+          "a caller's print bindings change no hash")
+      (testing "and not vacuously"
+        (is (< 1500 (count (filter coll? values))))
+        (is (< 100 (reduce + 0 (map prefix-keyed-maps values)))
+            "maps whose order the keys alone do not decide")
+        (is (< 300 (count (filter #(re-find #"\\[ntrfb\"\\\\]" (scan/canonical-form %)) values)))
+            "strings with escapes"))))
+  (testing "real documents: every .hdoc under test/fixtures and examples, parsed"
+    (let [docs (for [^File f (concat (file-seq (io/file "test/fixtures")) (file-seq (io/file "examples")))
+                     :when (str/ends-with? (.getName f) ".hdoc")
+                     :let [d (try (parser/parse (slurp f) {:source (str f)}) (catch Exception _ nil))]
+                     :when d]
+                 d)]
+      (is (< 40 (count docs)))
+      (is (every? #(= (reference-canonical-form %) (scan/canonical-form %)) docs)))))
 
 (deftest generated-book-test
   (let [root (.getAbsoluteFile (io/file "test/fixtures/libraries/generated"))

@@ -1690,7 +1690,7 @@
 
 ;; --- TASK-258: one long line emits in linear time ----------------------------
 
-(deftest long-line-emit-time-test
+(deftest ^:timing long-line-emit-time-test
   (testing "TASK-258: a one-line paragraph of ~400k characters, emphasis and book
             references throughout, renders in time linear in its length. Each
             Inline copied the paragraph's HTML so far (`(str html inline-html)`),
@@ -1709,7 +1709,7 @@
 
 ;; --- TASK-261: very many Blocks emit in linear time ---------------------------
 
-(deftest many-blocks-emit-time-test
+(deftest ^:slow ^:timing many-blocks-emit-time-test
   (testing "TASK-261: 20k code blocks (~4.2 MB of source) render in time linear in
             their number. Each Block copied the HTML so far (`(str html
             block-html)`), so this took ~15 s on JDK 17; now well under a second.
@@ -1727,7 +1727,7 @@
             and table rows are joined in order. Each footnote walked every footnote
             before it to fill in its own entry, and the items and rows were joined
             like the Blocks (~17 s for the footnotes alone on JDK 17). Only 2000
-            rows: reading a table is itself quadratic in flexmark."
+            rows: reading a table was itself quadratic in flexmark until TASK-262."
     (let [n 20000
           notes (parser/parse (str/join (map #(str "p[^" % "]\n\n[^" % "]: n" % "\n\n") (range n))))
           items (parser/parse (str/join (map #(str "- i" % "\n") (range n))))

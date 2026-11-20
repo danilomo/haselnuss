@@ -1,5 +1,9 @@
-(ns ^:parallel haselnuss.repl-config-test
+(ns ^:parallel ^:slow ^:shares-target haselnuss.repl-config-test
   "Fixtures for the pinned agent-facing nREPL (TASK-45).
+
+  `^:shares-target` (TASK-302): the nested `lein` runs write under
+  `target/`, which `haselnuss.uberjar-test`'s `lein uberjar` deletes, so
+  `bin/test` runs them in one shard. `^:slow`: outside the fast gate.
 
   This namespace exists because the code it covers lives in `project.clj`
   and `bin/repl`, which no *static* gate can settle. Since TASK-50.2
@@ -54,29 +58,37 @@
           (is (str/includes? script (str "PORT=" port))))))))
 
 (deftest repl-refuses-connection-overrides
-  (testing "an environment override is refused before anything binds --
-            :repl-options alone would lose to it, since Leiningen resolves
-            LEIN_REPL_* ahead of the project map"
-    ;; Each value has to be one Leiningen itself accepts -- a non-numeric
-    ;; LEIN_REPL_PORT dies on Integer/valueOf in Leiningen's own JVM
-    ;; (leiningen.repl/configured-repl-connection) before the project JVM
-    ;; exists, which would prove nothing about this guard.
-    (doseq [[variable value] [["LEIN_REPL_HOST" "0.0.0.0"]
-                              ["LEIN_REPL_PORT" "9999"]
-                              ["LEIN_REPL_SOCKET" "/tmp/haselnuss-test.sock"]]]
-      (let [{:keys [exit out err]} (sh-with-env {variable value} "lein" "repl" ":headless")
-            text (str out err)]
-        (is (not (zero? exit)) (str variable " must abort the repl task"))
-        (is (str/includes? text variable)
-            (str "the failure must name " variable " rather than being a bare timeout"))
-        (is (not (str/includes? text "nREPL server started"))
-            "nothing may bind before the guard runs"))))
-  (testing "the guard is scoped to the implicitly-activated :repl profile,
-            so an override sitting in the ambient environment cannot fail
-            a build that was never going to open a socket"
-    (let [{:keys [exit out]} (sh-with-env {"LEIN_REPL_HOST" "0.0.0.0"} "lein" "run" "--" "--help")]
-      (is (zero? exit) "lein run must be unaffected by the repl guard")
-      (is (str/includes? out "Usage: haselnuss")))))
+  ;; All four nested `lein` runs start together and are asserted on
+  ;; afterwards (TASK-302): each is a cold JVM of ~30 s, and none depends on
+  ;; another, so one after another they made this the suite's slowest test.
+  ;;
+  ;; Each value has to be one Leiningen itself accepts -- a non-numeric
+  ;; LEIN_REPL_PORT dies on Integer/valueOf in Leiningen's own JVM
+  ;; (leiningen.repl/configured-repl-connection) before the project JVM
+  ;; exists, which would prove nothing about this guard.
+  (let [refused (mapv (fn [[variable value]]
+                        [variable (future (sh-with-env {variable value} "lein" "repl" ":headless"))])
+                      [["LEIN_REPL_HOST" "0.0.0.0"]
+                       ["LEIN_REPL_PORT" "9999"]
+                       ["LEIN_REPL_SOCKET" "/tmp/haselnuss-test.sock"]])
+        unaffected (future (sh-with-env {"LEIN_REPL_HOST" "0.0.0.0"} "lein" "run" "--" "--help"))]
+    (testing "an environment override is refused before anything binds --
+              :repl-options alone would lose to it, since Leiningen resolves
+              LEIN_REPL_* ahead of the project map"
+      (doseq [[variable run] refused]
+        (let [{:keys [exit out err]} @run
+              text (str out err)]
+          (is (not (zero? exit)) (str variable " must abort the repl task"))
+          (is (str/includes? text variable)
+              (str "the failure must name " variable " rather than being a bare timeout"))
+          (is (not (str/includes? text "nREPL server started"))
+              "nothing may bind before the guard runs"))))
+    (testing "the guard is scoped to the implicitly-activated :repl profile,
+              so an override sitting in the ambient environment cannot fail
+              a build that was never going to open a socket"
+      (let [{:keys [exit out]} @unaffected]
+        (is (zero? exit) "lein run must be unaffected by the repl guard")
+        (is (str/includes? out "Usage: haselnuss"))))))
 
 (defn- occupy
   "Holds `port` on loopback, returning the socket, or nil if something

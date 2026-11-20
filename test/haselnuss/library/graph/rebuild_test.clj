@@ -104,6 +104,20 @@
                       (book "b") (book "w" [:link "y"]))]
       (is (= #{(id "b") (id "z") (id "x") (id "y")} (rebuild/affected-by g [(id "b")]))))))
 
+(deftest many-dependents-do-not-overflow-the-stack-test
+  ;; TASK-267: the closure once nested one lazy `concat` per visited book,
+  ;; and a hub note's 3,000 linkers overflowed the stack
+  (let [n 20000
+        linkers (map #(id (str "l" %)) (range n))
+        g (apply graph-of (book "hub")
+                 (book "q0" [:quote "hub"])
+                 (for [i (range n)] (book (str "l" i) [:link "hub"])))]
+    (is (= (into #{(id "hub") (id "q0")} linkers) (rebuild/affected-by g [(id "hub")])))
+    (testing "a quote chain as long"
+      (let [g (apply graph-of (book "c0")
+                     (for [i (range 1 n)] (book (str "c" i) [:quote (str "c" (dec i))])))]
+        (is (= n (count (rebuild/affected-by g [(id "c0")]))))))))
+
 (deftest ids-not-in-the-graph-test
   (testing "a deleted book is in the answer and its dependents are found"
     (let [g (-> (graph-of (book "a" [:quote "b"]) (book "b" [:quote "c"]) (book "c")

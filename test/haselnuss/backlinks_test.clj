@@ -77,7 +77,7 @@
     (vec (keep-indexed (fn [i line] (when-let [[_ written] (re-find re line)] [written (inc i)]))
                        (str/split-lines (slurp example-file))))))
 
-(deftest catechism-quotes-test
+(deftest ^:slow catechism-quotes-test
   (let [expected (source-quotes "romanos")
         {:keys [status out err]} (main-run "--libraries" @catechism-yaml "--backlinks" "bible:romanos"
                                            "--format" "json")

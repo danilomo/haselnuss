@@ -1,11 +1,16 @@
-(ns haselnuss.emit.hdoc-test
+(ns ^:parallel haselnuss.emit.hdoc-test
   "Fixtures for `haselnuss.emit.hdoc` (TASK-95): the `.hdoc` emitter's own
   half of Block (`:section`/`:para`/`:thematic-break`/`:block-quote`) plus
   every Inline variant. `haselnuss.parser/parse` is the oracle throughout
   (this namespace's own docstring, doc-7 decision 4): every test proves a
   round trip by actually parsing, emitting, and re-parsing real `.hdoc`
   source rather than asserting on the emitted string's own shape, so a
-  test here would fail the same way a real caller's build would."
+  test here would fail the same way a real caller's build would.
+
+  `^:parallel` (TASK-302): the tests are pure parse/emit round trips with
+  no shared state, and run one after another they were the suite's
+  longest namespace (~260 s of CPU on one core). The two that assert a
+  wall-time bound are `^:serial`, so they run alone, before the rest."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
@@ -1521,7 +1526,7 @@
   [& cps]
   (apply str (map #(String. (Character/toChars (int %))) cps)))
 
-(deftest attribute-value-quoting-test
+(deftest ^:slow attribute-value-quoting-test
   (let [nbsp (code-points 0xa0) em-space (code-points 0x2003)]
     (testing "TASK-205 AC #1: a value holding a character flexmark's
               attribute grammar rejects bare (`\"'=<>{}``), whitespace the
@@ -1746,7 +1751,7 @@
       (is (= out (emit-src src)) src)
       (is (fixed-point? src) src))))
 
-(deftest table-cell-math-pipe-fuzz-test
+(deftest ^:slow table-cell-math-pipe-fuzz-test
   (testing "TASK-230 fuzz: cell source over `$`, pipes, `\\|`, backticks and
             `@{` either round-trips or is refused with an ex-info"
     (let [pieces ["a" "|" "||" " " "$" "$x" "x$" "\\|" "\\" "`" "@{" "{" "}" "b" "$a|b$" "$a\\|b$"]
@@ -2630,7 +2635,7 @@
       (doseq [[src document out] emitted]
         (is (= document (parser/parse out)) (pr-str src))))))
 
-(deftest block-after-table-in-tight-list-item-test
+(deftest ^:slow block-after-table-in-tight-list-item-test
   (testing "TASK-201 AC #1: a Block whose first line cannot continue the
             table above it -- no unescaped `|`, no setext underline, no
             caption line -- ends that table and is written on the next
@@ -3077,6 +3082,106 @@
                 as spaces, so the writer never sees the tab: a fixed point"
         (is (fixed-point? "- $$\n  a\n  \tb\n  $$\n"))
         (is (fixed-point? "> $$\n> a\n> \tb\n> $$\n"))))))
+
+(defn- headless-table-docs
+  "`n` documents, seeded with `seed`, built around delimiter rows with no
+  header row above them (TASK-281): at the start, after a blank line, a
+  heading or a paragraph line, in list items and quotes, with or without
+  would-be body rows below -- and sometimes a real header row above."
+  [seed n]
+  (let [r (java.util.Random. seed)
+        pick (fn [v] (nth v (.nextInt r (count v))))
+        before ["" "" "" "a\n\n" "# h\n" "a\n" "| a | b |\n" "x | y\n"]
+        prefixes ["" "" " " "   " "> " "- " "1. " "  > " "> - "]
+        seps ["|---|" "---|---" "|:-|-:|" "|---|---|" ":--|--:" "| - | - |" "|---" "---|" "|:-:|"]
+        bodies ["| a | b |" "| x |" "a | b" "|---|" "c"]
+        block (fn [] (let [p (pick prefixes)]
+                       (str (pick before) p (pick seps) "\n"
+                            (apply str (repeatedly (.nextInt r 3) #(str (if (zero? (.nextInt r 2)) p "") (pick bodies) "\n"))))))]
+    (vec (repeatedly n #(str/join (pick ["" "\n"]) (repeatedly (inc (.nextInt r 3)) block))))))
+
+(deftest ^:slow headless-table-separator-fuzz-test
+  (testing "TASK-281 fuzz: a delimiter row with no header row parses without an
+            exception, never to a :table without head cells, and when no table
+            results at all, the hdoc written for it reads back as the same
+            document (one with a table can meet the emitter's own pre-existing
+            limits, e.g. a head and body of different widths)"
+    (let [^com.vladsch.flexmark.parser.Parser headless-flexmark
+          (.build (com.vladsch.flexmark.parser.Parser/builder
+                   (doto (com.vladsch.flexmark.util.data.MutableDataSet.)
+                     (.set com.vladsch.flexmark.parser.Parser/EXTENSIONS
+                           (java.util.List/of (com.vladsch.flexmark.ext.tables.TablesExtension/create))))))
+          headless? (fn headless? [^com.vladsch.flexmark.util.ast.Node node]
+                      (or (and (instance? com.vladsch.flexmark.ext.tables.TableHead node)
+                               (not (.hasChildren node)))
+                          (some headless? (.getChildren node))))
+          docs (headless-table-docs 281 3000)
+          parsed (mapv (fn [d] [d (try (parser/parse d) (catch Exception e e))]) docs)
+          tables (fn [document] (filter #(= :table (:t %)) (tree-seq coll? seq document)))]
+      (is (< 1500 (count (filter #(headless? (.parse headless-flexmark ^String %)) docs)))
+          "enough documents hold a delimiter row flexmark's default would read as a headless table")
+      (is (< 300 (count (filter (comp seq tables second) parsed)))
+          "enough documents also hold a real table")
+      (is (< 1000 (count (filter #(and (map? (second %)) (empty? (tables (second %)))) parsed)))
+          "enough documents hold no table at all, to check their round trip")
+      (doseq [[d document] parsed]
+        (is (map? document) (str (pr-str d) " " (when (instance? Exception document) (ex-message document))))
+        (when (map? document)
+          (doseq [table (tables document)]
+            (is (seq (:cells (:head table))) (pr-str d)))
+          (when (empty? (tables document))
+            (is (= document (parser/parse (hdoc/emit-document document))) (pr-str d))))))))
+
+(deftest caption-block-lead-in-fuzz-test
+  (testing "TASK-281 fuzz: a caption line opening with block syntax, or empty with
+            more lines after it, parses without an exception to one captioned
+            table, and the hdoc written for it reads back as the same document --
+            except where the caption holds a `|`, which the writer does not escape
+            on a caption line (a separate, pre-existing limit)"
+    (let [r (java.util.Random. 281)
+          pick (fn [v] (nth v (.nextInt r (count v))))
+          leads ["" "" "- " "+ " "* " "# " "### " "> " "```" "~~~" "1. " "2) " "***" "---" "[a]: " "<div>" "#"]
+          texts ["x" "*y*" "@tbl:q" "" "a b" "`c`"]
+          rest-lines ["" "" "" "\n| b |" "\n|---|" "\n    code" "\n2. z" "\nmore" "\n==="]
+          groups ["" "" " {#tbl:a}" " {#tbl:b .c}"]
+          ;; Table and caption at the top level, in a quote or in a list
+          ;; item, the lines after the caption's first lazy -- where a `===`
+          ;; is no setext underline of the whole caption paragraph, but is
+          ;; one in the caption's own parse (TASK-281 review).
+          containers [["" ""] ["> " "> "] ["- " "  "]]
+          gen (fn []
+                (let [[first-prefix prefix] (pick containers)
+                      ;; `===` only lazy, under a container; `2. z` only at the
+                      ;; top level, as flexmark ends a quote or list item there
+                      rest-line (pick (if (= "" prefix) (pop rest-lines) (remove #{"\n2. z"} rest-lines)))
+                      group (pick groups)
+                      caption (str (pick leads) (pick texts)
+                                   (if (= "\n===" rest-line) (str group rest-line) (str rest-line group)))]
+                  [(str first-prefix "| a |\n" prefix "|---|\n" prefix ": " caption "\n") first-prefix caption]))
+          parsed (mapv (fn [[d container caption]]
+                         [d container caption (try (parser/parse d) (catch Exception e e))])
+                       (repeatedly 3000 gen))
+          table-of (fn [container document]
+                     (case container
+                       "" (when (= [:table] (map :t (:blocks document))) (first (:blocks document)))
+                       "> " (let [[q] (:blocks document)]
+                              (when (= [:table] (map :t (:blocks q))) (first (:blocks q))))
+                       "- " (let [[l] (:blocks document)]
+                              (when (= [[:table]] (map #(map :t %) (:items l))) (ffirst (:items l))))))
+          checked (filter (fn [[_ _ caption document]] (and (map? document) (not (str/includes? caption "|")))) parsed)]
+      (is (< 2000 (count checked)) "enough documents get the round-trip check")
+      (is (< 500 (count (filter (fn [[_ c _ document]] (seq (:caption (table-of c document)))) checked)))
+          "enough of them have a non-empty caption")
+      (is (< 50 (count (filter (fn [[_ c caption document]]
+                                 (and (str/ends-with? caption "===") (:id (:attr (table-of c document)))))
+                               checked)))
+          "enough of them have a lazy `===` line under a caption with an id")
+      (doseq [[d container _ document] parsed]
+        (is (map? document) (str (pr-str d) " " (when (instance? Exception document) (ex-message document))))
+        (when (map? document)
+          (is (some? (table-of container document)) (pr-str d))))
+      (doseq [[d _ _ document] checked]
+        (is (= document (parser/parse (hdoc/emit-document document))) (pr-str d))))))
 
 (deftest table-round-trip-test
   (testing "TASK-97 AC #4: alignments, column widths and a trailing caption line
@@ -4492,7 +4597,7 @@
 
 ;; --- TASK-258: one long line emits in linear time ----------------------------
 
-(deftest long-line-emit-time-test
+(deftest ^:serial ^:timing long-line-emit-time-test
   (testing "TASK-258: a one-line paragraph of ~136k characters, emphasis and book
             references throughout, is written back in time linear in its length.
             Each Inline copied everything written so far (`(str text inline-text)`)
@@ -4517,7 +4622,7 @@
 
 ;; --- TASK-261: very many Blocks emit in linear time ---------------------------
 
-(deftest many-blocks-emit-time-test
+(deftest ^:serial ^:timing many-blocks-emit-time-test
   (testing "TASK-261: 20k code blocks (~4.2 MB of source) are written back in
             time linear in their number. Each Block copied everything written so
             far (`(str text \"\\n\\n\" block-text)`), so this took ~14 s on JDK 17;

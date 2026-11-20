@@ -192,3 +192,67 @@
   (is (= {"a" {"b" {} "c" {}} "d" {}}
          (library/shelf-tree-of (for [shelf [["a" "b"] ["a" "c"] ["d"] [] ["a"]]]
                                   {:id (book-ref/book-id "l" shelf "s")})))))
+
+;; --- valid-book-id? and valid-name? against their first versions (TASK-279) ----
+
+(defn- round-trip-valid-book-id?
+  "`valid-book-id?` as first written: the id formats and parses back to
+  itself."
+  [id]
+  (and (map? id)
+       (string? (:library id))
+       (string? (:slug id))
+       (vector? (:shelf id))
+       (every? string? (:shelf id))
+       (= {:id id} (book-ref/parse-book-ref (book-ref/format-book-id id)))))
+
+(defn- round-trip-valid-name?
+  "`valid-name?` as first written."
+  [s]
+  (and (string? s) (round-trip-valid-book-id? (book-ref/book-id s "x"))))
+
+(defrecord ^:private IdRecord [library shelf slug])
+
+(def ^:private fuzz-names
+  ["a" "lib" "x-1" "9z" "a-" "-a" "" "A" "a b" "a:b" "a/b" "a#b" "a.b" "é" "a\n" "a#" ":" "/"])
+
+(defn- fuzz-name
+  "A name: mostly from `fuzz-names` (valid ones and every way to break the
+  grammar: case, `:`, `#`, `/`, spaces, empty, a newline), else random
+  characters from those."
+  [^java.util.Random rnd]
+  (let [n (.nextInt rnd 20)]
+    (cond
+      (< n 15) (nth fuzz-names (.nextInt rnd (if (< n 12) 5 (count fuzz-names))))
+      :else (let [cs "ab9z-0:#/. Aé\n"]
+              (apply str (repeatedly (.nextInt rnd 5) #(.charAt cs (.nextInt rnd (count cs)))))))))
+
+(defn- fuzz-id
+  "A BookId-like value: a valid shape most of the time, else a record, a
+  sorted map, an extra key, a list or nil shelf, or a non-string part."
+  [^java.util.Random rnd]
+  (let [library (fuzz-name rnd)
+        shelf (vec (repeatedly (.nextInt rnd 3) #(fuzz-name rnd)))
+        slug (fuzz-name rnd)]
+    (case (.nextInt rnd 9)
+      0 (->IdRecord library shelf slug)
+      1 (into (sorted-map) {:library library :shelf shelf :slug slug})
+      2 {:library library :shelf shelf :slug slug :extra 1}
+      3 {:library library :shelf (seq shelf) :slug slug}
+      4 {:library library :shelf shelf :slug (keyword slug)}
+      5 {:library library :slug slug}
+      {:library library :shelf shelf :slug slug})))
+
+(deftest valid-book-id-matches-its-round-trip-test
+  (testing "seeded fuzz (seed 279): the part checks answer what the format/parse round trip did"
+    (let [rnd (java.util.Random. 279)
+          ids (vec (repeatedly 20000 #(fuzz-id rnd)))
+          names (vec (repeatedly 5000 #(fuzz-name rnd)))]
+      (is (empty? (remove #(= (round-trip-valid-book-id? %) (library/valid-book-id? %)) ids))
+          (pr-str (take 3 (remove #(= (round-trip-valid-book-id? %) (library/valid-book-id? %)) ids))))
+      (is (empty? (remove #(= (round-trip-valid-name? %) (library/valid-name? %)) (conj names nil 7 :a))))
+      (testing "and not vacuously: both answers are common"
+        (is (< 2000 (count (filter library/valid-book-id? ids))))
+        (is (< 10000 (count (remove library/valid-book-id? ids))))
+        (is (< 1000 (count (filter library/valid-name? names))))
+        (is (< 1000 (count (remove library/valid-name? names))))))))

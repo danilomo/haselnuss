@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<meta name="theme-color" content="#f4ecd8"/>
+<title>Haselnuss</title>
+<link rel="stylesheet" href="app.css"/>
+<link rel="manifest" href="manifest.webmanifest"/>
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png"/>
+<link rel="apple-touch-icon" href="apple-touch-icon.png"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-title" content="Haselnuss"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="default"/>
+<script src="app.js" defer></script>
+</head>
+<body id="home-app" class="home">
+<header class="bar">
+  <h1 id="screen-title">Library</h1>
+  <button id="avatar" class="avatar" type="button" aria-label="Switch reader" hidden></button>
+</header>
+
+<main>
+  <section id="view-home" class="view">
+    <div id="continue" hidden>
+      <h2>Continue reading</h2>
+      <ul id="continue-list" class="continue-list"></ul>
+    </div>
+    <h2>All books</h2>
+    <div class="grid-host" data-grid="all"></div>
+  </section>
+
+  <section id="view-libraries" class="view" hidden>
+    <div id="library-list-wrap">
+      <ul id="library-list" class="library-list"></ul>
+    </div>
+    <div id="library-books" hidden>
+      <button id="library-back" class="link-button" type="button">&lsaquo; Libraries</button>
+      <h2 id="library-name"></h2>
+      <div class="grid-host" data-grid="library"></div>
+    </div>
+  </section>
+
+  <section id="view-search" class="view" hidden>
+    <input id="search-input" class="search-input" type="search" placeholder="Title, author or library"
+           autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Search books"/>
+    <p id="search-status" class="status" role="status"></p>
+    <ul id="search-results" class="results"></ul>
+  </section>
+
+  <p id="message" class="status" role="status" hidden></p>
+</main>
+
+<nav class="tabs" aria-label="Sections">
+  <a id="tab-home" href="#home" aria-current="page">Home</a>
+  <a id="tab-libraries" href="#libraries">Libraries</a>
+  <a id="tab-search" href="#search">Search</a>
+</nav>
+
+<div id="chooser" class="overlay" hidden role="dialog" aria-modal="true" aria-labelledby="chooser-title">
+  <div class="sheet">
+    <h2 id="chooser-title">Who's reading?</h2>
+    <ul id="reader-list" class="reader-list"></ul>
+    <form id="add-reader" class="add-reader">
+      <label for="reader-name">Add a reader</label>
+      <input id="reader-name" type="text" maxlength="100" autocomplete="off" placeholder="Name"/>
+      <button type="submit">Add</button>
+    </form>
+    <p id="chooser-error" class="error" role="alert" hidden></p>
+    <button id="chooser-close" class="link-button" type="button" hidden>Cancel</button>
+  </div>
+</div>
+</body>
+</html>

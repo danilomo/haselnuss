@@ -296,6 +296,24 @@
     (keyword (get node field))
     (keyword (name ref-kind))))
 
+(def ^:private fields-holding-index
+  "`fields-holding`'s answers, precomputed once from `table` (TASK-263):
+  `{type-key {child-kind [field ...]}}`, each vector holding the `[:many
+  child-kind]` fields of that node type in schema declaration order. The
+  passes that ask (`haselnuss.resolver`'s `inline-blocks` and friends)
+  ask once per Inline, several times over, so re-filtering the schema
+  entry on every call was the single largest cost of resolving a
+  document with very many blocks."
+  (into {}
+        (map (fn [[type-key field-specs]]
+               [type-key
+                (reduce (fn [acc [field [arity kind]]]
+                          (cond-> acc
+                            (= :many arity) (update kind (fnil conj []) field)))
+                        {}
+                        field-specs)]))
+        (:children table)))
+
 (defn fields-holding
   "The fields of `node` (a value of reference kind `ref-kind`) that hold a
   VECTOR of `child-kind` children -- `(:children table)`'s own `[:many
@@ -316,11 +334,17 @@
   forgot it, which is exactly what happened to all four of those when
   TASK-116 added `:highlight` and `:sticky-note`."
   [ref-kind node child-kind]
-  (let [{:keys [children discriminators]} table]
-    (into []
-          (keep (fn [[field [arity kind]]]
-                  (when (and (= :many arity) (= child-kind kind)) field)))
-          (get children (node-type discriminators ref-kind node) []))))
+  (-> (get fields-holding-index (node-type (:discriminators table) ref-kind node))
+      (get child-kind [])))
+
+(defn fields-holding-by-kind
+  "`fields-holding` for every child kind at once: `{child-kind [field
+  ...]}` for `node` (a value of reference kind `ref-kind`), so that
+  `(get (fields-holding-by-kind ref-kind node) child-kind [])` is
+  `(fields-holding ref-kind node child-kind)`. For a traversal that asks
+  about several child kinds of every node (TASK-263)."
+  [ref-kind node]
+  (get fields-holding-index (node-type (:discriminators table) ref-kind node)))
 
 (def every-ref-kind
   "Every reference kind `table` uses anywhere -- the union of every
@@ -331,6 +355,19 @@
         (vals (:children table))))
 
 ;; --- fold: a read-only, path-reporting visit (AC #5) -----------------------
+
+(defn- reduce-indexed
+  "`(reduce (fn [acc [i x]] (f acc i x)) init (map-indexed vector coll))`
+  without the lazy seq and the pair per element (TASK-263): `fold` and
+  `rewrite` run once per node of every pass, so what they allocate per
+  child is paid hundreds of thousands of times on a large document."
+  [f init coll]
+  (loop [acc init
+         i 0
+         s (seq coll)]
+    (if s
+      (recur (f acc i (first s)) (inc i) (next s))
+      acc)))
 
 (declare fold-position)
 
@@ -386,17 +423,17 @@
 
       :many
       (if-let [children (get node field)]
-        (reduce (fn [acc [i child]] (fold walker acc ref-kind child (conj path field i)))
-                acc (map-indexed vector children))
+        (reduce-indexed (fn [acc i child] (fold walker acc ref-kind child (conj path field i)))
+                        acc children)
         acc)
 
       :many-of-many
       (if-let [groups (get node field)]
-        (reduce (fn [acc [i group]]
-                  (reduce (fn [acc [j child]]
-                            (fold walker acc ref-kind child (conj path field i j)))
-                          acc (map-indexed vector group)))
-                acc (map-indexed vector groups))
+        (reduce-indexed (fn [acc i group]
+                          (reduce-indexed (fn [acc j child]
+                                            (fold walker acc ref-kind child (conj path field i j)))
+                                          acc group))
+                        acc groups)
         acc))))
 
 ;; --- rewrite: 0/1/many at list positions, exactly 1 at a single one -------
@@ -431,6 +468,53 @@
 (declare rewrite)
 (declare rewrite-post)
 
+;; TASK-263: a rewrite pass that changes nothing below a node now hands
+;; back that very node, rather than an equal copy rebuilt field by field.
+;; Most passes change almost nothing -- a cross-reference pass touches only
+;; the cross-references -- yet each used to rebuild every map and vector of
+;; the document. Only a VECTOR is ever handed back as is: a field that
+;; arrived as some other sequence still comes out as the vector it always
+;; did, so no caller can see the difference.
+
+(defn- splice-children
+  "`(into [] (mapcat (fn [[i x]] (f i x))) (map-indexed vector kids))` --
+  each child replaced by the 0..N nodes `f` returns for it -- except that
+  when `kids` is a vector and every child came back as exactly itself
+  (one node, `identical?`), `kids` itself is returned."
+  [kids f]
+  (loop [i 0
+         s (seq kids)
+         out (when-not (vector? kids) (transient []))]
+    (if s
+      (let [child (first s)
+            replacements (f i child)]
+        (if (and (nil? out)
+                 (== 1 (count replacements))
+                 (identical? child (first replacements)))
+          (recur (inc i) (next s) nil)
+          (recur (inc i) (next s)
+                 (reduce conj!
+                         (or out (reduce conj! (transient []) (subvec kids 0 i)))
+                         replacements))))
+      (if out (persistent! out) kids))))
+
+(defn- map-unless-unchanged
+  "`(mapv (fn [[i x]] (f i x)) (map-indexed vector coll))`, except that
+  when `coll` is a vector and `f` returned every element `identical?` to
+  itself, `coll` itself is returned."
+  [coll f]
+  (loop [i 0
+         s (seq coll)
+         out (when-not (vector? coll) (transient []))]
+    (if s
+      (let [x (first s)
+            x' (f i x)]
+        (if (and (nil? out) (identical? x x'))
+          (recur (inc i) (next s) nil)
+          (recur (inc i) (next s)
+                 (conj! (or out (reduce conj! (transient []) (subvec coll 0 i))) x'))))
+      (if out (persistent! out) coll))))
+
 (defn- descend-into-position
   "The arity/scope logic `rewrite-position` and `rewrite-post-position`
   (TASK-94) share rather than each hand-rolling its own copy (AC #5, this
@@ -446,6 +530,11 @@
   `fold-position` -- when `ref-kind` is out of `(:scope walker)`, or the
   field is altogether absent from `parent-node`.
 
+  A nil `parent-path` means the caller has no use for paths (`rewrite`),
+  and every `child-path` is nil too. When no child changed (each came back
+  as exactly itself), `parent-node` itself is returned rather than an
+  equal copy -- see `splice-children` (TASK-263).
+
   `recurse` is the one thing `rewrite-position` and `rewrite-post-position`
   each supply differently: whether it re-walks a returned node's own
   children (`rewrite`, ignoring `child-path`) or has already done so before
@@ -457,34 +546,48 @@
     (case arity
       :one
       (if-let [child (get parent-node field)]
-        (assoc parent-node field
-               (expect-count-one! walker parent-ref-kind parent-node field
-                                  (recurse ref-kind child (conj parent-path field))))
+        (let [child' (expect-count-one! walker parent-ref-kind parent-node field
+                                        (recurse ref-kind child
+                                                 (when parent-path (conj parent-path field))))]
+          (if (identical? child child')
+            parent-node
+            (assoc parent-node field child')))
         parent-node)
 
       :many
       (if-let [kids (get parent-node field)]
-        (assoc parent-node field
-               (into [] (mapcat (fn [[i child]] (recurse ref-kind child (conj parent-path field i))))
-                     (map-indexed vector kids)))
+        (let [kids' (splice-children
+                     kids
+                     (fn [i child]
+                       (recurse ref-kind child (when parent-path (conj parent-path field i)))))]
+          (if (identical? kids kids')
+            parent-node
+            (assoc parent-node field kids')))
         parent-node)
 
       :many-of-many
       (if-let [groups (get parent-node field)]
-        (assoc parent-node field
-               (mapv (fn [[i group]]
-                       (into [] (mapcat (fn [[j child]] (recurse ref-kind child (conj parent-path field i j))))
-                             (map-indexed vector group)))
-                     (map-indexed vector groups)))
+        (let [groups' (map-unless-unchanged
+                       groups
+                       (fn [i group]
+                         (splice-children
+                          group
+                          (fn [j child]
+                            (recurse ref-kind child
+                                     (when parent-path (conj parent-path field i j)))))))]
+          (if (identical? groups groups')
+            parent-node
+            (assoc parent-node field groups')))
         parent-node))))
 
 (defn- rewrite-position
   "`parent-node` with one child-bearing field (`field`, `[arity ref-kind]`
   spec) rewritten by recursing into `rewrite` (AC #3/#4, `descend-into-
   position`'s own docstring) -- `rewrite`'s own path-blind `recurse`, so
-  the path `descend-into-position` threads through is simply discarded."
+  the path `descend-into-position` threads through is simply discarded --
+  so none is built at all (a nil `parent-path`, TASK-263)."
   [walker parent-node parent-ref-kind field spec]
-  (descend-into-position walker parent-node parent-ref-kind [] field spec
+  (descend-into-position walker parent-node parent-ref-kind nil field spec
                          (fn [ref-kind child _child-path] (rewrite walker ref-kind child))))
 
 (defn rewrite
@@ -512,13 +615,23 @@
   or care which kind of position invoked it."
   [walker ref-kind node]
   (let [{:keys [children discriminators]} (:table walker)
-        rewrite-fn (:rewrite-fn walker)]
-    (mapv (fn [replacement]
-            (let [type-key (node-type discriminators ref-kind replacement)]
-              (reduce (fn [node' [field spec]] (rewrite-position walker node' ref-kind field spec))
-                      replacement
-                      (get children type-key []))))
-          (rewrite-fn ref-kind node))))
+        rewrite-fn (:rewrite-fn walker)
+        rewrite-children (fn [replacement]
+                           (let [type-key (node-type discriminators ref-kind replacement)]
+                             (reduce (fn [node' [field spec]] (rewrite-position walker node' ref-kind field spec))
+                                     replacement
+                                     (get children type-key []))))
+        replacements (rewrite-fn ref-kind node)]
+    ;; TASK-263: the common case -- one node back, nothing below it
+    ;; changed -- returns the very vector `rewrite-fn` produced, so
+    ;; `splice-children` can see that nothing changed.
+    (if (and (vector? replacements) (== 1 (count replacements)))
+      (let [replacement (nth replacements 0)
+            replacement' (rewrite-children replacement)]
+        (if (identical? replacement replacement')
+          replacements
+          [replacement']))
+      (mapv rewrite-children replacements))))
 
 ;; --- rewrite-post: children first, then the node, never re-walked (TASK-94,
 ;; doc-7 decision 2) ---------------------------------------------------------

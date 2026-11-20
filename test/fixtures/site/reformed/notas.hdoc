@@ -1,0 +1,9 @@
+---
+title: Notas (single file)
+lang: pt-BR
+---
+
+# Notas {#sec:notas}
+
+This book and `notas/book.hdoc` beside it share one canonical id,
+`reformed:notas`, so no reference can reach either.

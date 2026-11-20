@@ -1653,7 +1653,7 @@
              (:blocks doc)))
       (is (ast/valid? ast/Document doc)))))
 
-(deftest many-math-blocks-parse-time-test
+(deftest ^:timing many-math-blocks-parse-time-test
   (testing "TASK-261: 3000 display math blocks parse in time linear in their
             number. Each `$$` opener searched for its scan boundary before its
             closer, and with no block marker after any blank line there is no
@@ -3694,3 +3694,223 @@
     (testing "only the leading BOM and only CRLF pairs are normalised"
       (is (= "a\uFEFFb\rc\n\n" (parser/normalize-source "\uFEFFa\uFEFFb\rc\r\n\r\n")))
       (is (= "x" (parser/normalize-source "x"))))))
+
+;; --- TASK-262: tables with many rows parse in linear time -----------------------
+
+(defn- flexmark-tree
+  "A flexmark node and its subtree as nested vectors of `toAstString` (node
+  type, source offsets and every detail flexmark prints), for comparing two
+  parses node by node."
+  [^com.vladsch.flexmark.util.ast.Node node]
+  (into [(.toAstString node true)]
+        (map flexmark-tree)
+        (iterator-seq (.iterator (.getChildren node)))))
+
+(defn- heading-fuzz-docs
+  "`n` documents, seeded with `seed`, of lines built to reach flexmark's
+  heading factory from every side: ATX openers (`#` to `#######`, escaped),
+  setext and thematic-break runs (`=`, `-`, `- - -`), lines that only look
+  like either (`#tag`, `##x`, `=a`, `--x`, `-=`), pipe-table rows,
+  separators and whole tables, list, quote and code-indent prefixes, tabs,
+  and lines starting with other punctuation."
+  [seed n]
+  (let [r (java.util.Random. seed)
+        pick (fn [v] (nth v (.nextInt r (count v))))
+        indents ["" "" "" " " "  " "   " "    " "\t" "> " "- " "  > " "1. "]
+        leads ["#" "##" "######" "#######" "=" "===" "-" "---" "- - -" "|" "| " "* " "+ "
+               "1. " "" "" "" "\\#" "`" "(" ":"
+               "#tag" "##x" "#\t" "#######x" "=a" "==" "--x" "-=" "=-" "-- -"]
+        bodies ["" " " "a" " a" " a |" "| b |" "|---|---|" "---|---" ":--|--:" " *y*" " #"
+                " ==x==" "\t" " $x$" "=" " -"]
+        line (fn [] (str (pick indents) (pick leads) (pick bodies) (pick bodies)))
+        table (fn [] (str/join "\n" (concat ["| a | b |" (pick ["|---|---|" "|:-|-:|" "---|---" "| - | - |"])]
+                                            (repeatedly (.nextInt r 5) line))))]
+    (vec (repeatedly n #(str (str/join "\n" (repeatedly (inc (.nextInt r 8))
+                                                        (fn [] (if (zero? (.nextInt r 4)) (table) (line)))))
+                             "\n")))))
+
+(deftest headless-table-separator-test
+  (testing "TASK-281: a delimiter row with no header row above it is no table (GFM),
+            so it parses to the paragraph text it is -- it was a TableBlock with an
+            empty head, and convert-table threw a NullPointerException"
+    (is (= [{:t :para :inlines [(str-inline "|---|")]}]
+           (:blocks (parser/parse "|---|\n"))))
+    (is (= [{:t :para :inlines [(str-inline "---|---")]}]
+           (:blocks (parser/parse " ---|---\n")))))
+  (testing "TASK-281: the same mid-document -- after a blank line or a heading, in a
+            list item or a quote -- and with would-be body rows below it"
+    (let [sep {:t :para :inlines [(str-inline "|---|")]}]
+      (is (= [{:t :para :inlines [(str-inline "a")]} sep]
+             (:blocks (parser/parse "a\n\n|---|\n"))))
+      (is (= [sep] (:blocks (first (:blocks (parser/parse "# h\n|---|\n"))))))
+      (is (= [[sep]] (:items (first (:blocks (parser/parse "- |---|\n"))))))
+      (is (= [sep] (:blocks (first (:blocks (parser/parse "> |---|\n"))))))
+      (is (= [{:t :para :inlines [(str-inline "|:-|-:|") {:t :soft-break}
+                                  (str-inline "|") space (str-inline "a") space
+                                  (str-inline "|") space (str-inline "b") space (str-inline "|")]}]
+             (:blocks (parser/parse "|:-|-:|\n| a | b |\n"))))))
+  (testing "TASK-281: a header row above the delimiter row still makes a table"
+    (is (= [:table] (map :t (:blocks (parser/parse "| a |\n|---|\n")))))
+    (is (= [:para :table] (map :t (:blocks (parser/parse "|---|\n\n| a |\n|---|\n| b |\n")))))))
+
+(deftest multi-row-table-head-test
+  (testing "TASK-281: two rows above a delimiter row are no table -- `:head` holds one
+            Row, and the first of them used to be dropped without a word -- so every
+            line stays paragraph text"
+    (is (= [{:t :para :inlines [(str-inline "|a|") {:t :soft-break} (str-inline "|b|") {:t :soft-break}
+                                (str-inline "|---|") {:t :soft-break} (str-inline "|c|")]}]
+           (:blocks (parser/parse "|a|\n|b|\n|---|\n|c|\n"))))
+    (is (= [{:t :block-quote :blocks [{:t :para :inlines [(str-inline "|a|") {:t :soft-break} (str-inline "|b|")
+                                                          {:t :soft-break} (str-inline "|---|")]}]}]
+           (:blocks (parser/parse "> |a|\n> |b|\n> |---|\n")))))
+  (testing "TASK-281: one header row is still a table, with every body row"
+    (let [[table] (:blocks (parser/parse "| a | b |\n|---|---|\n| c | d |\n| e | f |\n"))]
+      (is (= :table (:t table)))
+      (is (= 2 (count (:cells (:head table)))))
+      (is (= 2 (count (:rows table)))))))
+
+(deftest caption-block-lead-in-test
+  (let [caption (fn [line] (let [[table & more] (:blocks (parser/parse (str "| a |\n|---|\n" line "\n")))]
+                             (is (= :table (:t table)) line)
+                             (is (empty? more) line)
+                             [(:caption table) (:attr table)]))
+        words (fn [& ws] (vec (interpose space (map str-inline ws))))]
+    (testing "TASK-281: a caption is paragraph text, so what would open a block on its own
+              line -- list, heading, quote, fence, thematic break, reference definition,
+              HTML -- stays caption text, every character of it (it threw, or a heading
+              lost its `#`)"
+      (doseq [[line expected] [[": - x" (words "-" "x")]
+                               [": + x" (words "+" "x")]
+                               [": 1. x" (words "1." "x")]
+                               [": 2) x" (words "2)" "x")]
+                               [": # x" (words "#" "x")]
+                               [": ### x" (words "###" "x")]
+                               [": > q" (words ">" "q")]
+                               [": ```x" (words "```x")]
+                               [": ~~~" (words "~~~")]
+                               [": ***" (words "***")]
+                               [": [a]: http://u" (words "[a]:" "http://u")]
+                               [": <div>" (words "<div>")]]]
+        (is (= [expected attr] (caption line)) line)))
+    (testing "TASK-281: the caption's own attribute group still goes to the table"
+      (is (= [(words "#" "x") (assoc attr :id "tbl:a" :classes ["c"])] (caption ": # x {#tbl:a .c}")))
+      (is (= [(words "-" "x") (assoc attr :id "tbl:a")] (caption ": - x {#tbl:a}"))))
+    (testing "TASK-281: an empty caption is empty, and the lines after an empty first
+              line are caption text too -- a delimiter row among them makes no table
+              (it threw), an indented line no code block"
+      (is (= [[] attr] (caption ": ")))
+      (is (= [[(str-inline "|") space (str-inline "b") space (str-inline "|") {:t :soft-break} (str-inline "|---|")] attr]
+             (caption ":  \n| b |\n|---|")))
+      (is (= [(words "code") attr] (caption ": \n    code")))
+      (is (= [(words "2." "x") attr] (caption ": \n2. x"))))
+    (testing "TASK-281 review: a lazy `===` line under a caption in a quote or list
+              item makes the caption's own parse a setext heading; its markup,
+              cross-reference and id are the caption's, as before TASK-281"
+      (let [quoted (fn [src] (-> (parser/parse src) :blocks first :blocks first))
+            listed (fn [src] (-> (parser/parse src) :blocks first :items ffirst))
+            lazy (quoted "> | a |\n> |---|\n> : *x* @tbl:q {#tbl:a}\n===\n")]
+        (is (= [:emph :space :cross-ref] (map :t (:caption lazy))))
+        (is (= "tbl:a" (:id (:attr lazy))))
+        (is (= lazy (quoted "> | a |\n> |---|\n> : *x* @tbl:q {#tbl:a}\n")))
+        (is (= [{:t :emph :inlines [(str-inline "x")]}] (:caption (listed "- | a |\n  |---|\n  : *x* {#tbl:a}\n===\n"))))
+        (is (= (listed "- | a |\n  |---|\n  : *x* {#tbl:a}\n")
+               (listed "- | a |\n  |---|\n  : *x* {#tbl:a}\n===\n")))))
+    (testing "TASK-281: a reference in such a caption keeps its line and column"
+      (doseq [[src line column] [["| a |\n|---|\n: - see @tbl:q\n" 3 9]
+                                 ["| a |\n|---|\n:   \n      ##  @tbl:q\n" 4 11]
+                                 ["> | a |\n> |---|\n> : # @tbl:q\n" 3 7]
+                                 ["| a |\n|---|\n: ``` @tbl:q\n" 3 7]]]
+        (is (= {:file "a.hdoc" :line line :column column}
+               (->> (tree-seq coll? seq (parser/parse src {:source "a.hdoc"}))
+                    (filter #(and (map? %) (= :cross-ref (:t %))))
+                    first
+                    ast/source))
+            src)))))
+
+(deftest ^:slow ^:timing many-table-rows-parse-time-test
+  (testing "TASK-262: a 20k-row table parses in time linear in its rows. flexmark
+            0.64.8's heading factory copied the whole paragraph so far for every
+            line not starting with a letter -- and a pipe table is a paragraph
+            until it closes -- so this took ~16 s on JDK 17; now under a second"
+    (let [n 20000
+          t (System/nanoTime)
+          doc (parser/parse (str "| a | b |\n|---|---|\n" (str/join (repeat n "| x | *y* |\n"))))
+          secs (/ (- (System/nanoTime) t) 1e9)
+          [table] (:blocks doc)]
+      (is (< secs 5.0) (str n " table rows took " secs " s to parse"))
+      (is (= :table (:t table)))
+      (is (= n (count (:rows table))))
+      (is (= [{:cells [{:blocks [{:t :para :inlines [(str-inline "x")]}]}
+                       {:blocks [{:t :para :inlines [{:t :emph :inlines [(str-inline "y")]}]}]}]}]
+             (distinct (:rows table))))))
+  (testing "TASK-262: so does a 20k-line paragraph of lines that start with `#` but
+            are no heading (~19 s on JDK 17): only a line one of flexmark's own
+            heading patterns matches reaches its factory"
+    (let [n 20000
+          t (System/nanoTime)
+          doc (parser/parse (str/join (repeat n "#tag line\n")))
+          secs (/ (- (System/nanoTime) t) 1e9)
+          [para] (:blocks doc)]
+      (is (< secs 5.0) (str n " #tag lines took " secs " s to parse"))
+      (is (= [:para] (map :t (:blocks doc))))
+      (is (= n (count (filter #(= "#tag" (:text %)) (:inlines para)))))))
+  (testing "TASK-262: `heading-patterns` is the pair flexmark's own (package-private)
+            `HeadingParser$HeadingParsing` compiles, for every combination of the
+            three options that choose it, and for the parser's own options"
+    (let [ctor (doto (.getDeclaredConstructor (Class/forName "com.vladsch.flexmark.parser.core.HeadingParser$HeadingParsing")
+                                              (into-array Class [com.vladsch.flexmark.util.data.DataHolder]))
+                 (.setAccessible true))
+          field (fn [o field-name] (str (.get (doto (.getDeclaredField (class o) field-name) (.setAccessible true)) o)))
+          heading-patterns @#'parser/heading-patterns
+          check (fn [^com.vladsch.flexmark.util.data.DataHolder options]
+                  (let [flexmark (.newInstance ctor (object-array [options]))]
+                    (is (= [(field flexmark "ATX_HEADING") (field flexmark "SETEXT_HEADING")]
+                           (map str (heading-patterns options))))))]
+      (doseq [no-space [false true] no-empty [false true] marker-length [1 2 3]]
+        (check (doto (com.vladsch.flexmark.util.data.MutableDataSet.)
+                 (.set com.vladsch.flexmark.parser.Parser/HEADING_NO_ATX_SPACE (Boolean/valueOf (boolean no-space)))
+                 (.set com.vladsch.flexmark.parser.Parser/HEADING_NO_EMPTY_HEADING_WITHOUT_SPACE (Boolean/valueOf (boolean no-empty)))
+                 (.set com.vladsch.flexmark.parser.Parser/HEADING_SETEXT_MARKER_LENGTH (Integer/valueOf (int marker-length))))))
+      (check (.getOptions ^com.vladsch.flexmark.parser.Parser (@#'parser/build-cm-parser true)))))
+  (testing "TASK-262: the heading factory that replaces flexmark's own sits at the
+            same place in the block-parser order flexmark resolves"
+    (let [factories (fn [^com.vladsch.flexmark.parser.Parser p]
+                      (let [f (doto (.getDeclaredField com.vladsch.flexmark.parser.Parser "blockParserFactories")
+                                (.setAccessible true))]
+                        (mapv #(if (instance? com.vladsch.flexmark.parser.core.HeadingParser$Factory %)
+                                 "heading"
+                                 (.getName (class %)))
+                              (.get f p))))
+          build @#'parser/build-cm-parser]
+      (doseq [tables? [true false]]
+        (is (= (factories (build tables? true)) (factories (build tables?))))
+        (is (= 1 (count (filter #{"heading"} (factories (build tables?)))))))))
+  (testing "TASK-262: over a seeded fuzz of 5000 documents, flexmark's tree with the
+            replacement heading factory is the tree with its own, node for node
+            (types, offsets, heading levels and markers), and the fuzz reaches
+            ATX and setext headings, tables, lines the replacement passes through
+            to flexmark's factory, heading lookalikes (`#`, `=` or `-` first) it
+            answers itself, and other lines it answers itself"
+    (let [build @#'parser/build-cm-parser
+          ^com.vladsch.flexmark.parser.Parser linear (build true)
+          ^com.vladsch.flexmark.parser.Parser core (build true true)
+          docs (heading-fuzz-docs 262 5000)
+          trees (mapv (fn [^String d] [(pr-str (flexmark-tree (.parse linear d)))
+                                       (pr-str (flexmark-tree (.parse core d)))])
+                      docs)
+          mismatches (keep-indexed (fn [i [a b]] (when (not= a b) (nth docs i))) trees)
+          count-docs (fn [re] (count (filter (fn [[a]] (re-find re a)) trees)))
+          [atx setext] (@#'parser/heading-patterns (.getOptions linear))
+          heading-line? (fn [l] (or (re-find atx l) (re-find setext l)))
+          firsts (keep #(not-empty (str/triml (str/replace % #"^(?:\s*(?:>|[-+*](?=\s)|\d+\.(?=\s))\s*)*" "")))
+                       (mapcat str/split-lines docs))
+          lookalike? (fn [l] (#{\# \= \-} (first l)))]
+      (is (empty? mismatches) (str "first mismatch: " (pr-str (first mismatches))))
+      (is (< 1000 (count-docs #"Heading\[[^\]]*\] textOpen:\[")) "ATX headings")
+      (is (< 40 (count-docs #"Heading\[[^\]]*\] text:\[")) "setext headings")
+      ;; 957 since TASK-281 limits a table to one header row (was over 1000).
+      (is (< 800 (count-docs #"TableBlock\[")) "tables")
+      (is (< 2000 (count (filter heading-line? firsts))) "lines passed through")
+      (is (< 8000 (count (filter #(and (lookalike? %) (not (heading-line? %))) firsts)))
+          "heading lookalikes answered by the pre-check")
+      (is (< 10000 (count (remove lookalike? firsts))) "other lines answered by the pre-check"))))

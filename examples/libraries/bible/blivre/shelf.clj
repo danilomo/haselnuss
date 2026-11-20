@@ -23,12 +23,29 @@
   {:t :para :inlines [{:t :strong :inlines [{:t :str :text (str verse)}]}
                       {:t :str :text (str " " text)}]})
 
+(defn- verse-anchor [chapter verse] (str "v" chapter "-" verse))
+
+(defn- anchored-verse
+  "A verse of the book's own page: its number in a span whose id is the
+  verse's anchor, `v14-8`, which `:locate` answers as `:anchor` so a site
+  link to `romanos#14:8` lands on the verse (TASK-269, TASK-284). A
+  passage's own blocks (`numbered-verse`) carry no id: a quote must not
+  repeat it."
+  [chapter verse text]
+  {:t :para :inlines [{:t :span
+                       :attr {:id (verse-anchor chapter verse) :classes ["verse"] :props {}}
+                       :inlines [{:t :strong :inlines [{:t :str :text (str verse)}]}]}
+                      {:t :str :text (str " " text)}]})
+
+;; `cap:N` is an anchor, not a numbered section kind: `numbered` = "false"
+;; says so, which is what keeps the chapter unnumbered without an
+;; unnumbered-section-id warning (TASK-284).
 (defn- chapter-of [title chapter verses]
   {:t :section
    :level 1
    :heading [{:t :str :text (str title " " chapter)}]
-   :attr {:id (str "cap:" chapter) :classes [] :props {}}
-   :blocks (mapv (fn [[_ v text]] (numbered-verse v text)) verses)})
+   :attr {:id (str "cap:" chapter) :classes [] :props {"numbered" "false"}}
+   :blocks (mapv (fn [[_ v text]] (anchored-verse chapter v text)) verses)})
 
 {:data ["blivre.json"]
 
@@ -67,6 +84,8 @@
             :message (str title " " locator " is only partly in this library (a subset of the Bíblia Livre)")}
            :else
            {:title (str title " " locator)
+            ;; where a site link lands: the first verse, or the chapter
+            :anchor (if from (verse-anchor chapter from) (str "cap:" chapter))
             :blocks (if (= 1 (count found))
                       [(verse-para (nth (first found) 2))]
                       (mapv (fn [[_ v text]] (numbered-verse v text)) found))}))

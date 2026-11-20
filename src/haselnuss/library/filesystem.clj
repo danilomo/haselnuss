@@ -45,8 +45,15 @@
   `:scripts true` (`scripts: true` in the library directory file); a
   `scripts` that is neither a boolean nor absent makes the config an
   `:invalid-library`. Without it the shelf lists no books and reports
-  `:scripts-disabled`. A shelf that lists no books (scripts disabled, or
-  `:script-failed` as a whole) also changes what `find-book` answers for
+  `:scripts-disabled`. The entry config's `:document-timeout-ms` and
+  `:document-output-limit` (TASK-300) raise the bounds of every
+  `:document` call into this library's generated shelves -- and only
+  this library's, only `:document` -- in place of the provider opts'
+  `:timeout-ms` and `:document-output-limit`; each must be a positive
+  integer up to `haselnuss.library.generated/max-document-timeout-ms` or
+  `max-document-output-limit`, else the config is an `:invalid-library`.
+  A shelf that lists no books (scripts disabled, or `:script-failed` as a
+  whole) also changes what `find-book` answers for
   a slug no listed book has: that shelf's diagnostic, as
   `:scripts-disabled`/`:script-failed` with the shelf's own under
   `:cause`, rather than nil -- the missing book may well be one of its
@@ -61,7 +68,8 @@
   the first `list-books`, `find-book`, `shelf-tree` or
   `library-diagnostics` call and cached with the value. Each Book in the
   index holds its own `delay` for its document, so a document is parsed at
-  most once per build however many times its book is looked up.
+  most once per build however many times its book is looked up -- except
+  by a reader that asks for an `unshared` copy, which loads its own.
 
   ## Front matter only
 
@@ -73,6 +81,31 @@
   normalised as `parser/normalize-source` does -- so what listing calls
   front matter is exactly what `parse` does. An opening fence not closed within
   `max-front-matter-chars` is reported instead of read to the end.
+
+  ## Listing cache
+
+  At tens of thousands of books even reading every front matter costs
+  more than a no-change site build may (doc-12, \"Scale\" consequence 1;
+  TASK-266). With `:listing-cache` (`filesystem-library`), each entry
+  file is stamped (`haselnuss.library.digest/stamp`: size, modification
+  time, file identity; one `stat`, no read) before it is read, and a file
+  whose stamp equals the one the previous run cached for its path is
+  listed from the cached fields without being opened. A generated
+  shelf's script is likewise not run while its `shelf.clj` and `:data`
+  files are unchanged (`haselnuss.library.generated/load-shelf`).
+  `listing-cache` hands the new cache back for the next run; the build
+  keeps it in its saved state (`haselnuss.library.state`). The walk
+  itself -- listing every folder -- still happens every time, so an added,
+  removed or moved book is always seen.
+
+  A stamp is cached only when it is trusted
+  (`haselnuss.library.digest/trusted-stamp`): an edit landing right after
+  a file was read, in the same timestamp tick and keeping its size,
+  would not change the stamp, so a file modified within the last two
+  seconds is read again next run rather than cached. A file that could
+  not be read is never cached. What remains unseen is an edit that keeps
+  the size and sets the modification time back to exactly its old value
+  (`touch -r` after editing); `--full` (TASK-268) is the way past that.
 
   `title` comes from `haselnuss.parser/front-matter`, so the listed title
   is the same inlines the document's own `meta.title` will be. `lang`,
@@ -152,7 +185,8 @@
             [haselnuss.library.generated :as generated]
             [haselnuss.parser :as parser]
             [haselnuss.resolver :as resolver])
-  (:import (java.io File)))
+  (:import (java.io File)
+           (java.nio.file Files)))
 
 ;; --- names -------------------------------------------------------------------
 
@@ -438,10 +472,15 @@
          :digests @digests})
       (catch java.io.IOException e
         (fail "cannot be read" (throwable-message e)))
+      (catch StackOverflowError t
+        (fail "failed to parse" (throwable-message t)))
+      ;; TASK-279: running out of memory is no fact about the book, and
+      ;; this answer is cached and, through the scan's record, saved
+      (catch VirtualMachineError t (throw t))
       (catch Throwable t
         (fail "failed to parse" (throwable-message t))))))
 
-(defrecord ^:private FileSystemBook [entry path file loaded]
+(defrecord ^:private FileSystemBook [entry path file loaded load-fn]
   library/Book
   (book-entry [_] entry)
   (document [_] (:document @loaded)))
@@ -450,6 +489,19 @@
   "True when `x` is a book this provider built."
   [x]
   (instance? FileSystemBook x))
+
+(defn unshared
+  "A copy of the filesystem `book` that loads its document afresh, on
+  first use, and keeps it only in itself: `book`'s own load, cached for
+  everyone who holds `book`, is neither used nor made. For a reader that
+  needs a book once and must not keep it in memory -- the reference
+  graph's scan reads every book's own document this way, so a collection
+  of tens of thousands of books is not held whole (TASK-279). Any other
+  value is answered as it is."
+  [book]
+  (if (filesystem-book? book)
+    (assoc book :loaded (delay ((:load-fn book))))
+    book))
 
 (defn book-path
   "The path on disk of a filesystem `book`: its book folder, or its file
@@ -568,31 +620,120 @@
                            (str "front matter cannot be read: " reason)))}
     field (assoc :field field)))
 
+(defn- read-fields
+  "`read-entry-fields`, with a file that cannot be read or parsed at all
+  answered as a problem; `::failed` true then."
+  [^File file open-reader]
+  (try (read-entry-fields file open-reader)
+       (catch Throwable t
+         {:fields {} :problems [(field-problem nil (throwable-message t))] ::failed true})))
+
+(defn- cached-fields?
+  "True when `entry` is a usable listing cache entry for a file: its
+  shape, fields a BookEntry can be made of (`library/entry-problem`, the
+  check a generated shelf's items go through too) and `{:field :reason}`
+  problems. A saved state is data from disk, so a hit is checked before
+  it is believed; one that fails is a miss and the file is read."
+  [entry]
+  (and (map? entry) (map? (:stamp entry)) (map? (:fields entry)) (vector? (:problems entry))
+       (nil? (library/entry-problem (:fields entry)))
+       (every? #(and (map? %) (string? (:reason %)) (or (nil? (:field %)) (keyword? (:field %))))
+               (:problems entry))))
+
+(defn- entry-fields
+  "`[{:fields :problems} cache-entry]` for the entry file `file`: its
+  front matter read (`read-fields`), and -- when the scan keeps a listing
+  cache (`:cache?`) -- the cache entry `{:stamp :fields :problems}` for
+  the next run, or nil when this one cannot be cached (the stamp is not
+  trusted, the file could not be read, or a string in what it listed
+  would not survive the UTF-8 the state is written in,
+  `digest/utf8-safe?`). Given the previous run's entry
+  for the same path in `:cache`, whose stamp equals the file's stamp now,
+  its fields are answered without opening the file (TASK-266)."
+  [^File file {:keys [open-reader cache? cache]}]
+  (if-not cache?
+    [(read-fields file open-reader) nil]
+    (let [now-ms (System/currentTimeMillis)
+          file-stamp (digest/stamp file)
+          hit (get (:files cache) (str file))]
+      (if (and (some? file-stamp) (cached-fields? hit) (= file-stamp (:stamp hit)))
+        [(select-keys hit [:fields :problems]) hit]
+        (let [{::keys [failed] :as found} (read-fields file open-reader)
+              found (dissoc found ::failed)
+              trusted (when (and (not failed) (digest/utf8-safe? found))
+                        (digest/trusted-stamp file-stamp now-ms))]
+          [found (when trusted (assoc found :stamp trusted))])))))
+
 (defn- book-for
   "The Book for `slug` on `shelf`, whose path on disk is `path` and entry
   file `file`, with the `:invalid-front-matter` diagnostics listing it
-  found. Front matter that cannot be read at all lists the book under its
-  slug; `document` then parses the file itself and reports what it finds."
-  [lib-name shelf slug ^File path ^File file {:keys [parse open-reader kinds transform]}]
+  found, and its listing cache entry (`entry-fields`). Front matter that
+  cannot be read at all lists the book under its slug; `document` then
+  parses the file itself and reports what it finds."
+  [lib-name shelf slug ^File path ^File file {:keys [parse kinds transform] :as opts}]
   (let [id (book-ref/book-id lib-name shelf slug)
-        {:keys [fields problems]}
-        (try (read-entry-fields file open-reader)
-             (catch Throwable t
-               {:fields {} :problems [(field-problem nil (throwable-message t))]}))]
-    {:book (->FileSystemBook (library/book-entry-value id fields) (str path) file
-                             (delay (load-book id file parse kinds transform)))
-     :diagnostics (mapv #(invalid-front-matter lib-name id file %) problems)}))
+        [{:keys [fields problems]} cache-entry] (entry-fields file opts)
+        load-fn #(load-book id file parse kinds transform)]
+    {:book (->FileSystemBook (library/book-entry-value id fields) (str path) file (delay (load-fn)) load-fn)
+     :diagnostics (mapv #(invalid-front-matter lib-name id file %) problems)
+     :cache-entry cache-entry}))
 
 (defn- generated-shelf
   "The walk result for the generated shelf in `dir` (TASK-158): its
   script's books, its diagnostics, and under `:unusable` the diagnostic
   that says why it listed no books at all, when it did not."
   [lib-name ^File dir shelf opts]
-  (let [{:keys [books diagnostics failure]}
-        (generated/load-shelf lib-name shelf dir (:generated opts))]
-    {:books books
-     :diagnostics diagnostics
-     :unusable (if failure [failure] [])}))
+  (let [{:keys [books diagnostics failure cache]}
+        (generated/load-shelf lib-name shelf dir
+                              (cond-> (:generated opts)
+                                (:cache? opts)
+                                (assoc :cache? true
+                                       :cache (get (:shelves (:cache opts)) (str dir)))))]
+    (cond-> {:books books
+             :diagnostics diagnostics
+             :unusable (if failure [failure] [])}
+      cache (assoc-in [:cache :shelves (str dir)] cache))))
+
+;; --- the walk record (TASK-296) -------------------------------------------------
+
+(defn- folder-record
+  "`{:folders {path observation} :complete? true}` for the folder `f`,
+  stamped now (`digest/folder-stamp`); `:complete?` false, and no
+  stamp, when it has none or the stamp is racy
+  (`digest/trusted-stamp`'s rule)."
+  [^File f]
+  (let [now-ms (System/currentTimeMillis)
+        [observation newest-ms] (digest/folder-stamp f)]
+    (if (and observation (< (long newest-ms) (- now-ms digest/racy-window-ms)))
+      {:folders {(str f) observation} :complete? true}
+      {:folders {} :complete? false})))
+
+(defn- walk-folder
+  "The walk record of a folder `walk` is about to look into: its
+  `folder-record`. Equal stamps of every folder a walk looked into, and
+  of every entry file it listed (the listing cache's), mean the next walk
+  lists exactly the same books (`listing-walk`)."
+  [^File dir]
+  (folder-record dir))
+
+(defn- merge-walks
+  [a b]
+  {:folders (merge (:folders a) (:folders b))
+   :complete? (boolean (and (:complete? a) (:complete? b)))})
+
+(defn- walk-unlisted
+  "The walk record `w` after the walk passed over `f`, an entry of a
+  folder it neither listed as a book nor walked into as a shelf: a
+  symbolic link may come to lead to a book or a shelf without the folder
+  holding it changing, so the record is no longer complete; a folder
+  (an `:invalid-book-name`) is stamped, since the diagnostic says whether
+  it holds a `book.hdoc`. A hidden or `_` entry is ignored whatever it is."
+  [w ^File f]
+  (cond
+    (ignored? (.getName f)) w
+    (Files/isSymbolicLink (.toPath f)) (assoc w :complete? false)
+    (.isDirectory f) (merge-walks w (folder-record f))
+    :else w))
 
 (defn- walk
   "Every book under `dir` (on shelf `shelf`), as `{:books :diagnostics
@@ -605,40 +746,65 @@
   deliberate and silent: the folder's books are already being listed from
   its first appearance, and a loop is no problem the author has to fix.
   (Two links to one folder that are not a loop list its books twice,
-  which `:duplicate-slug` then reports.)"
+  which `:duplicate-slug` then reports.)
+
+  With a listing cache (`:cache?`) the answer also holds `:walk`, what
+  `listing-walk` hands out: see `walk-folder`."
   [lib-name ^File dir shelf opts seen]
-  (let [canonical-dir (try (.getCanonicalPath dir) (catch java.io.IOException _ (str dir)))
+  (let [cache? (:cache? opts)
+        ;; TASK-296: stamped BEFORE the folder is looked into
+        start (when cache? (walk-folder dir))
+        canonical-dir (try (.getCanonicalPath dir) (catch java.io.IOException _ (str dir)))
         looped? (contains? seen canonical-dir)
         generated? (and (not looped?) (generated/generated-shelf? dir))
         children (when-not (or looped? generated?) (.listFiles dir))
-        seen (conj seen canonical-dir)]
+        seen (conj seen canonical-dir)
+        with-walk (fn [result complete?]
+                    (cond-> result
+                      cache? (assoc :walk (cond-> start (not complete?) (assoc :complete? false)))))]
     (cond
-      looped? {:books [] :diagnostics [] :unusable []}
-      generated? (generated-shelf lib-name dir shelf opts)
+      looped? (with-walk {:books [] :diagnostics [] :unusable []} true)
+      generated? (let [{:keys [cache unusable] :as result} (generated-shelf lib-name dir shelf opts)]
+                   ;; a shelf listed by running its script, not from its
+                   ;; cache, may list otherwise next time; one whose
+                   ;; scripts are disabled lists none while the folder
+                   ;; and the directory file stay as they are
+                   (with-walk result (or (some? cache) (= [:scripts-disabled] (mapv :type unusable)))))
       (nil? children)
-      {:books []
-       :diagnostics [{:type :unreadable-shelf
-                      :library lib-name
-                      :path (str dir)
-                      :message (str "library " (pr-str lib-name) ": cannot list folder " dir)}]
-       :unusable []}
+      (with-walk {:books []
+                  :diagnostics [{:type :unreadable-shelf
+                                 :library lib-name
+                                 :path (str dir)
+                                 :message (str "library " (pr-str lib-name) ": cannot list folder " dir)}]
+                  :unusable []}
+        false)
       :else
       (reduce
        (fn [acc ^File f]
          (let [[kind a b c] (candidate f (empty? shelf))]
            (case kind
-             :book (let [{:keys [book diagnostics]} (book-for lib-name shelf a b c opts)]
-                     (-> acc
-                         (update :books conj book)
-                         (update :diagnostics into diagnostics)))
+             :book (let [{:keys [book diagnostics cache-entry]} (book-for lib-name shelf a b c opts)]
+                     (cond-> (-> acc
+                                 (update :books conj book)
+                                 (update :diagnostics into diagnostics))
+                       cache-entry (assoc-in [:cache :files (str c)] cache-entry)
+                       ;; listed by reading its front matter, which the
+                       ;; next run reads again
+                       (and cache? (nil? cache-entry)) (assoc-in [:walk :complete?] false)))
              :shelf (let [sub (walk lib-name f (conj shelf a) opts seen)]
                       (-> acc
                           (update :books into (:books sub))
                           (update :diagnostics into (:diagnostics sub))
-                          (update :unusable into (:unusable sub))))
-             :invalid (update acc :diagnostics conj (invalid-book-name lib-name f a))
-             acc)))
-       {:books [] :diagnostics [] :unusable []}
+                          (update :unusable into (:unusable sub))
+                          (cond-> (:cache sub)
+                            (-> (update-in [:cache :files] merge (:files (:cache sub)))
+                                (update-in [:cache :shelves] merge (:shelves (:cache sub)))))
+                          (cond-> cache? (update :walk merge-walks (:walk sub)))))
+             :invalid (cond-> (update acc :diagnostics conj (invalid-book-name lib-name f a))
+                        cache? (update :walk walk-unlisted f))
+             (cond-> acc
+               cache? (update :walk walk-unlisted f)))))
+       (with-walk {:books [] :diagnostics [] :unusable []} true)
        (sort-by #(.getName ^File %) children)))))
 
 (defn- ambiguity
@@ -663,15 +829,18 @@
 (defn- scan
   [lib-name ^File root opts]
   (try
-    (let [{:keys [books diagnostics unusable]} (walk lib-name root [] opts #{})
+    (let [{:keys [books diagnostics unusable cache] walked :walk} (walk lib-name root [] opts #{})
           entries (mapv :entry books)
           index (group-by (comp book-ref/book-key :id :entry) books)]
-      {:entries entries
-       :books (vec books)
-       :index index
-       :tree (library/shelf-tree-of entries)
-       :diagnostics (into (vec diagnostics) (duplicate-slugs lib-name index))
-       :unusable unusable})
+      (cond-> {:entries entries
+               :books (vec books)
+               :index index
+               :tree (library/shelf-tree-of entries)
+               :diagnostics (into (vec diagnostics) (duplicate-slugs lib-name index))
+               :unusable unusable}
+        (:cache? opts) (assoc :cache {:files (or (:files cache) {})
+                                      :shelves (or (:shelves cache) {})}
+                              :walk walked)))
     (catch Throwable t
       {:entries [] :books [] :index {} :tree {} :unusable []
        :diagnostics [{:type :unreadable-shelf
@@ -741,6 +910,46 @@
   [x]
   (instance? FileSystemLibrary x))
 
+(defn listing-cache
+  "The listing cache of the filesystem library `lib`'s listing (see the
+  namespace docstring, \"Listing cache\"): plain data `{:files {entry-path
+  entry} :shelves {folder-path entry}}` for the next run's
+  `:listing-cache`. nil when `lib` keeps none (built without
+  `:listing-cache`), has not been listed yet in this build -- this never
+  lists it -- or failed to list, and for any other value."
+  [lib]
+  (when (and (filesystem-library? lib) (realized? (:scanned lib)))
+    (:cache @(:scanned lib))))
+
+(defn listing-walk
+  "What the listing of the filesystem library `lib` -- built with
+  `:listing-cache` and listed in this build -- looked at besides the
+  entry files its listing cache stamps (TASK-296): `{:folders {path
+  observation} :complete? bool}`, the `digest/folder-stamp` observation
+  of every folder it looked into (each shelf it walked, the library
+  root first, and each folder it reported as an `:invalid-book-name`),
+  taken before it looked. `:complete?` is true when the next listing,
+  given this one's `listing-cache`, lists exactly the same books with the
+  same diagnostics as long as each of those folders, each entry file the
+  cache stamps (`digest/stamp`) and each generated shelf's cached files
+  are as stamped: every stamp was trusted, every book came from or went
+  into the cache, every generated shelf from its cache (or its scripts
+  are disabled), every folder could be listed, and no entry it passed
+  over is a symbolic link (which can come to lead to a book or a shelf
+  with no folder changing). nil when the library keeps no cache, has not
+  been listed, or its listing failed; for any other value."
+  [lib]
+  (when (and (filesystem-library? lib) (realized? (:scanned lib)))
+    (:walk @(:scanned lib))))
+
+(defn- bound-problem
+  "Why `value`, the entry config's `key-name` (a raised `:document` bound,
+  TASK-300), is not a positive integer of at most `ceiling` -- nil when it
+  is, or when it is absent."
+  [key-name value ceiling]
+  (when (and (some? value) (not (and (int? value) (<= 1 value ceiling))))
+    (str key-name " must be a whole number from 1 to " ceiling ", got " (pr-str value))))
+
 (defn filesystem-library
   "A Library over the folder `(:path entry-config)`, named
   `(:name entry-config)`, or an `:invalid-library` diagnostic. See the
@@ -770,17 +979,27 @@
   of the book applies `--transform` (TASK-242, `--check`); its
   diagnostics are among the book's `load-warnings`. Default nil, no
   rewriting: a build never sets it for the books it references.
-  `provider` turns these opts into a registry provider.
+  `:listing-cache`, a map of library name -> the `listing-cache` a
+  previous run's listing left (`{}` when there is none yet): when given,
+  the listing keeps a cache and reuses this library's entry from it (see
+  \"Listing cache\" in the namespace docstring); default nil, no cache --
+  listing then stats nothing and reads every front matter, as before
+  TASK-266. `provider` turns these opts into a registry provider.
 
   The entry config's own `:scripts` (true, false or absent) says whether
-  generated shelves run; see the namespace docstring."
+  generated shelves run, and its `:document-timeout-ms` and
+  `:document-output-limit`, when given, bound their `:document` calls
+  (TASK-300); see the namespace docstring."
   ([entry-config] (filesystem-library entry-config {}))
   ([entry-config {:keys [parse open-reader kinds transform timeout-ms output-limit
                          document-output-limit on-script-call]
+                  previous :listing-cache
                   :or {parse parser/parse open-reader default-open-reader}}]
    (let [lib-name (when (map? entry-config) (:name entry-config))
          path (when (map? entry-config) (:path entry-config))
          scripts (when (map? entry-config) (:scripts entry-config))
+         entry-timeout (when (map? entry-config) (:document-timeout-ms entry-config))
+         entry-limit (when (map? entry-config) (:document-output-limit entry-config))
          root (when (and (string? path) (not (str/blank? path)))
                 (.getAbsoluteFile (io/file path)))
          problem (cond
@@ -797,7 +1016,12 @@
                    (not (or (nil? transform) (ifn? transform))) ":transform must be a fn"
                    (not (or (nil? scripts) (boolean? scripts)))
                    (str "scripts must be true or false, got " (pr-str scripts))
-                   :else nil)]
+                   :else (or (bound-problem "document-timeout-ms" entry-timeout
+                                            generated/max-document-timeout-ms)
+                             (bound-problem "document-output-limit" entry-limit
+                                            generated/max-document-output-limit)
+                             (when-not (or (nil? previous) (map? previous))
+                               ":listing-cache must be a map of library name to listing cache")))]
      (if problem
        {:type :invalid-library
         :library lib-name
@@ -807,11 +1031,16 @@
                                                         :open-reader open-reader
                                                         :kinds kinds
                                                         :transform transform
+                                                        :cache? (some? previous)
+                                                        :cache (let [c (get previous lib-name)]
+                                                                 (when (map? c) c))
                                                         :generated {:scripts? (true? scripts)
                                                                     :timeout-ms timeout-ms
                                                                     :output-limit output-limit
                                                                     :document-output-limit
-                                                                    document-output-limit
+                                                                    (or entry-limit document-output-limit)
+                                                                    :document-timeout-ms
+                                                                    (or entry-timeout timeout-ms)
                                                                     :on-script-call on-script-call}})))))))
 
 (defn provider
@@ -821,6 +1050,10 @@
   its parse vocabulary to the books it references:
 
       (directory/register-provider directory/default-registry :filesystem
-                                   (provider {:kinds kinds}))"
+                                   (provider {:kinds kinds}))
+
+  It is also how a build lists from its saved listing cache (TASK-266):
+  `:listing-cache` goes among the same opts, beside the kinds and
+  anything else the build configures, so nothing it set is lost."
   [opts]
   (fn [entry-config] (filesystem-library entry-config opts)))

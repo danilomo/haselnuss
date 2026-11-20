@@ -12,7 +12,7 @@
       {:data     [\"almeida.json\"]                      ; read by the host
        :books    (fn [data] [{:slug \"romanos\" :title \"Romanos\" :lang \"pt-BR\"} ...])
        :document (fn [data slug] {:meta {...} :blocks [...]})
-       :locate   (fn [data slug locator] {:title ... :blocks [...]})}   ; optional
+       :locate   (fn [data slug locator] {:title ... :blocks [...] :anchor? ...})}   ; optional
 
   `:data` is a vector of paths relative to the shelf folder. The host reads
   and parses each one before calling the script -- `.json` (object keys
@@ -29,7 +29,12 @@
   plain Haselnuss AST data. `:locate`, when given, makes every book of the
   shelf Locatable: it answers `{:title :blocks}` for a locator such as
   `14:8-9`; it rejects one by returning nil, or a `{:type :message}` map
-  whose message says why -- both become `:bad-locator`.
+  whose message says why -- both become `:bad-locator`. The answer may
+  also carry `:anchor`, the id of the element of the book's `:document`
+  the passage starts at (`\"v14-8\"`, on a span around the verse number):
+  a `--build-site` link to the passage lands there (TASK-269). An anchor
+  the document does not have is ignored, and the link lands on the top of
+  the book's page, as it does with no `:anchor`.
 
   ## The sandbox
 
@@ -44,6 +49,15 @@
   for `:books` and `:locate`, and `default-document-output-limit` (ten
   times larger) for `:document`, since a whole book is far larger than
   any renderer result.
+
+  The library's own directory entry -- the trust marker `scripts: true`
+  is, and nothing else -- can raise the two `:document` bounds for its
+  generated shelves (TASK-300): `document-timeout-ms` and
+  `document-output-limit`, positive integers up to
+  `max-document-timeout-ms` and `max-document-output-limit`
+  (`haselnuss.library.filesystem` checks them). Loading the script,
+  `:books` and `:locate` keep the default bounds: they answer a listing or
+  one passage, never a whole book.
 
   sci records an error's line only for code run on the thread that built
   its context, and every sandboxed call runs on a worker. Binding
@@ -82,6 +96,14 @@
   once per book per build. `:locate` is not cached, as for every
   Locatable book.
 
+  Across builds (TASK-266, doc-12 \"Scale\"): given the previous run's
+  listing cache entry for the shelf, `load-shelf` lists the shelf from it
+  without running the script while its `shelf.clj` and `:data` files are
+  unchanged (see `load-shelf`). The cache assumes a script answers
+  `:books` from its files alone: one whose listing varies from run to run
+  (sci offers `rand`, `rand-int` and `shuffle`) keeps the listing of the
+  run that cached it until its `shelf.clj` or a `:data` file changes.
+
   ## Diagnostics
 
   All `:level :warning`, carrying `:library`, `:shelf` (the shelf path,
@@ -102,8 +124,8 @@
     `meta.bibliography` (the host would read that file for the script),
     or that holds an `:include` block (only a `.hdoc` file's own include
     expansion resolves one, and an unexpanded one aborts the host's
-    emit); a `:locate` result that is not `{:title? :blocks}` of valid
-    blocks, or holds an `:include`; or
+    emit); a `:locate` result that is not `{:title? :blocks :anchor?}` of
+    valid blocks (`:anchor` a non-empty string), or holds an `:include`; or
     a `:books` entry whose title, lang, ddc or tags cannot make a
     BookEntry (the book is then not listed).
   - `:invalid-book-name` (`:slug`) -- a `:books` slug that is not a valid
@@ -190,8 +212,30 @@
   generated book is far larger than any renderer or transform result (a
   Psalms in this fixture's AST shape prints to about half a megabyte), so
   it gets its own cap, ten times `haselnuss.sandbox/default-output-limit`.
-  `:books` and `:locate` keep the sandbox's."
+  `:books` and `:locate` keep the sandbox's. A library's own directory
+  entry can raise it, up to `max-document-output-limit` (TASK-300)."
   2000000)
+
+(def max-document-timeout-ms
+  "The most a library's directory entry may set its generated shelves'
+  `:document` timeout to (`document-timeout-ms`, TASK-300), in wall-clock
+  milliseconds. The whole Bíblia Livre as one book -- 66 books, 31,100
+  verses -- takes 12-15 s to generate on the development machine (a
+  12-core desktop), against the sandbox's 5 s default; two minutes is
+  eight times that, room for a machine several times slower or a busy
+  build, and still a bound: a script that loops costs that library's
+  build at most two minutes per book it is asked for, never a hang."
+  120000)
+
+(def max-document-output-limit
+  "The most a library's directory entry may set its generated shelves'
+  `:document` output cap to (`document-output-limit`, TASK-300), in printed
+  characters. The whole Bíblia Livre as one book prints to 9,303,380
+  characters; 32,000,000 is over three times that -- a Bible
+  with notes, or a larger collection -- while bounding what one script can
+  make the host hold, copy and emit for a single book (the copy, the
+  resolved document and its page are each of that order in memory)."
+  32000000)
 
 (defn- located-scope
   "A `sandbox/sci-call!` `:scope` binding sci's location marker (see the
@@ -326,8 +370,12 @@
 
 (defn- read-data
   "`{:data {written value} :files [canonical-path] :digests {canonical-path
-  digest}}` for the spec's `:data`, or `{:failure diagnostic}` for the
-  first path that is refused or cannot be read."
+  digest} :stamps [{:written :path :stamp}]}` for the spec's `:data`, or
+  `{:failure diagnostic}` for the first path that is refused or cannot be
+  read. Each `:stamp` (`haselnuss.library.digest/stamp`) is taken before
+  the file is read, for the listing cache (TASK-266) -- only when the
+  shelf keeps one (`:cache?`); nil otherwise, so an uncached listing
+  stats nothing extra."
   [{:keys [dir] :as shelf} paths]
   (reduce (fn [acc written]
             (let [found (data-file dir written)
@@ -338,13 +386,15 @@
                                                         :data written)}))]
               (if (string? found)
                 (fail found)
-                (try (let [[value file-digest] (parse-data found written)]
+                (try (let [file-stamp (when (:cache? shelf) (digest/stamp found))
+                           [value file-digest] (parse-data found written)]
                        (-> acc
                            (assoc-in [:data written] value)
                            (update :files conj (str found))
-                           (update :digests digest/record (str found) file-digest)))
+                           (update :digests digest/record (str found) file-digest)
+                           (update :stamps conj {:written written :path (str found) :stamp file-stamp})))
                      (catch Throwable t (fail (str "cannot read it: " (throwable-message t))))))))
-          {:data {} :files [] :digests {}}
+          {:data {} :files [] :digests {} :stamps []}
           paths))
 
 ;; --- books -------------------------------------------------------------------
@@ -386,7 +436,8 @@
   "The book `id`'s document (slug `slug`), or the diagnostic it failed with."
   [{:keys [spec data] :as shelf} id slug]
   (notify! shelf :document slug)
-  (let [outcome (try {:value (call! shelf (:document-limit shelf)
+  (let [outcome (try {:value (call! (update shelf :sandbox-opts merge (:document-sandbox-opts shelf))
+                                    (:document-limit shelf)
                                     (str script-file-name " :document for " (canonical id))
                                     (:document spec) data slug)}
                      (catch Throwable t {:failure (script-failed shelf t :book (canonical id))}))]
@@ -467,11 +518,20 @@
   its hash with the content the books were generated from. `{}` for any
   other value."
   [book]
-  (if (generated-book? book) (::digests book {}) {}))
+  (if (generated-book? book)
+    (let [d (::digests book {})] (if (fn? d) (d) d))
+    {}))
 
 (defn- book-of
-  "`{:book Book}` for the `:books` item `item`, or `{:diagnostic ...}`."
-  [{:keys [lib-name shelf script spec] :as shelf-ctx} item]
+  "`{:book Book}` for the `:books` item `item`, or `{:diagnostic ...}`.
+  `source` is a 0-argument fn answering the loaded shelf (`load-source`:
+  `{:shelf-ctx ctx}` holding the script's spec and data, or `{:failure
+  diagnostic}`), which the book's `:document` and `:locate` calls go
+  through; `locate?` says whether the script has a `:locate`;
+  `data-files` and `digests` are what `data-files` and `file-digests`
+  answer (`digests` a map, or a 0-argument fn answering one)."
+  [{:keys [lib-name shelf script] :as shelf-ctx}
+   {:keys [source locate? digests] book-data-files :data-files} item]
   (let [slug (:slug item)
         fields (select-keys item [:title :lang :ddc :tags])]
     (if-not (library/valid-name? slug)
@@ -486,16 +546,19 @@
                                    (str "book " (canonical id) " is not listed: " problem)
                                    :book (canonical id))}
           (let [entry (library/book-entry-value id fields)
-                loaded (delay (generate-document shelf-ctx id slug))]
-            {:book (assoc (if (:locate spec)
+                loaded (delay (let [{ctx :shelf-ctx :keys [failure]} (source)]
+                                (or failure (generate-document ctx id slug))))]
+            {:book (assoc (if locate?
                             (->LocatableGeneratedBook entry (str script) loaded
-                                                      #(locate-passage shelf-ctx id slug %))
+                                                      #(let [{ctx :shelf-ctx :keys [failure]} (source)]
+                                                         (or failure (locate-passage ctx id slug %))))
                             (->GeneratedBook entry (str script) loaded))
-                          ::data-files (vec (:data-files shelf-ctx))
-                          ::digests (:digests shelf-ctx {}))}))))))
+                          ::data-files (vec book-data-files)
+                          ::digests (or digests {}))}))))))
 
-(defn- list-books
-  "`{:books :diagnostics}` from the script's `:books`, or `{:failure ...}`."
+(defn- call-books
+  "`{:items [map ...]}`, what the script's `:books` answered, or
+  `{:failure ...}`."
   [{:keys [spec data] :as shelf}]
   (notify! shelf :books)
   (let [outcome (try {:value (call! shelf (:output-limit shelf) (str script-file-name " :books")
@@ -508,14 +571,125 @@
       {:failure (diagnostic :script-failed shelf
                             (str ":books must answer a sequence of maps {:slug :title ...}, got "
                                  (bounded-pr result)))}
-      :else
-      (reduce (fn [acc item]
-                (let [made (book-of shelf item)]
-                  (if-let [book (:book made)]
-                    (update acc :books conj book)
-                    (update acc :diagnostics conj (:diagnostic made)))))
-              {:books [] :diagnostics []}
-              result))))
+      :else {:items result})))
+
+(defn- books-from-items
+  "`{:books :diagnostics}` for the `:books` items `items` (`book-of`, with
+  `book-opts`)."
+  [shelf-ctx book-opts items]
+  (reduce (fn [acc item]
+            (let [made (book-of shelf-ctx book-opts item)]
+              (if-let [book (:book made)]
+                (update acc :books conj book)
+                (update acc :diagnostics conj (:diagnostic made)))))
+          {:books [] :diagnostics []}
+          items))
+
+(defn- load-source
+  "The shelf's script loaded and its `:data` read: `{:shelf-ctx ctx
+  :script-stamp stamp :data-stamps [...]}`, `ctx` being `shelf-ctx` with
+  the script's `:ctx`, `:spec`, `:data`, `:data-files` and `:digests`,
+  and each stamp taken before its file was read (`read-data`) -- or
+  `{:failure diagnostic}`."
+  [shelf-ctx]
+  (let [script-stamp (when (:cache? shelf-ctx) (digest/stamp (:script shelf-ctx)))
+        shelf-ctx (assoc shelf-ctx :ctx (sandbox/fork))
+        {:keys [spec failure] script-digest :digest} (load-script shelf-ctx)]
+    (if failure
+      {:failure failure}
+      (let [{:keys [data files failure digests stamps]} (read-data shelf-ctx (:data spec))]
+        (if failure
+          {:failure failure}
+          {:shelf-ctx (assoc shelf-ctx :spec spec :data data :data-files files
+                             :digests (digest/record digests (str (:script shelf-ctx)) script-digest))
+           :script-stamp script-stamp
+           :data-stamps stamps})))))
+
+;; --- the listing cache (TASK-266) -----------------------------------------------
+
+(def ^:private item-keys
+  "The keys of a `:books` item listing reads (`book-of`)."
+  [:slug :title :lang :ddc :tags])
+
+(defn- cache-limits
+  "The sandbox bounds that can change what `:books` answers."
+  [shelf-ctx]
+  {:timeout-ms (:timeout-ms (:sandbox-opts shelf-ctx))
+   :output-limit (:output-limit shelf-ctx)})
+
+(defn- edn-round-trips?
+  "True when `x` prints to EDN and reads back equal, and its strings
+  survive the UTF-8 the state is written in (`digest/utf8-safe?`), so a
+  cache entry holding it lists exactly what it was built from after the
+  state is saved and loaded."
+  [x]
+  (try
+    (and (digest/utf8-safe? x)
+         (= x (edn/read-string (binding [*print-length* nil *print-level* nil *print-meta* false
+                                         *print-namespace-maps* false *print-readably* true]
+                                 (pr-str x)))))
+    (catch Exception _ false)))
+
+(defn- cache-entry
+  "The listing cache entry for a shelf that listed `items` from `loaded`
+  (`load-source`), whose files were stamped after the wall clock read
+  `now-ms`; nil when a stamp is not trusted
+  (`haselnuss.library.digest/trusted-stamp`) or the items would not come
+  back from the saved state as they are."
+  [{:keys [lib-name shelf script] :as shelf-ctx} loaded now-ms items]
+  (let [{ctx :shelf-ctx :keys [script-stamp data-stamps]} loaded
+        script-stamp (digest/trusted-stamp script-stamp now-ms)
+        data (mapv #(update % :stamp digest/trusted-stamp now-ms) data-stamps)
+        items (mapv #(select-keys % item-keys) items)]
+    (when (and script-stamp (every? :stamp data) (edn-round-trips? items))
+      {:library lib-name
+       :shelf shelf
+       :limits (cache-limits shelf-ctx)
+       :script {:path (str script) :stamp script-stamp}
+       :data data
+       :data-files (vec (:data-files ctx))
+       :digests (:digests ctx)
+       :locate? (some? (:locate (:spec ctx)))
+       :items items})))
+
+(defn cache-files-unchanged?
+  "True when the files of the listing cache entry `entry` of the
+  generated shelf in the folder `dir` are as it stamped them: its
+  `shelf.clj`, and each `:data` path as written still naming the same
+  file. Stats files; reads none. What `load-shelf` checks of the files
+  before it lists the shelf from the entry, so a caller that knows the
+  library, shelf and bounds are the same (the directory file is) can
+  tell from it that the shelf lists as before (TASK-296)."
+  [dir entry]
+  (let [dir (io/file dir)
+        script (script-file dir)]
+    (boolean
+     (and (map? entry) (vector? (:data entry))
+          (let [{:keys [path stamp]} (:script entry)]
+            (and (some? stamp) (= path (str script)) (= stamp (digest/stamp script))))
+          (every? (fn [{:keys [written path stamp]}]
+                    (and (string? written) (some? stamp)
+                         (let [found (data-file dir written)]
+                           (and (instance? File found)
+                                (= path (str found))
+                                (= stamp (digest/stamp found))))))
+                  (:data entry))))))
+
+(defn- cache-hit?
+  "True when the cache entry `entry` still lists the shelf `shelf-ctx`:
+  same library, shelf and sandbox bounds, its `shelf.clj` stamped as
+  before, and each `:data` path as written still naming the same file,
+  stamped as before (`cache-files-unchanged?`). Stats files; reads none."
+  [{:keys [lib-name shelf dir] :as shelf-ctx} entry]
+  (boolean
+   (and (map? entry)
+        (= lib-name (:library entry))
+        (= shelf (:shelf entry))
+        (= (cache-limits shelf-ctx) (:limits entry))
+        (vector? (:items entry)) (every? map? (:items entry))
+        (vector? (:data entry)) (vector? (:data-files entry)) (map? (:digests entry))
+        (boolean? (:locate? entry))
+        (cache-files-unchanged? dir entry))))
 
 (defn load-shelf
   "The books of the generated shelf in the folder `dir`, on shelf `shelf`
@@ -531,34 +705,71 @@
   `:output-limit`, the cap on a `:books` or `:locate` result, default
   `haselnuss.sandbox/default-output-limit`; `:document-output-limit`, the
   cap on a `:document` result, default `default-document-output-limit`;
-  `:on-script-call`, a test seam (see `notify!`). Never throws."
+  `:document-timeout-ms`, the timeout of a `:document` call alone, default
+  `:timeout-ms` (TASK-300: the library entry's `document-timeout-ms`,
+  checked against `max-document-timeout-ms` by the caller);
+  `:on-script-call`, a test seam (see `notify!`).
+
+  The listing cache (TASK-266): with `:cache?` true, the answer also
+  holds `:cache`, an entry (plain data) for the next run's `:cache`, or
+  nil when this listing cannot be cached -- a shelf that listed no books,
+  a file modified too recently to trust its stamp
+  (`haselnuss.library.digest/trusted-stamp`), items that would not come
+  back from EDN as they are. Given `:cache`, the previous run's entry,
+  that is still good (its `shelf.clj` and every `:data` file stamped as
+  before, same library, shelf and sandbox bounds; stats only), the
+  script is NOT run to list: the books come from the cached items, and
+  the script loads, and its data is read, only when a book's document or
+  a passage is asked for -- once for the whole shelf. Never throws."
   [lib-name shelf ^File dir {:keys [scripts? timeout-ms output-limit document-output-limit
-                                    on-script-call]}]
+                                    document-timeout-ms on-script-call cache? cache]}]
   (let [shelf-ctx {:lib-name lib-name
                    :shelf shelf
                    :dir dir
                    :script (script-file dir)
                    :on-script-call on-script-call
+                   :cache? (boolean cache?)
                    :output-limit (or output-limit sandbox/default-output-limit)
                    :document-limit (or document-output-limit default-document-output-limit)
                    :sandbox-opts (cond-> {}
-                                   timeout-ms (assoc :timeout-ms timeout-ms))}
+                                   timeout-ms (assoc :timeout-ms timeout-ms))
+                   ;; :document only (TASK-300); load, :books and :locate
+                   ;; keep :sandbox-opts
+                   :document-sandbox-opts (cond-> {}
+                                            document-timeout-ms
+                                            (assoc :timeout-ms document-timeout-ms))}
         fail (fn [d] {:books [] :diagnostics [d] :failure d})]
     (if-not scripts?
       (fail (diagnostic :scripts-disabled shelf-ctx
                         (str "shelf " (pr-str (str/join "/" shelf)) " is generated by its "
                              script-file-name ", which is not run: the library's entry in the"
                              " library directory does not say scripts: true")))
-      (let [shelf-ctx (assoc shelf-ctx :ctx (sandbox/fork))
-            {:keys [spec failure] script-digest :digest} (load-script shelf-ctx)]
-        (if failure
-          (fail failure)
-          (let [{:keys [data files failure digests]} (read-data shelf-ctx (:data spec))]
-            (if failure
-              (fail failure)
-              (let [listed (list-books (assoc shelf-ctx :spec spec :data data :data-files files
-                                              :digests (digest/record digests (str (:script shelf-ctx))
-                                                                      script-digest)))]
-                (if-let [failure (:failure listed)]
-                  (fail failure)
-                  (assoc listed :failure nil))))))))))
+      (if (and cache? (cache-hit? shelf-ctx cache))
+        (let [loaded (delay (load-source shelf-ctx))
+              cached-digests (:digests cache)]
+          (assoc (books-from-items shelf-ctx
+                                   {:source #(deref loaded)
+                                    :locate? (:locate? cache)
+                                    :data-files (:data-files cache)
+                                    ;; the bytes the lazy load read, once it ran
+                                    :digests (fn []
+                                               (or (when (realized? loaded)
+                                                     (:digests (:shelf-ctx @loaded)))
+                                                   cached-digests))}
+                                   (:items cache))
+                 :failure nil
+                 :cache cache))
+        (let [now-ms (System/currentTimeMillis)
+              loaded (load-source shelf-ctx)
+              ctx (:shelf-ctx loaded)
+              called (when ctx (call-books ctx))]
+          (if-let [failure (or (:failure loaded) (:failure called))]
+            (fail failure)
+            (cond-> (assoc (books-from-items ctx
+                                             {:source (constantly loaded)
+                                              :locate? (some? (:locate (:spec ctx)))
+                                              :data-files (:data-files ctx)
+                                              :digests (:digests ctx)}
+                                             (:items called))
+                           :failure nil)
+              cache? (assoc :cache (cache-entry shelf-ctx loaded now-ms (:items called))))))))))

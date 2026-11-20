@@ -1,0 +1,9 @@
+---
+title: A Dangling Reference
+lang: en
+---
+
+# Apocrypha {#sec:apocrypha}
+
+This book links to a Bible book the library does not hold:
+@{bible:tobias#1:1}. That one reference is this book's only warning.

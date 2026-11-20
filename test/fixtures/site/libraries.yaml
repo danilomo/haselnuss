@@ -1,0 +1,14 @@
+# The site fixture set (TASK-264; doc-12, "Left to the builder"): a small
+# library directory the library-server tasks build and measure against, so
+# examples/ stays as it is. README.md beside this file says what each book
+# is for; haselnuss.site-fixtures-test pins what --check reports over it.
+#
+# `scripts: true` is what lets the Bible library's generated shelf
+# (bible/blivre/shelf.clj) run at all.
+- name: bible
+  type: filesystem
+  path: bible
+  scripts: true
+- name: reformed
+  type: filesystem
+  path: reformed

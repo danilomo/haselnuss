@@ -86,6 +86,22 @@
   ;; would bundle it into the uberjar): `haselnuss.example-test` converts
   ;; the committed example document, and reading it off the classpath
   ;; keeps that independent of the runner's working directory.
+  ;; TASK-302: `lein test :fast` (and `bin/test --fast`) runs every test
+  ;; except those tagged `^:slow`, on the deftest or on its namespace's `ns`
+  ;; form. The tag, not a list here, is the record of what the fast gate
+  ;; leaves out; CLAUDE.md ("Finishing a task") says when that suffices.
+  ;; There is deliberately no :default selector: plain `lein test` still runs
+  ;; everything.
+  ;;
+  ;; :phase is `bin/test`'s own: `:phase shard` is every test not tagged
+  ;; `^:timing` and `:phase timing` every test that is, each optionally
+  ;; narrowed to the fast subset by a trailing `fast`, so that the shards and
+  ;; the quiet phase after them partition the suite exactly. Arguments arrive
+  ;; as symbols (Leiningen read-strings them).
+  :test-selectors {:fast (complement :slow)
+                   :phase (fn [m phase & [subset]]
+                            (and (if (= 'timing phase) (:timing m) (not (:timing m)))
+                                 (or (not= 'fast subset) (not (:slow m)))))}
   :profiles {:uberjar {:aot :all}
              ;; TASK-245: the graph soak and with-book benchmark (doc-11,
              ;; "GraalVM investigation phase"), `haselnuss.soak` under `dev/`.

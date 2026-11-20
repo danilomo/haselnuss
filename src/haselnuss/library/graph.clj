@@ -21,6 +21,7 @@
        :files       #{path-string}          ; every file the output depends on
        :labels      {label-string hash}     ; label -> hash of the labelled node
        :label-spans? {label-string [first last]} ; document-order span of each label
+       :document-hash? string               ; hash of the book's own document
        :edges       [Edge]                  ; outgoing references
        :diagnostics [diagnostic]}           ; the book's own diagnostics
 
@@ -32,7 +33,9 @@
        :kind     :link | :quote
        :status   :resolved | :dangling
        :problem? keyword                             ; the diagnostic :type, when dangling
-       :position? {:line pos-int :file? string :column? pos-int}}
+       :digest?  string                              ; what the citing page shows, when resolved
+       :position? {:line pos-int :file? string :column? pos-int}
+       :via?     string}                             ; derived: the !quote it came in by
 
   As in doc-11's tables, a trailing `?` marks an OPTIONAL key; the key
   itself is written without it (`:problem`, `:passage`, `:id`). `:files`
@@ -60,6 +63,32 @@
   quoted passage. Both are optional: a record without them (built by
   hand, or by an older scanner) only lets a reference count as inside a
   label it is directly under.
+
+  `:digest` and `:document-hash` (TASK-267) are what narrowing a rebuild
+  set by content compares (`haselnuss.library.graph.rebuild/narrowed`).
+  A resolved edge's `:digest` is a short hash of what the citing book's
+  page shows of the target passage: for a `:link`, its canonical
+  reference, title and URL (the link text and `href`); for a `:quote`,
+  those, the passage's blocks, and what each cross-reference in them
+  that the target never resolved (one its `locate` built) shows once the
+  quoting book resolves it into a link to that label of the target. A
+  record's `:document-hash` is set
+  where `:hash` is too coarse to tell whether the book's own page
+  changed -- a generated book's, whose `:hash` covers the `:data` file
+  every book of its shelf shares. Both are optional: an edge or record
+  without one only makes narrowing rebuild more.
+
+  An edge with `:via` (TASK-287) is DERIVED: a reference the book did
+  not write, but that a passage it quotes holds where that passage was
+  built by the quoted book's `locate` rather than read from its
+  document -- so no record has an edge for it except the quoting
+  book's, which resolves it. `:via` is the reference as written of the
+  book's own `!quote` it arrives through; its `:from` and `:position`
+  are that `!quote`'s, and it follows that quote's edge in `:edges`
+  (`haselnuss.library.graph.scan/located-references`). Derived edges are
+  dependencies: the rebuild functions and `edges-to` see them, but they
+  carry no diagnostic, and `--check`'s quote problems and `--backlinks`
+  leave them out (`derived?`).
 
   `BookRecord` and `Edge` are malli schemas; `valid-book-record?` and
   `explain-book-record` check one.
@@ -247,7 +276,9 @@
              [:kind [:enum :link :quote]]
              [:status [:enum :resolved :dangling]]
              [:problem {:optional true} :keyword]
-             [:position {:optional true} [:ref ::position]]]
+             [:digest {:optional true} :string]
+             [:position {:optional true} [:ref ::position]]
+             [:via {:optional true} :string]]
             [:fn {:error/message
                   "a resolved edge needs :to :id and no :problem; a dangling edge needs a :problem"}
              (fn [{:keys [to status problem]}]
@@ -269,6 +300,7 @@
                      [:map-of :string [:and [:tuple nat-int? nat-int?]
                                        [:fn {:error/message "a span must not end before it starts"}
                                         (fn [[a b]] (<= a b))]]]]
+                    [:document-hash {:optional true} :string]
                     [:edges [:vector [:ref ::edge]]]
                     [:diagnostics [:vector [:ref ::diagnostic]]]]
                    [:fn {:error/message "every edge's :from :id must be the record's :id"}
@@ -358,6 +390,13 @@
   [edge]
   (let [parsed (book-ref/parse-book-ref (:written (:to edge)))]
     (when-not (book-ref/malformed? parsed) parsed)))
+
+(defn derived?
+  "True when `edge` is derived (it has a `:via`; see the namespace
+  docstring, \"Values\"): a reference inside a locator-built passage the
+  book quotes, not one the book wrote."
+  [edge]
+  (some? (:via edge)))
 
 (defn target-key
   "The book-key `edges-to` finds `edge` under: the resolved target's,

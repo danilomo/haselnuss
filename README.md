@@ -22,6 +22,7 @@ inline; this README documents what you can write today.
 - `haselnuss.emit.html` — HTML exporter
 - `haselnuss.emit.latex` — LaTeX exporter
 - `haselnuss.cli` — command-line entry point
+- `haselnuss.site` — the site folder `--build-site` writes (pages, reader app files, lock)
 
 ## Usage
 
@@ -1008,6 +1009,35 @@ no document can:
 Without it the shelf's books are missing and a reference to one says why
 (`scripts-disabled`).
 
+Each `:document` call -- one whole book -- may run for 5 s and print to at most
+2,000,000 characters (ten times the cap on `:books`, `:locate` and extension results). The
+defaults are generous for an ordinary book -- the largest book of the Bible, Psalms, is
+about 0.6 MB in the AST shape the example uses -- and short enough that a script that
+loops or builds without end costs a build seconds, not a hang. A library that genuinely
+holds larger books (a whole Bible as one book prints to about 9.3 MB and takes 12-15 s to
+generate) can raise both, again only in its own entry:
+
+```yaml
+- name: bible
+  type: filesystem
+  path: ~/books/bible
+  scripts: true
+  document-timeout-ms: 60000        # up to 120000 (two minutes)
+  document-output-limit: 20000000   # printed characters, up to 32000000
+```
+
+The settings apply to that library's generated shelves only, and only to `:document`:
+loading a script, `:books` and `:locate` keep their bounds, since they answer a listing
+or one passage. Each must be a whole number from 1 to its ceiling -- 120,000 ms and
+32,000,000 characters, several times what a whole Bible needs, so the build still gives
+up on a runaway script within two minutes per book (on newer JDKs, and in the native
+binary, the script's worker thread may keep running after the build has stopped waiting
+for it). A large output cap needs heap to match: building and checking a book that size
+holds several copies of it in memory -- a site build of the libraries holding the 9.3 MB
+Bible peaked at about 1.9 GB. Any other value makes that entry an `invalid-library` and
+the other libraries still load. No document, `--extensions` file or shelf script can
+change them.
+
 A worked example is committed beside the example documents: `examples/libraries/bible/`
 is a library whose `blivre/shelf.clj` serves a subset of the Bíblia Livre (BLIVRE), a
 Portuguese Bible under CC BY 3.0 Brasil -- exactly the verses
@@ -1267,6 +1297,403 @@ stable contract, and the report a future `--client --backlinks` and a reader's
   position).
 - `summary` counts `references` (the entries of `edges`), the distinct `books` they come
   from, and `self`.
+
+#### Building a site
+
+`--build-site DIR` builds every book of every library in the directory into one folder of
+HTML, for reading the whole collection in a browser:
+
+```
+haselnuss --libraries libs.yaml --build-site ~/haselnuss-site
+haselnuss --build-site ~/haselnuss-site --extensions directives.clj --transform rules.clj
+```
+
+It takes no input file and no library names: cross-library links make a partial site
+wrong, so it always builds every library the directory file names (`--libraries`,
+`$HASELNUSS_LIBRARIES` or `~/.config/haselnuss/libraries.yaml`, as every command finds it).
+The folder it writes:
+
+```
+DIR/
+  index.html  app.css  app.js  sw.js  manifest.webmanifest   the reader app
+  icon-192.png  icon-512.png  icon-maskable-512.png
+  apple-touch-icon.png                                       its icons
+  catalog/index.json  catalog/<library>/<n>.json             the libraries, then their books in pages of 500
+  books/<library>/<shelf...>/<slug>/index.html               one page per book
+  books/<library>/<shelf...>/<slug>/backlinks.json           what refers to the book (--backlinks JSON)
+  books/<library>/<shelf...>/<slug>/previews.json            the passages other books link to in it
+  books/<library>/<shelf...>/<slug>/<image path>             the images the book shows, copied
+  readers/                                                   reading positions; never touched by a build
+  .haselnuss/state/  .haselnuss/lock                         build state and lock
+  .haselnuss/images                                          the image copies the last build made
+  .haselnuss/pending                                         what an interrupted build was rebuilding
+  .haselnuss/unchanged                                       what tells the next build nothing changed
+```
+
+- **A page** is the book's normal `html` build -- what `haselnuss <book-id>` writes, with
+  the default stylesheet and MathJax when it has maths -- plus one `<link>` to `app.css`
+  and one `<script>` for `app.js`, both relative to the page, so it still opens on its own
+  in a browser. Its `<head>` also gets `viewport-fit=cover` and a tiny inline style and
+  script that apply the reader's theme and font size before the page is first drawn, and
+  each book link carries `data-passage`, the passage as `previews.json` keys it (`"14:8"`;
+  `""` for a whole book). The `<body>` is the `html` build's, byte for byte, apart from
+  that attribute. `--extensions` and `--transform` apply to every page as to that build
+  (`--trusted-extensions` too). A generated book (a `shelf.clj` shelf) has no source file:
+  its page is built from the document its script makes, and `--transform` does not
+  rewrite it, as `--check` reads it.
+- **Images** a page shows by a relative path (`![...](figures/tree.png)`) are copied from
+  the book's folder -- the folder its file is in -- to the same relative path below the
+  page, so the `src` still finds them. Only a raster web image (`png`, `jpg`, `jpeg`, `gif`,
+  `webp`, `avif`, `bmp`, `ico`, `apng`) of at most 50 MiB inside that folder is copied.
+  Everything else is dropped to its alt text with a warning (`site-image`): a path with
+  `..`, an absolute path, a hidden file, a symbolic link leading out of the folder, a
+  missing or larger file, one that differs only in case from another image of the page,
+  one whose copy would land in another book's page folder (`s.hdoc` showing `x/fig.png`
+  beside a book `s/x.hdoc`), and every relative image of a generated book, which has no
+  folder. SVG is not copied for now: opened on its own, an SVG runs its script on the
+  site's origin. An `http`/`https` URL is left as it is (the sanitizer has already dropped
+  `data:` and every other scheme). Copies are streamed, never held in memory. The saved
+  state records each copy's digest; `.haselnuss/images` lists the copies (and
+  `.haselnuss/images.pending` those a killed build made), so a copy no page shows any more
+  is removed by the next build, whatever happened to the saved state; an image file put
+  under `books/` by hand is kept. Two limits, by design: a hard link inside the book's
+  folder to a file elsewhere is copied (the build reads what its user can read), and an
+  image is opened by its real path just after that path is checked, so someone writing
+  into the book's folder during the build could swap a folder on the way for a link.
+  Likewise, `.haselnuss/images.pending` replaced by a symbolic link fails each page that
+  copies an image, and replaced by a FIFO stalls the build; either needs write access to
+  `.haselnuss/`, which can already rewrite the build state.
+- **The catalog** is what the reader app's home screen draws its cover grid from.
+  `catalog/index.json` is `{"version":1,"page-size":500,"libraries":[{"name","colour",
+  "books","pages"}]}`, every library of the directory sorted by name (one with no page
+  is listed with 0 books and 0 pages). `catalog/<library>/<n>.json`, `n` from 1, is
+  `{"version":1,"library","page","pages","books":[...]}` with at most 500 books, each
+  `{"id","title","authors","library","shelf","path","colour"}`: the canonical ID, the
+  title as text, the front matter's authors (`[]` for none, and for a generated book
+  whose document names none), the shelf as `a/b` (`""` for none), the page relative to
+  the site (`books/.../index.html`), and the cover colour, `#rrggbb`, derived from the
+  library's name alone (a hue from its SHA-256), so each library keeps its colour. Books
+  are sorted by shelf, then title, then ID, each compared case- and accent-blind first
+  (Unicode NFD, marks dropped, lower-cased without a locale, so every machine sorts the
+  same) and by the text itself to break a tie. Only books with a page are listed: the two
+  books of a shared ID, and a book whose page failed, are not.
+- **`backlinks.json`** beside each page is the book's `--backlinks --format json` report
+  (see "Listing backlinks"), except that each position's `file` is
+  `<library>/<path below the library's folder>` (`reformed/estudos/queda.hdoc`) -- the
+  citing book's library first, else the library whose folder holds the file -- and
+  `null` when no library's folder does (an included file from elsewhere). A site file
+  never shows an absolute path of the machine that built it, and its bytes do not depend
+  on where the build ran. The reader opens a citing passage at
+  `books/<library>/<shelf...>/<slug>/index.html#<from.passage>`.
+- **`previews.json`** beside each page holds every passage other books `@{...}`-link to
+  in this book (a resolved link from another book; quotes copy their passage in and need
+  none): `{"version":1,"book","limit":2000,"previews":[{"passage","ref","title","url",
+  "html","cut","math"}]}`, ordered as `--backlinks` orders its groups. `passage` is the passage
+  as written without whitespace (`"14:8"`; `null` for a link to the whole book), `ref`
+  its canonical reference, `title` the link text as text (`Romanos 14:8`), `url` where
+  the passage is on the book's page (`index.html#v14-8`), relative to `previews.json`
+  like every URL in `html`. `html` is exactly what `!quote <ref>` shows on the book's own
+  page -- `<figure class="book-quote-figure">`, the passage in its `<blockquote>`, the
+  source in its `<figcaption>`, then any footnotes -- built through the same sanitizer
+  as a page. An image shows only when the page copied it (it is that copy); any other
+  is its alt text, as on the page. A passage of more than about 2,000 characters of text
+  is cut, on the document before it is rendered, so the markup stays whole:
+  - the body is counted first, footnotes after: the blocks that fit, then as much of the
+    next as fits -- into paragraphs, emphasis, sections, quotes and list items -- ending
+    before the first word that does not fit, followed by `…`. A table, code, maths or a
+    directive (an admonition, say) is never cut inside: one that does not fit is left
+    out, unless it is the first thing in the passage (after headings), when it is kept
+    whole, as is a single word longer than the limit cut inside (never inside a letter
+    and its accents) -- a preview is never empty;
+  - then the footnotes of what was kept get what is left of the 2,000, in order; the
+    first that does not fit is cut, and those after it are left out with their markers.
+  `cut` is then `true`, the preview always ends with `…`, and the reader offers "Open to
+  read more". `math` is `true` when the `html` holds maths, which the reader typesets with
+  MathJax configured exactly as a page's (see "Converting a document you do not trust").
+  A preview that cannot be built is left out with a `preview-failed`
+  warning. The preview is made from the linked book alone, so editing that book's text
+  changes only its own `previews.json`, never the pages that link to it.
+- **A data file is written only when its bytes change**, so an unchanged `catalog/`,
+  `backlinks.json` or `previews.json` keeps its modification time, and one this build did
+  not write (a book's that is gone, a catalog page beyond the last) is removed. Any other
+  file under `catalog/` is left alone.
+- **Two books sharing one canonical ID** (`notas.hdoc` beside `notas/book.hdoc`) are both
+  left unbuilt, with the `duplicate-slug` warning: no reference can reach either.
+- **`DIR` must be empty, absent (it is made), or a site an earlier build made** -- one
+  holding `.haselnuss/state/`. Anything else is refused, so a mistyped path cannot fill a
+  folder of yours. A build holds `.haselnuss/lock` (an operating-system lock, released
+  when the process ends, however it ends), so a second build of the same site while one
+  runs is refused. `DIR` may be a symbolic link to a folder; the site is built where it
+  leads. Inside the site no symbolic link is followed: a page whose folder is reached
+  through one (`books/` or `books/<library>` replaced by a link, say) is not written, and
+  is an `emit-failed` error.
+- **Every file is written to a temporary file and renamed into place**, so a reader sees
+  the old page or the new one, never half of one. Pages are emitted on one thread per
+  core, and the output never depends on which finished first.
+- **A build into a site rebuilds only what changed** since the last one, and leaves a
+  site byte for byte the same as a clean build into an empty folder would. The build
+  state, saved last in `.haselnuss/state/`, holds the reference graph, each book's page,
+  images, authors and warnings, and a stamp (size, modification time, file identity,
+  SHA-256) of every file a book was made from. The next build compares those stamps --
+  a file whose size and modification time are unchanged is not even read -- lists every
+  library again (so added, removed and moved books are seen), rescans the books whose
+  files changed, and rebuilds a book when its page could differ: its source changed (by
+  content: one verse edited in a generated shelf's shared data file rebuilds only that
+  book), a book it quotes or links to changed what its page shows, an image it shows
+  changed (or one it had to drop -- a missing file, say -- can now be shown), a book was
+  added inside its folder, or its page is missing. A symbolic link on the way to a file
+  (a linked folder an `!include` goes through) is stamped by where it points, so
+  pointing it elsewhere is seen too. A book that no
+  longer exists has its folder removed, and the pages referring to it are rebuilt with
+  `??`. `backlinks.json` is written again only for the books whose incoming references
+  changed, `previews.json` also only when the passages linked to in them did, and the
+  catalog only where its bytes change. A new version of the reader app is copied, with
+  a new service-worker version in `sw.js` (a digest of the app files), without rebuilding
+  any book.
+- **A build when nothing changed** takes seconds even at 50,000 books (4.9-5.2 s with
+  the native binary, against about 50 s to find nothing to do the long way): a build
+  that leaves every page and data file written also saves `.haselnuss/unchanged`, the
+  stamps of every file it read, every library folder it listed and every folder of the
+  site's `books/`, which Haselnuss build wrote it, and the summary a no-change run
+  prints, and the next build checks those -- and that every page, data file and catalog
+  file is still in the site -- before it loads the state. One stamp off (a file put
+  into `books/` by hand, another build of Haselnuss), and it builds as above.
+- **A build after an edit** builds only the libraries the edit can reach: the record
+  above is kept per library, so the next build tells which libraries changed, and
+  loads, lists, rebuilds and sweeps only those and the libraries connected to them by
+  links and quotes, either way; every other library's pages, catalog pages, saved state
+  and warnings are kept as they are. One note edited in the 50,000-book collection
+  rebuilds in about 11 s with the native binary (about 60 s the long way). When the
+  build finds that the edit reaches further -- a book now refers to a library it left
+  alone, or a library became available or unavailable -- it builds every library
+  instead, before it has written any page, catalog file or state.
+- **A full build** -- every page written again -- happens on the first build, with
+  `--full`, after an upgrade of Haselnuss, and when the directory file or an
+  `--extensions`/`--transform` file (or their order) changed, or `--trusted-extensions`
+  was given or withdrawn (an untrusted extension's output is sanitized, a trusted one's
+  is not). `--full` is also the way
+  past what stamps cannot see: a file edited and then given back its old size and
+  modification time (`touch -r`), or a file of the site edited by hand.
+- **An interrupted build** (killed, or stopped by an error) leaves the previous state,
+  and the list of the books it was rebuilding in `.haselnuss/pending`, so the next build
+  does its work again and the site ends up as an uninterrupted build would leave it.
+
+It prints, on stderr, one line per book rebuilt or removed with the reason (and the
+books left unbuilt), the problems of the books it rebuilt exactly as `--check` prints
+them, and a summary that counts the warnings of every book, so a warning in a book this
+build did not touch is not forgotten (`--check` lists them all). A first build:
+
+```
+rebuilt  bible:blivre/romanos           (full build)
+rebuilt  reformed:dangling              (full build)
+skipped  reformed:notas                 (2 books share this id)
+removed  reformed:old-draft             (no longer in the libraries)
+test/fixtures/site/reformed/dangling.hdoc:9:1: warning: [unknown-book] bible:tobias#1:1: library "bible" has no book "tobias"
+9 of 11 books rebuilt, 0 up to date, 2 not built; 2 warnings in 3 books
+```
+
+and one after editing Romans 14:8, which the catechism quotes in a question the study
+`estudos/queda` quotes in turn:
+
+```
+rebuilt  bible:blivre/romanos           (source changed)
+rebuilt  reformed:catecismo-heidelberg  (a book it refers to changed)
+rebuilt  reformed:estudos/queda         (a book it refers to changed)
+skipped  reformed:notas                 (2 books share this id)
+3 of 11 books rebuilt, 6 up to date, 2 not built; 2 warnings in 3 books
+```
+
+A book whose page cannot be built at all (a bibliography file that is missing, say, which
+fails its own `html` build too) is a `failed` line and an `emit-failed` error, and gets no
+page; one whose `backlinks.json` or `previews.json` cannot be written is a
+`data-failed` error. Besides what `--check` reports, a build finds a few problems only while it emits a
+page -- a link the sanitizer dropped (`unsafe-url`, a `javascript:` link, say) or what an
+untrusted extension's output lost -- and prints and counts those too, at the book's file.
+The summary counts every book file, so the two books of a shared ID count as two, and a
+warning about both is in both.
+
+**Exit codes:** 0 when no book has a warning or error, 1 when one does -- the site is
+still fully written -- and 2 when the build could not run, and nothing was written: `DIR`
+neither empty nor a site, or not writable; another build holding the lock; no library
+directory file, or one that cannot be read or is invalid; an `--extensions`/`--transform`
+file that cannot be loaded; an input file given. A build that stops partway (the reader
+app's files or the state cannot be written) is 2 as well; a page that cannot be written
+is that book's `emit-failed` error. Build options a page does not use (`--target`, `--output`,
+`--no-stylesheet`, ...) are warned about on stderr as having no effect.
+
+#### Serving a site
+
+`--serve DIR` serves a site `--build-site` built, and stores each reader's reading
+positions in it. It never builds, and needs no restart after a build: a build replaces
+every file by rename, so a request sees the old file or the new one, and the search
+reloads the catalog when the build changes it.
+
+```
+haselnuss --serve ~/haselnuss-site             # http://127.0.0.1:8080/
+haselnuss --serve ~/haselnuss-site --port 9000 --bind 0.0.0.0
+haselnuss --serve ~/haselnuss-site --host home.tailnet-name.ts.net   # behind tailscale serve
+```
+
+It listens on `127.0.0.1:8080` unless `--bind` and `--port` say otherwise (`--port 0`
+picks a free port; the line it prints says which). `127.0.0.1` is right behind
+`tailscale serve`, which puts HTTPS in front -- phones install the reader as an app, and
+keep books offline, only over HTTPS. `--bind 0.0.0.0` serves the whole LAN over plain
+HTTP: browsing works, installing does not. There are no passwords: anyone who can reach
+the server can read every book and pick any reader.
+
+**Names it answers to.** "Anyone who can reach the server" must not include a web page
+on some other site: such a page can point a DNS name of its own at your machine (DNS
+rebinding) and then read and write the readers' positions through the visitor's browser.
+So the server answers only requests whose `Host` names it, and everything else -- files
+and API alike -- gets `421`:
+
+- `localhost`, and any loopback address (`127.0.0.1`, `[::1]`);
+- the `--bind` address (or name); with `--bind 0.0.0.0` (or `::`), the machine's own
+  address the request arrived on, so `http://192.168.1.5:8080/` works on the LAN -- but
+  never just any name;
+- each `--host NAME` (a host name or IP address, no port; repeat it for several).
+
+The port, letter case and a trailing dot do not matter; a missing, repeated or malformed
+`Host` answers `400`. A name is only compared, never looked up. **Behind `tailscale
+serve`, give the machine's tailnet name**: Tailscale passes the browser's
+`Host: home.tailnet-name.ts.net` on, and without `--host home.tailnet-name.ts.net` every
+request answers 421 ("this server answers only to localhost, ..."). Likewise a LAN name
+(`--host pi.local`) for `--bind 0.0.0.0` reached by name rather than address. The
+second line the server prints when it starts lists what it accepts (`haselnuss:
+answering requests to localhost, home.tailnet-name.ts.net, 127.0.0.1, any loopback
+address`). In addition, a `POST` or `PUT` whose `Origin` is not the request's own host
+and port (another site, another port such as `http://localhost:3000`, or `null`; a port
+left out is the scheme's default) answers `403` -- so a reverse proxy in front of the
+server must pass `Host` on unchanged, as `tailscale serve` does.
+
+It runs until stopped (Ctrl-C, or the service manager); as a systemd user service,
+`~/.config/systemd/user/haselnuss.service`:
+
+```
+[Unit]
+Description=Haselnuss library server
+
+[Service]
+ExecStart=%h/bin/haselnuss --serve %h/haselnuss-site --port 8080 --host home.tailnet-name.ts.net
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+then `systemctl --user enable --now haselnuss` and `tailscale serve --bg 8080`
+(`tailscale status` shows the machine's name; replace `home.tailnet-name.ts.net` with it).
+
+**Memory.** The server keeps the catalog in memory for the search, about 28 MB for 50,000
+books (on the JVM; key names and repeated values such as the library are held once), and
+twice that while it reloads one. After a reload it collects the old one at once. The
+native binary (`bin/native`) also caps its young generation at 128 MB, so its memory does
+not creep up from reload to reload. Measured with the native binary and no flags on a
+built 50,000-book site (`haselnuss.synth`), under searches, page, `backlinks.json` and
+catalog requests and 150 catalog reloads: at most 303 MB resident, about 280 MB between
+reloads (before these changes: 535 MB after 40 reloads, and rising). It needs no `-Xmx`;
+one still lowers the cap if you want (`haselnuss -Xmx192m --serve ...`). `--build-site` is a different
+matter: see "Native binary" below for what a 50,000-book build needs.
+
+**Files.** `GET` (or `HEAD`) of any file under `DIR` answers it with its `Content-Type`,
+an `ETag` (a `304` for a matching `If-None-Match`) and `Cache-Control: no-cache`; a folder
+answers its `index.html`. Never served: `.haselnuss/`, `readers/`, any name starting with
+`.`, and anything outside `DIR` -- `..` in any spelling (`%2e%2e`, `%252e%252e`, an encoded
+`/` or `\`) and symbolic links that lead out of `DIR` (or into `.haselnuss/` or
+`readers/`) all answer 404, the same as a missing file. Every answer carries
+`X-Content-Type-Options: nosniff`, and every file under `books/` that is not a page (an
+image a book shows, its JSON) carries `Content-Security-Policy: sandbox`, so a file opened
+on its own runs no script on the site. Book pages do not: they run the reader app and
+MathJax.
+
+**API.** JSON in and out. A `POST` or `PUT` must send `Content-Type: application/json`
+(else 415): that way another site's page cannot send one without a CORS preflight, which
+the server never grants. A body over 64 KB answers 413, malformed JSON or a bad position
+400, an unknown reader or book 404, a method a path does not take 405, each with
+`{"error": "..."}`. A client has 30 seconds to send a request and 300 to take a response;
+then the server closes its connection, so clients that stall (a phone that left the
+network mid-save) cannot hold its threads.
+
+| Request | Answer |
+| --- | --- |
+| `GET /api/readers` | `[{"id": "ana", "name": "Ana"}, ...]`, sorted by id |
+| `POST /api/readers` `{"name": "Ána"}` | `201` `{"id": "ana", "name": "Ána"}`; `409` when the id exists |
+| `GET /api/readers/<id>/positions` | `{"<book-id>": <position>, ...}` |
+| `GET /api/readers/<id>/positions/<book-id>` | `{"book", "position"}`: that one position, `null` when there is none |
+| `PUT /api/readers/<id>/positions/<book-id>` `<position>` | `{"book", "position", "saved"}`: the position now stored, and whether it is the one sent |
+| `GET /api/books?id=<book-id>&id=...` | `{"books": {"<book-id>": <entry>, ...}}`: the catalog entry of each id asked for that the catalog holds (up to 100 ids) |
+| `GET /api/search?q=words` | `{"query", "books": [...], "more"}`: up to 50 catalog entries whose title, authors or library hold every word, ignoring case and accents |
+
+A reader's id is its name made into a slug -- accents dropped, lower case, every run of
+other characters one `-` (`Ána Maria!` is `ana-maria`); a URL may name the reader by
+either. Only the letters a-z and digits survive, so a name with none (`Анна`, `李娜`) is
+refused with 400: add some. Its positions live in `DIR/readers/<id>.json`, `{"name": "Ána", "positions":
+{...}}`. A position is
+
+```json
+{"id": "sec:q12", "heading": {"index": 14, "text": "12. Visto que..."}, "offset": 0.35,
+ "percent": 41.2, "savedAt": "2026-11-13T21:04:11Z", "device": "iPad"}
+```
+
+`savedAt` is required (a date-time with an offset) and may be at most a day ahead of the
+server's clock, so a device whose clock is years ahead cannot pin a position for good; the
+strings (`id`, `heading.text`, `device`) hold at most 1024 characters, and the numbers fit
+a long or a double. Anything else answers 400; other keys are dropped. A `PUT` keeps
+whichever of the stored and the sent position has the later `savedAt`, compared as
+instants, so a device sending an old save after coming back online does not undo a newer
+one. The book id (`bible:blivre/romanos`, its `/` as written or as `%2F`) must be in the
+catalog; a position for a book later removed is kept. Writes to one reader are made one
+at a time, each to a temporary file renamed over the old one, so two devices saving at
+once cannot corrupt it. Search entries are the catalog's own (`id`, `title`, `authors`,
+`library`, `shelf`, `path`, `colour`), in catalog order.
+
+**Reading a book.** A book page is the book's own HTML with the reader's controls around
+it. A thin header shows the current section and a footer the percentage read; a tap in the
+middle of the page shows or hides the controls: `‹ Library`, the title, `Aa` (text size and
+a light, sepia or dark theme, kept on the device), a slider through the book, Contents (the
+book's headings), Search (in this book, ignoring case and accents) and Referenced by (the
+books that link to or quote this one, from `backlinks.json`, grouped by passage). Tapping a
+book link opens its passage in a sheet, from the target's `previews.json`, with Open and
+Close; a `??` link opens nothing. After following a link to another book the controls also
+offer `‹ Back to <title>`, which returns to the exact spot left -- an installed app on iOS
+has no browser Back button.
+
+**Where you left off.** For the reader chosen on the home screen, a book page saves its
+place a couple of seconds after scrolling stops and when the page is hidden or left, and
+opening the book again on any device goes back to it -- unless it was opened at a passage
+(a link with `#...`) or by Back; then nothing is saved until the reader has moved more
+than a screen from that passage, so a quick look does not move their place. The place is
+the innermost element with an author's label (`{#...}`; ids Haselnuss numbers itself,
+such as footnotes and bibliography entries, are skipped) at the line under the header,
+the nearest heading by its order and its text (without section number), how far into
+that block the line is, and the percentage; opening tries the label, then a heading with
+the same text nearest the same order, then the same order, then the percentage (kept
+inside the heading's section when the label is gone), so a rebuild that fixed a typo
+earlier in the book still lands on the same section. A save the server cannot be
+reached for is kept on the device (IndexedDB) and sent when the connection returns; a
+save the server fails on is tried again later without holding up the others; the newer
+`savedAt` wins. `savedAt` is the device's time corrected by how far its clock is from
+the server's (`Date` header, read before a page sends its first save), so a device
+whose clock is wrong is neither refused nor wins over later saves.
+
+**Installing and reading offline.** Served over HTTPS (or opened on `localhost`), the site
+is an installable app: `manifest.webmanifest` (standalone, sepia colours, 192 and 512 px
+icons, one maskable) and, for iOS, `apple-touch-icon` and the `apple-mobile-web-app-*`
+tags. Its service worker (`sw.js`) keeps the app's files from install, every book page
+and image once it has been opened (network first, the kept copy after a few seconds or
+with no connection), and MathJax from its CDN after the first use, so a book opened
+before reads offline, maths included; a book never opened on the device shows a page
+saying so. It never caches `api/...`; the catalog pages and a book's `backlinks.json` and
+`previews.json` are kept by the app itself, which is why the home screen can search
+offline. The app asks the browser once for storage that is not evicted early. A rebuild
+that changes the app gives `sw.js` a new version: the new worker installs in the
+background and takes over on the next launch -- once no page of the app is open -- never
+in the middle of a page or a reading session.
+
+**Exit codes:** 2 when it cannot start -- `DIR` is not a built site (no
+`.haselnuss/state/` or no `catalog/index.json`; run `--build-site` first), or the address
+cannot be listened on. Options it does not use (`--libraries`, `--target`, ...) are warned
+about; `--port` and `--bind` without `--serve` are usage errors.
 
 ### Overlays
 
@@ -1955,10 +2382,20 @@ sdk install java 21.0.2-graalce   # or set GRAALVM_HOME to an existing GraalVM
 This is **optional and not part of the build or the test gate.** GraalVM is not
 in the requirements above, `lein test` never needs it, and nothing about the
 distributed jar changes. The binary is also platform-specific -- unlike the jar,
-one build does not run everywhere -- and it is 101MB.
+one build does not run everywhere -- and it is about 120MB.
 
 Verify a binary you have built with `lein test haselnuss.native-test`, which
 compares its output against the jar's and skips when no binary is present.
+
+**Memory.** `bin/native` caps the binary's young generation at 128 MB
+(`-R:MaxNewSize=128m`), which keeps `--serve` under 512 MB with no flags (see
+"Serving a site"), and leaves its maximum heap at the default, 80% of RAM.
+`--build-site` needs the room: building the 50,000-book synthetic collection
+(`haselnuss.synth`, below) from scratch held up to 4.7 GB of live data and
+peaked at 9.8 GB resident on a 32 GB machine (59 minutes; 10,000 books: 2.1 GB,
+under 10 minutes). Both defaults can be overridden on the binary's command line
+(`haselnuss -Xmx<size> ...`, `-XX:MaxNewSize=<size>`); a heap cap below the
+live data a build holds makes it fail with an out-of-memory error.
 `doc-4` records why each flag in `bin/native` is there -- every one of them is
 load-bearing -- and `doc-9` is the story of how the binary came about, including
 what the investigation got wrong on the way.
@@ -1972,29 +2409,62 @@ driver in `dev/`, which the shipped jar and binary never contain. It runs for
 minutes, so it is not part of the test gate. The results are recorded in doc-11
 ("Findings: :memory-index baseline").
 
+`haselnuss.synth`, also in `dev/`, writes a synthetic collection to measure the
+library server against (doc-12, "Scale"): 50,000 books by default, in six
+libraries, with deep shelves, a hub note 3,000 notes link to, and quote chains.
+Every reference in it resolves, and the same seed writes the same files.
+
+```sh
+lein with-profile +test run -m haselnuss.synth /tmp/synth          # 50,000 books
+lein with-profile +test run -m haselnuss.synth /tmp/synth-1k 1000  # BOOKS [SEED]
+haselnuss --libraries /tmp/synth/libraries.yaml --check
+```
+
+The folder must not exist or be empty. 50,000 books take about 13 s and 130 MB.
+The namespace docstring describes the layout. The small fixture set the tests
+build against is `test/fixtures/site/` (see its README).
+
 ## Test
 
 ```sh
-lein test                                               # everything, ~90s
+bin/test                                                # everything, sharded over several JVMs
+bin/test --fast                                         # everything not tagged ^:slow
+lein test                                               # everything, one JVM (~24 min)
 lein test haselnuss.parser-test                         # one namespace
 lein test :only haselnuss.parser-test/inline-math-test  # one test
+bin/gate / bin/gate --fast                              # bin/lint alongside bin/test / --fast
 ```
+
+`bin/test` (TASK-302) runs the same `lein test` in several JVMs at once, namespaces
+balanced by the measured times in `test/timings.tsv`, then runs the tests tagged
+`^:timing` (wall-clock bounds) on their own, and adds the counts up; `bin/test --help` has
+the details, and `haselnuss.test-parallel`'s docstring the test tags (`^:slow`,
+`^:timing`, `^:shares-target`, `^:parallel`, `^:serial`).
 
 Requires `pdflatex`, `bibtex`, `pdftotext`, `pdfinfo` and `qpdf` on `PATH`: several
 namespaces compile real LaTeX and read the resulting PDF back rather than asserting on
 emitted strings, and they fail rather than skip without a toolchain. `qpdf` is what
 TASK-121's annotation tests read the PDF's own `/Annots` with -- the claim there is that a
 reader opening the file sees a real annotation, so the test has to look at the PDF and not
-at the `.tex`. Three of them are most of the wall time, for
-that same deliberate reason:
+at the `.tex`. Those, and the namespaces that run a real build, a browser or a nested JVM,
+are most of the wall time, for that same deliberate reason. Seconds inside one plain `lein
+test` run (TASK-302, 12 cores, otherwise idle; JVM start not included):
 
 | namespace | ~time | why |
 | --------- | ----- | --- |
-| `haselnuss.emit.latex-test` | 45s | compiles fixtures with a real `pdflatex` |
-| `haselnuss.repl-config-test` | 19s | five nested `lein` invocations, each a fresh JVM |
-| `haselnuss.uberjar-test` | 14s | rebuilds the uberjar and runs the jar |
+| `haselnuss.uberjar-test` | 99s | rebuilds the uberjar and runs the jar |
+| `haselnuss.positions-app-test` | 77s | drives a headless Chrome against `--serve` |
+| `haselnuss.emit.hdoc-test` | 73s | parse/emit round-trip fuzzing (`^:parallel`; 259s on one core) |
+| `haselnuss.emit.latex-test` | 67s | compiles fixtures with a real `pdflatex` |
+| `haselnuss.check-test` | 65s | real library builds and `--check` runs |
+| `haselnuss.native-test` | 63s | runs the native binary beside the jar (when `dist/haselnuss` exists) |
+| `haselnuss.serve-test` | 54s | a real `--serve` over a built site |
+| `haselnuss.site-incremental-test` | 46s | real incremental site builds |
+| `haselnuss.repl-config-test` | 45s | five nested `lein` invocations, each a fresh JVM |
+| `haselnuss.library.generated-bounds-test` | 42s | sandboxed shelf scripts against real time limits |
+| `haselnuss.cli-test` | 36s | the CLI end to end, many through `pdflatex`/`bibtex` |
 
-Everything else is under ten seconds each, most of that JVM startup — including
+Everything else is under 25 seconds, most under ten — including
 `haselnuss.thesis-test` (~7s), which is the end-to-end fixture for book-length output:
 `test/fixtures/thesis.hdoc` is one chaptered document carrying chapters, two abstracts, the
 front-matter prose family, the three lists, a multi-panel figure, a listing, an algorithm and
@@ -2003,7 +2473,8 @@ a minimal host. Every other whole-document fixture here is paper-shaped, and a p
 show the numbering a book gets wrong.
 
 While iterating, a single namespace -- or the nREPL below, which starts no JVM at all after the first -- is
-the fast path; the full run is the gate before a task is finished (see `CLAUDE.md`).
+the fast path; `bin/gate` (or `bin/gate --fast`, where `CLAUDE.md` says that suffices) is
+the gate before a task is finished.
 
 ## Permission allowlist (agent tooling)
 

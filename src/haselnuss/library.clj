@@ -18,7 +18,11 @@
   cheap description a library lists without loading any document.
 
   A Passage is `{:ref canonical-ref :title [Inline] :blocks [Block]
-  :url?}`: `:title` is link text, `:blocks` is what a quote splices.
+  :url? :anchor?}`: `:title` is link text, `:blocks` is what a quote
+  splices. `:anchor` (TASK-269) is only a locator passage's: the id, in
+  the book's own document, of the element the locator lands on -- what a
+  `--build-site` link to the passage puts after `#`. A locator passage
+  without one lands on the top of the book's page.
 
   `:title` is always inlines (a vector of `haselnuss.ast/Inline`). Where
   this namespace accepts a title from a caller it also takes a plain
@@ -161,19 +165,27 @@
 
 (defn valid-book-id?
   "True when `id` is a well-formed BookId: library, shelf segments and slug
-  all match the book-reference grammar's `name`."
+  all match the book-reference grammar's `name`, and it holds nothing
+  else -- so formatting it and parsing that back gives it again, which is
+  how this was first written (a round trip per call; TASK-279 checks the
+  parts directly, as hot as this is: every page path, record and edge).
+  Not a record: a record never equals the parsed map."
   [id]
   (and (map? id)
+       (not (record? id))
+       (= 3 (count id))
        (string? (:library id))
        (string? (:slug id))
        (vector? (:shelf id))
        (every? string? (:shelf id))
-       (= {:id id} (book-ref/parse-book-ref (book-ref/format-book-id id)))))
+       (book-ref/valid-name? (:library id))
+       (every? book-ref/valid-name? (:shelf id))
+       (book-ref/valid-name? (:slug id))))
 
 (defn valid-name?
   "True when `s` is a valid library name (the grammar's `name`)."
   [s]
-  (and (string? s) (valid-book-id? (book-ref/book-id s "x"))))
+  (and (string? s) (book-ref/valid-name? s)))
 
 (defn title-inlines
   "`title` as inlines: a string becomes one `:str` inline, inlines pass
@@ -304,11 +316,11 @@
                                (str "checking it threw: " (throwable-message t)))))))
 
 (defn passage-problem
-  "Why `result` is not a `:locate` result `{:title? :blocks :url?}`, or
-  nil. Public for the same reason as `document-problem`."
+  "Why `result` is not a `:locate` result `{:title? :blocks :url?
+  :anchor?}`, or nil. Public for the same reason as `document-problem`."
   [result]
   (cond
-    (not (map? result)) "expected a map {:title ... :blocks [...] :url? ...}"
+    (not (map? result)) "expected a map {:title ... :blocks [...] :url? ... :anchor? ...}"
     (not (vector? (:blocks result)))
     ":blocks must be a vector of blocks (realise a lazy seq with vec)"
     (seq-problem (select-keys result [:title :blocks]) [])
@@ -316,6 +328,8 @@
     (and (some? (:title result)) (nil? (title-inlines (:title result))))
     ":title must be a string or a vector of inlines"
     (and (some? (:url result)) (not (string? (:url result)))) ":url must be a string"
+    (and (some? (:anchor result)) (not (and (string? (:anchor result)) (seq (:anchor result)))))
+    ":anchor must be a non-empty string, the id of an element of the book's document"
     (every? #(ast/valid? ast/Block %) (:blocks result)) nil
     :else (bounded-explanation [:vector ast/Block] (:blocks result))))
 
@@ -323,7 +337,7 @@
   "Normalise what a `:locate` fn -- or any book's `locate` -- returned for
   `locator` on the book `id` into a Passage or a diagnostic. `:ref` is
   always the canonical reference, whatever the fn returned; keys other
-  than `:title`, `:blocks` and `:url` are dropped. A diagnostic passes
+  than `:title`, `:blocks`, `:url` and `:anchor` are dropped. A diagnostic passes
   through; anything that is neither is an `:invalid-book-document`.
   Idempotent: a Passage it returned comes back unchanged."
   [id locator result]
@@ -338,7 +352,8 @@
           (cond-> {:ref ref-text
                    :title (or (title-inlines (:title result)) (title-inlines ref-text))
                    :blocks (:blocks result)}
-            (:url result) (assoc :url (:url result)))))
+            (:url result) (assoc :url (:url result))
+            (:anchor result) (assoc :anchor (:anchor result)))))
       (catch Throwable t
         (assoc (invalid-book-document id (str "passage for " (pr-str locator))
                                       (str "checking it threw: " (throwable-message t)))
@@ -404,7 +419,7 @@
   too, and can call `virtual-book` again for a fresh one.
 
   The result also satisfies Locatable exactly when `:locate` is given.
-  `:locate` returns `{:title :blocks :url?}` (a string `:title` is
+  `:locate` returns `{:title :blocks :url? :anchor?}` (a string `:title` is
   accepted) or a diagnostic; the Passage's `:ref` is always the canonical
   reference. A nil or empty locator is a `:bad-locator` without calling
   `:locate`. It is not cached.

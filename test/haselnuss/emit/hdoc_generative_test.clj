@@ -321,7 +321,7 @@
         (is (<= lo (count (filter #(and (str/starts-with? (name (:ctx %)) prefix) (= :refused (:status %))) results)))
             (str "contexts " prefix "* are refused often enough"))))))
 
-(deftest known-gaps-are-not-stale-test
+(deftest ^:slow known-gaps-are-not-stale-test
   (testing "each repro still fails and is excused by exactly its own predicate"
     (doseq [{:keys [id repro pred]} known-gaps]
       (is (= :bad (:status (classify repro))) (str id " no longer fails: remove it from known-gaps"))

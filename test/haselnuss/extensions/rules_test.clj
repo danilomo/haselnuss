@@ -215,7 +215,7 @@
           [rule] (rules/load-transforms [path])]
       (is (= #{1 2} ((:transform rule) minimal-node {}))))))
 
-(deftest ac6-non-terminating-transform-stopped-test
+(deftest ^:timing ac6-non-terminating-transform-stopped-test
   (testing "AC #6: a :transform function that does not terminate is
             bounded by the same sandbox timeout an --extensions renderer
             gets, not merely at load time but at CALL time (wrap-fn) --

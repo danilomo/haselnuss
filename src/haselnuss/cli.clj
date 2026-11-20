@@ -96,20 +96,28 @@
             [haselnuss.library.directory :as directory]
             [haselnuss.library.filesystem :as fs]
             [haselnuss.library.generated :as generated]
+            [haselnuss.library.graph :as graph]
             [haselnuss.library.graph.backlinks :as backlinks]
             [haselnuss.library.graph.check :as check]
+            [haselnuss.library.graph.rebuild :as rebuild]
             [haselnuss.library.graph.registry :as graph-registry]
             [haselnuss.library.graph.scan :as scan]
             [haselnuss.library.graph.text :as graph-text]
             [haselnuss.library.passage :as passage]
             [haselnuss.library.references :as references]
+            [haselnuss.library.state :as state]
             [haselnuss.lower :as lower]
             [haselnuss.parser :as parser]
             [haselnuss.registry :as registry]
             [haselnuss.resolver :as resolver]
             [haselnuss.sandbox :as sandbox]
             [haselnuss.sanitize :as sanitize]
-            [haselnuss.transform :as transform])
+            [haselnuss.serve :as serve]
+            [haselnuss.site :as site]
+            [haselnuss.site.incremental :as incremental]
+            [haselnuss.site.unchanged :as unchanged]
+            [haselnuss.transform :as transform]
+            [haselnuss.version :as version])
   (:gen-class))
 
 (def targets
@@ -426,58 +434,6 @@
                (latex/register-environments))
            latex/default-directive-environments)))
 
-(def ^:private version
-  "This build's own version, for `--version` (TASK-46). Never a literal
-  in source: the point of the flag is telling *which build* a jar on
-  disk is, and a duplicated string would drift from `project.clj` the
-  first time the version changed.
-
-  Two sources, in order:
-
-  - `META-INF/maven/haselnuss/haselnuss/pom.properties`, which
-    Leiningen generates from `project.clj` and packs into the jar. This
-    is the one that matters, since the flag exists for the packaged
-    artifact (`:uberjar-name` deliberately carries no version, so the
-    filename cannot answer the question either). The full
-    groupId/artifactId path is spelled out because an uberjar contains
-    a `pom.properties` for every dependency.
-  - `project.clj` in the working directory, for a source checkout,
-    where the jar resource does not exist. Guarded on the file really
-    being *this* project's `defproject` form, so running from an
-    unrelated project directory reports `unknown` rather than someone
-    else's version.
-
-  That second branch reads a file chosen by the *caller's* working
-  directory, so it is read defensively (found by review):
-  `*read-eval*` is bound off, since it is on by default and a
-  `#=(...)` form in a stray `project.clj` would otherwise be evaluated
-  before the `defproject` guard ever sees the form; and the whole read,
-  including pulling the version out of the form, is inside the `try`,
-  so a truncated `(defproject haselnuss)` yields `unknown` rather than
-  an IndexOutOfBoundsException surfacing as a build error.
-  `clojure.edn/read-string` would be the obvious alternative and is
-  not usable: it rejects the `~` unquote forms a `project.clj` may
-  legitimately contain.
-
-  Delayed only so a tool that mostly does not print its version does
-  not pay the I/O on every startup. It is *not* an AOT workaround: a
-  top-level initializer is re-run when the class loads, not frozen at
-  compile time."
-  (delay
-    (or (when-let [resource (io/resource "META-INF/maven/haselnuss/haselnuss/pom.properties")]
-          (with-open [in (io/input-stream resource)]
-            (.getProperty (doto (java.util.Properties.) (.load in)) "version")))
-        (let [file (io/file "project.clj")]
-          (when (.isFile file)
-            (try
-              (let [form (binding [*read-eval* false] (read-string (slurp file)))]
-                (when (and (seq? form)
-                           (= 'defproject (first form))
-                           (= 'haselnuss (second form)))
-                  (some-> (nth form 2 nil) str)))
-              (catch Exception _ nil))))
-        "unknown")))
-
 (def ^:private usage
   "The `--help` text (TASK-26 AC #2 will reuse this verbatim from the
   packaged jar; it lives here so there is one description of the
@@ -489,6 +445,8 @@
     "       haselnuss [--libraries PATH] --list-books LIBRARY"
     "       haselnuss [--libraries PATH] --check [LIBRARY ...] [--format json]"
     "       haselnuss [--libraries PATH] --backlinks BOOK-REF [--format json]"
+    "       haselnuss [--libraries PATH] --build-site DIR [--full]"
+    "       haselnuss --serve DIR [--port PORT] [--bind ADDRESS] [--host NAME ...]"
     ""
     "Converts a Haselnuss document to HTML, LaTeX, its own JSON interchange"
     "representation, or canonical .hdoc source."
@@ -531,7 +489,25 @@
     "                          directory, into the book (lib:[shelf/...]slug) or one"
     "                          of its passages (lib:slug#passage), and exit; takes no"
     "                          input. See \"--backlinks\" below"
-    "      --format FORMAT     --check and --backlinks only: text (default) or json"
+    "      --build-site DIR    build every book of every library in the directory into"
+    "                          the site folder DIR and exit; takes no input. See"
+    "                          \"--build-site\" below"
+    "      --full              --build-site only: rebuild every book, ignoring what"
+    "                          the last build saved"
+    "      --serve DIR         serve the site --build-site built in DIR, and the"
+    "                          readers' reading positions, until stopped; builds"
+    "                          nothing and takes no input. See \"--serve\" below"
+    "      --port PORT         --serve only: the port to listen on (default 8080;"
+    "                          0 picks a free one)"
+    "      --bind ADDRESS      --serve only: the address to listen on (default"
+    "                          127.0.0.1; 0.0.0.0 for every interface)"
+    "      --host NAME         --serve only: also answer requests made to NAME (a"
+    "                          host name or IP address, no port; an IPv6 address in"
+    "                          brackets, [::1]), e.g. the machine.tailnet.ts.net"
+    "                          name tailscale serve passes on."
+    "                          Repeatable. Without it only localhost, loopback and"
+    "                          the listening address are answered (others: 421)"
+    "      --format FORMAT    --check and --backlinks only: text (default) or json"
     "      --overlay PATH     a .hdoc overlay file patching the base document via"
     "                          prepend/append/describe/highlight/sticky-note directives"
     "                          (repeatable; see README \"Overlays\" and \"Annotations\")."
@@ -691,6 +667,33 @@
     "each edge with from, to, kind, status, problem and position (see README"
     "\"Listing backlinks\"). Finding no reference is a success."
     ""
+    "--build-site DIR writes every book of every library in the directory to"
+    "DIR/books/<library>/<shelf...>/<slug>/index.html -- its html build, with the"
+    "same --extensions and --transform, plus a link to the reader app -- and the"
+    "reader app's files to DIR. DIR must be empty, absent, or a site an earlier"
+    "build made (it holds .haselnuss/state/); a page no book has is removed;"
+    "DIR/readers/ is never touched. Two books sharing one canonical ID are both"
+    "left unbuilt. A build into a site rebuilds only the books whose page could"
+    "have changed since the last one (--full rebuilds them all). It prints, on"
+    "stderr, a line per book rebuilt or removed with the reason, the problems"
+    "of the books it rebuilt as --check prints them, and a summary counting the"
+    "problems of every book:"
+    ""
+    "  rebuilt  reformed:confessions/heidelberg  (source changed)"
+    "  1 of 11 books rebuilt, 8 up to date, 2 not built; 2 warnings in 3 books"
+    ""
+    "Build options a page does not use (--target, --output, ...) are warned"
+    "about. See README \"Building a site\"."
+    ""
+    "--serve DIR answers HTTP requests for the files of the site in DIR"
+    "(never .haselnuss/ or readers/, nor anything outside DIR) and the"
+    "reader app's API: /api/readers, /api/readers/<reader>/positions and"
+    "/api/search?q=. It stores each reader's positions in DIR/readers/ and"
+    "sees a new build without a restart. It listens on 127.0.0.1:8080 unless"
+    "--bind and --port say otherwise, and answers only requests whose Host"
+    "is localhost, a loopback or the listening address, or a --host NAME."
+    "See README \"Serving a site\"."
+    ""
     "Exit codes:"
     "  0  the document was converted and written; --check: no warnings or errors"
     "     (info notices do not count); --backlinks: the list was printed, even"
@@ -704,7 +707,14 @@
     "     be read or is invalid; unknown library \"x\"; known: a, b; an --extensions"
     "     or --transform file that cannot be loaded; an input file given: --check"
     "     takes no input). --backlinks: likewise, and a malformed BOOK-REF or one"
-    "     naming no book (an unknown library or book, a slug two books share)"]))
+    "     naming no book (an unknown library or book, a slug two books share)."
+    "     --build-site: 0 when no book has a warning or error, 1 when one does (the"
+    "     site is still written), 2 when the build could not run -- DIR neither"
+    "     empty nor a site, or not writable, another build holding its lock, no"
+    "     or an invalid library directory file, an --extensions or --transform"
+    "     file that cannot be loaded -- and nothing was written, or it stopped"
+    "     partway. --serve: 2 when it cannot start (DIR is not a built site,"
+    "     the address cannot be listened on)"]))
 
 (defn- check-format!
   "Throws a usage error unless `--format` is absent, `text` or `json`."
@@ -735,6 +745,16 @@
         message (str (:message parsed))
         reason (if (str/starts-with? message prefix) (subs message (count prefix)) message)]
     (str "malformed book reference \"" (str/trim (str arg)) "\": " reason)))
+
+(defn- parse-port
+  "The `--port` value `s` as a port number, 0 (any free port) to 65535,
+  or throws a usage error."
+  [s]
+  (or (when (re-matches #"[0-9]{1,5}" (str s))
+        (let [n (Long/parseLong s)]
+          (when (<= 0 n 65535) n)))
+      (throw (ex-info (str "option --port takes a port number from 0 to 65535; got " (pr-str s))
+                      {:type ::usage-error}))))
 
 (defn- parse-args
   "Parses `args` into `{:input :target :output :computed-numbers
@@ -792,7 +812,7 @@
           _ (when (and inline-value
                        (contains? #{"--help" "--version" "--computed-numbers"
                                     "--no-stylesheet" "--fragment" "--trusted-extensions"
-                                    "--in-place" "--untrusted" "--check"}
+                                    "--in-place" "--untrusted" "--check" "--full"}
                                   arg))
               ;; A value on a flag that takes none must be an error, not
               ;; silently discarded: `--computed-numbers=false` turned
@@ -814,6 +834,29 @@
           ;; to convert something, so neither needs a document.
           (:help opts) opts
           (:version opts) opts
+          ;; TASK-273: serving is its own mode, and builds nothing.
+          (and (:serve opts) (or (:build-site opts) (:check opts) (:list-books opts) (:backlinks opts)))
+          (throw (ex-info (str "--serve cannot be combined with "
+                               (cond (:build-site opts) "--build-site"
+                                     (:check opts) "--check"
+                                     (:list-books opts) "--list-books"
+                                     :else "--backlinks"))
+                          {:type ::usage-error}))
+          (and (some #(contains? opts %) [:port :bind :hosts]) (not (:serve opts)))
+          (throw (ex-info (str (cond (contains? opts :port) "--port"
+                                     (contains? opts :bind) "--bind"
+                                     :else "--host")
+                               " applies only to --serve")
+                          {:type ::usage-error}))
+          ;; TASK-268: one mode per run.
+          (and (:build-site opts) (or (:check opts) (:list-books opts) (:backlinks opts)))
+          (throw (ex-info (str "--build-site cannot be combined with "
+                               (cond (:check opts) "--check"
+                                     (:list-books opts) "--list-books"
+                                     :else "--backlinks"))
+                          {:type ::usage-error}))
+          (and (:full opts) (not (:build-site opts)))
+          (throw (ex-info "--full applies only to --build-site" {:type ::usage-error}))
           ;; TASK-242: a check converts nothing either. Its positional
           ;; arguments are library names, so one that cannot be a library
           ;; name is an input file given to it.
@@ -845,6 +888,31 @@
             opts)
           (:format opts)
           (throw (ex-info "--format applies only to --check and --backlinks" {:type ::usage-error}))
+          ;; TASK-268: the site is built from the libraries, never from
+          ;; an input; the folder is the flag's value.
+          (:build-site opts)
+          (cond
+            (contains? opts :input)
+            (throw (ex-info (str "--build-site takes no input file; got " (pr-str (:input opts)))
+                            {:type ::usage-error}))
+            (str/blank? (:build-site opts))
+            (throw (ex-info "option --build-site requires a folder" {:type ::usage-error}))
+            :else opts)
+          ;; TASK-273: likewise, the folder served is the flag's value.
+          (:serve opts)
+          (cond
+            (contains? opts :input)
+            (throw (ex-info (str "--serve takes no input file; got " (pr-str (:input opts)))
+                            {:type ::usage-error}))
+            (str/blank? (:serve opts))
+            (throw (ex-info "option --serve requires a folder" {:type ::usage-error}))
+            (and (contains? opts :bind) (str/blank? (:bind opts)))
+            (throw (ex-info "option --bind requires an address" {:type ::usage-error}))
+            :else
+            (do (try (serve/allowed-hosts nil nil (:hosts opts))
+                     (catch IllegalArgumentException e
+                       (throw (ex-info (ex-message e) {:type ::usage-error}))))
+                opts))
           ;; TASK-157: a listing converts nothing, so an input given
           ;; alongside it is a mistake rather than something to ignore.
           (and (:list-books opts) (:input opts))
@@ -936,10 +1004,45 @@
         (let [[value rest-args] (take-value arg)]
           (recur rest-args (assoc opts :format value) literal?))
 
-        ;; The one repeatable flag (TASK-83.1): every other branch here
-        ;; uses `assoc`, since every other option is single-valued, so
-        ;; `--overlay a.hdoc --overlay b.hdoc` collects into a vector
-        ;; instead of the second occurrence silently replacing the first.
+        ;; TASK-268: the site folder is the flag's value.
+        (and (not literal?) (= "--build-site" arg))
+        (let [[value rest-args] (take-value arg)]
+          (when (contains? opts :build-site)
+            (throw (ex-info "--build-site given more than once; it builds one site"
+                            {:type ::usage-error})))
+          (recur rest-args (assoc opts :build-site value) literal?))
+
+        (and (not literal?) (= "--full" arg))
+        (recur more (assoc opts :full true) literal?)
+
+        ;; TASK-273: the site folder is the flag's value, as --build-site's.
+        (and (not literal?) (= "--serve" arg))
+        (let [[value rest-args] (take-value arg)]
+          (when (contains? opts :serve)
+            (throw (ex-info "--serve given more than once; it serves one site"
+                            {:type ::usage-error})))
+          (recur rest-args (assoc opts :serve value) literal?))
+
+        (and (not literal?) (= "--port" arg))
+        (let [[value rest-args] (take-value arg)]
+          (recur rest-args (assoc opts :port (parse-port value)) literal?))
+
+        (and (not literal?) (= "--bind" arg))
+        (let [[value rest-args] (take-value arg)]
+          (recur rest-args (assoc opts :bind value) literal?))
+
+        ;; TASK-292: repeatable, as `--overlay` -- one name per name the
+        ;; server is reached by (a tailnet name, a LAN name).
+        (and (not literal?) (= "--host" arg))
+        (let [[value rest-args] (take-value arg)]
+          (recur rest-args (update opts :hosts (fnil conj []) value) literal?))
+
+        ;; The first repeatable flag (TASK-83.1; since joined by
+        ;; --extensions, --transform and --host): the other repeatable
+        ;; branches use `update ... conj` and every single-valued one
+        ;; `assoc`, so `--overlay a.hdoc --overlay b.hdoc` collects into a
+        ;; vector instead of the second occurrence silently replacing the
+        ;; first.
         (and (not literal?) (= "--overlay" arg))
         (let [[value rest-args] (take-value arg)]
           (recur rest-args (update opts :overlay (fnil conj []) value) literal?))
@@ -1441,11 +1544,13 @@
 
 (defn- load-directory!
   "The library directory for `opts`, loaded now, or a hard error when
-  there is none at all. `what` prefixes the message, naming what needed it."
-  [opts kinds what]
-  (or (:library-directory opts)
-      ((references/directory-loader (directory-opts opts kinds)))
-      (throw (ex-info (str what ": " no-directory-message) {:type ::no-library-directory}))))
+  there is none at all. `what` prefixes the message, naming what needed it;
+  `fs-opts` are further `fs/provider` options (`directory-opts`)."
+  ([opts kinds what] (load-directory! opts kinds what {}))
+  ([opts kinds what fs-opts]
+   (or (:library-directory opts)
+       ((references/directory-loader (directory-opts opts kinds fs-opts)))
+       (throw (ex-info (str what ": " no-directory-message) {:type ::no-library-directory})))))
 
 (defn- find-library!
   "The Library `lib-name` of `dir`, or a hard error: an unknown library
@@ -1548,7 +1653,9 @@
   directory, whose load problems `build` has already reported, or the
   injected `:library-directory` value, or a lazy loader; a passage context
   sharing `resolve-opts`, so a book numbers and names its labels with this
-  build's lexicon; and `:self` for a book."
+  build's lexicon; `:self` for a book; and, for a `--build-site` page,
+  `::link-url`, which links every book inside the site instead of through
+  the directory's URL templates (`site-emitter`; TASK-269)."
   [opts kinds resolve-opts]
   (let [{book-id :id dir :directory} (::book opts)]
     (references/books-option
@@ -1556,8 +1663,14 @@
                              (:library-directory opts)
                              (references/directory-loader (directory-opts opts kinds)))
               :directory-reported? (some? dir)
-              :context (passage/context {:resolve-opts resolve-opts})}
-       book-id (assoc :self book-id)))))
+              ;; TASK-271: a site preview's renderer shares one context
+              ;; between the previews of a book (`::passage-context`, an
+              ;; atom made empty), so the book is resolved once
+              :context (if-let [cell (::passage-context opts)]
+                         (or @cell (swap! cell #(or % (passage/context {:resolve-opts resolve-opts}))))
+                         (passage/context {:resolve-opts resolve-opts}))}
+       book-id (assoc :self book-id)
+       (::link-url opts) (assoc :link-url (::link-url opts))))))
 
 (defn- with-books
   "`resolve-opts` -- the build's own `resolve-document` options -- with
@@ -1693,14 +1806,22 @@
     to stop the command with diagnostics of its own;
   - `:report`, `(fn [graph prepared base-dir] report)`, run on the
     scanned graph; `base-dir` is the working directory paths are shown
-    relative to.
+    relative to;
+  - `:fs-opts`, more `fs/provider` options for every directory loaded
+    here (`--build-site`'s `:listing-cache`, TASK-268; default none);
+  - `:scan`, `(fn [ctx scope] graph-or-result)` in place of `scan/scan`,
+    whose answer `:report` gets (`--build-site`'s `scan/refresh` of the
+    saved graph, TASK-272; default `scan/scan`).
+
+  Answers `{:report :prepared :ctx}`, `:ctx` being the scan context.
 
   Throws `:failed-type` when the command cannot run: no library
   directory, a directory file that cannot be read or is invalid, an
   `--extensions`/`--transform` file that cannot be loaded, an unknown
   library name in `:scope` (`unknown library \"x\"; known: a, b`), or the
   graph backend failing."
-  [opts {:keys [command failed-type flag-diagnostics scope prepare report]}]
+  [opts {:keys [command failed-type flag-diagnostics scope prepare report fs-opts]
+         scan-fn :scan :or {scan-fn scan/scan}}]
   (let [fail (fn [^Throwable e message]
                (throw (ex-info message {:type failed-type ::diagnostics flag-diagnostics} e)))
         backend-failed (fn [^Throwable e]
@@ -1717,12 +1838,13 @@
             transform-rules (rules/load-transforms (:transform opts) {:ctx sandbox-ctx})
             resolve-opts (shared-resolve-opts base-registry lexicon (set (keys front-matter/blocks))
                                               sidecar-extensions)
-            dir (load-directory! opts kinds command)
+            dir (load-directory! opts kinds command (or fs-opts {}))
             prepared (when prepare (prepare dir))
             own-dir (when (and (seq transform-rules) (nil? (:library-directory opts)))
                       (references/directory-loader
                        (directory-opts opts kinds
-                                       {:transform #(transform/transform-document % transform-rules)})))
+                                       (assoc fs-opts
+                                              :transform #(transform/transform-document % transform-rules)))))
             ctx (scan/context (cond-> {:directory dir :resolve-opts resolve-opts}
                                 own-dir (assoc :own-directory own-dir)))
             base-dir (or (::check-base-dir opts) (System/getProperty "user.dir"))
@@ -1731,13 +1853,13 @@
             ;; unknown library name is the caller's; anything else is the
             ;; backend's (doc-11: "a bug, not a document problem").
             result (try
-                     (report (scan/scan ctx scope) prepared base-dir)
+                     (report (scan-fn ctx scope) prepared base-dir)
                      (catch clojure.lang.ExceptionInfo e
                        (if (= ::scan/unknown-library (:type (ex-data e)))
                          (fail e (ex-message e))
                          (backend-failed e)))
                      (catch Exception e (backend-failed e)))]
-        {:report result :prepared prepared})
+        {:report result :prepared prepared :ctx ctx})
       (catch clojure.lang.ExceptionInfo e
         (if (= failed-type (:type (ex-data e)))
           (throw e)
@@ -1850,6 +1972,50 @@
       {:report report
        :diagnostics (into flag-diagnostics (:diagnostics prepared))})))
 
+(defn- image-handler
+  "The html emitter's `:image` handler for a `--build-site` page
+  (TASK-270): the built-in one with `:src` replaced by `(image-src
+  src)`, or, when that is nil (the image is not shown from the site,
+  `haselnuss.site/image-collector`), the image's alt text in its place,
+  as the sanitizer drops an unsafe image. `run`'s `::image-src`."
+  [image-src]
+  (let [built-in (:image html/built-in-inline-handlers)
+        text (:str html/built-in-inline-handlers)]
+    (fn [ctx inline footnotes]
+      (if-let [src (image-src (:src inline))]
+        (built-in ctx (assoc inline :src src) footnotes)
+        (text ctx {:t :str :text (str (:alt inline))} footnotes)))))
+
+(def ^:private site-book-link-prefix
+  "How the html emitter's built-in `:book-ref` handler starts a resolved
+  book link."
+  "<a class=\"book-ref\" href=\"")
+
+(defn- book-ref-handler
+  "The html emitter's `:book-ref` handler for a `--build-site` page and its
+  previews (TASK-275): the built-in one, with a resolved link (an `<a>`)
+  also carrying `data-passage`, the passage as written without whitespace
+  (`graph/passage-key`; empty for a link to the whole book) -- the key
+  the target book's `previews.json` files that passage under. The reader
+  app finds a tapped link's preview by it: the link's URL alone is
+  ambiguous, since two passages can land on one anchor (`#14:8` and
+  `#14:8-10` both on `v14-8`). A dangling link, a `<span>`, is unchanged.
+  Every other build keeps the built-in handler, so its output is as before."
+  []
+  (let [built-in (:book-ref html/built-in-inline-handlers)]
+    (fn [ctx inline footnotes]
+      (let [[^String out footnotes'] (built-in ctx inline footnotes)]
+        [(if (str/starts-with? out site-book-link-prefix)
+           (str "<a class=\"book-ref\" data-passage=\""
+                (-> (str (graph/passage-key (:passage inline)))
+                    (str/replace "&" "&amp;")
+                    (str/replace "<" "&lt;")
+                    (str/replace ">" "&gt;")
+                    (str/replace "\"" "&quot;"))
+                "\" href=\"" (subs out (count site-book-link-prefix)))
+           out)
+         footnotes']))))
+
 (defn run
   "The pure core (AC #1/#2/#3): parses `source`, resolves it, lowers it
   for `opts`' own target, and emits it. Returns `{:output :diagnostics
@@ -1891,6 +2057,14 @@
   gets the emitter's own default instead (`meta.bibliography` with its
   extension stripped), which names a `.bib` nothing here produces --
   such a caller is writing the files itself and owns that file too.
+  `::image-src` (html only; `--build-site`, TASK-270) is a fn of an
+  image's `src` answering the src the page uses, or nil to show the
+  alt text instead (`image-handler`); without it every src is emitted
+  as written. `::after-resolve` (TASK-271, a site preview's) is a fn of
+  the resolved document answering the document to sanitize, lower and
+  emit instead; `::passage-context` an atom holding the passage context
+  book references resolve through, made on first use and then shared by
+  every `run` given the same atom.
 
   Throws whatever `parse`/`lower`/`emit-document` throw. That is the
   unrecoverable half of the split this namespace's docstring describes
@@ -1989,7 +2163,13 @@
         ;; where it used to report the parse error -- true on every
         ;; target EXCEPT json/hdoc (TASK-107, just below), which never
         ;; make that report at all.
-        bib-path (bibliography-path opts (:bibliography (parser/front-matter source (when (:input opts) {:source (:input opts)}))))
+        ;; TASK-268: `::document` is a book's document already parsed (a
+        ;; generated book's, which has no source), used in place of
+        ;; `source`; its own `meta.bibliography` names the bibliography.
+        given-document (::document opts)
+        bib-path (bibliography-path opts (:bibliography (if given-document
+                                                          (:meta given-document)
+                                                          (parser/front-matter source (when (:input opts) {:source (:input opts)})))))
         ;; TASK-107: required everywhere except the json/hdoc branch
         ;; below, which reads this only for `vocabulary`'s `:cite-keys`
         ;; (never the bibliography's own content) and, per that branch's
@@ -2021,7 +2201,8 @@
                      ;; dangles.
                      {:kinds kinds
                       :cite-keys (set (keys bibliography))})
-        document (parser/parse source (cond-> vocabulary (:input opts) (assoc :source (:input opts))))
+        document (or given-document
+                     (parser/parse source (cond-> vocabulary (:input opts) (assoc :source (:input opts)))))
         ;; TASK-103, doc-7 decision 1: the transform pass runs HERE,
         ;; immediately after parsing and before the json/hdoc-vs-resolve
         ;; branch below, so it composes with EVERY target -- including
@@ -2196,6 +2377,10 @@
             diagnostics (into (vec flag-diagnostics)
                               (into (vec transform-diagnostics)
                                     (into (vec overlay-load-warnings) diagnostics)))
+            ;; TASK-271: a site preview cuts its quoted passage here, on the
+            ;; resolved document, so the sanitizer and the emitter below
+            ;; see only what is kept (`site-previewer`).
+            document (if-let [f (::after-resolve opts)] (f document) document)
             ;; TASK-136. After the resolver, so overlay-copied `describe`
             ;; props and bibliography links are already in the tree, and
             ;; before lowering and every emitter: a javascript:/data: URL
@@ -2337,11 +2522,21 @@
               (try
                 {:output (case emit-target
                            :html (html/emit-document lowered
-                                                     (assoc emit-opts
-                                                            :ordered-keys ordered-keys
-                                                            :stylesheet (if (:no-stylesheet opts)
-                                                                          :none
-                                                                          :default)))
+                                                     (cond-> (assoc emit-opts
+                                                                    :ordered-keys ordered-keys
+                                                                    :stylesheet (if (:no-stylesheet opts)
+                                                                                  :none
+                                                                                  :default))
+                                                       ;; TASK-270: a site page's images
+                                                       ;; point at their copies; TASK-275:
+                                                       ;; its book links say their passage
+                                                       (or (::image-src opts) (::link-url opts))
+                                                       (assoc :inline-handlers
+                                                              (cond-> {}
+                                                                (::image-src opts)
+                                                                (assoc :image (image-handler (::image-src opts)))
+                                                                (::link-url opts)
+                                                                (assoc :book-ref (book-ref-handler))))))
                            :latex (latex/emit-document lowered latex-opts))
                  :preamble (when fragment-latex? (latex/emit-preamble lowered latex-opts))
                  :front-matter (when fragment-latex? (latex/emit-front-matter lowered latex-opts))}
@@ -2425,6 +2620,11 @@
      ;; a document with none, and nil for any other build -- a
      ;; standalone document places them itself.
          :front-matter front-matter
+     ;; TASK-268: the warnings only lowering and emitting this document
+     ;; find -- links the sanitizer dropped, what an untrusted extension's
+     ;; output lost -- which a library scan (`--check`) never sees, so
+     ;; `--build-site` reports them beside the scan's.
+         ::emit-diagnostics (into (vec sanitize-diagnostics) @extension-warnings)
          :output output}))))
 
 (def ^:private generated-bibtex-marker
@@ -3041,6 +3241,608 @@
                           e))
           (throw e))))))
 
+;; --- --build-site (TASK-268, doc-12 "The build: --build-site") ------------------
+
+(def ^:private site-flags
+  "The build options a site build uses: every page is an `html` build of
+  its book with them."
+  #{:extensions :transform :trusted-extensions})
+
+(defn- site-flag-diagnostics
+  "One irrelevant-flag warning (TASK-108's policy) per build option given
+  with `--build-site` that a page does not use -- the folder decides where
+  pages go and the page is always the default `html` -- and
+  `--trusted-extensions` with no `--extensions`, as for a build."
+  [opts]
+  (cond-> (vec (for [[k flag] build-only-flags
+                     :when (and (not (site-flags k)) (some? (get opts k)))]
+                 (irrelevant-flag-diagnostic flag (str flag " has no effect with --build-site"))))
+    (and (:trusted-extensions opts) (empty? (:extensions opts)))
+    (conj (irrelevant-flag-diagnostic
+           "--trusted-extensions" "--trusted-extensions grants nothing with no --extensions given"))))
+
+(defn- site-directory-file
+  "The library directory file a site build of `opts` reads, or nil (an
+  injected `:library-directory`, or none found)."
+  [opts]
+  (when (nil? (:library-directory opts))
+    (try (directory/find-directory-file (directory-opts opts nil))
+         (catch Exception _ nil))))
+
+(defn- site-inputs
+  "`{[role position path] digest}` of a site build's input files -- the
+  library directory file (`:libraries`), the `--extensions` and
+  `--transform` files in command-line order -- for the saved state
+  (`haselnuss.library.state/input-digests`): reordering the files, or
+  moving one to the other flag, changes it. And, when given,
+  `--trusted-extensions`, the one other option a page's build uses
+  (`site-flags`), keyed `[:trusted-extensions 0 \"--trusted-extensions\"]`:
+  without it an untrusted extension's output is sanitized, so giving or
+  withdrawing it changes every page an extension touches, and the next
+  build is a full one (TASK-296 review; before, withdrawing trust kept
+  the pages built with it)."
+  [opts]
+  (let [canonical #(.getCanonicalPath (io/file %))
+        directory-file (site-directory-file opts)
+        role (fn [k paths] (map-indexed (fn [i p] [k i (canonical p)]) paths))]
+    (cond-> (state/input-digests (concat (role :libraries (when directory-file [directory-file]))
+                                         (role :extensions (:extensions opts))
+                                         (role :transform (:transform opts))))
+      (:trusted-extensions opts) (assoc [:trusted-extensions 0 "--trusted-extensions"] "given"))))
+
+(defn- site-emitter
+  "`(fn [Book site] {:html :diagnostics :images :image-dir})` (`site`:
+  `haselnuss.site/image-collector`'s) for the books of the loaded
+  directory `dir`: the `html` build of the book, and the warnings only
+  its lowering and emitting found (`run`'s `::emit-diagnostics`: the
+  scan reports every other one), with `opts`' `--extensions` and
+  `--transform`, exactly as building it by its BOOK-ID would be (`run` with
+  `::book`, so its references resolve through `dir` and its own `:self`).
+  A filesystem book is built from its entry file. Any other book (a
+  generated one) has no source: its document is built as given, and
+  `--transform` does not rewrite it, as `--check` reads it (TASK-242).
+  Throws when the book cannot be built.
+
+  Unlike that build, every book link and quote source points at the
+  target's page in the site, relative to this book's page, and no `url:`
+  template is used (`::link-url`, `haselnuss.site/book-url`; doc-12,
+  \"Output folder\"; TASK-269). And every image with a relative src is
+  read from the book's folder (the entry file's) and answered as
+  `:images`, to be copied beside the page, its src pointing at the copy;
+  one that cannot be (it leaves the folder, is no web image, is missing
+  or too large, would land in another book's page folder, or the book is
+  generated and has no folder) is dropped to its alt
+  text with a warning (`::image-src`, `haselnuss.site/image-collector`;
+  TASK-270). `:image-dir` is that folder."
+  [opts dir]
+  (let [base (cond-> {:target "html"}
+               (seq (:extensions opts)) (assoc :extensions (:extensions opts))
+               (:trusted-extensions opts) (assoc :trusted-extensions true))
+        ;; TASK-279: one passage context for every page of the build, so a
+        ;; book the pages refer to is resolved once, not once per citing
+        ;; page (a Bible book cited by thousands of notes; the anchor check
+        ;; of a locator, TASK-269, resolves it whole). What a page shows of
+        ;; another book never depends on the page: the context keeps only
+        ;; the build-wide resolver options, the same for every page.
+        passages (atom nil)]
+    (fn [book site]
+      (let [id (:id (library/book-entry book))
+            image-dir (when (fs/filesystem-book? book)
+                        (.getParentFile (.getAbsoluteFile (io/file (fs/entry-file book)))))
+            images (site/image-collector image-dir site)
+            book-opts (assoc base
+                             ::passage-context passages
+                             ::book {:id id :directory dir}
+                             ::link-url (fn [to passage anchor] (site/book-url id to passage anchor))
+                             ::image-src (:src images))
+            [result book-meta]
+            (if (fs/filesystem-book? book)
+              (let [input (str (fs/entry-file book))
+                    source (slurp input)
+                    result (run source
+                                (cond-> (assoc book-opts
+                                               :input input
+                                               :base-dir (.getParent (.getAbsoluteFile (io/file input))))
+                                  (seq (:transform opts)) (assoc :transform (:transform opts))))]
+                ;; read after the build, which has already refused a
+                ;; front matter that does not parse
+                [result (parser/front-matter source {:source input})])
+              (let [document (library/document book)]
+                (when (library/diagnostic? document)
+                  (throw (ex-info (:message document) {:type ::book-failed})))
+                [(run nil (assoc book-opts ::document document)) (:meta document)]))
+            copied ((:result images))
+            authors (:authors book-meta)]
+        {:html (:output result)
+         :diagnostics (into (vec (::emit-diagnostics result)) (:diagnostics copied))
+         :images (:images copied)
+         :image-dir image-dir
+         ;; TASK-272: refused for what is on disk, which a later build
+         ;; must notice changing
+         :refused-images (:refused copied)
+         ;; TASK-271: for the catalog, as the front matter names them
+         :authors (if (sequential? authors) (filterv string? authors) [])}))))
+
+(defn- site-previewer
+  "`(fn [BookId passages] [{:key :ref :title :url :html :cut?}])`, the
+  `previews.json` renderer `haselnuss.site/write-site!` calls with a
+  book's `site/preview-passages` (doc-12, \"Output folder\": link
+  previews; TASK-271). Each passage is rendered exactly as `!quote <the
+  passage's canonical reference>` would be on the book's own page: a
+  document of that one quote built by `run` as an `html` build with
+  `opts`' `--extensions`, through the library directory `dir`, every
+  book link and the quote's source pointing into the site relative to
+  the book's page (`site/book-url` from the book itself) -- so relative
+  to `previews.json`, which sits beside it -- and an image only when the
+  page copied it, `copied` (`site/preview-image-src`), else its alt text.
+  Before it is sanitized and emitted, the quoted passage is cut at about
+  `site/preview-limit` characters on the AST (`site/cut-passage`), so the
+  markup is whole.
+
+  Answered per passage: `:key` the passage key, `:ref` the canonical
+  reference, `:title` the passage's title as text, `:url` the quote's
+  source URL (`index.html#<anchor>`), `:html` the content of the emitted
+  `<body>` -- the quote's `<figure>`, the passage in its `<blockquote>`
+  and the source in its `<figcaption>`, then any footnotes -- and `:cut?`.
+  A passage that no longer resolves, or whose build throws, is `{:key
+  :failed message}` instead, which the build reports as a
+  `preview-failed` warning. Everything comes from the book itself (the
+  passages to show come from the graph): a body edit of the book changes
+  only its own `previews.json`. One passage context per call, so the
+  book is resolved once for all its previews."
+  [opts dir]
+  (let [base (cond-> {:target "html" :library-directory dir}
+               (seq (:extensions opts)) (assoc :extensions (:extensions opts))
+               (:trusted-extensions opts) (assoc :trusted-extensions true))]
+    (fn [id passages copied]
+      (let [cell (atom nil)
+            image-src (site/preview-image-src copied)]
+        (mapv (fn [{passage-key :key :keys [passage]}]
+                (let [ref-text (book-ref/format-book-ref (cond-> {:id id} passage (assoc :passage passage)))
+                      found (volatile! nil)
+                      cut (fn [document]
+                            (let [[quote-node] (:blocks document)]
+                              (if (and (= :book-quote (keyword (:t quote-node))) (:canonical quote-node))
+                                (let [{:keys [blocks cut?]} (site/cut-passage (:blocks quote-node)
+                                                                              site/preview-limit)]
+                                  (vreset! found {:ref (:canonical quote-node)
+                                                  :title (site/node-text (:title quote-node))
+                                                  :url (:url quote-node)
+                                                  :cut? cut?})
+                                  (assoc document :blocks [(assoc quote-node :blocks blocks)]))
+                                document)))
+                      result (try
+                               (run nil (assoc base
+                                               ::document {:meta {} :blocks [{:t :book-quote :ref ref-text}]}
+                                               ::link-url (fn [to p anchor] (site/book-url id to p anchor))
+                                               ::image-src image-src
+                                               ::passage-context cell
+                                               ::after-resolve cut))
+                               (catch Exception e
+                                 {::failed (or (ex-message e) (.getName (class e)))})
+                               (catch StackOverflowError _
+                                 {::failed "the passage is nested too deeply to preview"}))]
+                  (cond
+                    (::failed result) {:key passage-key :failed (::failed result)}
+                    (nil? @found) {:key passage-key
+                                   :failed (str "!quote " ref-text " no longer resolves")}
+                    ;; TASK-275: `:math?` is whether the emitter gave the
+                    ;; page MathJax (its `mathjax-config` and pinned
+                    ;; script come together, only when there is maths)
+                    :else (assoc @found
+                                 :key passage-key
+                                 :html (site/page-body (:output result))
+                                 :math? (str/includes? (:output result) "<script id=\"MathJax-script\"")))))
+              passages)))))
+
+(defn- site-start
+  "Where a site build of `opts` into `site-dir`, whose input digests are
+  `inputs` (`site-inputs`), starts (doc-12, \"What gets rebuilt\" step 1;
+  TASK-272): `{:loaded state}` (`haselnuss.library.state/load-state`)
+  when the folder is a site whose saved state is usable and was saved
+  with the same inputs, else `{:full reason}`, the reason each rebuilt
+  book's line gives: `--full`, no state, another Haselnuss version or
+  state format, a state that cannot be read, or changed inputs (the
+  directory file, an `--extensions` or `--transform` file, their order or
+  flags; `--trusted-extensions` given or withdrawn).
+
+  `scope` (TASK-297), when not nil, is the set of libraries whose state
+  to load (`state/load-state`'s `:libraries`)."
+  [opts site-dir inputs scope]
+  (if (:full opts)
+    {:full "full build: --full"}
+    (let [loaded (when (site/site? site-dir)
+                   (state/load-state site-dir (cond-> {} scope (assoc :libraries scope))))]
+      (cond
+        (nil? loaded) {:full "full build"}
+        (not (:usable? loaded)) {:full (case (:reason loaded)
+                                         :missing "full build"
+                                         :version "full build: another Haselnuss version built the site"
+                                         :format "full build: the saved state has another format"
+                                         "full build: the saved state cannot be read")}
+        (not= (state/plain inputs) (:inputs loaded))
+        (let [trust [:trusted-extensions 0 "--trusted-extensions"]]
+          {:full (if (= (dissoc (state/plain inputs) trust) (dissoc (:inputs loaded) trust))
+                   "full build: --trusted-extensions was given or withdrawn"
+                   "full build: the directory file, --extensions or --transform changed")})
+        :else {:loaded loaded}))))
+
+(defn- site-library-roots
+  "The root folder of every library of the saved graph `g0` and of every
+  filesystem library of `ctx`'s directory, as path strings: handed to
+  `scan/refresh`, each makes it list its library again, so books added,
+  removed and moved are seen (doc-12, \"What gets rebuilt\" step 2). (A
+  refresh lists only libraries `g0` has records for: given a graph of
+  some libraries, TASK-297, it lists only those.)"
+  [ctx g0]
+  (let [dir (:directory ctx)]
+    (into (into #{} (map str) (vals (site/library-roots g0)))
+          (keep (fn [lib-name]
+                  (let [lib (library/find-library dir lib-name)]
+                    (when (fs/filesystem-library? lib) (fs/library-root lib)))))
+          (when dir (scan/directory-library-names dir)))))
+
+(defn- delta-refused
+  "Why a build of only some libraries (TASK-297), whose refresh of `g0`
+  gave `g`, cannot stand for a build of every library, or nil when it
+  can: a library became available or unavailable (every
+  `:unknown-library` message lists them, in every library), or a book
+  now refers to one of the libraries `carried`, left as they were --
+  whose pages, backlinks and items that may change, which a build of
+  only the others would not see."
+  [g0 g carried]
+  (let [before (graph/indexed-libraries g0)
+        after (graph/indexed-libraries g)]
+    (cond
+      (some (fn [[lib record]] (not= (:status record) (:status (get before lib)))) after)
+      "a library became available or unavailable"
+      (some (fn [id]
+              (some #(contains? carried (first (graph/target-key %))) (graph/edges-from g id)))
+            (keys (graph/indexed-books g)))
+      "a book refers to a library left as it was"
+      :else nil)))
+
+(defn- site-env
+  "What a site build's record of an unchanged site
+  (`haselnuss.site.unchanged`) depends on besides the files it stamps:
+  the input digests (`site-inputs`), the home folder (a `~` in the
+  directory file), the folder paths are shown relative to,
+  `--trusted-extensions`, and this build's identity
+  (`haselnuss.version/build-identity`: every development build shares
+  one version, and a rebuilt binary may report or emit otherwise; nil,
+  unknown, is never a hit). `::build-identity` (a test seam) stands for
+  it."
+  [opts inputs base-dir]
+  {:inputs inputs
+   :home (if (contains? opts :library-home) (:library-home opts) (System/getProperty "user.home"))
+   :base-dir base-dir
+   :trusted-extensions (boolean (:trusted-extensions opts))
+   :build (if (contains? opts ::build-identity) (::build-identity opts) (version/running-build-identity))})
+
+(defn- build-site*
+  "`--build-site DIR` (doc-12; TASK-268, TASK-272): build every library of
+  the directory into the site folder `DIR` (`haselnuss.site`), rebuilding
+  only what changed since the saved state (`haselnuss.library.state`) when
+  it can be trusted (`site-start`), else everything. Scans the libraries
+  as `--check` does (`scan-for-report`, with the same `--extensions` and
+  `--transform`) -- incrementally, by `scan/refresh` of the saved graph
+  with the files whose stamps changed (`haselnuss.site.incremental/
+  check-files`) and every library root -- then follows the plan
+  `haselnuss.site.incremental/plan` makes (`site/full-plan` on a full
+  build): writes the reader app's files and the pages to rebuild, the
+  data files that changed, the catalog, removes pages no book has, and
+  saves the build state last, with the file stamps (`check-files`'s,
+  taken before the build read the files, and `verified-stamps` for files
+  it read first). Answers `{:diagnostics :lines :items :shown :summary}`:
+  the irrelevant-flag warnings, a line per book, the `--check` items of
+  every book with the warnings only emitting its page found (sanitizer
+  and untrusted-extension drops) and an `:emit-failed` error per page not
+  written -- for all books, kept ones as their last build saved them --
+  those of them to print (`:shown`), and `haselnuss.site/write-site!`'s
+  summary counts.
+
+  Throws `::site-failed` (exit 2) when the build cannot run, before
+  anything is written: `DIR` neither empty nor a site, or not writable
+  (`site/preflight!`); no library directory, or one that cannot be read
+  or is invalid; an `--extensions`/`--transform` file that cannot be
+  loaded; another build holding the lock -- and when it stops partway
+  (the graph backend failing, a file of the app or the state that cannot
+  be written). The lock is taken after the inputs have loaded, so every
+  refusal above leaves `DIR` as it was.
+
+  `::site-threads` (not a command-line option) sets the emit pool's size;
+  default the cores. `::site-hook`, a test seam, is `write-site!`'s
+  `:hook`, and is called with `:save` just before the state is saved: a
+  hook that throws stands for a build killed there.
+
+  `::delta` (TASK-297), `haselnuss.site.unchanged/delta-scope` of what
+  the record of the last build tells (`site-unchanged`): every library
+  outside its `:libraries` is as that build left it, and none of them
+  refers to or is referred to by one inside. The build then loads,
+  lists, builds and sweeps only those libraries -- the others' state
+  parts, pages, catalog files and share of the summary are carried as
+  they are (`write-site!`'s `:frozen`, `save-state!`'s `:carry`) -- unless
+  the refresh shows that cannot stand for a build of every library
+  (`delta-refused`), or the saved state cannot be used or is not the one
+  the record was saved beside (another build saved since), or -- told
+  under this build's lock, held until its state is saved -- the record
+  is not the one examined (another build ran, finished or not) or a
+  pending list is there: then it
+  throws `::delta-fallback` before it has written a page, a data file,
+  the catalog or the state -- by then it may hold the lock and have
+  cleared the record (`:prepare`), which the long run writes again --
+  and the caller builds the long way."
+  [opts]
+  (let [site-dir (:build-site opts)
+        flag-diagnostics (site-flag-diagnostics opts)
+        fail (fn [^Throwable e]
+               (throw (ex-info (or (ex-message e) (str e))
+                               {:type ::site-failed ::diagnostics flag-diagnostics} e)))
+        lock (volatile! nil)
+        ;; TASK-297 review: why `:prepare` found the site not as examined
+        slipped-in (volatile! nil)
+        {scope :libraries :keys [carried global-folders] :as delta} (::delta opts)]
+    (try
+      (site/preflight! site-dir)
+      (let [;; step 1: the saved state, loaded once, and the input
+            ;; digests, both before anything is read for the build
+            inputs (site-inputs opts)
+            start (volatile! (site-start opts site-dir inputs scope))
+            _ (when (and delta (not (:loaded @start)))
+                (throw (ex-info "the saved state cannot be used" {:type ::delta-fallback})))
+            ;; TASK-297 review: the record was examined under a lock since
+            ;; released; a build that saved in between left a state the
+            ;; record's shares of the other libraries do not stand beside
+            ;; (the lock's own check below then covers the rest)
+            _ (when (and delta (not= (:generation delta) (get-in @start [:loaded :generation])))
+                (throw (ex-info "another build saved the state since the record was read"
+                                {:type ::delta-fallback})))
+            ;; step 2: the stamps of every file the saved graph names,
+            ;; taken before the refresh reads any of them
+            checked (when-let [{g0 :graph files :files} (:loaded @start)]
+                      (incremental/check-files (incremental/graph-files g0) files))
+            {scanned :report :keys [ctx]}
+            (scan-for-report opts
+                             {:command "--build-site"
+                              :failed-type ::site-failed
+                              :flag-diagnostics flag-diagnostics
+                              :scope nil
+                              ;; TASK-266: list with the saved listing cache
+                              ;; (a fresh one on a full build), saved below
+                              :fs-opts {:listing-cache (or (get-in @start [:loaded :listing]) {})}
+                              :prepare (fn [_]
+                                         (vreset! lock (site/acquire-lock! site-dir))
+                                         ;; TASK-297 review: the record was examined
+                                         ;; under a lock since released. Any build that
+                                         ;; took it meanwhile and was not a hit cleared
+                                         ;; the record in its own `:prepare`, finished or
+                                         ;; not; one that stopped partway left its pending
+                                         ;; lists, which a build of some libraries would
+                                         ;; drop for the others. Checked under this lock
+                                         ;; hold, which lasts until the state is saved.
+                                         (when (and delta
+                                                    (or (nil? (:record-digest delta))
+                                                        (not= (:record-digest delta)
+                                                              (unchanged/record-digest (:dir @lock)))
+                                                        (incremental/pending? (:dir @lock))
+                                                        (site/images-pending? (:dir @lock))))
+                                           (vreset! slipped-in "another build ran since the record was read"))
+                                         ;; TASK-296: this run may change the site;
+                                         ;; until its end says otherwise, the next
+                                         ;; one must look for itself
+                                         (unchanged/clear! (:dir @lock))
+                                         ;; the state was loaded before the lock:
+                                         ;; another build may have saved since
+                                         (when-let [{:keys [generation]} (:loaded @start)]
+                                           (when (not= generation (state/saved-generation (:dir @lock)))
+                                             (vreset! start {:full (str "full build: another build saved"
+                                                                        " the state meanwhile")})))
+                                         nil)
+                              ;; step 3: refresh the saved graph with the changed
+                              ;; files and every library root, so each library is
+                              ;; listed again
+                              :scan (fn [ctx whole]
+                                      (if-let [{g0 :graph} (and (not @slipped-in) (:loaded @start))]
+                                        (let [refreshed (scan/refresh ctx g0 (into (:changed checked)
+                                                                                   (site-library-roots ctx g0)))]
+                                          (if-let [why (and delta (delta-refused g0 (:graph refreshed) carried))]
+                                            {::fallback why}
+                                            refreshed))
+                                        (if delta
+                                          {::fallback (or @slipped-in "the saved state cannot be used")}
+                                          (scan/scan ctx whole))))
+                              :report (fn [x _ _] x)})
+            _ (when (::fallback scanned)
+                (throw (ex-info (::fallback scanned) {:type ::delta-fallback})))
+            loaded (:loaded @start)
+            g (if loaded (:graph scanned) scanned)
+            dir (:directory ctx)
+            ;; the real path: a DIR that is (or sits below) a symbolic link
+            ;; is built where it leads, and nothing below it is followed
+            real-dir (:dir @lock)
+            base-dir (or (::check-base-dir opts) (System/getProperty "user.dir"))
+            hook (::site-hook opts)
+            pending (when loaded (incremental/read-pending real-dir))
+            plan (fn [entries]
+                   (let [p (if loaded
+                             (incremental/plan entries
+                                               {:dir real-dir
+                                                :old-graph (:graph loaded)
+                                                :refresh scanned
+                                                :narrowed (rebuild/narrowed (:graph loaded) scanned)
+                                                :saved (:books loaded)
+                                                :pending pending})
+                             (site/full-plan entries (:full @start)))]
+                     ;; before any page is written: a build that stops
+                     ;; before its state is saved rebuilds them next time
+                     (incremental/write-pending! real-dir p)
+                     p))
+            lib-names (cond->> (scan/directory-library-names dir)
+                        delta (filterv #(contains? scope %)))
+            result (site/write-site! real-dir
+                                     (cond-> {:directory dir
+                                              :library-names lib-names
+                                              :emit (site-emitter opts dir)
+                                              :threads (::site-threads opts)
+                                              :report (check/check-report g {:base-dir base-dir})
+                                              :library-diagnostics (mapcat :diagnostics
+                                                                           (vals (graph/indexed-libraries g)))
+                                              :base-dir base-dir
+                                              :graph g
+                                              :previews (site-previewer opts dir)
+                                              :plan plan
+                                              :hook hook}
+                                       ;; TASK-297: the other libraries as their
+                                       ;; last build left them
+                                       delta (assoc :frozen (update-vals carried (comp :settled :piece)))))
+            records (graph/indexed-books g)
+            files (incremental/graph-files g)
+            pre-read (select-keys (:stamps checked) files)
+            stamps (merge (incremental/verified-stamps g (remove #(contains? pre-read %) files)) pre-read)
+            books (into {}
+                        (map (fn [[id entry]]
+                               [id (cond-> entry
+                                     (get-in records [id :hash])
+                                     (assoc :hash (get-in records [id :hash])))]))
+                        (:books result))
+            listing (cond-> (scan/listing-caches ctx)
+                      delta (select-keys lib-names))
+            {:keys [rescanned rewritten vanished]} (when loaded (:changes scanned))]
+        (when hook (hook :save nil))
+        ;; step 7, last, so an interrupted build leaves the previous state.
+        ;; A page's emit diagnostics and preview failures are kept with it,
+        ;; so a later run that does not rebuild the page still counts them.
+        ;; A run that changed nothing the state holds -- no record, no
+        ;; page's entry, no stamp, no listing -- leaves it as it is: at
+        ;; 50,000 books saving it is seconds of a no-change run.
+        (when-not (and loaded
+                       (empty? rescanned) (empty? rewritten) (empty? vanished)
+                       (= (graph/indexed-libraries g) (graph/indexed-libraries (:graph loaded)))
+                       (= books (:books loaded))
+                       (= stamps (:files loaded))
+                       (= listing (:listing loaded)))
+          (state/save-state! real-dir
+                             (cond-> {:graph g
+                                      :inputs inputs
+                                      :books books
+                                      :files stamps
+                                      :listing listing
+                                      ;; TASK-297: a part as it was loaded is kept
+                                      :previous (:saved-parts loaded)}
+                               delta (assoc :carry (state/carried-parts (:header loaded) (keys carried))
+                                            ;; TASK-297 review: a file a carried
+                                            ;; library's books claim too goes where
+                                            ;; the whole build puts it
+                                            :other-claimants (unchanged/carried-claimants carried files)))))
+        (incremental/clear-pending! real-dir)
+        ;; TASK-296: last, what the next run checks to tell that nothing
+        ;; changed since -- when this run left the site settled and
+        ;; everything it read is stamped well enough to trust (else the
+        ;; record cleared at the start stays away)
+        ;; (an optimisation: whatever fails here leaves no record, and the
+        ;; build, done and saved, does not fail for it)
+        (try
+          (let [r (unchanged/record (assoc (site-env opts inputs base-dir)
+                                           :generation (state/saved-generation real-dir)
+                                           :output (when (nil? (:library-directory opts)) (:settled result))
+                                           :libraries (:libraries result)
+                                           :catalog (:catalog result)
+                                           :lib-names lib-names
+                                           :books books
+                                           :files-by-lib (unchanged/graph-files-by-library g)
+                                           :stamps stamps
+                                           :listing listing
+                                           :walks (scan/listing-walks ctx)
+                                           :links (unchanged/graph-links g)
+                                           :carried carried
+                                           ;; stamped after the sweep: a file another
+                                           ;; process wrote into books/ while this build
+                                           ;; held the lock is taken for the build's own
+                                           :books-dir (io/file real-dir "books")
+                                           :site-entries (unchanged/site-folder-entries
+                                                          (io/file real-dir "books")
+                                                          (distinct (concat (:folders result) global-folders)))
+                                           :manifest (unchanged/manifest-digest real-dir)))]
+            (when (:head r)
+              (unchanged/write-record! real-dir r)))
+          (catch Exception _ (unchanged/clear! real-dir)))
+        (-> result
+            (dissoc :settled :catalog :folders :libraries)
+            (assoc :diagnostics flag-diagnostics)))
+      (catch clojure.lang.ExceptionInfo e
+        (if (contains? #{::site-failed ::delta-fallback} (:type (ex-data e))) (throw e) (fail e)))
+      (catch Exception e (fail e))
+      (finally (site/release-lock! @lock)))))
+
+(defn- site-unchanged
+  "TASK-296: what a `--build-site` run of `opts` answers when the record
+  the last build left (`haselnuss.site.unchanged/check`) tells that
+  nothing changed since: that build's settled summary, after writing the
+  reader app's files where they differ and sweeping the top of the site
+  and the catalog, as a no-change build does. nil when the build has to
+  look: `--full`, an injected `:library-directory` (no file to stamp),
+  `DIR` no site (or refused by `site/preflight!`), no record, anything it
+  stamps changed, or another build holding the lock -- the build then
+  reports each as it always did. Throws `::site-failed` when an app file
+  or a sweep fails.
+
+  Answers `{:output output}` on a hit, and -- TASK-297 -- `{:delta
+  scope}` when the record tells that only some libraries changed
+  (`haselnuss.site.unchanged/examine`, `delta-scope`), for `build-site*`'s
+  `::delta`."
+  [opts]
+  (let [site-dir (:build-site opts)]
+    (when (and (not (:full opts)) (nil? (:library-directory opts))
+               (try (site/preflight! site-dir) (site/site? site-dir) (catch Exception _ false)))
+      (when-let [lock (try (site/acquire-lock! site-dir) (catch Exception _ nil))]
+        (try
+          (let [dir (:dir lock)
+                env (site-env opts (site-inputs opts) (or (::check-base-dir opts) (System/getProperty "user.dir")))
+                {:keys [hit delta]} (try (unchanged/examine dir env) (catch Exception _ nil))]
+            (cond
+              hit
+              (let [{:keys [output index libraries]} hit]
+                (site/copy-app-files! dir)
+                (site/sweep-catalog! dir (into (if index #{"catalog/index.json"} #{})
+                                               (mapcat (comp keys :catalog :settled val))
+                                               libraries))
+                (site/sweep-root! dir)
+                {:output (assoc output :unchanged? true :diagnostics (site-flag-diagnostics opts))})
+
+              ;; read under the lock `examine` read the record under, so it
+              ;; is that record's (TASK-297 review: `build-site*`'s
+              ;; `:prepare` compares it again under its own lock)
+              delta {:delta (assoc (unchanged/delta-scope delta)
+                                   :record-digest (unchanged/record-digest dir))}
+
+              :else nil))
+          (catch Exception e
+            (throw (ex-info (or (ex-message e) (str e))
+                            {:type ::site-failed ::diagnostics (site-flag-diagnostics opts)} e)))
+          (finally (site/release-lock! lock)))))))
+
+(defn build-site
+  "`--build-site DIR`: `site-unchanged` when the last build's record
+  shows that nothing changed since (TASK-296), else the build itself
+  (`build-site*`) -- of only the libraries the record shows may have
+  changed, and those connected to them, when it can (TASK-297; it falls
+  back to the whole build when that turns out not to stand for one).
+  The build identity (`site-env`) is read once, here, so the check and
+  the record a long run saves at its end name the same build -- the one
+  that ran, not whatever is on disk by then (TASK-296 review)."
+  [opts]
+  (let [opts (cond-> opts
+               (not (contains? opts ::build-identity))
+               (assoc ::build-identity (version/running-build-identity)))
+        {:keys [output delta]} (site-unchanged opts)]
+    (cond
+      output output
+      delta (or (try (build-site* (assoc opts ::delta delta))
+                     (catch clojure.lang.ExceptionInfo e
+                       (when-not (= ::delta-fallback (:type (ex-data e))) (throw e))))
+                (build-site* opts))
+      :else (build-site* opts))))
+
 (defn- err-line!
   "Prints `line` to stderr as exactly one line, its control and format
   characters `haselnuss.library.graph.text/escape-controls`ed (TASK-247).
@@ -3096,6 +3898,42 @@
   ([message data]
    (err-line! (str "haselnuss: error: " message (error-detail data)))))
 
+;; --- --serve (TASK-273, doc-12 "The server: --serve") ----------------------------
+
+(defn- serve-flag-diagnostics
+  "One irrelevant-flag warning per option given with `--serve` that it
+  does not use: it serves what a build wrote and reads no library."
+  [opts]
+  (vec (for [[k flag] (conj build-only-flags [:libraries "--libraries"])
+             :when (some? (get opts k))]
+         (irrelevant-flag-diagnostic flag (str flag " has no effect with --serve")))))
+
+(defn- serve-site
+  "`--serve DIR` (`haselnuss.serve`): warns about the flags it ignores,
+  starts the server on `--bind` (default 127.0.0.1) and `--port` (default
+  8080), prints where it listens, and serves until the process is
+  stopped. Throws `::serve-failed` (exit 2) when `DIR` is not a built
+  site or the server cannot start. `::serve-hook`, a test seam, is
+  called with the running server instead of waiting; the server is then
+  stopped and this returns 0."
+  [opts]
+  (let [diagnostics (serve-flag-diagnostics opts)
+        _ (run! warn! diagnostics)
+        server (try (serve/start! (cond-> {:dir (:serve opts)}
+                                    (contains? opts :port) (assoc :port (:port opts))
+                                    (contains? opts :bind) (assoc :bind (:bind opts))
+                                    (contains? opts :hosts) (assoc :hosts (:hosts opts))))
+                    (catch clojure.lang.ExceptionInfo e
+                      (throw (ex-info (ex-message e) {:type ::serve-failed} e))))]
+    (err-line! (str "haselnuss: serving " (:serve opts) " at " (:url server) " (stop with Ctrl-C)"))
+    ;; TASK-292: a request to any other Host answers 421; say which are
+    ;; accepted, so a proxy's name missing a --host is plain to see
+    (err-line! (str "haselnuss: answering requests to " (:answers-to server)
+                    " (more with --host NAME)"))
+    (if-let [hook (::serve-hook opts)]
+      (try (hook server) 0 (finally (serve/stop! server)))
+      @(promise))))
+
 (defn main*
   "The whole command-line behavior except the process exit itself:
   parses `args`, runs `build`, prints every diagnostic to stderr, and
@@ -3122,7 +3960,7 @@
      (let [opts (merge (parse-args args) overrides)]
        (cond
          (:help opts) (do (println usage) 0)
-         (:version opts) (do (println (str "haselnuss " @version)) 0)
+         (:version opts) (do (println (str "haselnuss " (version/version))) 0)
         ;; TASK-157: the listing is the document here, so it goes to
         ;; stdout; the library's problems go to stderr like any warning.
          (:list-books opts)
@@ -3153,6 +3991,19 @@
                     (backlinks/render-text report)))
            (flush)
            0)
+         ;; TASK-268: a build, so every line goes to stderr, as a build's
+         ;; do: a line per book, the problems as --check prints them, and
+         ;; the summary. 0 or 1 by the problems; 2 when it could not run.
+         (:build-site opts)
+         (let [{:keys [diagnostics lines items shown summary]} (build-site opts)]
+           (run! warn! diagnostics)
+           (run! err-line! lines)
+           (run! #(err-line! (check/render-line %)) (or shown items))
+           (err-line! (site/summary-line summary))
+           (site/exit-status summary))
+         ;; TASK-273: runs until stopped; 2 when it cannot start.
+         (:serve opts)
+         (serve-site opts)
          :else
          (let [{:keys [diagnostics bibtex-path front-matter-paths]
                 written :output-path preamble-file :preamble-path}
@@ -3195,6 +4046,8 @@
          ;; that cannot run at all is 2.
          ::check-failed 2
          ::backlinks-failed 2
+         ::site-failed 2
+         ::serve-failed 2
          1))
      (catch Exception e
        (fail! (or (ex-message e) (str e)))

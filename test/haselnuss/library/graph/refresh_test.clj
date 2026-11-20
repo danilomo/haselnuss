@@ -611,3 +611,37 @@
             g3 (do (write! root "lib/x/book.hdoc" "# Two {#sec:two}\n\nSee @{p:nosuch2}.\n")
                    (step g2 ["lib/x/book.hdoc"]))]
         (is (= (view g0) (view g3)) "back where it started")))))
+
+;; --- shelf.clj and :data files (TASK-266, doc-12 "Left to the builder") ---------
+;; (an edited :data file is covered by `refresh-cases-test`)
+
+(deftest generated-shelf-files-refresh-test
+  (testing "refresh sees an edited shelf.clj or :data file, whether or not a book claims it"
+    (let [{:keys [root] :as env} (fixture-copy)
+          g0 (scan/scan (context (:yaml env)) nil)
+          broken "check/gen/broken/shelf.clj"
+          scripture "generated/scripture/shelf.clj"
+          fixed (id "check" ["gen" "broken"] "fixed")]
+      (testing "the starting graph is not vacuous"
+        (is (empty? (graph/books-for-file g0 (scan/canonical-path (io/file root broken))))
+            "the broken shelf lists no books, so nothing claims its script")
+        (is (some #(= :script-failed (:type %))
+                  (:diagnostics (get (graph/indexed-libraries g0) "check"))))
+        (is (seq (graph/books-for-file g0 (scan/canonical-path (io/file root scripture))))
+            "the scripture shelf's books claim theirs"))
+      (let [g1 (testing "a failing shelf.clj that nothing claims, fixed: seen through the root re-list"
+                 (write! root broken
+                         (str "{:books (fn [_] [{:slug \"fixed\" :title \"Fixed\"}])\n"
+                              " :document (fn [_ _] {:meta {} :blocks [{:t :para :inlines [{:t :str :text \"ok\"}]}]})}\n"))
+                 (let [r (refresh! env g0 [broken])
+                       g (check-step env g0 r [fixed] #{fixed})]
+                   (is (some? (record-of g fixed)))
+                   (is (not-any? #(= :script-failed (:type %))
+                                 (:diagnostics (get (graph/indexed-libraries g) "check")))
+                       "the library record's diagnostics follow the script")
+                   g))
+            scripture-books (graph/books-for-file g1 (scan/canonical-path (io/file root scripture)))]
+        (testing "an edited shelf.clj its books claim: every one of them is scanned again"
+          (spit (io/file root scripture) (str (slurp (io/file root scripture)) "\n;; edited\n"))
+          (let [r (refresh! env g1 [scripture])]
+            (check-step env g1 r (vec scripture-books) (set scripture-books))))))))

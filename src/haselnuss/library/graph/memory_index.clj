@@ -73,26 +73,29 @@
 
 (defn- ->graph
   [state]
-  (with-meta
-    (reify graph/ReferenceGraph
-      (with-book [_ record]
-        (graph/check-book-record! record)
-        (->graph (-> state (unindex (:id record)) (index record))))
-      (without-book [_ id]
-        (->graph (unindex state id)))
-      (indexed-books [_]
-        (update-vals (:records state) #(dissoc % :id :edges)))
-      (edges-from [_ id]
-        (get-in state [:records id :edges] []))
-      (edges-to [_ target]
-        (let [parsed (graph/parse-target target)]
-          (into []
-                (comp cat (filter #(graph/edge-matches-target? parsed %)))
-                (vals (get-in state [:targets (:key parsed)])))))
-      (books-for-file [_ path]
-        (get-in state [:files path] #{})))
-    ;; for `internal-state`, i.e. for tests; no protocol read sees it
-    {::state state}))
+  ;; TASK-279: a build asks one graph for `indexed-books` a dozen times
+  ;; (the refresh once per library), and at 50,000 books each answer was
+  ;; 50,000 new maps; the graph is a value, so the answer is made once
+  (let [books (delay (update-vals (:records state) #(dissoc % :id :edges)))]
+    (with-meta
+      (reify graph/ReferenceGraph
+        (with-book [_ record]
+          (graph/check-book-record! record)
+          (->graph (-> state (unindex (:id record)) (index record))))
+        (without-book [_ id]
+          (->graph (unindex state id)))
+        (indexed-books [_] @books)
+        (edges-from [_ id]
+          (get-in state [:records id :edges] []))
+        (edges-to [_ target]
+          (let [parsed (graph/parse-target target)]
+            (into []
+                  (comp cat (filter #(graph/edge-matches-target? parsed %)))
+                  (vals (get-in state [:targets (:key parsed)])))))
+        (books-for-file [_ path]
+          (get-in state [:files path] #{})))
+      ;; for `internal-state`, i.e. for tests; no protocol read sees it
+      {::state state})))
 
 (def ^:private empty-state {:records {} :targets {} :files {}})
 

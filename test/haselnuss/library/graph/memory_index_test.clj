@@ -8,7 +8,7 @@
             [haselnuss.library.graph.contract :as contract]
             [haselnuss.library.graph.memory-index :as memory-index]))
 
-(deftest graph-contract-test
+(deftest ^:slow graph-contract-test
   (let [counts (contract/check-graph-contract {:new-graph memory-index/memory-index})]
     (is (zero? (:mismatches counts)))))
 

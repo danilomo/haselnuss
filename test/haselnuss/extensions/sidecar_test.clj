@@ -318,7 +318,7 @@
           [entry] (sidecar/load-extensions [path])]
       (is (= #{1 2} ((get-in entry [:emit :html]) {} {}))))))
 
-(deftest ac7-non-terminating-code-stopped-test
+(deftest ^:timing ac7-non-terminating-code-stopped-test
   (testing "AC #7: an interpreted infinite loop does not hang the build
             -- bounded by a short, test-local :timeout-ms rather than
             this namespace's own (generous) default, so this test itself

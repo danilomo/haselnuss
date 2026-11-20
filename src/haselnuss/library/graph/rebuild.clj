@@ -3,7 +3,8 @@
   dependencies\"; TASK-239): which books' output a change to some books,
   or to some files, can alter. `refresh` uses `affected-by` for its
   `:rebuild` set; a future daemon uses `affected-by-files` on a file
-  event.
+  event. `narrowed` (TASK-267) narrows a refresh's `:rebuild` set by
+  content, for a site build: see its docstring.
 
   Written only against the portable `ReferenceGraph` operations
   (`edges-to` and `books-for-file`) -- no backend internals, no
@@ -74,14 +75,18 @@
   them. Also answers the sources of every edge into each book it
   visits, as `:any`, so a caller needs no second pass."
   [g seen frontier]
+  ;; `frontier` is a vector used as a stack: a closure does not depend on
+  ;; the order books are visited in, and `(concat more fresh)` here once
+  ;; nested one lazy seq per visited book, which overflowed the stack on
+  ;; the 3,000 linkers of a hub note (TASK-267)
   (loop [closed (into seen frontier)
-         frontier (seq (remove seen (set frontier)))
+         frontier (into [] (remove seen) (set frontier))
          any #{}]
-    (if-let [[id & more] (seq frontier)]
+    (if-let [id (peek frontier)]
       (let [incoming (graph/edges-to g id)
-            fresh (remove closed (sources (filter #(= :quote (:kind %)) incoming)))]
+            fresh (into [] (remove closed) (sources (filter #(= :quote (:kind %)) incoming)))]
         (recur (into closed fresh)
-               (concat more fresh)
+               (into (pop frontier) fresh)
                (into any (sources incoming))))
       {:closed closed :any any})))
 
@@ -93,6 +98,97 @@
   [g book-ids]
   (let [{changed :closed one-hop :any} (quote-closure g #{} book-ids)]
     (:closed (quote-closure g changed (remove changed one-hop)))))
+
+;; --- narrowing by content (TASK-267) ------------------------------------------
+
+(defn- content-key
+  "What a book's own page is made from, as far as its record tells:
+  its `:document-hash` where it has one, else its `:hash`, and its
+  `:labels`."
+  [record]
+  [(or (:document-hash record) (:hash record)) (:labels record)])
+
+(defn- resolutions
+  "`{[kind written] #{[to-id status problem digest]}}` over `edges`: how
+  each reference, as written, resolved."
+  [edges]
+  (reduce (fn [m {:keys [kind to status problem digest]}]
+            (update m [kind (:written to)] (fnil conj #{}) [(:id to) status problem digest]))
+          {}
+          edges))
+
+(defn- resolution-changed?
+  "True when a reference written in both `old-edges` and `new-edges`
+  resolves differently in them. A reference only one of them has is
+  ignored: the book's own text changed, which its content key shows, and
+  a quote of a passage that holds it changed too, which its quoter's
+  own edge digest shows."
+  [old-edges new-edges]
+  (let [before (resolutions old-edges)
+        after (resolutions new-edges)]
+    (boolean (some (fn [[k v]] (and (contains? after k) (not= v (get after k)))) before))))
+
+(defn narrowed
+  "`refresh-result`'s `:rebuild` set (`haselnuss.library.graph.scan/
+  refresh` of the graph `g`) narrowed by content (doc-12, \"What gets
+  rebuilt\" step 3 and \"Scale\" consequence 4; TASK-267): the books whose
+  page a build could render differently. A set of BookIds.
+
+  `g` is the graph the refresh started from -- for a site build, the one
+  its saved state loaded (`haselnuss.library.state`), so the saved
+  document and `:labels` hashes are the ones on its records and the
+  caller need not keep its own. The result's `:graph` is the refreshed
+  graph and `:changes` what the refresh did; a result without `:changes`,
+  or with `{:full? true}` (the directory file changed), is not narrowed.
+
+      CHANGED  = the vanished books, the new ones, and every rescanned
+                 book whose content key changed: its `:document-hash`
+                 (a generated book's own document), else its `:hash`
+                 (its files' bytes), and its `:labels`
+      RESOLVED = the rescanned or rewritten books with a reference,
+                 written before and after, that now resolves
+                 differently: another target, status or problem, or
+                 another `:digest` -- for a link, the target passage's
+                 title, canonical reference or URL; for a quote, those
+                 or its blocks
+      result   = CHANGED ∪ quote*(RESOLVED), quote* over both graphs
+
+  - A book whose content key is the same produces the same page from the
+    same references, so one edited verse in a shared `:data` file marks
+    only the book that holds it, however many books the file feeds.
+  - A link's page shows the target's title, number and URL, never its
+    body (previews live in the target's `previews.json`), so a body edit
+    leaves its linkers alone and a title or number change reaches every
+    one of them, through the link's `:digest`.
+  - A quote copies the passage in, so its digest covers the blocks; a
+    book that quotes a book whose page changed for any reference
+    reason (a quote of a quote, a link inside the quoted text) is
+    rebuilt too, transitively and over-approximately (any passage), as
+    in `affected-by`. A quoter of a book that changed only in its own
+    text needs no quote*: its own edge into it was resolved again and
+    its digest shows whether the quoted passage changed.
+
+  `refresh` re-resolves every edge whose resolution it may have changed,
+  so its graph equals a fresh scan's; that is what makes comparing edges
+  enough. Over-inclusion is harmless: a record without a
+  `:document-hash`, or edges without a `:digest` (a state saved before
+  either existed), only rebuild more."
+  [g {g2 :graph :keys [rebuild changes]}]
+  (if (or (nil? g2) (not (map? changes)) (:full? changes))
+    (set rebuild)
+    (let [{:keys [rescanned vanished rewritten]} changes
+          before (graph/indexed-books g)
+          after (graph/indexed-books g2)
+          content-changed? (fn [id]
+                             (let [a (get before id) b (get after id)]
+                               (or (nil? a) (nil? b) (not= (content-key a) (content-key b)))))
+          changed (into (set vanished) (filter content-changed?) rescanned)
+          resolved (into #{}
+                         (filter #(resolution-changed? (graph/edges-from g %) (graph/edges-from g2 %)))
+                         (into (set rescanned) rewritten))]
+      (-> changed
+          (into (:closed (quote-closure g #{} resolved)))
+          (into (:closed (quote-closure g2 #{} resolved)))))))
 
 (defn affected-by-files
   "The rebuild set for a change to the files `paths` (strings, compared

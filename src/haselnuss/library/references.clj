@@ -78,6 +78,19 @@
   the book up. `:diagnostics` are the directory's load problems when this
   call loaded it, as for `:resolve`.
 
+  ## Site URLs (TASK-269)
+
+  A `--build-site` page links every book inside the site, by a path
+  relative to the citing page, whatever URL template the directory has
+  (doc-12, \"Output folder\"). The build passes `:link-url`, `(fn [id
+  passage anchor] url-or-nil)`, which then replaces the templates
+  entirely: called with the target book's CURRENT id, the passage as
+  written (nil for the whole book) and the resolved Passage's `:anchor`
+  (nil when it has none, and always nil through `:url`, whose references
+  are labels), its answer is the URL, and no template is read or
+  reported. Without `:link-url` -- every build but a site page -- nothing
+  here changes.
+
   A library directory file that cannot be read or is invalid is a hard
   error (doc-10): loading it throws, out of the build."
   (:require [clojure.string :as str]
@@ -173,8 +186,9 @@
   book itself; `:directory-reported?`, true when the caller has already
   reported the directory's own load problems (the CLI does, having loaded
   the directory itself to find a book given as its input), so they are
-  not handed back a second time."
-  [{:keys [directory context self directory-reported?]}]
+  not handed back a second time; `:link-url`, a site page's URL function
+  (see \"Site URLs\" in the namespace docstring)."
+  [{:keys [directory context self directory-reported? link-url]}]
   (let [ctx (or context (passage/context))
         dir (delay (if (satisfies? library/LibraryDirectory directory)
                      directory
@@ -188,7 +202,7 @@
               (vec (library/library-diagnostics d))
               [])))
         bad-templates (atom #{})
-        url-of
+        template-url-of
         (fn [id passage]
           (let [d @dir
                 lib-name (:library id)
@@ -209,6 +223,13 @@
                      :message (str "library " (pr-str lib-name) ": " problem
                                    "; its links and quotes have no URL")}]))}
               :else {:url (url/fill template id passage) :diagnostics []})))
+        url-of
+        (if link-url
+          (fn [id passage anchor]
+            (if-let [u (link-url id passage anchor)]
+              {:url u :diagnostics []}
+              {:diagnostics []}))
+          (fn [id passage _anchor] (template-url-of id passage)))
         resolve-ref
         (fn [written parsed]
           (let [found (find-book @dir written parsed)
@@ -220,7 +241,7 @@
                 (if (library/diagnostic? result)
                   (assoc (failure written (assoc result :canonical (book-ref/format-book-id id)))
                          :diagnostics diagnostics)
-                  (let [{u :url url-diagnostics :diagnostics} (url-of id (:passage parsed))]
+                  (let [{u :url url-diagnostics :diagnostics} (url-of id (:passage parsed) (:anchor result))]
                     {:passage (if u (assoc result :url u) (dissoc result :url))
                      :id id
                      :warnings (if-let [w (stale-shelf written (:shelf (:id parsed)) id)] [w] [])
@@ -229,6 +250,6 @@
     (cond-> {:resolve resolve-ref
              :url (fn [{:keys [id passage]}]
                     (let [build-level (directory-diagnostics)
-                          result (url-of id passage)]
+                          result (url-of id passage nil)]
                       (update result :diagnostics #(into build-level %))))}
       self (assoc :self self))))

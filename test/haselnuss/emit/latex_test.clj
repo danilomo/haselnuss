@@ -1,4 +1,4 @@
-(ns ^:parallel haselnuss.emit.latex-test
+(ns ^:parallel ^:slow haselnuss.emit.latex-test
   "Fixtures for `haselnuss.emit.latex` (TASK-21, extended by TASK-22): the
   LaTeX emitter core. AC #1 of TASK-21 (\"a document exercising every
   covered block/inline node produces a .tex file that compiles without

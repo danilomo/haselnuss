@@ -175,11 +175,14 @@
            (com.vladsch.flexmark.parser InlineParser InlineParserExtension
                                         InlineParserExtensionFactory
                                         LightInlineParser LinkRefProcessor
-                                        LinkRefProcessorFactory Parser)
+                                        LinkRefProcessorFactory Parser Parser$Builder)
+           (com.vladsch.flexmark.parser.block BlockParserFactory BlockStart
+                                              MatchedBlockParser ParserState)
+           (com.vladsch.flexmark.parser.core HeadingParser$Factory)
            (com.vladsch.flexmark.parser.core.delimiter Bracket Delimiter)
            (com.vladsch.flexmark.parser.delimiter DelimiterProcessor)
            (com.vladsch.flexmark.util.ast Block Document Node)
-           (com.vladsch.flexmark.util.data MutableDataSet NullableDataKey)
+           (com.vladsch.flexmark.util.data DataHolder MutableDataSet NullableDataKey)
            (com.vladsch.flexmark.util.sequence BasedSequence Escaping)
            (java.time ZoneOffset)
            (java.util Date)
@@ -1846,40 +1849,129 @@
                           (catch StackOverflowError e
                             (throw (attribute-group-too-long input i e)))))))))))))
 
+;; --- Headings without a per-line paragraph copy (TASK-262) --------------------
+;;
+;; flexmark 0.64.8's core `HeadingParser$BlockFactory/tryStart` runs for every
+;; line that continues a paragraph and does not start with a letter (flexmark's
+;; `DocumentParser` skips block starts for those), and before it looks at the
+;; line it calls `MatchedBlockParser/getParagraphContent`, which joins every
+;; line of the paragraph so far into a new `SegmentedSequence`
+;; (`BlockContent/getContents`). The content is only used when the line turns
+;; out to be a setext underline, but it is built every time, so such a
+;; paragraph of n lines costs O(n^2). A pipe table is one until
+;; `TablesExtension`'s paragraph pre-processor turns it into a table at the end,
+;; so a 20k-row table took ~16 s to parse; 20k lines of `#tag line` ~19 s.
+;;
+;; `tryStart` returns `BlockStart/none` unless its ATX pattern or its setext
+;; pattern `find`s on the line from its first non-space character.
+;; `linear-heading-factory` is the core factory with those two tests in front:
+;; a line neither matches gets `none` without the paragraph copy, and any other
+;; goes to flexmark's own `tryStart` unchanged. The patterns are flexmark's own
+;; (`HeadingParser$HeadingParsing`, package-private, so not reachable from
+;; here), chosen from the same three options its constructor reads
+;; (`heading-patterns`); `haselnuss.parser-test` compares the parse against the
+;; core factory over a fuzz of heading-like lines. `build-cm-parser` turns the
+;; core factory off (`HEADING_PARSER`) and registers this one; it reports the
+;; core factory's dependencies, so the block-parser order flexmark resolves is
+;; the same (checked there too).
+
+(defn- heading-patterns
+  "The ATX and setext patterns flexmark 0.64.8's `HeadingParser$HeadingParsing`
+  compiles for `options`, as `[atx setext]` -- the same choice, from
+  `HEADING_NO_ATX_SPACE`, `HEADING_NO_EMPTY_HEADING_WITHOUT_SPACE` and
+  `HEADING_SETEXT_MARKER_LENGTH`, read from its constructor's bytecode. The
+  `\\t` in each is a literal tab, as in flexmark's Java source."
+  [^DataHolder options]
+  (let [marker-length (int (.get Parser/HEADING_SETEXT_MARKER_LENGTH options))]
+    [(re-pattern (cond (true? (.get Parser/HEADING_NO_ATX_SPACE options)) "^#{1,6}(?:[ \t]*|$)"
+                       (true? (.get Parser/HEADING_NO_EMPTY_HEADING_WITHOUT_SPACE options))
+                       "^#{1,6}(?:[ \t]*(?=[^ \t#])|[ \t]+$)"
+                       :else "^#{1,6}(?:[ \t]+|$)"))
+     (re-pattern (if (<= marker-length 1)
+                   "^(?:=+|-+)[ \t]*$"
+                   (str "^(?:={" marker-length ",}|-{" marker-length ",})[ \t]*$")))]))
+
+(def ^:private linear-heading-factory
+  "flexmark's core heading `CustomBlockParserFactory`, with its own ATX and
+  setext tests in front of its `tryStart` -- see this section's comment.
+  `proxy`, not `reify`, for the reason `inline-math-extension-factory` gives
+  (the factory is also a `Function`); a subclass of the core factory so it
+  stays one in any `instanceof` check."
+  (let [core (HeadingParser$Factory.)]
+    (proxy [HeadingParser$Factory] []
+      (getAfterDependents [] (.getAfterDependents core))
+      (getBeforeDependents [] (.getBeforeDependents core))
+      (affectsGlobalScope [] (.affectsGlobalScope core))
+      (getLeadInHandler [options] (.getLeadInHandler core ^DataHolder options))
+      (apply [options]
+        (let [^BlockParserFactory flexmark (.apply core ^DataHolder options)
+              [^java.util.regex.Pattern atx ^java.util.regex.Pattern setext] (heading-patterns options)]
+          (reify BlockParserFactory
+            (tryStart [_ state matched]
+              (let [^ParserState state state
+                    line (.getLine state)
+                    rest-of-line (.subSequence line (.getNextNonSpaceIndex state) (.length line))]
+                (if (or (.find (.matcher atx rest-of-line)) (.find (.matcher setext rest-of-line)))
+                  (.tryStart flexmark state ^MatchedBlockParser matched)
+                  (BlockStart/none))))))))))
+
 (defn- build-cm-parser
   "A flexmark Parser with every construct `cm-parser`'s docstring lists,
   and pipe tables only when `tables?` -- see `cm-parser` and
-  `fragment-parser`, the two it builds."
-  ^Parser [tables?]
-  (.build (.customDelimiterProcessor
-           (.customDelimiterProcessor
+  `fragment-parser`, the two it builds. Headings come from
+  `linear-heading-factory` unless `core-headings?` (TASK-262: for
+  `haselnuss.parser-test` to compare it against flexmark's own)."
+  (^Parser [tables?] (build-cm-parser tables? false))
+  (^Parser [tables? core-headings?]
+   (let [^Parser$Builder builder
+         (.customDelimiterProcessor
+          (.customDelimiterProcessor
+           (.customInlineParserExtensionFactory
             (.customInlineParserExtensionFactory
              (.customInlineParserExtensionFactory
+              ;; TASK-168: `AttributesExtension/extend`, by hand -- its
+              ;; post-processor, and `attributes-extension-factory` in
+              ;; place of its inline parser. Its `parserOptions` only
+              ;; adjusts fenced-code-info options this parser never sets.
               (.customInlineParserExtensionFactory
-               ;; TASK-168: `AttributesExtension/extend`, by hand -- its
-               ;; post-processor, and `attributes-extension-factory` in
-               ;; place of its inline parser. Its `parserOptions` only
-               ;; adjusts fenced-code-info options this parser never sets.
-               (.customInlineParserExtensionFactory
-                (.postProcessorFactory
-                 (.linkRefProcessorFactory
-                  (Parser/builder (doto (MutableDataSet.)
-                                    ;; TASK-208: no MultiMarkdown `[caption]`
-                                    ;; line -- see this namespace's docstring.
-                                    (.set TablesExtension/WITH_CAPTION false)
-                                    (.set Parser/EXTENSIONS
-                                          (if tables?
-                                            (java.util.List/of (TablesExtension/create)
-                                                               (FootnoteExtension/create))
-                                            (java.util.List/of (FootnoteExtension/create))))))
-                  attributed-ref-processor)
-                 (AttributesNodePostProcessor$Factory.))
-                attributes-extension-factory)
-               inline-math-extension-factory)
-              cross-ref-cite-extension-factory)
-             cite-bracket-extension-factory)
-            (highlight-delimiter-processor))
-           (strike-delimiter-processor))))
+               (.postProcessorFactory
+                (.linkRefProcessorFactory
+                 (Parser/builder (doto (MutableDataSet.)
+                                   ;; TASK-208: no MultiMarkdown `[caption]`
+                                   ;; line -- see this namespace's docstring.
+                                   (.set TablesExtension/WITH_CAPTION false)
+                                   ;; TASK-281: a delimiter row needs a header
+                                   ;; row above it, as in GFM. flexmark's
+                                   ;; default of 0 made a lone `|---|` a table
+                                   ;; with an empty TableHead; now it stays the
+                                   ;; paragraph text it is. And at most one:
+                                   ;; the AST's `:head` is a single Row, so a
+                                   ;; second header row was silently dropped
+                                   ;; (`|a|\n|b|\n|---|` lost `a`); with this,
+                                   ;; flexmark keeps such lines a paragraph.
+                                   ;; Boxed: `set` takes an Object.
+                                   (.set TablesExtension/MIN_HEADER_ROWS (Integer/valueOf 1))
+                                   (.set TablesExtension/MAX_HEADER_ROWS (Integer/valueOf 1))
+                                   ;; TASK-262: `linear-heading-factory`
+                                   ;; instead, registered below. Boxed: `set`
+                                   ;; takes an Object.
+                                   (.set Parser/HEADING_PARSER (Boolean/valueOf (boolean core-headings?)))
+                                   (.set Parser/EXTENSIONS
+                                         (if tables?
+                                           (java.util.List/of (TablesExtension/create)
+                                                              (FootnoteExtension/create))
+                                           (java.util.List/of (FootnoteExtension/create))))))
+                 attributed-ref-processor)
+                (AttributesNodePostProcessor$Factory.))
+               attributes-extension-factory)
+              inline-math-extension-factory)
+             cross-ref-cite-extension-factory)
+            cite-bracket-extension-factory)
+           (highlight-delimiter-processor))
+          (strike-delimiter-processor))]
+     (.build (if core-headings?
+               builder
+               (.customBlockParserFactory builder linear-heading-factory))))))
 
 (def ^:private ^Parser cm-parser
   "A single, reusable flexmark Parser for CommonMark's core constructs plus
@@ -3502,6 +3594,24 @@
           (let [base-offset (.getIndexOffset content (int i))]
             (when-not (neg? base-offset) (column base-offset))))))))
 
+(defn- caption-guarded-text
+  "`[text offsets]` for caption text `s` (marker already stripped) whose
+  own parse opens with a block other than a paragraph (TASK-281): `s`
+  with its first non-blank line's opener escaped by `guard-first-line`
+  and that line's indent dropped -- any empty lines before it are kept,
+  so line numbers still match -- and `offsets`, an `int-array` giving
+  each character of `text` its offset in `s`, or -1 for an inserted
+  backslash (see `fragment-source-offsets`)."
+  [^String s]
+  (let [body-start (count (re-find #"^\s*" s))
+        prefix-end (inc (.lastIndexOf s "\n" (int (dec body-start))))
+        body (guard-first-line (subs s body-start))
+        body-offsets (fragment-source-offsets s body-start body)
+        offsets (int-array (+ prefix-end (alength body-offsets)))]
+    (dotimes [i prefix-end] (aset offsets i (int i)))
+    (System/arraycopy body-offsets 0 offsets prefix-end (alength body-offsets))
+    [(str (subs s 0 prefix-end) body) offsets]))
+
 (defn- table-caption-and-attr
   "`[caption attr]` for a qualifying caption Paragraph `para` (see
   `table-caption-paragraph?`): strips the leading `table-caption-re` marker
@@ -3519,26 +3629,56 @@
   A documented consequence shared with every other per-chunk mini-parse in
   this file: a reference-style link inside a caption only resolves against
   `[ref]: url` definitions within the caption's own single line, not the
-  whole document."
+  whole document.
+
+  TASK-281: the caption is part of a paragraph, so it is parsed as one.
+  `fragment-parser` (no tables) keeps a `|---|` among its later lines from
+  making a table of them, and when its text would open some other block
+  on its own (`- x`, `# x`, `> q`, a fence, or, after an empty first
+  line, an indented line), `caption-guarded-text` escapes that opener,
+  so every character the caption line holds stays caption text."
   [^Paragraph para]
   (let [content-chars (.getContentChars para)
         content (.toString content-chars)
         stripped (str/replace-first content table-caption-re "")
-        ^Document mini-doc (binding [*caption-parse* true] (.parse cm-parser stripped))
+        parse (fn ^Document [^String text]
+                (binding [*caption-parse* true] (.parse fragment-parser text)))
+        ;; A setext Heading counts as the caption's paragraph, as it did
+        ;; before TASK-281: a lazy `===` line under a caption in a quote
+        ;; or list item makes one, and its text, markup and trailing
+        ;; attribute group are the caption's (the `===` is dropped).
+        para-like? (fn [node] (or (instance? Paragraph node)
+                                  (and (instance? Heading node) (.isSetextHeading ^Heading node))))
+        para-first? (fn [^Document d] (para-like? (first (.getChildren d))))
+        marker (- (count content) (count stripped))
+        plain-doc (parse stripped)
+        [^Document mini-doc offsets] (if (or (str/blank? stripped) (para-first? plain-doc))
+                                       [plain-doc nil]
+                                       (let [[text offsets] (caption-guarded-text stripped)]
+                                         [(parse text) offsets]))
         mini-para (first (.getChildren mini-doc))]
-    (if mini-para
-      (let [[attr children] (pop-trailing-attr-group mini-para)]
+    (cond
+      (nil? mini-para) [[] default-attr]
+
+      (para-like? mini-para)
+      (let [[attr children] (pop-trailing-attr-group mini-para)
+            column (when *line-base* (caption-offset-column content-chars marker))]
         ;; The caption is parsed on its own, so its line 0 is the line the
         ;; caption paragraph starts on (TASK-143); its columns are traced
-        ;; back through `content` (TASK-248).
+        ;; back through `content` (TASK-248), and through the escapes
+        ;; `caption-guarded-text` added, which have none.
         [(binding [*line-base* (some-> *line-base* (+ (.getLineNumber para)))
-                   *offset-column* (when *line-base*
-                                     (caption-offset-column content-chars
-                                                            (- (count content) (count stripped))))
+                   *offset-column* (if (and column offsets)
+                                     (fn [offset]
+                                       (when (< -1 (long offset) (alength ^ints offsets))
+                                         (let [j (aget ^ints offsets (int offset))]
+                                           (when-not (neg? j) (column j)))))
+                                     column)
                    *line-starts* (when *line-base* (doc-line-starts mini-doc))]
            (convert-children mini-doc #{} children))
          attr])
-      [[] default-attr])))
+
+      :else [(text->inlines (unescape-backslashes (str/trim stripped))) default-attr])))
 
 (defn- table-cell-align
   "`(.getAlignment cell)` (`TableCell$Alignment/LEFT`/`CENTER`/`RIGHT`, or

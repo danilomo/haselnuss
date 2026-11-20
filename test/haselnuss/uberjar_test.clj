@@ -1,5 +1,9 @@
-(ns haselnuss.uberjar-test
+(ns ^:slow ^:shares-target haselnuss.uberjar-test
   "Fixtures for the packaged CLI (TASK-26).
+
+  `^:shares-target` (TASK-302): `lein uberjar` auto-cleans all of
+  `target/`, so `bin/test` keeps this namespace in one shard with the
+  others that read or build there. `^:slow`: outside the fast gate.
 
   Deliberately builds and runs the *real* jar rather than exercising
   `haselnuss.cli` in-process, because every acceptance criterion here is

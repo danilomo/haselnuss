@@ -1,0 +1,53 @@
+---
+title: Catecismo de Heidelberg (1563), Domingo 1
+authors:
+  - Zacarias Ursino
+  - Gaspar Oleviano
+lang: pt-BR
+---
+
+# Sobre esta edição {#sec:edicao}
+
+Uma cópia do primeiro domingo de `examples/catecismo-heidelberg.hdoc`, com
+menos provas bíblicas, para o conjunto de testes do servidor de bibliotecas
+(TASK-264). O texto do catecismo foi transcrito de
+https://www.monergismo.com/textos/catecismos/catecismo\_heidelberg.htm.
+
+Os versículos vêm da biblioteca `bible`: cada prova é citada com `!quote`, e o
+texto também liga às passagens com `@{...}`, como @{bible:romanos#8:28} ou
+@{bible:blivre/joao#10:27-30}.
+
+**Texto bíblico.** Todas as Escrituras em português citadas são da Bíblia
+Livre (BLIVRE), Copyright © Diego Santos, Mario Sérgio e Marco Teles,
+https://sites.google.com/site/biblialivre/, licença Creative Commons
+Atribuição 3.0 Brasil (https://creativecommons.org/licenses/by/3.0/br/).
+
+# Domingo 1 {#sec:domingo-1}
+
+## 1. Qual é o seu único fundamento, na vida e na morte? {#sec:q1}
+
+O meu único fundamento é meu fiel Salvador Jesus Cristo (@{bible:1-corintios#3:23}). A Ele pertenço, em corpo e alma, na vida e na morte (@{bible:romanos#14:8}), e não pertenço a mim mesmo. Agora Ele me protege de tal maneira (@{bible:joao#10:27-30}) que, sem a vontade do meu Pai do céu, não perderei nem um fio de cabelo (@{bible:mateus#10:29-30}). Além disto, tudo coopera para o meu bem (@{bible:romanos#8:28}).
+
+**Provas bíblicas**
+
+!quote bible:1-corintios#3:23
+
+!quote bible:romanos#14:8
+
+!quote bible:joao#10:27-30
+
+!quote bible:mateus#10:29-30
+
+!quote bible:romanos#8:28
+
+## 2. O que você deve saber para viver e morrer neste fundamento? {#sec:q2}
+
+Primeiro: como são grandes meus pecados e minha miséria (@{bible:mateus#9:12}). Segundo: como sou salvo de meus pecados e de minha miséria (@{bible:joao#17:3}). Terceiro: como devo ser grato a Deus por tal salvação. A primeira pergunta (@sec:q1) já o disse.
+
+**Provas bíblicas**
+
+!quote bible:mateus#9:12
+
+!quote bible:romanos#3:10
+
+!quote bible:joao#17:3

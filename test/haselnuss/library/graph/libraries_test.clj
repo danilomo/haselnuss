@@ -9,7 +9,7 @@
             [haselnuss.library.graph.libraries :as libraries]
             [haselnuss.library.graph.memory-index :as memory-index]))
 
-(deftest wrapped-graph-passes-the-graph-contract-test
+(deftest ^:slow wrapped-graph-passes-the-graph-contract-test
   (let [counts (contract/check-graph-contract
                 {:new-graph (comp libraries/library-indexed memory-index/memory-index)})]
     (is (zero? (:mismatches counts)))))

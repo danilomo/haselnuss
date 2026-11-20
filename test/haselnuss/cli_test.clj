@@ -2622,7 +2622,7 @@
         (is (str/includes? bare "float: right")
             "including the inline fallbacks, which is what opting out must not cost")))))
 
-(deftest generated-bibtex-database-test
+(deftest ^:slow generated-bibtex-database-test
   (let [csl (str "[{\"id\":\"knuth1984\",\"type\":\"book\","
                  "\"author\":[{\"family\":\"Knuth\",\"given\":\"Donald E.\"}],"
                  "\"issued\":{\"date-parts\":[[1984]]},\"title\":\"The TeXbook\","
@@ -2888,7 +2888,7 @@
                   checked (found by review)"
           (is (not (.exists (io/file dir "doc.bib")))))))))
 
-(deftest fragment-citations-through-bibtex-test
+(deftest ^:slow fragment-citations-through-bibtex-test
   (testing "AC #2, and DECISION 2 end to end: the three files a
             --fragment build writes -- body, companion preamble and
             generated .bib -- compile in a minimal host through a real
@@ -3066,7 +3066,7 @@
         (let [[ok? log] (compiles? dir (:output tex))]
           (is ok? (str "expected the parted .tex to compile:\n" log)))))))
 
-(deftest untypesettable-character-test
+(deftest ^:slow untypesettable-character-test
   (testing "TASK-76 AC #1/#2: a character the emitted LaTeX cannot
             typeset is reported as a warning naming it, and the
             diagnostic says which file to go and look in. Before this the
@@ -3185,7 +3185,7 @@
       (is (not (str/includes? (:output latex) "́"))
           "and it is not in the fragment body, which is the point of scanning the side files"))))
 
-(deftest table-column-widths-test
+(deftest ^:slow table-column-widths-test
   (let [rows (str "| Approach | Description | Ref |\n"
                   "|----------|-------------|-----|\n"
                   "| Alpha | A description long enough that it has to wrap inside its own"
@@ -3307,7 +3307,7 @@
         (is (str/includes? text "https://example.com/a_b?c=1") text)
         (is (str/includes? text "someone@example.com") text)))))
 
-(deftest image-caption-markup-test
+(deftest ^:slow image-caption-markup-test
   (testing "TASK-69: an image caption carrying emphasis, inline math and
             a citation prints all three in both targets. The markup used
             to be flattened before the caption was built, which cost the
@@ -3727,7 +3727,7 @@
         (is (= 2 status))
         (is (str/includes? err "--in-place needs a file input, not a book ID") err)))))
 
-(deftest book-id-input-writes-into-working-directory-test
+(deftest ^:slow book-id-input-writes-into-working-directory-test
   (testing "AC #3: with no --output, a book ID writes <slug>.<ext> in the current
             directory -- and an existing file of the same name is a file, not a
             book. Run in a separate JVM, since a JVM cannot change its own

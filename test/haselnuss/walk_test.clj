@@ -582,3 +582,180 @@
       (is (= :cell (walk/node-type discriminators ::ast/cell {:blocks []})))
       (testing "a JSON-decoded tag arriving as a string still resolves"
         (is (= :section (walk/node-type discriminators ::ast/block {:t "section"})))))))
+
+;; --- TASK-263: an unchanged subtree comes back as itself --------------------
+;;
+;; `rewrite`/`rewrite-post` used to rebuild every map and vector they walked,
+;; changed or not, and that rebuilding was most of what resolving a document
+;; of many blocks cost. They now hand an unchanged node back as itself. The
+;; reference implementations below are the pre-TASK-263 code, kept verbatim
+;; in spirit, and the seeded fuzz pins the new code to them: same values,
+;; same vector-vs-seq shapes, same paths in the same order.
+
+(defn- reference-descend
+  [scope parent-node parent-path field [arity ref-kind] recurse]
+  (if-not (contains? scope ref-kind)
+    parent-node
+    (case arity
+      :one (if-let [child (get parent-node field)]
+             (let [rs (recurse ref-kind child (conj parent-path field))]
+               (when-not (= 1 (count rs))
+                 (throw (ex-info "arity" {:type ::walk/arity-error :field field})))
+               (assoc parent-node field (first rs)))
+             parent-node)
+      :many (if-let [kids (get parent-node field)]
+              (assoc parent-node field
+                     (into [] (mapcat (fn [[i child]] (recurse ref-kind child (conj parent-path field i))))
+                           (map-indexed vector kids)))
+              parent-node)
+      :many-of-many
+      (if-let [groups (get parent-node field)]
+        (assoc parent-node field
+               (mapv (fn [[i group]]
+                       (into [] (mapcat (fn [[j child]] (recurse ref-kind child (conj parent-path field i j))))
+                             (map-indexed vector group)))
+                     (map-indexed vector groups)))
+        parent-node))))
+
+(defn- reference-rewrite
+  [scope rewrite-fn ref-kind node]
+  (let [{:keys [children discriminators]} walk/table]
+    (mapv (fn [replacement]
+            (reduce (fn [node' [field spec]]
+                      (reference-descend scope node' [] field spec
+                                         (fn [kind child _] (reference-rewrite scope rewrite-fn kind child))))
+                    replacement
+                    (get children (walk/node-type discriminators ref-kind replacement) [])))
+          (rewrite-fn ref-kind node))))
+
+(defn- reference-rewrite-post
+  [scope rewrite-fn ref-kind node path]
+  (let [{:keys [children discriminators]} walk/table
+        node' (reduce (fn [node' [field spec]]
+                        (reference-descend scope node' path field spec
+                                           (fn [kind child child-path]
+                                             (reference-rewrite-post scope rewrite-fn kind child child-path))))
+                      node
+                      (get children (walk/node-type discriminators ref-kind node) []))]
+    (rewrite-fn path ref-kind node')))
+
+(defn- shape
+  "`x` with every collection tagged by what it is, so two trees that are `=`
+  but differ in vector-vs-seq compare unequal."
+  [x]
+  (cond
+    (map? x) (into {} (map (fn [[k v]] [k (shape v)])) x)
+    (vector? x) [:vector (mapv shape x)]
+    (sequential? x) [:seq (mapv shape x)]
+    :else x))
+
+(defn- random-doc
+  "A random Document from `rng` (a `java.util.Random`): nested Sections,
+  Lists, Tables, Figures, Directives, footnotes, emphasis, links and Cites,
+  with roughly one `:many` field in five a list rather than a vector."
+  [^java.util.Random rng]
+  (letfn [(pick [xs] (nth xs (.nextInt rng (count xs))))
+          (many [f n] (let [xs (vec (repeatedly (.nextInt rng (inc n)) f))]
+                        (if (zero? (.nextInt rng 5)) (seq xs) xs)))
+          (text [] {:t :str :text (pick ["a" "b" "dup" "drop" "x" "wrap" "list"])})
+          (inline [d]
+            (if (zero? d)
+              (pick [(text) (text) {:t :space}])
+              (case (int (.nextInt rng 7))
+                (0 1 2) (text)
+                3 {:t :emph :inlines (many #(inline (dec d)) 3)}
+                4 {:t :link :inlines (many #(inline (dec d)) 2) :target "u" :attr attr}
+                5 {:t :note :blocks (many #(block (dec d)) 2)}
+                6 {:t :cite :items (many (fn [] {:key "k" :prefix (many #(inline (dec d)) 2)
+                                                 :suffix (many #(inline (dec d)) 2)})
+                                         2)})))
+          (cell [d] {:blocks (many #(block (dec d)) 2)})
+          (block [d]
+            (if (zero? d)
+              {:t :para :inlines (many #(inline 0) 4)}
+              (case (int (.nextInt rng 7))
+                (0 1) {:t :para :inlines (many #(inline (dec d)) 4)}
+                2 {:t :section :level 1 :heading (many #(inline (dec d)) 2)
+                   :blocks (many #(block (dec d)) 3) :attr attr}
+                3 {:t :list :ordered false :tight true
+                   :items (many #(many (fn [] (block (dec d))) 2) 3) :attr attr}
+                4 {:t :figure :content {:t :para :inlines (many #(inline (dec d)) 3)}
+                   :caption (many #(inline (dec d)) 2) :attr attr}
+                5 {:t :table :head {:cells (many #(cell d) 2)}
+                   :rows (many (fn [] {:cells (many #(cell d) 2)}) 2)
+                   :caption (many #(inline (dec d)) 2) :colspec [] :attr attr}
+                6 {:t :directive :name "d" :blocks (many #(block (dec d)) 2) :attr attr})))]
+    {:meta {:title (many #(inline 2) 2)} :blocks (many #(block 3) 4)}))
+
+(defn- text-rule
+  "What the fuzz does to a `:str` by its text: duplicate it, drop it,
+  change it, wrap it in a fresh `:emph` (whose own children the walk then
+  visits), or hand it back in a list rather than a vector; anything else
+  comes back unchanged as `[node]`."
+  [ref-kind node]
+  (if (and (= ::ast/inline ref-kind) (= :str (:t node)))
+    (case (:text node)
+      "dup" [node node]
+      "drop" []
+      "x" [(assoc node :text "y")]
+      "wrap" [{:t :emph :inlines [(assoc node :text "w")]}]
+      "list" (list node)
+      [node])
+    [node]))
+
+(deftest rewrite-and-rewrite-post-match-the-pre-task-263-walk-test
+  (let [rng (java.util.Random. 263)
+        scopes [walk/every-ref-kind block-and-inline #{::ast/block ::ast/meta ::ast/row ::ast/cell}]
+        identity-fn (fn [_ node] [node])
+        counts (atom {:cases 0 :changed 0 :unchanged-identical 0 :seq-fields 0})]
+    (dotimes [_ 300]
+      (let [doc (random-doc rng)
+            scope (nth scopes (.nextInt rng (count scopes)))]
+        (swap! counts update :cases inc)
+        (when (some #(and (seq? %) (not (vector? %))) (tree-seq coll? seq doc))
+          (swap! counts update :seq-fields inc))
+        (doseq [rule [text-rule identity-fn]]
+          (let [expected (reference-rewrite scope rule ::ast/document doc)
+                actual (walk/rewrite {:table walk/table :scope scope :rewrite-fn rule}
+                                     ::ast/document doc)]
+            (is (= (shape expected) (shape actual)))
+            (when (and (= rule text-rule) (not= doc (first actual)))
+              (swap! counts update :changed inc))
+            (when (identical? doc (first actual))
+              (swap! counts update :unchanged-identical inc)))
+          (let [post-log (fn [log] (fn [path ref-kind node]
+                                     (swap! log conj [path ref-kind])
+                                     (rule ref-kind node)))
+                expected-log (atom [])
+                actual-log (atom [])
+                expected (reference-rewrite-post scope (post-log expected-log) ::ast/document doc [])
+                actual (walk/rewrite-post {:table walk/table :scope scope
+                                           :rewrite-fn (post-log actual-log)}
+                                          ::ast/document doc)]
+            (is (= (shape expected) (shape actual)))
+            (is (= @expected-log @actual-log))))))
+    (testing "the fuzz is not vacuous: it changes documents, leaves others
+              alone, and meets list-valued fields"
+      (let [{:keys [cases changed unchanged-identical seq-fields]} @counts]
+        (is (= 300 cases))
+        (is (< 100 changed) (pr-str @counts))
+        (is (< 50 unchanged-identical) (pr-str @counts))
+        (is (< 150 seq-fields) (pr-str @counts))))))
+
+(deftest rewrite-hands-back-an-unchanged-subtree-as-itself-test
+  (let [untouched (para (str-inline "a"))
+        touched (para (str-inline "x"))
+        a-document {:meta {:title [(str-inline "t")]} :blocks [untouched touched]}
+        walker {:table walk/table :scope walk/every-ref-kind :rewrite-fn text-rule}
+        result (first (walk/rewrite walker ::ast/document a-document))]
+    (testing "a rewrite that changes nothing returns the very same document"
+      (is (identical? a-document
+                      (first (walk/rewrite (assoc walker :rewrite-fn (fn [_ node] [node]))
+                                           ::ast/document a-document)))))
+    (testing "a change rebuilds only its own ancestors"
+      (is (= "y" (get-in result [:blocks 1 :inlines 0 :text])))
+      (is (identical? untouched (get-in result [:blocks 0])))
+      (is (identical? (:meta a-document) (:meta result))))
+    (testing "a list-valued field still comes back as a vector, as it always did"
+      (let [listy {:t :para :inlines (list (str-inline "a"))}]
+        (is (vector? (:inlines (first (walk/rewrite walker ::ast/block listy)))))))))

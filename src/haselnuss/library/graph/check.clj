@@ -28,7 +28,10 @@
     of some book in the cycle (or at the head of the chain) reports it at.
     Resolved quotes are followed; one whose passage did not resolve can
     still close a cycle or a chain, as a build checks the book first
-    (TASK-249). Under `--check --transform` the quoted books' edges and
+    (TASK-249). Derived edges (`haselnuss.library.graph/derived?`,
+    TASK-287) carry no diagnostic and are not followed: a cycle or chain
+    through a quote inside a locator-built passage is not derived here.
+    Under `--check --transform` the quoted books' edges and
     spans are those of their transformed copies, which a build does not
     quote (the README documents the difference).
 
@@ -464,7 +467,12 @@
   `cycle-path` looks."
   [g]
   (let [books (graph/indexed-books g)
-        edges (into {} (map (fn [id] [id (graph/edges-from g id)])) (keys books))
+        ;; derived edges (TASK-287) are left out: a build meets a quote
+        ;; nested in a located passage one level below the book's own
+        ;; `!quote`, which a derived edge, placed at that `!quote`, would
+        ;; put one level too high
+        edges (into {} (map (fn [id] [id (into [] (remove graph/derived?) (graph/edges-from g id))]))
+                    (keys books))
         libraries (if (satisfies? graph/LibraryIndex g) (graph/indexed-libraries g) {})
         quotes (update-vals edges #(filterv resolved-quote? %))
         index {:quotes quotes
@@ -727,6 +735,21 @@
   [{:keys [file line message book library] :as it}]
   [(if file 0 1) (or file book library "") (or line 0) (str (:type it)) (str (:ref it)) message])
 
+(defn book-item
+  "The report item of a `diagnostic` found on the book `book` (canonical
+  id text) of library `lib-name` that is not in the graph -- one a build
+  finds only when it emits the book (`--build-site`, TASK-268) -- placed
+  at `file` when it names no file itself. Formatted exactly as
+  `check-report` formats a book record's."
+  [diagnostic {:keys [book lib-name file base-dir]}]
+  (item diagnostic {:book book :lib-name lib-name :fallback-file file :base-dir base-dir}))
+
+(defn sort-items
+  "`items` in the report's order (file, then line, ...; see the namespace
+  docstring), as a vector."
+  [items]
+  (vec (sort-by sort-key items)))
+
 (defn check-report
   "The `--check` report of the graph `g` (see the namespace docstring):
   `{:version :diagnostics [item ...] :summary {...}}`. Pure: reads only
@@ -747,7 +770,7 @@
                              d (:diagnostics record)]
                          (item d {:lib-name lib-name :fallback-file (:root record)
                                   :base-dir base-dir}))
-         items (vec (sort-by sort-key (concat book-items derived library-items)))
+         items (sort-items (concat book-items derived library-items))
          counts (frequencies (map :level items))]
      {:version report-version
       :diagnostics items

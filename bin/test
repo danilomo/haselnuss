@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+# Runs the test suite as several concurrent `lein test` shards (TASK-302).
+#
+# `lein test` runs every namespace one after another in one JVM, and much of
+# the suite's wall time is spent waiting on child processes (pdflatex, nested
+# lein, headless Chrome) or on one core -- so on a multi-core machine most
+# cores sit idle. This script splits the namespaces across N `lein test` JVMs
+# and adds the results up. Every test still runs, in a real `lein test`,
+# against the same toolchain; only the scheduling differs.
+#
+# Usage:
+#   bin/test                      # the complete suite
+#   bin/test NS...                # only these namespaces
+#   bin/test --fast               # every test not tagged ^:slow
+#   bin/test --fast NS...         # the fast subset, plus NS... in full
+#   bin/test --shards N ...       # shard count (default: HASELNUSS_TEST_SHARDS,
+#                                 # else a third of the cores, 2 to 4)
+#   bin/test --log-dir DIR ...    # where the run's logs go (default: a new
+#                                 # directory under /tmp)
+#   bin/test [--fast] --record-timings
+#                                 # then rewrite this run's lines of
+#                                 # test/timings.tsv (only if it passed)
+#   bin/test --dry-run ...        # print the plan, run nothing
+#
+# Two phases. The shards run every test not tagged ^:timing. Tests tagged
+# ^:timing assert a wall-clock bound that a loaded machine can miss, so they
+# run afterwards, in one JVM that has loaded its namespaces alongside the
+# shards and waits (haselnuss.test-parallel's barrier) until at most one
+# shard is still running.
+# The `:phase` selector in project.clj splits the suite between the two, so
+# the counts add up to plain `lein test`'s.
+#
+# Which namespaces exist is read from the `ns` forms under test/, the same
+# files `lein test` itself discovers, so a new namespace is picked up with no
+# list to update. Shards are balanced by test/timings.tsv (measured seconds
+# per namespace; an unlisted namespace counts as 5 s), longest first onto the
+# least-loaded shard. Namespaces whose `ns` form carries ^:shares-target build
+# into or read Leiningen's target/ tree (`lein uberjar` auto-cleans all of
+# it), so they all go to one shard. Each JVM's in-namespace parallelism
+# (^:parallel) is capped so that the shards together fit the machine.
+#
+# Exits 0 only if every JVM ran to its summary line with no failures and no
+# errors, and says so on its last line (PASSED or FAILED, with the counts).
+# Interrupted, it stops every JVM it started. Logs and timings stay in the
+# printed directory.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+# The timings are written with a decimal point; a locale with a decimal comma
+# would make `sort -n` misread them. Only this script's own tools see this:
+# the lein JVMs get the caller's locale back (see `launch`).
+caller_lc_all="${LC_ALL-}"
+caller_lc_all_set="${LC_ALL+set}"
+export LC_ALL=C
+
+fast=0
+record=0
+dry=0
+log_parent=""
+shards="${HASELNUSS_TEST_SHARDS:-}"
+named=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fast) fast=1 ;;
+    --record-timings) record=1 ;;
+    --dry-run) dry=1 ;;
+    --shards)
+      shift
+      shards="${1:-}"
+      ;;
+    --log-dir)
+      shift
+      log_parent="${1:-}"
+      ;;
+    -h | --help)
+      sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    -*)
+      echo "bin/test: unknown option $1 (see --help)" >&2
+      exit 2
+      ;;
+    *) named+=("$1") ;;
+  esac
+  shift
+done
+
+cores=$(nproc 2>/dev/null || echo 2)
+if [ -z "$shards" ]; then
+  shards=$((cores / 3))
+  [ "$shards" -gt 4 ] && shards=4
+  [ "$shards" -lt 2 ] && shards=2
+fi
+if ! [[ "$shards" =~ ^[1-9][0-9]*$ ]]; then
+  echo "bin/test: --shards needs a positive integer, got '$shards'" >&2
+  exit 2
+fi
+if [ "$record" -eq 1 ] && [ "${#named[@]}" -gt 0 ]; then
+  echo "bin/test: --record-timings needs the whole suite or fast subset (no namespaces)" >&2
+  exit 2
+fi
+
+# "name<TAB>shares-target(0|1)<TAB>has-timing-tests(0|1)" for every
+# namespace under test/. Tags count only on a `(deftest` or `(ns` line, not
+# in comments or docstrings. This is a line-based reading, so every JVM this
+# script starts gets it as HASELNUSS_TEST_PLAN and checks it against what
+# Clojure itself reads (haselnuss.test-parallel: check-discovery!,
+# timing-check), failing loudly on any difference rather than skipping tests.
+discover() {
+  find test -name '*.clj' -print0 | sort -z | xargs -0 awk '
+    function flush() { if (name != "") print name "\t" shared "\t" timing; name = "" }
+    FNR == 1 { flush(); seen = 0; timing = 0 }
+    /^\((deftest|ns)[ \t].*\^:timing([ \t]|$)/ { timing = 1 }
+    !seen && /^\(ns[ \t]/ {
+      seen = 1
+      shared = ($0 ~ /\^:shares-target([ \t]|$)/) ? 1 : 0
+      for (i = 2; i <= NF; i++) if ($i !~ /^\^/) { name = $i; gsub(/\)/, "", name); break }
+    }
+    END { flush() }'
+}
+
+all=$(discover)
+if [ -z "$all" ]; then
+  echo "bin/test: no namespaces found under test/" >&2
+  exit 2
+fi
+
+for ns in "${named[@]}"; do
+  if ! cut -f1 <<<"$all" | grep -qxF "$ns"; then
+    echo "bin/test: no test namespace $ns under test/" >&2
+    exit 2
+  fi
+done
+
+# ^:shares-target namespaces stay together: naming one names them all, so
+# that a --fast run does not put some in a full shard and the rest in a fast
+# one, running concurrently.
+shared_names=$(awk -F'\t' '$2 == 1 { print $1 }' <<<"$all")
+for ns in "${named[@]}"; do
+  if grep -qxF "$ns" <<<"$shared_names"; then
+    mapfile -t -O "${#named[@]}" named <<<"$shared_names"
+    mapfile -t named < <(printf '%s\n' "${named[@]}" | sort -u)
+    break
+  fi
+done
+
+# Rows of "$all" whose name is (keep=1) or is not (keep=0) among the named.
+select_named() {
+  awk -F'\t' -v keep="$1" 'NR == FNR { if ($0 != "") n[$0] = 1; next }
+                           (($1 in n) ? 1 : 0) == keep' \
+    <(printf '%s\n' "${named[@]}") <(printf '%s\n' "$all")
+}
+
+# What runs as the fast subset, and what runs in full.
+if [ "$fast" -eq 1 ]; then
+  subset=$(select_named 0)
+  full=$(select_named 1)
+elif [ "${#named[@]}" -gt 0 ]; then
+  subset=""
+  full=$(select_named 1)
+else
+  subset=""
+  full="$all"
+fi
+
+# Shards for a discovered list: one line per non-empty shard, "load<TAB>ns
+# ns ...". Longest-processing-time first onto the least-loaded shard. The
+# weight of a namespace is its line in test/timings.tsv, looked up as
+# PREFIX + name ("timing:" for its time in the timing phase).
+plan() {
+  local list="$1" n="$2" prefix="${3:-}"
+  [ -z "$list" ] && return 0
+  awk -F'\t' -v n="$n" -v prefix="$prefix" -v weights="test/timings.tsv" '
+    BEGIN {
+      while ((getline line < weights) > 0) {
+        if (line ~ /^#/ || line == "") continue
+        split(line, f, "\t"); w[f[1]] = f[2] + 0
+      }
+    }
+    $1 == "" { next }
+    {
+      # the fast subset falls back on the whole namespace time
+      t = ((prefix $1) in w) ? w[prefix $1] : ((prefix == "fast:" && ($1 in w)) ? w[$1] : 5)
+      if ($2 == 1) { shared = shared (shared == "" ? "" : " ") $1; sharedw += t }
+      else { items[++m] = $1; iw[m] = t }
+    }
+    END {
+      if (shared != "") { items[++m] = shared; iw[m] = sharedw }
+      for (i = 1; i <= m; i++)
+        for (j = i + 1; j <= m; j++)
+          if (iw[j] > iw[i]) { tn = items[i]; items[i] = items[j]; items[j] = tn
+                               tw = iw[i]; iw[i] = iw[j]; iw[j] = tw }
+      for (s = 1; s <= n; s++) load[s] = 0
+      for (i = 1; i <= m; i++) {
+        best = 1
+        for (s = 2; s <= n; s++) if (load[s] < load[best]) best = s
+        load[best] += iw[i]
+        out[best] = out[best] (out[best] == "" ? "" : " ") items[i]
+      }
+      for (s = 1; s <= n; s++) if (out[s] != "") printf "%d\t%s\n", load[s], out[s]
+    }' <(printf '%s\n' "$list")
+}
+
+# The rows of a discovered list whose namespaces hold ^:timing tests.
+timing_of() {
+  awk -F'\t' '$3 == 1' <(printf '%s\n' "$1")
+}
+
+# Whether any of the namespaces NS... is ^:shares-target.
+shares_target() {
+  local ns
+  for ns in "$@"; do
+    awk -F'\t' -v ns="$ns" '$1 == ns && $2 == 1 { found = 1 } END { exit !found }' \
+      <(printf '%s\n' "$all") && return 0
+  done
+  return 1
+}
+
+# Shard counts: named namespaces run in full alongside a fast subset get a
+# share of the shards in proportion to their measured time.
+subset_shards="$shards"
+full_shards=0
+if [ -n "$subset" ] && [ -n "$full" ]; then
+  full_load=$(plan "$full" 1 | cut -f1)
+  subset_load=$(plan "$subset" 1 "fast:" | cut -f1)
+  full_shards=$(((shards * full_load + (full_load + subset_load) / 2) / (full_load + subset_load + 1)))
+  full_count=$(plan "$full" "$shards" | grep -c .)
+  [ "$full_shards" -gt "$full_count" ] && full_shards="$full_count"
+  [ "$full_shards" -gt $((shards - 1)) ] && full_shards=$((shards - 1))
+  [ "$full_shards" -lt 1 ] && full_shards=1
+  subset_shards=$((shards - full_shards))
+  [ "$subset_shards" -lt 1 ] && subset_shards=1
+elif [ -n "$full" ]; then
+  full_shards="$shards"
+fi
+threads=$((cores / shards))
+[ "$threads" -lt 2 ] && threads=2
+
+if [ "$dry" -eq 1 ]; then
+  run_dir=""
+elif [ -n "$log_parent" ]; then
+  mkdir -p "$log_parent" || exit 2
+  run_dir=$(mktemp -d "$log_parent/haselnuss-test.XXXXXX") || exit 2
+else
+  run_dir=$(mktemp -d /tmp/haselnuss-test.XXXXXX) || exit 2
+fi
+barrier="$run_dir/barrier"
+
+pids=()
+gated=()
+labels=()
+holds_shared=()
+
+# launch LABEL GATED SELECTOR NS...
+launch() {
+  local label="$1" gate="$2" selector="$3"
+  shift 3
+  # Sorted, so a JVM runs its namespaces in the order `lein test` would.
+  # shellcheck disable=SC2046
+  set -- $(printf '%s\n' "$@" | sort)
+  if [ "$dry" -eq 1 ]; then
+    printf '%s (%s): %s\n' "$label" "$selector" "$*"
+    return 0
+  fi
+  local i=${#pids[@]}
+  local env_extra=(HASELNUSS_TEST_TIMINGS="$run_dir/timings-$i.edn" HASELNUSS_TEST_THREADS="$threads"
+    HASELNUSS_TEST_PLAN="$run_dir/plan.tsv" HASELNUSS_TEST_PHASE=shard)
+  if [ "$gate" -eq 1 ]; then
+    env_extra=(HASELNUSS_TEST_TIMINGS="$run_dir/timing-phase-$i.edn" HASELNUSS_TEST_THREADS=1
+      HASELNUSS_TEST_PLAN="$run_dir/plan.tsv" HASELNUSS_TEST_PHASE=timing
+      HASELNUSS_TEST_BARRIER="$barrier" HASELNUSS_TEST_BARRIER_OWNER="$$")
+  fi
+  # One JVM (the first) also checks the namespace list itself.
+  [ "$i" -eq 0 ] && env_extra+=(HASELNUSS_TEST_CHECK_DISCOVERY=1)
+  printf '%s\n' "$@" >"$run_dir/shard-$i.namespaces"
+  (
+    if [ -n "$caller_lc_all_set" ]; then
+      export LC_ALL="$caller_lc_all"
+    else
+      unset LC_ALL
+    fi
+    start=$SECONDS
+    # shellcheck disable=SC2086
+    env "${env_extra[@]}" lein test "$@" $selector >"$run_dir/shard-$i.log" 2>&1
+    rc=$?
+    echo "$((SECONDS - start))" >"$run_dir/shard-$i.secs"
+    exit "$rc"
+  ) &
+  pids+=($!)
+  gated+=("$gate")
+  labels+=("$label, $# ns")
+  if [ "$gate" -eq 0 ] && shares_target "$@"; then
+    holds_shared+=(1)
+  else
+    holds_shared+=(0)
+  fi
+}
+
+# shard LIST N SUBSET-WORD: N shards of LIST, then its ^:timing tests in at
+# most two JVMs (mostly one-threaded tests, so two do not contend on a
+# machine the shards have left).
+shard() {
+  local list="$1" n="$2" word="$3" load nses
+  while IFS=$'\t' read -r load nses; do
+    [ -z "$nses" ] && continue
+    # shellcheck disable=SC2086
+    launch "${word:-full} ~${load}s" 0 ":phase shard $word" $nses
+  done < <(plan "$list" "$n" "${word:+$word:}")
+  while IFS=$'\t' read -r load nses; do
+    [ -z "$nses" ] && continue
+    # shellcheck disable=SC2086
+    launch "${word:-full} timing ~${load}s" 1 ":phase timing $word" $nses
+  done < <(plan "$(timing_of "$list")" 2 "timing:")
+}
+
+if [ "$dry" -eq 0 ]; then
+  printf '%s\n' "$all" >"$run_dir/plan.tsv"
+  # Every JVM in a process group of its own (job control), so that an
+  # interrupted bin/test stops each one with everything it started -- an
+  # orphaned uberjar-test would go on to wipe target/ under the next run.
+  set -m
+  finished=0
+  stop_all() {
+    [ "$finished" -eq 1 ] && return 0
+    local pid
+    for pid in "${pids[@]}"; do
+      kill -TERM -- "-$pid" 2>/dev/null
+    done
+  }
+  trap 'stop_all; echo "bin/test: interrupted; stopped its JVMs" >&2; exit 130' INT
+  trap 'stop_all; echo "bin/test: terminated; stopped its JVMs" >&2; exit 143' TERM
+  trap 'stop_all' EXIT
+fi
+
+started=$SECONDS
+[ -n "$subset" ] && shard "$subset" "$subset_shards" fast
+[ -n "$full" ] && shard "$full" "$full_shards" ""
+
+if [ "$dry" -eq 1 ]; then
+  exit 0
+fi
+echo "bin/test: ${#pids[@]} JVM(s), $threads thread(s) each for ^:parallel namespaces; logs in $run_dir"
+
+# Release the timing phase once at most one shard is still running: one
+# shard keeps a few of the cores busy, which the bounds' headroom absorbs,
+# while waiting for the last one too would leave the machine idle. A shard
+# is running while its process is alive (`kill -0`) -- not "until it wrote
+# its .secs file", which a killed shard never does.
+#
+# Not while the ^:shares-target shard runs, though: a timing test may read
+# target/ too (native-serve-test's binary sits beside the jar it is compared
+# with).
+while :; do
+  running=0
+  shared_running=0
+  for i in "${!pids[@]}"; do
+    if [ "${gated[$i]}" -eq 0 ] && kill -0 "${pids[$i]}" 2>/dev/null; then
+      running=$((running + 1))
+      [ "${holds_shared[$i]}" -eq 1 ] && shared_running=1
+    fi
+  done
+  [ "$running" -le 1 ] && [ "$shared_running" -eq 0 ] && break
+  sleep 1
+done
+released=$((SECONDS - started))
+touch "$barrier"
+codes=()
+for i in "${!pids[@]}"; do
+  wait "${pids[$i]}"
+  codes[i]=$?
+done
+finished=1
+
+status=0
+tests=0
+assertions=0
+failures=0
+errors=0
+crashed=0
+for i in "${!pids[@]}"; do
+  rc="${codes[$i]}"
+  log="$run_dir/shard-$i.log"
+  secs=$(cat "$run_dir/shard-$i.secs" 2>/dev/null || echo "?")
+  ran=$(grep -E '^Ran [0-9]+ tests containing [0-9]+ assertions\.$' "$log" | tail -n 1)
+  tally=$(grep -E '^[0-9]+ failures, [0-9]+ errors\.$' "$log" | tail -n 1)
+  if [ -z "$ran" ] || [ -z "$tally" ]; then
+    printf '  %d (%s): %ss, CRASHED (exit %s) -- see %s\n' "$i" "${labels[$i]}" "$secs" "$rc" "$log"
+    tail -n 20 "$log" | sed 's/^/    | /'
+    status=1
+    crashed=$((crashed + 1))
+    continue
+  fi
+  if [ "$rc" -ne 0 ] && [ "$(awk '{ print $1 + $3 }' <<<"$tally")" -eq 0 ]; then
+    # a summary with no failures, yet the JVM failed: count it as crashed
+    crashed=$((crashed + 1))
+  fi
+  t=$(awk '{ print $2 }' <<<"$ran")
+  a=$(awk '{ print $5 }' <<<"$ran")
+  f=$(awk '{ print $1 }' <<<"$tally")
+  e=$(awk '{ print $3 }' <<<"$tally")
+  tests=$((tests + t))
+  assertions=$((assertions + a))
+  failures=$((failures + f))
+  errors=$((errors + e))
+  printf '  %d (%s): %ss, %d tests, %d assertions, %d failures, %d errors\n' \
+    "$i" "${labels[$i]}" "$secs" "$t" "$a" "$f" "$e"
+  if [ "$rc" -ne 0 ] || [ "$f" -ne 0 ] || [ "$e" -ne 0 ]; then
+    status=1
+    grep -E '^lein test :only ' "$log" | sort -u | sed 's/^/    /'
+    awk '/^(FAIL|ERROR) in /{ n = 14 } n > 0 { print "    | " $0; n-- }' "$log"
+  fi
+done
+
+# Namespace times from the shards (the timing phase's own are in its file).
+timings=$(cat "$run_dir"/timings-*.edn 2>/dev/null |
+  sed -n -E 's/^\{:ns ([^,]+), :secs ([0-9.]+), :test ([0-9]+)[,}].*$/\1\t\2\t\3/p' | sort -t$'\t' -k2,2 -rn)
+
+if [ -n "$timings" ]; then
+  echo
+  echo "Slowest namespaces in the shards (s, tests):"
+  head -n 10 <<<"$timings" | awk -F'\t' '{ printf "  %7.1f  %4d  %s\n", $2, $3, $1 }'
+fi
+
+if [ "$record" -eq 1 ]; then
+  if [ "$status" -eq 0 ]; then
+    # A complete run rewrites the NS and timing:NS lines, a --fast run the
+    # fast:NS lines; each keeps the other's.
+    if [ "$fast" -eq 1 ]; then
+      kept=$(grep -v -E '^(#|fast:)' test/timings.tsv 2>/dev/null)
+      # a namespace with no fast test ran nothing: weight 0, not its full time
+      fresh=$(awk -F'\t' 'NR == FNR { t[$1] = $2; next }
+                          $1 != "" { printf "fast:%s\t%.1f\n", $1, t[$1] + 0 }' \
+        <(printf '%s\n' "$timings") <(printf '%s\n' "$subset"))
+    else
+      kept=$(grep -E '^fast:' test/timings.tsv 2>/dev/null)
+      fresh=$({
+        awk -F'\t' 'NR == FNR { t[$1] = $2; next } $1 != "" { printf "%s\t%.1f\n", $1, t[$1] + 0 }' \
+          <(printf '%s\n' "$timings") <(printf '%s\n' "$full")
+        cat "$run_dir"/timing-phase-*.edn 2>/dev/null |
+          sed -n -E 's/^\{:ns ([^,]+), :secs ([0-9.]+)[,}].*$/timing:\1\t\2/p'
+      })
+    fi
+    {
+      echo "# Seconds per test namespace in bin/test's shards (its ^:timing tests"
+      echo "# excluded); as timing:NS in its timing phase, as fast:NS in the shards"
+      echo "# of --fast. bin/test balances its JVMs by these; regenerate with"
+      echo "# bin/test --record-timings and bin/test --fast --record-timings."
+      echo "# Unlisted: 5 s."
+      printf '%s\n%s\n' "$kept" "$fresh" | sed '/^$/d' | sort
+    } >test/timings.tsv
+    echo "bin/test: rewrote test/timings.tsv"
+  else
+    echo "bin/test: not rewriting test/timings.tsv from a failed run"
+  fi
+fi
+
+echo
+echo "Ran $tests tests containing $assertions assertions."
+echo "$failures failures, $errors errors."
+echo "Wall time: $((SECONDS - started)) s (timing phase released at $released s)."
+# The last line says it outright: a crashed JVM's tests are missing from the
+# counts above, which can otherwise read as a clean run.
+if [ "$status" -eq 0 ] && [ "$failures" -eq 0 ] && [ "$errors" -eq 0 ]; then
+  echo "bin/test: PASSED -- $tests tests, $assertions assertions, 0 failures, 0 errors, ${#pids[@]} JVMs"
+  exit 0
+fi
+echo "bin/test: FAILED -- $tests tests, $assertions assertions, $failures failures, $errors errors," \
+  "$crashed of ${#pids[@]} JVMs crashed or failed outside a test"
+exit 1

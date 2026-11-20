@@ -130,7 +130,11 @@
 
 ;; --- parsing ----------------------------------------------------------------
 
-(defn- valid-name? [s] (boolean (re-matches name-re s)))
+(defn valid-name?
+  "True when the string `s` is a library name, shelf segment or slug (the
+  grammar's `name`)."
+  [s]
+  (boolean (re-matches name-re s)))
 
 (defn- valid-label? [s]
   (and (boolean (re-matches label-re s))

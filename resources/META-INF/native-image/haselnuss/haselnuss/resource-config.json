@@ -299,6 +299,24 @@
   }, {
     "pattern":"\\Qhaselnuss/select__init.class\\E"
   }, {
+    "pattern":"\\Qhaselnuss/site/app.css\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/site/app.js\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/site/apple-touch-icon.png\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/site/icon-192.png\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/site/icon-512.png\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/site/icon-maskable-512.png\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/site/index.html\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/site/manifest.webmanifest\\E"
+  }, {
+    "pattern":"\\Qhaselnuss/site/sw.js\\E"
+  }, {
     "pattern":"\\Qhaselnuss/transform.clj\\E"
   }, {
     "pattern":"\\Qhaselnuss/transform__init.class\\E"

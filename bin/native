@@ -11,6 +11,8 @@
 # staging and native-image invocation below, so it measures the image the
 # shipped flags produce; only the jar it starts from and the output name
 # differ. The shipped binary is unchanged by it and never contains the soak.
+# Since TASK-278 that includes -R:MaxNewSize=128m, which the doc-11 soak
+# baseline (measured 2026-11-12) did not have: re-measure before comparing.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -100,9 +102,39 @@ echo "== native-image =="
 #   The exact class names matter: Clojure's AOT naming puts `clojure.math__init`
 #   in package `clojure`, NOT in a package called `clojure.math`, so a
 #   package-level deferral silently fails to match it.
+#
+# -Dsun.net.httpserver.* (TASK-273): the JDK HTTP server --serve uses reads its
+#   settings once, in sun.net.httpserver.ServerConfig's static initializer, and
+#   the image initializes that class at BUILD time (deferring it with
+#   --initialize-at-run-time fails the build: something in the JDK initializes
+#   it there anyway), so the build's values are the binary's, and a -D given to
+#   the binary is ignored. They are haselnuss.serve/server-properties, which
+#   haselnuss.serve sets itself on the JVM, where they are read at run time;
+#   haselnuss.serve-test checks the two lists agree. nodelay: without it every
+#   response on a kept-alive connection waits ~40 ms on Nagle and the client's
+#   delayed ACK (haselnuss.native-test checks it). maxReqTime/maxRspTime: without
+#   them eight clients that send half a request hold every server thread for good.
+#
+# -R:MaxNewSize=128m (TASK-278): the binary's default young generation. The
+#   image's serial collector otherwise lets the young generation grow to a third
+#   of its maximum heap (80% of RAM: 8.5 GB on a 32 GB machine), and --serve, which
+#   allocates a whole catalog's worth of garbage on every catalog reload, grew
+#   with it: on the 50,000-book catalog its peak RSS crept up reload after reload
+#   (458 MB after 40, still rising); with this cap it peaked at 381 MB, and with
+#   the cap and the System/gc haselnuss.serve makes after a reload at 317 MB.
+#   It has to be a build-time default: SubstrateVM's heap sizes are fixed at
+#   startup, so --serve cannot lower them for itself. The cost is --build-site,
+#   about 8% slower on 10,000 books (64m: 14%). -XX:MaxNewSize=N given to the
+#   binary overrides it; the maximum heap is left at its default (80% of RAM),
+#   because a 50,000-book --build-site needs several GB. Numbers: README,
+#   "Serving a site", and TASK-278's notes.
 native-image -jar "$staged" --no-fallback \
   --features=clj_easy.graal_build_time.InitClojureClasses \
   --initialize-at-run-time=haselnuss,sci,clj_yaml,edamame,flatland,malli,fipp,borkdude,com.vladsch.flexmark,org.yaml.snakeyaml,clojure.data.json__init,clojure.math__init,clojure.pprint__init,clojure.pprint.dispatch__init,flatland.ordered.map__init \
+  -Dsun.net.httpserver.nodelay=true \
+  -Dsun.net.httpserver.maxReqTime=30 \
+  -Dsun.net.httpserver.maxRspTime=300 \
+  -R:MaxNewSize=128m \
   -o "$out"
 status=$?
 

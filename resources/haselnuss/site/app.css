@@ -1,0 +1,179 @@
+/* Haselnuss reader app stylesheet. Book pages link it too, so everything for the
+   home screen (TASK-274) sits under body.home, and the reading screen (TASK-275)
+   has its own section at the end, under html[data-theme] and .hz. */
+body.home {
+  --paper: #f4ecd8; --ink: #3b3226; --muted: #7a6c58; --line: #ddd0b4; --accent: #8a5a2b;
+  margin: 0; background: var(--paper); color: var(--ink);
+  font: 16px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding-bottom: calc(64px + env(safe-area-inset-bottom));
+  -webkit-tap-highlight-color: transparent;
+}
+body.home [hidden] { display: none !important; }
+.home .bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: calc(12px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right)) 8px calc(16px + env(safe-area-inset-left));
+}
+.home h1 { margin: 0; font-size: 1.7rem; }
+.home h2 { margin: 18px 0 8px; font-size: .8rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.home main { padding: 0 calc(16px + env(safe-area-inset-right)) 0 calc(16px + env(safe-area-inset-left)); }
+.avatar {
+  width: 40px; height: 40px; border-radius: 50%; border: 0; background: var(--accent); color: #fff;
+  font-weight: 600; font-size: 1.1rem; line-height: 40px; text-align: center; padding: 0; cursor: pointer;
+}
+.link-button { border: 0; background: none; color: var(--accent); font: inherit; padding: 6px 0; cursor: pointer; }
+.status { color: var(--muted); margin: 8px 0; }
+.error { color: #a02020; }
+
+/* generated covers: the library's colour, the title, the library's name */
+.cover {
+  display: flex; flex-direction: column; justify-content: space-between; box-sizing: border-box;
+  border-radius: 6px; padding: 10px; color: #fff; text-decoration: none; overflow: hidden;
+  background: var(--cover, #6b5d4a); box-shadow: 0 1px 3px rgba(0,0,0,.3);
+}
+.cover .t { font: 600 .95rem/1.2 Georgia, serif; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+.cover .l { font-size: .7rem; opacity: .8; text-transform: uppercase; letter-spacing: .05em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.cover.pending { opacity: .55; }
+
+/* the virtualised grid: a spacer as tall as every row, covers placed on it */
+.grid-host { position: relative; }
+.grid { position: relative; width: 100%; }
+.grid .cover { position: absolute; }
+
+.continue-list { list-style: none; margin: 0; padding: 0; display: flex; gap: 12px; overflow-x: auto; padding-bottom: 6px; }
+.continue-list li { flex: 0 0 132px; }
+.continue-list .cover { height: 176px; }
+.progress { height: 5px; background: var(--line); border-radius: 3px; margin-top: 6px; overflow: hidden; }
+.progress > i { display: block; height: 100%; background: var(--accent); }
+.pct { font-size: .75rem; color: var(--muted); }
+
+.library-list, .results { list-style: none; margin: 0; padding: 0; }
+.library-list li button, .results a {
+  display: flex; align-items: center; gap: 12px; width: 100%; box-sizing: border-box; text-align: left;
+  border: 0; border-bottom: 1px solid var(--line); background: none; color: inherit; font: inherit;
+  padding: 12px 0; text-decoration: none; cursor: pointer;
+}
+.swatch { flex: 0 0 28px; height: 38px; border-radius: 4px; background: var(--cover, #6b5d4a); }
+.sub { display: block; font-size: .8rem; color: var(--muted); }
+.search-input {
+  width: 100%; box-sizing: border-box; font: inherit; padding: 10px 12px; margin-top: 8px;
+  border: 1px solid var(--line); border-radius: 8px; background: #fffaf0; color: var(--ink);
+}
+
+.tabs {
+  position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: #efe4c9; border-top: 1px solid var(--line);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.tabs a { flex: 1; text-align: center; padding: 14px 0; color: var(--muted); text-decoration: none; font-size: .9rem; }
+.tabs a[aria-current="page"] { color: var(--accent); font-weight: 600; }
+
+.overlay { position: fixed; inset: 0; background: rgba(40,30,20,.55); display: flex; align-items: flex-end; justify-content: center; z-index: 10; }
+.sheet {
+  width: 100%; max-width: 480px; box-sizing: border-box; background: var(--paper); border-radius: 14px 14px 0 0;
+  padding: 18px 18px calc(18px + env(safe-area-inset-bottom)); max-height: 85vh; overflow-y: auto;
+}
+.sheet h2 { margin: 0 0 10px; font-size: 1.3rem; text-transform: none; letter-spacing: 0; color: var(--ink); }
+.reader-list { list-style: none; margin: 0 0 12px; padding: 0; }
+.reader-list button {
+  display: flex; align-items: center; gap: 12px; width: 100%; border: 0; border-bottom: 1px solid var(--line);
+  background: none; font: inherit; color: inherit; padding: 10px 0; cursor: pointer; text-align: left;
+}
+.reader-list .avatar { flex: none; }
+.add-reader { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.add-reader label { flex: 1 0 100%; font-size: .85rem; color: var(--muted); }
+.add-reader input { flex: 1; font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fffaf0; }
+.add-reader button { font: inherit; padding: 8px 16px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; }
+
+/* ===== the reading screen (TASK-275) =====================================================
+   Book pages only: their inline theme script sets html[data-theme] before first paint
+   (the page's own inline <style> gives each theme its page colours). Every control is
+   fixed in place over the page, so showing or hiding one never moves the text. */
+html[data-theme=light] { --hz-page: #fff; --hz-ui: #f6f6f4; --hz-ink: #1d1d1d; --hz-muted: #6b6b6b; --hz-line: #dcdcd8; --hz-accent: #8a5a2b; --hz-link: #1a5fb4; }
+html[data-theme=sepia] { --hz-page: #f4ecd8; --hz-ui: #efe4c9; --hz-ink: #3b3226; --hz-muted: #7a6c58; --hz-line: #ddd0b4; --hz-accent: #8a5a2b; --hz-link: #7b4a1c; }
+html[data-theme=dark]  { --hz-page: #121212; --hz-ui: #1f1f1f; --hz-ink: #d6d0c4; --hz-muted: #948b7e; --hz-line: #353535; --hz-accent: #d9a066; --hz-link: #9cc0f0; }
+html[data-theme] body {
+  padding-top: calc(30px + env(safe-area-inset-top));
+  padding-bottom: calc(40px + env(safe-area-inset-bottom));
+  padding-left: max(1rem, env(safe-area-inset-left));
+  padding-right: max(1rem, env(safe-area-inset-right));
+  margin-top: 0; margin-bottom: 0;
+  /* a long URL in the text would widen the page, and a phone would zoom the
+     whole page out, controls and all */
+  overflow-wrap: break-word;
+}
+html[data-theme] a { color: var(--hz-link); }
+html[data-theme] [id], html[data-theme] :is(h1, h2, h3, h4, h5, h6) { scroll-margin-top: calc(36px + env(safe-area-inset-top)); }
+html.hz-sheet-open { overflow: hidden; }
+
+.hz { font: 15px/1.35 -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--hz-ink);
+      -webkit-tap-highlight-color: transparent; }
+.hz [hidden] { display: none !important; }
+.hz button, .hz a.hz-library, .hz-running, .hz-pct, .hz-title, .hz-tools, .hz-sheet-head {
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+}
+.hz button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 8px 10px; border-radius: 8px; }
+.hz button:focus-visible, .hz a:focus-visible { outline: 2px solid var(--hz-accent); outline-offset: 1px; }
+
+.hz-running, .hz-pct {
+  position: fixed; left: 0; right: 0; z-index: 10; box-sizing: border-box; background: var(--hz-page);
+  color: var(--hz-muted); font-size: 12px; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  padding-left: calc(16px + env(safe-area-inset-left)); padding-right: calc(16px + env(safe-area-inset-right));
+}
+.hz-running { top: 0; padding-top: calc(6px + env(safe-area-inset-top)); height: calc(26px + env(safe-area-inset-top)); }
+.hz-pct { bottom: 0; padding-top: 6px; height: calc(28px + env(safe-area-inset-bottom)); }
+
+.hz-top, .hz-bottom {
+  position: fixed; left: 0; right: 0; z-index: 20; box-sizing: border-box; background: var(--hz-ui);
+  padding-left: calc(8px + env(safe-area-inset-left)); padding-right: calc(8px + env(safe-area-inset-right));
+  visibility: hidden; transition: transform .18s ease, visibility .18s; box-shadow: 0 0 6px rgba(0,0,0,.18);
+}
+.hz-top { top: 0; padding-top: env(safe-area-inset-top); transform: translateY(-110%); }
+.hz-bottom { bottom: 0; padding-bottom: calc(6px + env(safe-area-inset-bottom)); transform: translateY(110%); }
+html.hz-show .hz-top, html.hz-show .hz-bottom { visibility: visible; transform: none; }
+.hz-row { display: flex; align-items: center; gap: 4px; }
+.hz-gap { flex: 1; }
+.hz-library { color: var(--hz-accent); text-decoration: none; padding: 10px 8px; white-space: nowrap; }
+.hz-back { color: var(--hz-accent); min-width: 0; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hz-aa { font-weight: 600; }
+.hz-title { text-align: center; font-weight: 600; padding: 0 8px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hz-slider { display: block; width: calc(100% - 16px); margin: 10px 8px 4px; accent-color: var(--hz-accent); }
+.hz-tools { justify-content: space-around; }
+
+.hz-overlay { position: fixed; inset: 0; z-index: 30; background: rgba(20,15,10,.5); display: flex; align-items: flex-end; justify-content: center; }
+.hz-sheet {
+  width: 100%; max-width: 560px; max-height: 80vh; box-sizing: border-box; display: flex; flex-direction: column;
+  background: var(--hz-page); color: var(--hz-ink); border-radius: 14px 14px 0 0;
+  padding: 10px calc(16px + env(safe-area-inset-right)) env(safe-area-inset-bottom) calc(16px + env(safe-area-inset-left));
+}
+.hz-sheet-head { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--hz-line); }
+.hz-sheet-title { flex: 1; margin: 0; font-size: 1.05rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hz-close { color: var(--hz-accent); }
+.hz-sheet[data-panel=preview] .hz-close { display: none; }   /* its own Open and Close */
+.hz-sheet-body { overflow-y: auto; overscroll-behavior: contain; padding: 8px 0 16px; }
+.hz-status { color: var(--hz-muted); }
+.hz-list { list-style: none; margin: 0; padding: 0; }
+.hz .hz-item { display: block; width: 100%; text-align: left; border-bottom: 1px solid var(--hz-line); border-radius: 0; padding: 10px 4px; }
+.hz-sub { display: block; font-size: .8rem; color: var(--hz-muted); }
+.hz-group { font-size: .8rem; letter-spacing: .06em; text-transform: uppercase; color: var(--hz-muted); margin: 14px 0 2px; }
+.hz-hit mark { background: rgba(255,200,60,.55); color: inherit; }
+.hz-search-input { width: 100%; box-sizing: border-box; font: inherit; padding: 9px 12px; margin-top: 6px;
+  border: 1px solid var(--hz-line); border-radius: 8px; background: var(--hz-ui); color: var(--hz-ink); }
+.hz-sizes, .hz-themes { justify-content: center; gap: 12px; padding: 10px 0; }
+.hz-size { min-width: 4em; text-align: center; }
+.hz .hz-sizes button { font-size: 1.1rem; border: 1px solid var(--hz-line); min-width: 56px; }
+.hz .hz-theme { border: 1px solid var(--hz-line); min-width: 80px; }
+.hz .hz-theme-light { background: #fff; color: #1d1d1d; }
+.hz .hz-theme-sepia { background: #f4ecd8; color: #3b3226; }
+.hz .hz-theme-dark { background: #121212; color: #d6d0c4; }
+.hz-theme[aria-pressed=true] { outline: 2px solid var(--hz-accent); }
+/* contain: paint makes the preview the box a position:fixed element inside it is placed
+   in, and clips everything to it: a style attribute in a cited book cannot cover the page */
+.hz-preview { font: 1rem/1.55 Georgia, "Times New Roman", serif; contain: paint; }
+.hz-preview figure { margin: .5rem 0; }
+.hz-preview figcaption { display: none; }   /* the sheet's own source line says it */
+.hz-preview blockquote { margin: .5rem 0; padding: .1rem 1rem; border-left: 3px solid var(--hz-line); }
+.hz-preview img { max-width: 100%; }
+.hz-more { font-style: italic; color: var(--hz-muted); }
+.hz-source { color: var(--hz-muted); text-align: right; margin: 4px 0 8px; }
+.hz-actions { justify-content: flex-end; gap: 8px; }
+.hz .hz-open { background: var(--hz-accent); color: #fff; }
+html[data-theme=dark] .hz .hz-open { color: #121212; }
