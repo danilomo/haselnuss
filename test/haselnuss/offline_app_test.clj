@@ -21,6 +21,7 @@
   (:import (com.sun.net.httpserver HttpExchange HttpHandler HttpServer)
            (java.io File StringWriter)
            (java.net InetSocketAddress URI)
+           (java.util.concurrent CountDownLatch Executors)
            (java.net.http HttpClient HttpClient$Redirect HttpRequest HttpRequest$BodyPublishers
                           HttpResponse HttpResponse$BodyHandlers)))
 
@@ -376,47 +377,64 @@
 (defn- start-proxy!
   "An HTTP server in front of `backend` (a URL ending in `/`), the way a
   reverse proxy sits in front of `--serve`: it passes requests through,
-  except that while `(down? path)` it answers 502 itself. Its URL is
-  `:url`; stop it with `(.stop (:server p) 0)`."
-  [backend down?]
-  (let [server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
-        handler (reify HttpHandler
-                  (handle [_ ex]
-                    (let [^HttpExchange ex ex
-                          raw (str (.getRawPath (.getRequestURI ex))
-                                   (some->> (.getRawQuery (.getRequestURI ex)) (str "?")))]
-                      (try
-                        (if (down? (.getPath (.getRequestURI ex)))
-                          (let [body (.getBytes "Bad Gateway from the proxy" "UTF-8")]
-                            (.set (.getResponseHeaders ex) "Content-Type" "text/plain; charset=utf-8")
-                            (.sendResponseHeaders ex 502 (alength body))
-                            (with-open [out (.getResponseBody ex)] (.write out body)))
-                          (let [method (.getRequestMethod ex)
-                                in-body (.readAllBytes (.getRequestBody ex))
-                                req (cond-> (HttpRequest/newBuilder (URI. (str (subs backend 0 (dec (count backend))) raw)))
-                                      (.getFirst (.getRequestHeaders ex) "Content-Type")
-                                      (.header "Content-Type" (.getFirst (.getRequestHeaders ex) "Content-Type"))
-                                      (.getFirst (.getRequestHeaders ex) "If-None-Match")
-                                      (.header "If-None-Match" (.getFirst (.getRequestHeaders ex) "If-None-Match"))
-                                      true (.method method (if (pos? (alength in-body))
-                                                             (HttpRequest$BodyPublishers/ofByteArray in-body)
-                                                             (HttpRequest$BodyPublishers/noBody))))
-                                ^HttpResponse r (.send proxy-client (.build ^java.net.http.HttpRequest$Builder req)
-                                                       (HttpResponse$BodyHandlers/ofByteArray))
-                                ^bytes body (.body r)
-                                n (alength body)]
-                            (doseq [h ["Content-Type" "ETag" "Date" "Cache-Control" "Location"]
-                                    :let [v (.firstValue (.headers r) h)]
-                                    :when (.isPresent v)]
-                              (.set (.getResponseHeaders ex) h (.get v)))
-                            (.sendResponseHeaders ex (.statusCode r) (if (or (zero? n) (= "HEAD" method)) -1 n))
-                            (when (and (pos? n) (not= "HEAD" method))
-                              (with-open [out (.getResponseBody ex)] (.write out body)))))
-                        (catch Exception _ nil)
-                        (finally (.close ex))))))]
-    (.createContext server "/" handler)
-    (.start server)
-    {:server server :url (str "http://127.0.0.1:" (.getPort (.getAddress server)) "/")}))
+  except that while `(down? path)` it answers 502 itself, and while
+  `(hang? path)` it takes the request and never answers -- a VPN up with no
+  network behind it (TASK-322). Its URL is `:url`; stop it with
+  `stop-proxy!`, which lets the requests it holds go."
+  ([backend down?] (start-proxy! backend down? (constantly false)))
+  ([backend down? hang?]
+   (let [server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+         release (CountDownLatch. 1)
+         handler (reify HttpHandler
+                   (handle [_ ex]
+                     (let [^HttpExchange ex ex
+                           raw (str (.getRawPath (.getRequestURI ex))
+                                    (some->> (.getRawQuery (.getRequestURI ex)) (str "?")))]
+                       (try
+                         (cond
+                           (hang? (.getPath (.getRequestURI ex)))
+                           (.await release)
+
+                           (down? (.getPath (.getRequestURI ex)))
+                           (let [body (.getBytes "Bad Gateway from the proxy" "UTF-8")]
+                             (.set (.getResponseHeaders ex) "Content-Type" "text/plain; charset=utf-8")
+                             (.sendResponseHeaders ex 502 (alength body))
+                             (with-open [out (.getResponseBody ex)] (.write out body)))
+
+                           :else
+                           (let [method (.getRequestMethod ex)
+                                 in-body (.readAllBytes (.getRequestBody ex))
+                                 req (cond-> (HttpRequest/newBuilder (URI. (str (subs backend 0 (dec (count backend))) raw)))
+                                       (.getFirst (.getRequestHeaders ex) "Content-Type")
+                                       (.header "Content-Type" (.getFirst (.getRequestHeaders ex) "Content-Type"))
+                                       (.getFirst (.getRequestHeaders ex) "If-None-Match")
+                                       (.header "If-None-Match" (.getFirst (.getRequestHeaders ex) "If-None-Match"))
+                                       true (.method method (if (pos? (alength in-body))
+                                                              (HttpRequest$BodyPublishers/ofByteArray in-body)
+                                                              (HttpRequest$BodyPublishers/noBody))))
+                                 ^HttpResponse r (.send proxy-client (.build ^java.net.http.HttpRequest$Builder req)
+                                                        (HttpResponse$BodyHandlers/ofByteArray))
+                                 ^bytes body (.body r)
+                                 n (alength body)]
+                             (doseq [h ["Content-Type" "ETag" "Date" "Cache-Control" "Location"]
+                                     :let [v (.firstValue (.headers r) h)]
+                                     :when (.isPresent v)]
+                               (.set (.getResponseHeaders ex) h (.get v)))
+                             (.sendResponseHeaders ex (.statusCode r) (if (or (zero? n) (= "HEAD" method)) -1 n))
+                             (when (and (pos? n) (not= "HEAD" method))
+                               (with-open [out (.getResponseBody ex)] (.write out body)))))
+                         (catch Exception _ nil)
+                         (finally (.close ex))))))]
+     (.createContext server "/" handler)
+     ;; a thread per request: one held by hang? must not hold up the rest
+     (.setExecutor server (Executors/newCachedThreadPool))
+     (.start server)
+     {:server server :release release
+      :url (str "http://127.0.0.1:" (.getPort (.getAddress server)) "/")})))
+
+(defn- stop-proxy! [p]
+  (.countDown ^CountDownLatch (:release p))
+  (.stop ^HttpServer (:server p) 0))
 
 (deftest a-server-error-shows-the-kept-copy-test
   (tb/with-site-dir site-of-books
@@ -455,4 +473,61 @@
                    (reset! down false)
                    (testing "the copy is still there once the server is back"
                      (is (js b (kept-js "haselnuss-books" plain)))))
-                 (finally (.stop ^HttpServer (:server front) 0)))))))))))
+                 (finally (stop-proxy! front)))))))))))
+
+;; --- a network that neither answers nor fails (TASK-322) -------------------------------------------
+
+(defn- search! [b q]
+  (js b (str "(() => { const i = document.getElementById('search-input'); i.value = " (json/write-str q) ";"
+             " i.dispatchEvent(new Event('input')); })()")))
+
+(def ^:private refs-js
+  "Open the Referenced by panel of the book page shown."
+  "document.querySelector('.hz-refs').click()")
+
+(deftest a-hanging-network-shows-the-kept-copies-test
+  (tb/with-site-dir site-of-books
+    (fn [dir]
+      (tb/call-with-browser
+       "offline-app-test"
+       (fn [b]
+         (tb/with-server dir
+           (fn [srv]
+             (let [hung (atom false)
+                   front (start-proxy! (:url srv) (constantly false) (fn [_] @hung))]
+               (try
+                 (let [base (:url front)
+                       plain (str base "books/lib/plain/index.html")
+                       no-refs "document.body.textContent.includes('No other book refers to this one.')"]
+                   (cdp b "Page.enable" {})
+                   (is (= 201 (http-json "POST" (str (:url srv) "api/readers") {"name" "Ana"})))
+                   (open-home! b base)
+                   (js b "localStorage.setItem('haselnuss.reader', JSON.stringify({id: 'ana', name: 'Ana'}))")
+                   (wait-for b "a controlling worker" controlled-js)
+                   (open-home! b base)
+                   (wait-for b "covers online" "document.querySelectorAll('[data-grid=\"all\"] .cover').length === 3")
+                   (wait-for b "the catalog kept" (kept-js "haselnuss-catalog" (str base "catalog/index.json")))
+                   (wait-for b "the position store" "indexedDB.databases().then(ds => ds.some(d => d.name === 'haselnuss-positions'))")
+                   (testing "online: a place saved on the device and the server, and the book's backlinks kept"
+                     (open-book! b plain)
+                     (scroll-to! b "P4-3")
+                     (wait-for b "a save" "document.documentElement.getAttribute('data-position-saves') === '1'")
+                     (wait-for b "sent" (str queued-js ".then(q => q && q.some(r => r[0] === 'ana\\nlib:plain' && r[1] === false))"))
+                     (js b refs-js)
+                     (wait-for b "backlinks online" no-refs))
+                   (reset! hung true)
+                   (testing "the network hangs: the home screen shows the covers kept on the device"
+                     (open-home! b base)
+                     (wait-for b "kept covers" "document.querySelectorAll('[data-grid=\"all\"] .cover').length === 3")
+                     (is (= "" (js b "document.getElementById('message').textContent"))))
+                   (testing "search answers from the kept catalog pages"
+                     (js b "location.hash = '#search'")
+                     (search! b "plain")
+                     (wait-for b "offline results" "document.getElementById('search-status').dataset.mode === 'offline' && document.querySelectorAll('#search-results li').length === 1"))
+                   (testing "an opened book is put back at the place kept on the device"
+                     (is (= "heading" (open-book! b plain)))
+                     (is (= "P4-3" (para-at-line b))))
+                   (testing "its backlinks come from the copy kept on the device"
+                     (js b refs-js)
+                     (wait-for b "kept backlinks" no-refs)))
+                 (finally (stop-proxy! front)))))))))))

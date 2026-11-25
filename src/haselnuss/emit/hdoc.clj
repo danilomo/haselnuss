@@ -385,9 +385,10 @@
   TASK-123 -- `:sticky-note` are schema-valid
   (`haselnuss.ast/registry`) and both existing emitters render them, but
   `haselnuss.parser` produces none of them. (`:strike` was a fifth until
-  TASK-137: `~~...~~` is its own spelling, an exact round trip except one
-  strike nested inside another, written as a `[text]{.strike}` role span
-  -- `render-strike`.) The first three are written
+  TASK-137: `~~...~~` is its own spelling, an exact round trip -- since
+  TASK-305 also for a strike nested inside another, except a hand-built
+  nesting no `~~` spelling reads back as, written as a `[text]{.strike}`
+  role span -- `render-strike`.) The first three are written
   here as the role span an author would reach for (`[text]{.sub}`, the
   same `[text]{...}` construct that already produces a `:span`), since
   re-parsing that spelling yields a `:span`, not the original tag; a
@@ -546,6 +547,22 @@
     (and (or (= \= c) (= \~ c))
          (< (inc i) (.length s))
          (= c (.charAt s (inc i))))))
+
+(defn- escapes-as-strike-neighbour?
+  "True when the character at `i` of `s` is a `~` (or an `=`) that sits
+  against a strike (highlight) delimiter written beside this text run
+  (TASK-317): at `i` 0 right after the same character (`ctx`'s
+  `::prev-char`, tracked by `render-inlines`), or last in `s` with a
+  `:strike` (`:highlight`) next (`::next-inline`).
+  `escapes-as-highlight-marker?` sees only a character followed by another
+  one in the same string, so a lone one at the edge joined the neighbouring
+  `~~` run and lost its escape."
+  [^String s i ctx]
+  (let [c (Character/valueOf (.charAt s i))]
+    (and (contains? #{\~ \=} c)
+         (or (and (zero? i) (= c (::prev-char ctx)))
+             (and (= i (dec (.length s)))
+                  (= (if (= \~ c) :strike :highlight) (:t (::next-inline ctx))))))))
 
 (defn- escapes-as-book-ref-brace?
   "True when the character at `i` in `s` is a `{` straight after an `@` --
@@ -843,6 +860,7 @@
                                           (:line-start? ctx true)))
                                  (contains? always-escaped-chars c))
                                (escapes-as-highlight-marker? s i)
+                               (escapes-as-strike-neighbour? s i ctx)
                                (escapes-as-book-ref-brace? s i ctx))
                            (str \\ c)
                            ;; TASK-198: decided later, by `resolve-at-marks`.
@@ -1096,6 +1114,25 @@
     true (into (map (fn [[k v]] (str k "=" (render-attr-value k v)))
                     (sort-by key props)))))
 
+(defn- pipe-line?
+  "True when `ctx` renders text the parser reads as a pipe-table LINE: a
+  table cell (`::in-table-cell`) or a table's caption line
+  (`::in-caption-line`, TASK-282: a `: ...` line holding an unescaped `|`
+  is read as one more row, not a caption). On one, a `|` an attribute
+  group, code span, `$..$` or `@{..}` holds is marked (`escape-mark`), not
+  escaped, since the parser splits the line aware of those; every other
+  one is escaped."
+  [ctx]
+  (boolean (or (::in-table-cell ctx) (::in-caption-line ctx))))
+
+(defn- escape-line-pipes
+  "`text` with every `|` not marked by `pipe-line?` rendering written as
+  `\\|`, and every marked one written bare."
+  [text]
+  (-> text
+      (str/replace #"(?<!\u0000)\|" "\\\\|")
+      (str/replace (str escape-mark "|") "|")))
+
 (defn- attr-group
   "Attr `attr` as a `{#id .class key=val}` attribute-group fragment (AC
   #6), or `\"\"` when `attr` carries none of the three -- the same
@@ -1110,7 +1147,7 @@
    ;; `|` in a group is therefore marked, not escaped: `resolve-escape-
    ;; marks` keeps the mark and `render-table-cell` passes the pipe on.
    (cond-> (attr-group attr)
-     (::in-table-cell ctx) (str/replace "|" (str escape-mark "|")))))
+     (pipe-line? ctx) (str/replace "|" (str escape-mark "|")))))
 
 (def ^:private line-terminators
   "Every character the header tokenizer's `.` refuses to match, or that
@@ -1482,6 +1519,8 @@
               (= target (str "mailto:" text)) (when (and at-ok? (re-matches email-autolink-re text))
                                                 text))]
     (when (and uri
+               ;; TASK-282: a caption line's splitter reads `<...>` whole, so
+               ;; its `|` is written bare (marked) there; a cell still refuses.
                (not (and (::in-table-cell ctx) (str/includes? uri "|")))
                (not (and (::in-cite-affix ctx) (re-find #"[\[\]`$]" uri))))
       uri)))
@@ -1524,7 +1563,8 @@
   `<http://x/|y>` and `<http://x/\\|y>` in a cell)."
   [ctx inline]
   (if-let [uri (bracket-autolink-text ctx inline)]
-    (str "<" uri ">")
+    (cond-> (str "<" uri ">")
+      (::in-caption-line ctx) (str/replace "|" (str escape-mark "|")))
     (throw (if-not (::in-cite-affix ctx)
              (ex-info
               (str "hdoc emitter cannot represent a link inside link text unless it is an autolink"
@@ -2140,19 +2180,262 @@
        (and (not single?) (str/ends-with? text marker))
        (as-> escaped (str (subs escaped 0 (dec (count escaped))) "\\" marker))))))
 
+(declare render-footnote-definitions)
+
+(defn- delimited-skeleton
+  "The nesting of the `kinds` nodes in `x` (inlines, or any tree holding
+  them) alone: `[[:strike [\"text\" [:strike [...]]]]]`, every other node
+  spliced out (what it holds, a link's text or a citation's affixes, kept
+  in place). The words inside a `kinds` node are kept, any blank as one
+  space, the text outside every one is not -- so a delimiter that reads
+  back in the wrong place shows. `emphasis-skeleton` (TASK-237) for
+  `#{:emph :strong}`, `strike-skeleton` (TASK-305) for `#{:strike}`."
+  [kinds x in-kind?]
+  (let [merge-text (fn [xs]
+                     (vec (reduce (fn [acc y] (if (and (string? y) (string? (peek acc)))
+                                                (conj (pop acc) (str (peek acc) y))
+                                                (conj acc y)))
+                                  [] xs)))]
+    (cond (and (map? x) (contains? kinds (:t x)))
+          [[(:t x) (delimited-skeleton kinds (:inlines x) true)]]
+          (and (map? x) in-kind? (contains? #{:str :space :soft-break} (:t x)))
+          [(case (:t x) :str (:text x) " ")]
+          (map? x) (merge-text (mapcat #(delimited-skeleton kinds (val %) in-kind?) (sort-by (comp str key) x)))
+          (sequential? x) (merge-text (mapcat #(delimited-skeleton kinds % in-kind?) x))
+          :else [])))
+
+(defn- strike-skeleton [x] (delimited-skeleton #{:strike} x false))
+
+(defn- holds-strike?
+  "True when `:strike` `inline` has another `:strike` anywhere inside it."
+  [inline]
+  (boolean (some #(and (map? %) (= :strike (:t %))) (rest (tree-seq coll? seq inline)))))
+
+(defn- strike-delimited
+  "`~~text~~` for a `:strike` whose Inlines `inlines` rendered as `text`,
+  with a literal `~` at either edge of `text` escaped
+  (`escape-highlight-boundary`) -- but not the `~~` of a strike nested at
+  that edge (TASK-305): that one is a delimiter, and has to stay bare to
+  join the outer one's run (`~~~~a~~ b~~`)."
+  [inlines text]
+  (let [nested-at? (fn [x] (= :strike (:t x)))
+        lead? (nested-at? (first inlines))
+        trail? (nested-at? (peek (vec inlines)))]
+    (str "~~"
+         (cond (and lead? trail?) text
+               lead? (cond-> text
+                       (str/ends-with? text "~") (-> (subs 0 (dec (count text))) (str "\\~")))
+               trail? (cond->> text (str/starts-with? text "~") (str "\\"))
+               :else (escape-highlight-boundary text "~"))
+         "~~")))
+
+(defn- spell-strike
+  "`[text footnotes']` for the outermost `:strike` `inline` written as
+  `~~struck text~~`, every strike nested in it spelled per `nesting`:
+  `:tilde` (`~~` delimiters of its own) or `:role-span` (`[text]{.strike}`)."
+  [ctx nesting inline footnotes]
+  (let [[text footnotes'] (render-inlines (assoc ctx :in-strike? true ::strike-nesting nesting)
+                                          (:inlines inline) footnotes)]
+    [(strike-delimited (:inlines inline) text) footnotes']))
+
+(defn- char-kind
+  "`:blank`, `:word` or `:punct` for `c`, as the flanking rules of
+  CommonMark tell them apart; a missing or `::unknown` character is blank."
+  [c]
+  (cond (or (nil? c) (= ::unknown c) (Character/isWhitespace (char c))) :blank
+        (Character/isLetterOrDigit (char c)) :word
+        :else :punct))
+
+(defn- next-char-kinds
+  "The `char-kind`s the first character written after the inline `ctx`
+  renders can have (`ctx`'s `::next-inline`, TASK-317): one for a `:str`
+  (its first character, a backslash when that one is escaped), blank for a
+  space, a break or no inline (the end of the block, or of an inline whose
+  closing marker is not known yet), and `:punct` for any
+  other inline, which opens with a marker character. Another
+  inline of the `kind` being written counts as blank too: a run of
+  delimiters, judged by the parser as a pair, not by a lone character
+  (`~~{~~~~..~~`, two strikes the parser itself makes)."
+  [ctx kind]
+  (let [next-inline (::next-inline ctx)]
+    (cond
+      (nil? next-inline) [:blank]
+      ;; TASK-323: in the `:fallback` mode the next one of the kind is written
+      ;; as a role span, so it opens with a `[`
+      (= kind (:t next-inline)) [(if (= :fallback (::adjacent-mode ctx)) :punct :blank)]
+      (= :str (:t next-inline)) (let [c (first (:text next-inline))]
+                                  [(if (or (nil? c) (contains? always-escaped-chars c)) :punct (char-kind c))])
+      (contains? #{:space :soft-break :line-break} (:t next-inline)) [:blank]
+      ;; every other inline is written starting with a marker character
+      :else [:punct])))
+
+(defn- prev-char-kind
+  "The `char-kind` of the character written before the inline `ctx`
+  renders (`::prev-char`), blank when it is a delimiter character of the
+  same `kind` (the end of a strike or highlight just before it)."
+  [ctx kind]
+  (let [c (::prev-char ctx)]
+    ;; TASK-323: only the closing delimiter of a sibling of the kind, not
+    ;; a literal `~` of a word
+    (if (and (= c (if (= :strike kind) \~ \=)) (= kind (:t (::prev-inline ctx)))) :blank (char-kind c))))
+
+(defn- adjacent-to-text?
+  "True when the inline `ctx` renders, a `kind` node, has, or may have, a
+  non-blank character directly before or after it (TASK-317), so that its
+  delimiters flank differently than they do against a blank (`x~~.a~~`)."
+  [ctx kind]
+  (boolean (or (not= :blank (prev-char-kind ctx kind))
+               (some #(not= :blank %) (next-char-kinds ctx kind)))))
+
+(defn- reread-delimited
+  "The Inlines of the paragraph the parser makes of `text` (an outermost
+  strike or highlight rendered under `ctx`, its `footnotes` numbered from
+  1 and defined after it) where it stands (TASK-317), or nil when the
+  source is not one paragraph. `next-kind` is the `char-kind` of the
+  character put after it.
+
+  At the start of the paragraph's line only when it opens a physical line
+  in place (`ctx`'s `::code-line-start?`, which is false inside another
+  inline or a table cell); otherwise after the character it follows in
+  place, a letter or a full stop standing for a word or a punctuation
+  character, and after a neutral `x ` where that is blank or unknown. A
+  line that starts with `~~~~!` is a tilde code fence, so the same strike
+  can read back at a line start and not elsewhere (`x ==~~~~!\\nc~~~~==`,
+  found by review)."
+  [ctx kind text footnotes next-kind]
+  (let [source (str (case (prev-char-kind ctx kind)
+                      :word "x"
+                      :punct "."
+                      (when-not (::code-line-start? ctx) "x "))
+                    (without-marks (escape-line-starts (resolve-escape-marks text)))
+                    (case next-kind :word "x" :punct "." "")
+                    (render-footnote-definitions footnotes) "\n")
+        blocks (:blocks (parser/parse source (select-keys ctx [:kinds :cite-keys])))]
+    (when (and (= 1 (count blocks)) (= :para (:t (first blocks))))
+      (:inlines (first blocks)))))
+
+(declare delimited-reads-back?)
+
 (defn- render-strike
   "Renders a `:strike` as `~~struck text~~` (TASK-137, sec5.6), an exact
-  round trip. As with a highlight, a strike nested inside another cannot
-  be spelled (the inner `~~` closes the outer one), so the inner one is
-  written as a `[text]{.strike}` role span, content-preserving and
-  kind-lossy, and reported by `lossy-role-span-diagnostics`."
+  round trip.
+
+  A strike nested in another is what the parser makes of `~~~~a~~~~` or
+  `~~a ~~b~~ c~~`: a run of `~` can both close one strike and open
+  another, CommonMark's left- and right-flanking rules decide which. So it
+  is written with `~~` delimiters of its own (TASK-305) whenever that
+  spelling reads back with the same nesting (`tilde-nesting-reads-back?`,
+  the TASK-237 pattern: a candidate, re-read, kept only if it survives).
+  A nesting that does not read back falls back to writing every strike
+  inside the outermost one as a `[text]{.strike}` role span,
+  content-preserving and kind-lossy: a hand-built one with no `~~`
+  spelling at all -- `~~a~~b~~~~` closes after `a`, since a run between
+  two letters can close, so strike[`a`, strike[`b`]] has none -- or one
+  whose text this writer escapes differently from its source (a lone
+  `\\~` next to a nested run). `lossy-role-span-diagnostics` reports
+  exactly the strikes this decision falls back on: it is told of each one
+  through `ctx`'s `::on-role-span-strike`. Before TASK-305 every nested
+  strike was written that way, and an as-parsed one came back as a
+  `:span`."
   [ctx inline footnotes]
-  (let [[text footnotes'] (render-inlines (assoc ctx :in-strike? true)
+  (if (:in-strike? ctx)
+    (let [[text footnotes'] (render-inlines ctx (:inlines inline) footnotes)]
+      [(if (= :tilde (::strike-nesting ctx))
+         (strike-delimited (:inlines inline) text)
+         (str "[" text "]{.strike}"))
+       footnotes'])
+    (let [nested? (holds-strike? inline)
+          checked? (or nested? (adjacent-to-text? ctx :strike))
+          nesting (cond (::force-role-span ctx) :outer-role-span
+                        (or (not checked?) (delimited-reads-back? ctx :strike :tilde inline)) :tilde
+                        (and nested? (or (not (adjacent-to-text? ctx :strike))
+                                         (delimited-reads-back? ctx :strike :role-span inline))) :role-span
+                        :else :outer-role-span)]
+      (when-let [on-role-span (and (not= :tilde nesting) (::on-role-span-strike ctx))]
+        (on-role-span inline))
+      (if (= :outer-role-span nesting)
+        (let [[text footnotes'] (render-inlines (assoc ctx :in-strike? true ::strike-nesting :role-span)
+                                                (:inlines inline) footnotes)]
+          [(str "[" text "]{.strike}") footnotes'])
+        (spell-strike ctx nesting inline footnotes)))))
+
+(defn- highlight-skeleton [x] (delimited-skeleton #{:highlight} x false))
+
+(defn- holds-highlight?
+  "True when `:highlight` `inline` has another `:highlight` anywhere inside it."
+  [inline]
+  (boolean (some #(and (map? %) (= :highlight (:t %))) (rest (tree-seq coll? seq inline)))))
+
+(defn- highlight-attr-groups
+  "The attribute group of every `:highlight` in `x`, in document order."
+  [x]
+  (mapv #(attr-group (:attr %)) (filter #(and (map? %) (= :highlight (:t %))) (tree-seq coll? seq x))))
+
+(defn- highlight-delimited
+  "`==text==` plus the attribute group for a `:highlight` `inline` whose
+  Inlines rendered as `text`, with a literal `=` at either edge of `text`
+  escaped (`escape-highlight-boundary`) -- but not the `==` of a highlight
+  nested at that edge (TASK-316): that one is a delimiter, and has to stay
+  bare to join the outer one's run (`====a====`)."
+  [inline text ctx]
+  (let [inlines (:inlines inline)
+        nested-at? (fn [x] (= :highlight (:t x)))
+        lead? (nested-at? (first inlines))
+        trail? (nested-at? (peek (vec inlines)))]
+    (str "=="
+         (cond (and lead? trail?) text
+               lead? (cond-> text
+                       (str/ends-with? text "=") (-> (subs 0 (dec (count text))) (str "\\=")))
+               trail? (cond->> text (str/starts-with? text "=") (str "\\"))
+               :else (escape-highlight-boundary text))
+         "==" (attr-group ctx (:attr inline)))))
+
+(defn- spell-highlight
+  "`[text footnotes']` for the outermost `:highlight` `inline` written as
+  `==marked text==`, every highlight nested in it spelled per `nesting`:
+  `:equals` (`==` delimiters of its own) or `:role-span`
+  (`[text]{.highlight}`)."
+  [ctx nesting inline footnotes]
+  (let [[text footnotes'] (render-inlines (assoc ctx :in-highlight? true ::highlight-nesting nesting)
                                           (:inlines inline) footnotes)]
-    [(if (:in-strike? ctx)
-       (str "[" text "]{.strike}")
-       (str "~~" (escape-highlight-boundary text "~") "~~"))
-     footnotes']))
+    [(highlight-delimited inline text ctx) footnotes']))
+
+(defn- delimited-reads-back?
+  "True when the outermost `:strike` or `:highlight` (`kind`) `inline`,
+  written with every one of its kind nested in it spelled per `nesting`
+  (`spell-strike` / `spell-highlight`), reads back -- re-read where it
+  stands (`reread-delimited`, with the characters next to it in place,
+  TASK-317) against each character class that can follow it. False when it
+  does not, or cannot be re-read at all.
+
+  With the delimiters' own nesting (`:tilde`, `:equals`) it reads back
+  when the kind's skeleton (`strike-skeleton`, `highlight-skeleton`) is
+  the same, and for a highlight the attribute groups too. With `:role-span`
+  the nested ones come back as spans, so it reads back when the outermost
+  one is the only node of its kind, over the same words (and, for a
+  highlight, with its own attribute group)."
+  [ctx kind nesting inline]
+  (try
+    (let [strike? (= :strike kind)
+          skeleton (if strike? strike-skeleton highlight-skeleton)
+          words (fn [sk] (apply str (filter string? (flatten sk))))
+          [text footnotes] (if strike?
+                             (spell-strike ctx nesting inline [])
+                             (spell-highlight ctx nesting inline []))
+          want (skeleton [inline])
+          want-attrs (when-not strike? (highlight-attr-groups inline))]
+      (every? (fn [next-kind]
+                (when-let [got (reread-delimited ctx kind text footnotes next-kind)]
+                  (let [have (skeleton got)
+                        have-attrs (when-not strike? (highlight-attr-groups got))]
+                    (if (#{:tilde :equals} nesting)
+                      (and (= want have) (= want-attrs have-attrs))
+                      (and (= 1 (count have))
+                           (= 1 (count (filter #{kind} (flatten have))))
+                           (= (words want) (words have))
+                           (= (take 1 want-attrs) have-attrs))))))
+              (next-char-kinds ctx kind)))
+    (catch Exception _ false)))
 
 (defn- render-highlight
   "Renders a `:highlight` (sec4.4) as `==marked text==`, plus its own
@@ -2170,15 +2453,43 @@
   `[text]{.highlight}`, which re-parses as a `:span` -- which is
   content-preserving and kind-lossy, exactly the contract `:strike`/
   `:small-caps`/`:sub`/`:sup` already round-trip under, and is reported
-  the same way."
+  the same way.
+
+  Since TASK-316 a highlight the PARSER nested in another (`====a====`,
+  `==a ==b== c==`) is written with `==` delimiters of its own, as TASK-305
+  does for strikes (`render-strike`): the outermost highlight that holds
+  another is spelled that way, re-read where it stands
+  (`highlight-nesting-reads-back?`), and kept only when the nesting and
+  every highlight's attributes come back. Otherwise -- a hand-built nesting
+  like the one above, which no `==` spelling reads back as -- the inner
+  ones fall back to the role span, as before, and the writer reports each
+  outermost highlight it fell back on through `ctx`'s
+  `::on-role-span-highlight`, which `lossy-role-span-diagnostics` listens
+  to. A highlight's attribute group trails its closing `==`, so an inner
+  one at the outer's edge sits against the outer's own `==` or inside it."
   [ctx inline footnotes]
-  (let [[text footnotes'] (render-inlines (assoc ctx :in-highlight? true)
-                                          (:inlines inline) footnotes)]
-    [(if (:in-highlight? ctx)
-       (str "[" text "]" (attr-group ctx (update (:attr inline) :classes
-                                                 (fnil conj []) "highlight")))
-       (str "==" (escape-highlight-boundary text) "==" (attr-group ctx (:attr inline))))
-     footnotes']))
+  (if (:in-highlight? ctx)
+    (let [[text footnotes'] (render-inlines ctx (:inlines inline) footnotes)]
+      [(if (= :equals (::highlight-nesting ctx))
+         (highlight-delimited inline text ctx)
+         (str "[" text "]" (attr-group ctx (update (:attr inline) :classes
+                                                   (fnil conj []) "highlight"))))
+       footnotes'])
+    (let [nested? (holds-highlight? inline)
+          checked? (or nested? (adjacent-to-text? ctx :highlight))
+          nesting (cond (::force-role-span ctx) :outer-role-span
+                        (or (not checked?) (delimited-reads-back? ctx :highlight :equals inline)) :equals
+                        (and nested? (or (not (adjacent-to-text? ctx :highlight))
+                                         (delimited-reads-back? ctx :highlight :role-span inline))) :role-span
+                        :else :outer-role-span)]
+      (when-let [on-role-span (and (not= :equals nesting) (::on-role-span-highlight ctx))]
+        (on-role-span inline))
+      (if (= :outer-role-span nesting)
+        (let [[text footnotes'] (render-inlines (assoc ctx :in-highlight? true ::highlight-nesting :role-span)
+                                                (:inlines inline) footnotes)]
+          [(str "[" text "]" (attr-group ctx (update (:attr inline) :classes (fnil conj []) "highlight")))
+           footnotes'])
+        (spell-highlight ctx nesting inline footnotes)))))
 
 ;; --- Book references (TASK-152, doc-10) --------------------------------------
 ;;
@@ -2215,7 +2526,7 @@
   [ctx inline footnotes]
   (check-spellable-book-ref! :book-ref (:ref inline))
   [(cond-> (str "@{" (:ref inline) "}")
-     (::in-table-cell ctx) (str/replace "|" (str escape-mark "|")))
+     (pipe-line? ctx) (str/replace "|" (str escape-mark "|")))
    footnotes])
 
 (defn- render-book-quote
@@ -2254,7 +2565,7 @@
            ;; text is marked (as `attr-group` does), not escaped:
            ;; `render-table-cell` passes the marked pipe on bare.
            (cond-> (str/replace (render-code-span (:text inline)) "\n" code-break)
-             (::in-table-cell ctx) (str/replace "|" (str escape-mark "|"))
+             (pipe-line? ctx) (str/replace "|" (str escape-mark "|"))
              true (vector footnotes)))
    ;; Raw TeX, verbatim, no escaping: an as-parsed MathInline's own :tex
    ;; is guaranteed to start/end on non-whitespace and never cross a
@@ -2265,7 +2576,7 @@
    ;; plus pipe (as for a code span and a book ref), so it is written bare.
    :math-inline (fn [ctx inline footnotes]
                   [(cond-> (str "$" (:tex inline) "$")
-                     (::in-table-cell ctx) (str/replace "|" (str escape-mark "|")))
+                     (pipe-line? ctx) (str/replace "|" (str escape-mark "|")))
                    footnotes])
    :link render-link
    :image (fn [ctx inline footnotes] [(render-image ctx inline) footnotes])
@@ -2350,7 +2661,9 @@
         next-inline (get inlines (inc idx))
         n (count inlines)
         kind (:t inline)
-        parent (::parent-emphasis ctx)
+        ;; TASK-317: an emphasis enclosing this one through a strike or
+        ;; another inline (`*a ~~*b*~~*`) counts as the parent too.
+        parent (or (::parent-emphasis ctx) (::outer-emphasis ctx))
         first? (zero? idx)
         last? (= idx (dec n))
         only? (and first? last?)
@@ -2404,6 +2717,8 @@
                                 (choose-emphasis-delim ctx inlines idx prev-emphasis prev-char))
                         [inline-text footnotes'] (render-inline (assoc ctx
                                                                        ::parent-emphasis nil
+                                                                       ::outer-emphasis (or (::parent-emphasis ctx)
+                                                                                            (::outer-emphasis ctx))
                                                                        ::delim delim
                                                                        ::tab-space? (and (= :space (:t inline))
                                                                                          (= :soft-break (:t next-inline)))
@@ -2413,7 +2728,19 @@
                                                                        ::code-line-start? code-start?
                                                                        :in-inline? true
                                                                        ;; TASK-152: `escapes-as-book-ref-brace?`.
-                                                                       :after-at? (= \@ prev-char))
+                                                                       :after-at? (= \@ prev-char)
+                                                                       ;; TASK-317
+                                                                       ::prev-char (if (pos? idx) prev-char ::unknown)
+                                                                       ::prev-inline (when (pos? idx) (nth inlines (dec idx)))
+                                                                       ::next-inline next-inline
+                                                                       ;; TASK-323: a strike or highlight written right
+                                                                       ;; against the closing delimiter of one of its kind
+                                                                       ::force-role-span
+                                                                       (and (= :fallback (::adjacent-mode ctx))
+                                                                            (pos? idx)
+                                                                            (contains? #{:strike :highlight} (:t inline))
+                                                                            (= (:t inline) (:t (nth inlines (dec idx))))
+                                                                            (= prev-char (if (= :strike (:t inline)) \~ \=))))
                                                                 inline footnotes)]
                     (.append sb (str inline-text))
                     [footnotes'
@@ -2439,6 +2766,16 @@
         text (str sb)]
     [(cond-> text (not (:in-inline? ctx)) resolve-escape-marks) footnotes']))
 
+(defn- some-sibling-seq
+  "The first truthy `(pred xs)` over every vector of siblings in `x` (inlines,
+  or any tree holding them), at any depth, or nil. A direct recursion over
+  vectors and the values of maps, with no `tree-seq` map entries, so the
+  walk every block pays (TASK-323) stays cheap."
+  [pred x]
+  (cond (sequential? x) (or (pred x) (some #(some-sibling-seq pred %) x))
+        (map? x) (some #(when (coll? %) (some-sibling-seq pred %)) (vals x))
+        :else nil))
+
 (defn- emphasis-risky?
   "TASK-237: whether any `:emph`/`:strong` in `inlines` (at any depth) is
   next to another emphasis or holds one as a direct child, the only places
@@ -2448,12 +2785,19 @@
   pays for it."
   [inlines]
   (let [em? (fn [x] (and (map? x) (contains? #{:emph :strong} (:t x))))
+        dl? (fn [x] (and (map? x) (contains? #{:strike :highlight} (:t x))))
         risky-siblings? (fn [xs]
-                          (or (some (fn [[a b]] (and (em? a) (em? b))) (partition 2 1 xs))
-                              (some (fn [x] (and (em? x) (some em? (:inlines x)))) xs)))]
+                          (or (some (fn [[a b]] (or (and (em? a) (em? b))
+                                                    ;; TASK-323: a delimiter run beside the emphasis's
+                                                    (and (em? a) (dl? b)) (and (dl? a) (em? b))))
+                                    (partition 2 1 xs))
+                              ;; TASK-317: at any depth, `*a ~~*b*~~*`
+                              (some (fn [x] (and (em? x) (some em? (rest (tree-seq coll? seq (:inlines x)))))) xs)
+                              ;; TASK-323: `*~~a~~*x.`, a delimiter inside the emphasis
+                              (some (fn [x] (and (em? x) (some dl? (rest (tree-seq coll? seq (:inlines x)))))) xs)))]
     ;; every sequence of siblings anywhere in the tree: a block's inlines, an
     ;; emphasis's children, a citation's prefix and suffix
-    (boolean (some risky-siblings? (filter sequential? (tree-seq coll? seq inlines))))))
+    (boolean (some-sibling-seq risky-siblings? inlines))))
 
 (defn- emphasis-skeleton
   "The emphasis nesting of `x` (inlines, or any tree holding them) alone:
@@ -2462,34 +2806,24 @@
   inside an emphasis are kept, any blank as one space (a fusion like `*e**e*`
   shows in its text too), the text outside every emphasis is not. What
   `render-inlines` compares a re-read paragraph against: a fused or
-  mis-nested emphasis changes it, a re-spelled link or merged text does not."
-  ([x] (emphasis-skeleton x false))
-  ([x in-emphasis?]
-   (let [merge-text (fn [xs]
-                      (vec (reduce (fn [acc y] (if (and (string? y) (string? (peek acc)))
-                                                 (conj (pop acc) (str (peek acc) y))
-                                                 (conj acc y)))
-                                   [] xs)))]
-     (cond (and (map? x) (contains? #{:emph :strong} (:t x)))
-           [[(:t x) (emphasis-skeleton (:inlines x) true)]]
-           (and (map? x) in-emphasis? (contains? #{:str :space :soft-break} (:t x)))
-           [(case (:t x) :str (:text x) " ")]
-           (map? x) (merge-text (mapcat #(emphasis-skeleton (val %) in-emphasis?) (sort-by (comp str key) x)))
-           (sequential? x) (merge-text (mapcat #(emphasis-skeleton % in-emphasis?) x))
-           :else []))))
+  mis-nested emphasis changes it, a re-spelled link or merged text does not.
+  `delimited-skeleton` for the two emphasis kinds."
+  [x]
+  (delimited-skeleton #{:emph :strong} x false))
 
 (defn- reread-emphasis-skeleton
   "The `emphasis-skeleton` of what the parser makes of the rendered inline
-  `text` as a one-paragraph document, or nil when it cannot say (it threw,
-  e.g. on a footnote marker with no definition, or the text is not one
-  paragraph)."
-  [text]
-  (try (let [blocks (:blocks (parser/parse (str (escape-line-starts (resolve-escape-marks text)) "\n")))]
+  `text` as a one-paragraph document, its footnotes `footnotes` defined
+  after it (TASK-316: a marker `[^n]` with no definition does not parse),
+  or nil when it cannot say (it threw, or the text is not one paragraph)."
+  [text footnotes]
+  (try (let [blocks (:blocks (parser/parse (str (escape-line-starts (resolve-escape-marks text))
+                                                (render-footnote-definitions footnotes) "\n")))]
          (when (and (= 1 (count blocks)) (= :para (:t (first blocks))))
            (emphasis-skeleton (:inlines (first blocks)))))
        (catch Exception _ nil)))
 
-(defn- render-inlines
+(defn- render-inlines-emphasis
   "`render-inlines-once`, plus TASK-237's care for emphasis that would touch:
   `*e*` followed by `_e_` is two emphases, but written `*e**e*` it reads back
   as ONE; an emphasis inside an emphasis at an edge fuses the same way.
@@ -2508,16 +2842,69 @@
   (if (or (and (:in-inline? ctx) (::emphasis-mode ctx)) (not (emphasis-risky? inlines)))
     (render-inlines-once (cond-> ctx (not (::emphasis-mode ctx)) (assoc ::emphasis-mode :star)) inlines footnotes)
     (let [star (render-inlines-once (assoc ctx ::emphasis-mode :star) inlines footnotes)
-          local (render-inlines-once (assoc ctx ::emphasis-mode :local) inlines footnotes)
+          ;; only rendered when the `*` spelling does not read back
+          local-delay (delay (render-inlines-once (assoc ctx ::emphasis-mode :local) inlines footnotes))
           want (emphasis-skeleton inlines)
-          have (reread-emphasis-skeleton (first star))]
+          ;; only this block's own footnotes (new to it), so the re-read is
+          ;; bounded by the block, not by every definition so far
+          fresh (fn [[_ footnotes']] (vec (drop (count footnotes) footnotes')))
+          have (reread-emphasis-skeleton (first star) (fresh star))]
       (cond (or (nil? have) (= want have)) star
-            (and (not= (first star) (first local))
-                 (= want (reread-emphasis-skeleton (first local)))) local
+            (let [local @local-delay]
+              (and (not= (first star) (first local))
+                   (= want (reread-emphasis-skeleton (first local) (fresh local)))))
+            @local-delay
             :else (throw (ex-info (str "hdoc emitter cannot write this emphasis so that it reads back "
                                        "with the same nesting: neither `*` nor `_` spelling of the "
                                        "touching runs survives")
                                   {:type ::unrepresentable-emphasis :inlines inlines}))))))
+
+(defn- adjacent-same-kind?
+  "Whether `inlines` hold, at any depth, two `:strike`s or two `:highlight`s
+  as direct neighbours (TASK-323), the only place a closing run of one can
+  fuse with the opening run of the next (`~~a~~~~\\~b~~`)."
+  [inlines]
+  (boolean (some-sibling-seq
+            (fn [xs]
+              (some (fn [[a b]] (and (map? a) (map? b) (= (:t a) (:t b))
+                                     (contains? #{:strike :highlight} (:t a))))
+                    (partition 2 1 xs)))
+            inlines)))
+
+(defn- reread-delimiter-skeleton
+  "The strike and highlight skeleton of what the parser makes of the rendered
+  inline `text` as a one-paragraph document, its footnotes `footnotes`
+  defined after it, or nil when it cannot say (`reread-emphasis-skeleton`'s
+  twin, TASK-323)."
+  [text footnotes]
+  (try (let [blocks (:blocks (parser/parse (str (escape-line-starts (resolve-escape-marks text))
+                                                (render-footnote-definitions footnotes) "\n")))]
+         (when (and (= 1 (count blocks)) (= :para (:t (first blocks))))
+           (delimited-skeleton #{:strike :highlight} (:inlines (first blocks)) false)))
+       (catch Exception _ nil)))
+
+(defn- render-inlines
+  "`render-inlines-emphasis`, plus TASK-323's care for a strike or highlight
+  written right after another of its kind: the closing run of the first and
+  the opening run of the second are one run of `~` or `=` to the parser, which
+  pairs them as it likes (`~~a~~~~\\~b~~`). A block's inline source with no
+  two such neighbours (`adjacent-same-kind?`, nearly all of them) is
+  rendered exactly as before. Otherwise it is rendered, and re-read; when the
+  strikes and highlights do not come back as they were, it is rendered again
+  in the `:fallback` `::adjacent-mode`, which writes each one that follows
+  its own kind as a role span (`[text]{.strike}`), content-preserving and
+  kind-lossy, and reported through `lossy-role-span-diagnostics`. Only the
+  outermost call of a block decides; the nested calls follow its
+  `::adjacent-mode`."
+  [ctx inlines footnotes]
+  (if (or (and (:in-inline? ctx) (::adjacent-mode ctx)) (not (adjacent-same-kind? inlines)))
+    (render-inlines-emphasis ctx inlines footnotes)
+    (let [checked (render-inlines-emphasis (assoc ctx ::adjacent-mode :check) inlines footnotes)
+          fresh (vec (drop (count footnotes) (second checked)))
+          have (reread-delimiter-skeleton (first checked) fresh)]
+      (if (or (nil? have) (= have (delimited-skeleton #{:strike :highlight} inlines false)))
+        checked
+        (render-inlines-emphasis (assoc ctx ::adjacent-mode :fallback) inlines footnotes)))))
 
 ;; --- Block dispatch (TASK-88) ------------------------------------------------
 
@@ -3191,10 +3578,7 @@
               {:type ::unrepresentable-table-cell :cell cell})))
     ;; TASK-221: a `|` an attribute group marked (`attr-group`) stays bare,
     ;; since the parser reads a row group-aware; every other one is escaped.
-    [(-> text
-         (str/replace #"(?<!\u0000)\|" "\\\\|")
-         (str/replace (str escape-mark "|") "|"))
-     footnotes']))
+    [(escape-line-pipes text) footnotes']))
 
 (defn- render-table-row
   "Renders Row `row` to `[cell-texts footnotes']`, `render-table-cell`
@@ -3250,7 +3634,11 @@
   `haselnuss.parser/column-widths` ever reads it from."
   [ctx block footnotes]
   (let [group (attr-group (table-caption-attr block))
-        [caption-text footnotes'] (render-inlines ctx (:caption block) footnotes)]
+        ;; TASK-282: a `|` on the caption line makes it a table row, so it
+        ;; is escaped as in a cell (`pipe-line?`).
+        [caption-text footnotes'] (render-inlines (assoc ctx ::in-caption-line true)
+                                                  (:caption block) footnotes)
+        caption-text (escape-line-pipes caption-text)]
     (if (and (str/blank? caption-text) (str/blank? group))
       [nil footnotes]
       [(str ": " caption-text (when (seq group) (str (when (seq caption-text) " ") group))) footnotes'])))
@@ -3766,7 +4154,11 @@
                ;; TASK-192: a footnote's Blocks are not the link text its
                ;; marker sits in (nor, TASK-198, its `@`s bracket content,
                ;; nor, TASK-199, citation text).
-               (dissoc ::in-link-text ::in-table-cell ::at-marks ::in-cite-affix ::emphasis-mode)
+               (dissoc ::in-link-text ::in-table-cell ::in-caption-line ::at-marks ::in-cite-affix ::emphasis-mode
+                       ;; TASK-305: nor is a footnote's own strike nested in
+                       ;; the one its marker sits in.
+                       ;; TASK-316: nor its highlight in the marker's highlight.
+                       :in-strike? ::strike-nesting :in-highlight? ::highlight-nesting)
                ;; TASK-195: whether this Block is written at column 0 of a
                ;; chunk sequence or inside a container's prefix.
                (assoc ::contained? (not (:chunk-level? ctx))))
@@ -3912,6 +4304,9 @@
               :inline-handlers (merge built-in-inline-handlers (:inline-handlers opts))
               :kinds (:kinds opts)
               :cite-keys (:cite-keys opts)
+              ;; TASK-305: `lossy-role-span-diagnostics`' listener.
+              ::on-role-span-strike (::on-role-span-strike opts)
+              ::on-role-span-highlight (::on-role-span-highlight opts)
               ;; TASK-173: the document's own Blocks are a chunk sequence.
               :chunk-level? true}
          _ (check-blocks-after-sections! "the document" (:blocks document))
@@ -3931,6 +4326,37 @@
   re-parse (this namespace's own docstring, AC #7)."
   #{:small-caps :sub :sup})
 
+(defn- role-span-nodes
+  "The `kind` (`:strike` or `:highlight`) nodes of `document` that
+  `emit-document` under `opts` writes with the nodes of that kind nested in
+  them as role spans (`render-strike`'s and `render-highlight`'s own
+  fallback, TASK-305, TASK-316), as a predicate on a node -- or nil when
+  `document` holds none inside another, which nearly all do not, and
+  nothing is emitted to find out.
+
+  Taken from the writer's own decision rather than judged again, so the
+  diagnostic and the output cannot drift apart (found by review: judged
+  per strike, an INNER strike re-read alone was reported though the
+  writer, deciding only at the outermost one, wrote it exactly). Matched
+  by identity, the node `walk/fold` reaches being the one the writer
+  rendered -- except in a document carrying U+0000, whose inlines
+  `replace-nul` copies before rendering, matched by value after the same
+  replacement. A document `emit-document` refuses reports none: nothing
+  is written."
+  [document opts kind]
+  ;; TASK-317: any strike or highlight can fall back, beside a word.
+  (when (some #(and (map? %) (= kind (:t %))) (tree-seq coll? seq document))
+    (let [seen (java.util.IdentityHashMap.)]
+      (try (emit-document document (assoc opts
+                                          (if (= :strike kind) ::on-role-span-strike ::on-role-span-highlight)
+                                          #(.put seen % true)))
+           (catch Exception _ nil))
+      (fn [node]
+        (let [replaced (first (replace-nul [node]))]
+          (if (identical? replaced node)
+            (.containsKey seen node)
+            (boolean (some #(= replaced %) (.keySet seen)))))))))
+
 (defn- lossy-role-span-visit
   "`haselnuss.walk/fold`'s own `:visit` for `lossy-role-span-diagnostics`:
   appends one `{:type ::lossy-role-span :t :node-path}` diagnostic per
@@ -3943,27 +4369,29 @@
   carries all of its content -- so it is reported through this one path
   rather than a second reporting shape. Its own type, though, because
   what it degrades to is a footnote rather than a `:span`, and the two
-  need different things said about them: a footnote takes a number."
-  [acc path _ref-kind node]
+  need different things said about them: a footnote takes a number.
+
+  `role-span-strike?` and `role-span-highlight?` are `role-span-nodes`'
+  predicates, or nil."
+  [role-span-strike? role-span-highlight? acc path _ref-kind node]
   (cond
     (contains? lossy-role-span-types (:t node))
     (conj acc {:type ::lossy-role-span :t (:t node) :path path})
 
     ;; A `:highlight` is an EXACT round trip except nested inside another
-    ;; one, which `==...==` cannot spell -- see `render-highlight`. Only
-    ;; the inner one is lossy, so this fires on a highlight that has one
-    ;; inside it rather than on every highlight.
-    (and (= :highlight (:t node))
-         (some #(= :highlight (:t %)) (rest (tree-seq coll? seq node))))
+    ;; one that `==...==` cannot spell -- see `render-highlight`. Only
+    ;; the inner one is lossy, so this fires on a highlight whose nested
+    ;; highlights the writer actually wrote as role spans (TASK-316).
+    (and (= :highlight (:t node)) role-span-highlight? (role-span-highlight? node))
     (conj acc {:type ::lossy-nested-highlight :t :highlight :path path
-               :message (str "one highlight nested inside another has no `==...==` spelling --"
-                             " the inner `==` would close the outer one -- so the inner"
-                             " highlight was written as a `[text]{.highlight}` role span,"
-                             " which re-parses as a span")})
+               :message (str "this highlight has no `==...==` spelling that reads back as the"
+                             " same nesting beside the text around it, so the highlights"
+                             " nested in it, or all of it, were written as"
+                             " `[text]{.highlight}` role spans, which re-parse as spans")})
 
-    ;; Likewise a `:strike` (TASK-137): exact unless nested in another.
-    (and (= :strike (:t node))
-         (some #(= :strike (:t %)) (rest (tree-seq coll? seq node))))
+    ;; Likewise a `:strike` (TASK-137), but only one whose nested strikes
+    ;; `render-strike` actually wrote as role spans (TASK-305).
+    (and (= :strike (:t node)) role-span-strike? (role-span-strike? node))
     (conj acc {:type ::lossy-role-span :t :strike :path path})
 
     (= :sticky-note (:t node))
@@ -3985,18 +4413,30 @@
   every reference kind the schema has (`walk/every-ref-kind`), since a
   `:strike`/`:small-caps`/`:sub`/`:sup`/`:sticky-note` node could in
   principle be reached from anywhere an Inline can occur."
-  {:table walk/table :scope walk/every-ref-kind :visit lossy-role-span-visit})
+  {:table walk/table :scope walk/every-ref-kind})
 
 (defn lossy-role-span-diagnostics
   "Every node in `document` this emitter can only write back as
   something of a different kind, in document order (AC #7; TASK-123):
   `:strike`/`:small-caps`/`:sub`/`:sup` as `{:type ::lossy-role-span :t
   node-type :path path}`, and `:sticky-note` as `{:type
-  ::lossy-sticky-note ...}` -- run this BEFORE `emit-document` writes
+  ::lossy-sticky-note ...}` -- a `:strike` only when `emit-document`
+  writes the strikes nested in it as role spans, for want of a `~~`
+  spelling that reads back (`render-strike`, `role-span-nodes`,
+  TASK-305) -- run this BEFORE `emit-document` writes
   `document` out, mirroring `haselnuss.emit.latex/unanchored-reference-
   diagnostics`'s own shape: a separate, pure diagnostics function a
   caller runs alongside emission, not folded into `emit-document`'s own
   return value (which stays a bare string, matching
-  `haselnuss.emit.html`/`haselnuss.emit.latex`)."
-  [document]
-  (walk/fold lossy-role-span-walker [] ::ast/document document))
+  `haselnuss.emit.html`/`haselnuss.emit.latex`).
+
+  `opts` are `emit-document`'s own: pass the ones the document will be
+  written with, since its handlers and vocabularies can change how a
+  nested strike is spelled."
+  ([document] (lossy-role-span-diagnostics document {}))
+  ([document opts]
+   (walk/fold (assoc lossy-role-span-walker
+                     :visit (partial lossy-role-span-visit
+                                     (role-span-nodes document opts :strike)
+                                     (role-span-nodes document opts :highlight)))
+              [] ::ast/document document)))

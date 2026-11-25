@@ -52,6 +52,9 @@
   - in the refresh's rebuild set narrowed by content
     (`haselnuss.library.graph.rebuild/narrowed`): its source changed, or
     a book it refers to did;
+  - saved `:transient?` (TASK-299): its last build met a failure of that
+    run, a generated shelf's script that ran out of time
+    (`haselnuss.library/transient?`), which this run may not;
   - showing an image that changed (`haselnuss.site/changed-image-books`
     over its saved `:images`; images are not in the graph's `:files`);
   - the owner of a page folder another book's page folder was added to or
@@ -61,7 +64,9 @@
 
   Every other buildable book is kept with its saved data. A kept book's
   data files are made again when they are missing, after an earlier
-  failure or interruption, and -- the narrowing of doc-12 step 6 --
+  failure or interruption, `previews.json` when a preview failed for a
+  reason of its run (a `:transient?` preview failure, TASK-299), and --
+  the narrowing of doc-12 step 6 --
   `backlinks.json` when the edges into it changed between the saved and
   the new graph (`edges-to`, found through the edges of the books the
   refresh rescanned, rewrote or removed), `previews.json` when, besides,
@@ -85,6 +90,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [haselnuss.book-ref :as book-ref]
+            [haselnuss.library :as library]
             [haselnuss.library.digest :as digest]
             [haselnuss.library.graph :as graph]
             [haselnuss.library.graph.scan :as scan]
@@ -245,6 +251,22 @@
                     lines))]
     {:pages (ids "page ") :data (ids "data ")}))
 
+(defn add-pending-pages!
+  "Merge `page <id>` lines for the BookIds `ids` into the site `dir`'s
+  pending list, keeping every `page` and `data` line already there, and
+  write it atomically: the pages `--build-doc` writes without saving the
+  state (TASK-328), which the next `--build-site` that trusts the state
+  rebuilds whatever their files say -- an edit undone in the meantime
+  included -- and which keep it off the unchanged-site shortcut and the
+  per-library delta build."
+  [dir ids]
+  (let [{:keys [pages data]} (read-pending dir)
+        texts (fn [xs] (into (sorted-set) (map book-ref/format-book-id) xs))
+        lines (concat (map #(str "page " %) (texts (concat pages ids)))
+                      (map #(str "data " %) (texts data)))]
+    (state/write-atomically! (io/file dir pending-rel)
+                             (fn [^Writer w] (doseq [l lines] (.write w (str l "\n")))))))
+
 (defn pending?
   "True when the site `dir` has a pending list, of whatever content, or
   something else under its name: an earlier build stopped before it was
@@ -319,6 +341,19 @@
       (not (site-file? (str d "backlinks.json"))) (conj :backlinks)
       (not (site-file? (str d "previews.json"))) (conj :previews))))
 
+(defn transient-left?
+  "True when a build leaves something only its own run can vouch for
+  (TASK-299): a record or library record of the graph `g` holding a
+  `haselnuss.library/transient?` diagnostic, or a page of `books` (the
+  state's `{BookId page}`) saved `:transient?` or with such a preview
+  failure. The next run must then look for itself
+  (`haselnuss.site.unchanged`): it retries them."
+  [g books]
+  (boolean
+   (or (some (fn [[_ record]] (some library/transient? (:diagnostics record))) (graph/indexed-books g))
+       (some (fn [[_ record]] (some library/transient? (:diagnostics record))) (graph/indexed-libraries g))
+       (some (fn [[_ page]] (or (:transient? page) (some :transient? (:preview-failures page)))) books))))
+
 (defn- edge-delta-keys
   "The `graph/target-key`s of every edge from the books `sources` that is
   in one of `g0` and `g1` and not the other: the books whose `edges-to`
@@ -371,12 +406,15 @@
         reason (fn [id]
                  (cond
                    (not (contains? before id)) "new book"
-                   (contains? pending-pages id) "an earlier build stopped before it was done"
+                   ;; an earlier build that stopped, or --build-doc (TASK-328)
+                   (contains? pending-pages id) "left pending by an earlier run"
                    (not (contains? saved id)) "not built before"
                    (contains? narrowed id) (if (and (contains? rescanned id)
                                                     (not= (content-key (get before id)) (content-key (get after id))))
                                              "source changed"
                                              "a book it refers to changed")
+                   ;; TASK-299: its build met a failure of that run
+                   (:transient? (get saved id)) "a script ran out of time when it was last built"
                    (contains? image-changed id) "an image it shows changed"
                    (contains? nested id) "a book was added or removed inside its folder"
                    (contains? missing id) "its page was missing"
@@ -394,6 +432,10 @@
                                  (let [redo? (or (contains? pending-data id) (some? (:data-failed saved-page)))
                                        which (cond-> (missing-data site-file? saved-page)
                                                redo? (into [:backlinks :previews])
+                                               ;; TASK-299: a preview its run failed to
+                                               ;; build for a reason of that run
+                                               (some :transient? (:preview-failures saved-page))
+                                               (conj :previews)
                                                (contains? edges-changed id) (conj :backlinks)
                                                (and (contains? edges-changed id)
                                                     (not= (site/preview-passages g0 id)

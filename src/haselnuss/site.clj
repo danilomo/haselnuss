@@ -95,7 +95,8 @@
   catalog entry, its images, its data files (unless the plan names them)
   and its warnings come from the saved state, so the site and the summary
   are the ones a clean build gives. The reader app's files are written
-  only when their bytes change; `sw.js` carries the app's version
+  only when their bytes change (or on a build that replaces its files,
+  `write-site!`'s `:replace-files?`); `sw.js` carries the app's version
   (`app-file-bytes`).
 
   ## Data files (TASK-271)
@@ -103,7 +104,10 @@
   Beside the pages a build writes what the reader app reads as data
   (doc-12, \"Output folder\", \"Scale\" 4-5), each one only when its
   bytes differ from the file already there (`write-if-changed!`), so an
-  unchanged file keeps its modification time:
+  unchanged file keeps its modification time -- except on a build with
+  `--full`, or a saved state that is missing, unreadable or of another
+  format, which replaces each with a new file (`write-site!`'s
+  `:replace-files?`; TASK-290):
 
   - `catalog/index.json` and `catalog/<library>/<n>.json` (`catalog-files`):
     every book whose page this build wrote, by library, in pages of
@@ -192,28 +196,29 @@
   "Throws `ex-info` `::refused` unless the site folder `dir` can be built
   into: it is absent (it will be made) or an empty folder, or a site
   (`site?`); and it, or the folder it would be made in, is writable.
-  Writes nothing."
-  [dir]
-  (let [f (io/file dir)
-        shown (str dir)]
-    (cond
-      (str/blank? shown)
-      (throw (refused "--build-site needs a folder"))
+  Writes nothing. `command` (default `--build-site`) starts each message."
+  ([dir] (preflight! dir "--build-site"))
+  ([dir command]
+   (let [f (io/file dir)
+         shown (str dir)]
+     (cond
+       (str/blank? shown)
+       (throw (refused (str command " needs a folder")))
 
-      (and (.exists f) (not (.isDirectory f)))
-      (throw (refused (str "--build-site " shown ": not a folder")))
+       (and (.exists f) (not (.isDirectory f)))
+       (throw (refused (str command " " shown ": not a folder")))
 
-      (and (.isDirectory f) (seq (.list f)) (not (site? f)))
-      (throw (refused (str "--build-site " shown ": the folder is neither empty nor a Haselnuss site"
-                           " (a site holds .haselnuss/state/); refusing to write into it")))
+       (and (.isDirectory f) (seq (.list f)) (not (site? f)))
+       (throw (refused (str command " " shown ": the folder is neither empty nor a Haselnuss site"
+                            " (a site holds .haselnuss/state/); refusing to write into it")))
 
-      :else
-      (let [^File target (if (.exists f) f (existing-ancestor f))]
-        (when-not (and target (.isDirectory target) (Files/isWritable (.toPath target))
-                       (or (not (.exists (io/file f ".haselnuss")))
-                           (Files/isWritable (.toPath (io/file f ".haselnuss")))))
-          (throw (refused (str "--build-site " shown ": cannot write to "
-                               (if (= target f) "the folder" (str target))))))))))
+       :else
+       (let [^File target (if (.exists f) f (existing-ancestor f))]
+         (when-not (and target (.isDirectory target) (Files/isWritable (.toPath target))
+                        (or (not (.exists (io/file f ".haselnuss")))
+                            (Files/isWritable (.toPath (io/file f ".haselnuss")))))
+           (throw (refused (str command " " shown ": cannot write to "
+                                (if (= target f) "the folder" (str target)))))))))))
 
 (defn acquire-lock!
   "Make `dir` a site -- `dir`, `.haselnuss/state/` -- and take
@@ -223,31 +228,33 @@
   for `release-lock!`. Throws `ex-info` `::lock-held` when another build
   holds it (in this process too), and `::refused` when the folder cannot
   be written. The state folder is made first, so a folder that has been
-  locked once is always a site."
-  [given]
-  (try
-    (when-not (.isDirectory (io/file given))
-      (Files/createDirectories (.toPath (io/file given)) (make-array FileAttribute 0)))
-    (let [dir (.toFile (.toRealPath (.toPath (io/file given)) (make-array LinkOption 0)))
-          lock-file (io/file dir ".haselnuss" "lock")]
-      (Files/createDirectories (.toPath (state/state-dir dir)) (make-array FileAttribute 0))
-      (when-not (site? dir)
-        (throw (refused (str "--build-site " given ": .haselnuss or .haselnuss/state is not a folder"))))
-      (let [ch (FileChannel/open (.toPath lock-file)
-                                 ^"[Ljava.nio.file.OpenOption;"
-                                 (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/WRITE]))
-            lock (try (.tryLock ch)
-                      (catch OverlappingFileLockException _ nil)
-                      (catch Throwable t (.close ch) (throw t)))]
-        (if lock
-          {:dir dir :channel ch :lock lock}
-          (do (.close ch)
-              (throw (ex-info (str "--build-site " given ": another build holds " lock-file)
-                              {:type ::lock-held}))))))
-    (catch IOException e
-      (throw (ex-info (str "--build-site " given ": cannot write to the folder: "
-                           (or (ex-message e) (.getName (class e))))
-                      {:type ::refused} e)))))
+  locked once is always a site. `command` (default `--build-site`) starts
+  each message."
+  ([given] (acquire-lock! given "--build-site"))
+  ([given command]
+   (try
+     (when-not (.isDirectory (io/file given))
+       (Files/createDirectories (.toPath (io/file given)) (make-array FileAttribute 0)))
+     (let [dir (.toFile (.toRealPath (.toPath (io/file given)) (make-array LinkOption 0)))
+           lock-file (io/file dir ".haselnuss" "lock")]
+       (Files/createDirectories (.toPath (state/state-dir dir)) (make-array FileAttribute 0))
+       (when-not (site? dir)
+         (throw (refused (str command " " given ": .haselnuss or .haselnuss/state is not a folder"))))
+       (let [ch (FileChannel/open (.toPath lock-file)
+                                  ^"[Ljava.nio.file.OpenOption;"
+                                  (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/WRITE]))
+             lock (try (.tryLock ch)
+                       (catch OverlappingFileLockException _ nil)
+                       (catch Throwable t (.close ch) (throw t)))]
+         (if lock
+           {:dir dir :channel ch :lock lock}
+           (do (.close ch)
+               (throw (ex-info (str command " " given ": another build holds " lock-file)
+                               {:type ::lock-held}))))))
+     (catch IOException e
+       (throw (ex-info (str command " " given ": cannot write to the folder: "
+                            (or (ex-message e) (.getName (class e))))
+                       {:type ::refused} e))))))
 
 (defn release-lock!
   "Release a lock `acquire-lock!` answered; nil is ignored."
@@ -257,20 +264,82 @@
 
 ;; --- writing -----------------------------------------------------------------------
 
+(def ^:private temp-random
+  "Picks temporary file names. Made on first use, and hinted where it is
+  used rather than here: a class tag on a `def` is a class lookup by name
+  when the namespace loads, which stops the native image at startup."
+  (delay (java.security.SecureRandom.)))
+
+(def ^:private exclusive-write
+  "How a temporary file is opened: made by this very call (`CREATE_NEW`),
+  so a file or symbolic link planted under its name is never opened."
+  #{StandardOpenOption/CREATE_NEW StandardOpenOption/WRITE LinkOption/NOFOLLOW_LINKS})
+
+(defn- temp-attributes
+  "The attributes a temporary file in `dir` is created with: none when
+  `public?`, so the operating system gives it what the umask allows an
+  ordinary new file (TASK-290), else owner-only where the file system
+  has POSIX permissions."
+  ^"[Ljava.nio.file.attribute.FileAttribute;" [^Path dir public?]
+  (if (and (not public?)
+           (contains? (.supportedFileAttributeViews (.getFileSystem dir)) "posix"))
+    (into-array FileAttribute
+                [(java.nio.file.attribute.PosixFilePermissions/asFileAttribute
+                  (java.nio.file.attribute.PosixFilePermissions/fromString "rw-------"))])
+    (make-array FileAttribute 0)))
+
+(defn- create-temp!
+  "Create a temporary file `.<name>.<digits>.tmp` in `dir`, its name
+  random, and answer `[path channel]`, the channel open for writing on
+  the file this call made. A clash tries another name."
+  [^Path dir ^String base public?]
+  (let [attrs (temp-attributes dir public?)]
+    (loop [n 0]
+      (let [n-name (.nextLong ^java.security.SecureRandom @temp-random)
+            p (.resolve dir (str "." base "." (Long/toUnsignedString n-name) ".tmp"))
+            ch (try (FileChannel/open p ^java.util.Set exclusive-write attrs)
+                    (catch java.nio.file.FileAlreadyExistsException e
+                      (when (>= n 100) (throw e))
+                      nil))]
+        (if ch [p ch] (recur (inc n)))))))
+
+(defn- temp-file-key
+  "What identifies the temporary file at `p` (a link is not followed).
+  Throws when the name no longer holds a regular file."
+  [^Path p]
+  (let [^java.nio.file.attribute.BasicFileAttributes attrs
+        (Files/readAttributes p java.nio.file.attribute.BasicFileAttributes
+                              ^"[Ljava.nio.file.LinkOption;" no-follow)]
+    (when-not (.isRegularFile attrs)
+      (throw (IOException. (str p " is no longer a regular file"))))
+    (.fileKey attrs)))
+
 (defn- write-atomically!
   "Write `content` to `target` through a temporary file in its folder
   (which exists), renamed over it -- atomically where the file system
-  allows. `content` is bytes, or a fn of the temporary file's Path that
-  writes it (a streamed copy). The temporary file is removed when
-  anything fails."
-  [^File target content]
+  allows. `content` is bytes, or a fn of an OutputStream that writes it
+  (a streamed copy). The temporary file is removed when anything fails.
+  The file is private to its owner (0600) unless `public?`: then it has
+  the mode the umask gives an ordinary new file, for a site another
+  user's web server reads (TASK-290).
+
+  Everything goes through the channel that created the file; its name is
+  never opened again, so a symbolic link swapped in under the name is
+  not written through. A name that no longer holds the file created is
+  not renamed into place. The rename replaces `target`'s directory
+  entry: a link there is not followed and a file hard-linked there keeps
+  its content and mode."
+  [^File target content public?]
   (let [dir (.getParentFile (.getAbsoluteFile target))
-        tmp (Files/createTempFile (.toPath dir) (str "." (.getName target) ".") ".tmp"
-                                  (make-array FileAttribute 0))]
+        [^Path tmp ^FileChannel ch] (create-temp! (.toPath dir) (.getName target) public?)]
     (try
-      (if (fn? content)
-        (content tmp)
-        (Files/write tmp ^bytes content ^"[Ljava.nio.file.OpenOption;" (make-array OpenOption 0)))
+      (let [created (temp-file-key tmp)]
+        (with-open [out (java.nio.channels.Channels/newOutputStream ch)]
+          (if (fn? content)
+            (content out)
+            (.write out ^bytes content)))
+        (when-not (= created (temp-file-key tmp))
+          (throw (IOException. (str tmp " was replaced while it was written")))))
       (try
         (Files/move tmp (.toPath target)
                     ^"[Ljava.nio.file.CopyOption;"
@@ -281,7 +350,9 @@
                       ^"[Ljava.nio.file.CopyOption;"
                       (into-array CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
       target
-      (finally (Files/deleteIfExists tmp)))))
+      (finally
+        (.close ch)
+        (Files/deleteIfExists tmp)))))
 
 (defn- real-folder!
   "Make the folder `p` unless it exists; throw unless it is then a folder
@@ -296,41 +367,51 @@
                     {:type ::not-a-folder :path (str p)}))))
 
 (defn write-under!
-  "Write `content` (bytes, or a fn writing the temporary file's Path; see
+  "Write `content` (bytes, or a fn writing to an OutputStream; see
   `write-atomically!`) to `rel`, a `/`-separated path below the site
   folder `root` (a real path, `acquire-lock!`'s `:dir`), atomically
   (temporary file and rename), making the folders on the way. Throws
   `ex-info` `::not-a-folder`, writing nothing, when a folder on the way
-  is a symbolic link or a file: nothing is written outside `root`."
-  [^File root rel content]
-  (let [parts (str/split rel #"/")]
-    (reduce (fn [^Path p part]
-              (let [next-p (.resolve p ^String part)]
-                (real-folder! next-p (str/replace (str (.relativize (.toPath root) next-p))
-                                                  File/separator "/"))
-                next-p))
-            (.toPath root)
-            (butlast parts))
-    (write-atomically! (io/file root rel) content)))
+  is a symbolic link or a file: nothing is written outside `root`.
+  The file is private (0600) unless `public?` (see `write-atomically!`):
+  only the files a web server shows are written public; the default is
+  private, as the build's own state must stay."
+  ([root rel content] (write-under! root rel content false))
+  ([^File root rel content public?]
+   (let [parts (str/split rel #"/")]
+     (reduce (fn [^Path p part]
+               (let [next-p (.resolve p ^String part)]
+                 (real-folder! next-p (str/replace (str (.relativize (.toPath root) next-p))
+                                                   File/separator "/"))
+                 next-p))
+             (.toPath root)
+             (butlast parts))
+     (write-atomically! (io/file root rel) content public?))))
 
 (defn write-if-changed!
-  "`write-under!` the bytes `content` to `rel` below the site folder
-  `root` unless the file there -- a regular file, reached through real
-  folders only -- already holds exactly those bytes, in which case
-  nothing is written and the file keeps its modification time (doc-12,
-  \"What gets rebuilt\" step 6; TASK-271). Answers true when it wrote."
-  [^File root rel ^bytes content]
-  (let [parts (str/split rel #"/")
-        folders (reductions (fn [^Path p ^String s] (.resolve p s)) (.toPath root) (butlast parts))
-        target (.resolve ^Path (last folders) ^String (last parts))
-        same? (and (every? #(Files/isDirectory ^Path % no-follow) (rest folders))
-                   (Files/isRegularFile target no-follow)
-                   (= (alength content) (try (Files/size target) (catch IOException _ -1)))
-                   (try (java.util.Arrays/equals content (Files/readAllBytes target))
-                        (catch IOException _ false)))]
-    (if same?
-      false
-      (do (write-under! root rel content) true))))
+  "`write-under!`, as a public file (TASK-290: the app files, the catalog,
+  the backlinks and previews are all shown by a web server), the bytes
+  `content` to `rel` below the site folder `root` unless the file there
+  -- a regular file, reached through real folders only -- already holds
+  exactly those bytes, in which case nothing is written and the file
+  keeps its modification time (doc-12, \"What gets rebuilt\" step 6;
+  TASK-271). With `replace?` it is written whatever is there, as a new
+  file with the mode the umask gives now (`write-site!`'s
+  `:replace-files?`). Answers true when it wrote."
+  ([root rel content] (write-if-changed! root rel content false))
+  ([^File root rel ^bytes content replace?]
+   (let [parts (str/split rel #"/")
+         folders (reductions (fn [^Path p ^String s] (.resolve p s)) (.toPath root) (butlast parts))
+         target (.resolve ^Path (last folders) ^String (last parts))
+         same? (and (not replace?)
+                    (every? #(Files/isDirectory ^Path % no-follow) (rest folders))
+                    (Files/isRegularFile target no-follow)
+                    (= (alength content) (try (Files/size target) (catch IOException _ -1)))
+                    (try (java.util.Arrays/equals content (Files/readAllBytes target))
+                         (catch IOException _ false)))]
+     (if same?
+       false
+       (do (write-under! root rel content true) true)))))
 
 (defn- json-bytes
   "`x` as one line of JSON and a newline, UTF-8, with `/` and non-ASCII
@@ -382,12 +463,14 @@
   `sw.js` is written last (`app-file-bytes` is sorted by name, and an
   assertion keeps it so): a device that sees the new worker -- which
   precaches the other files at once -- finds the new files already in
-  place (TASK-277)."
-  [dir]
-  (let [files (app-file-bytes)]
-    (assert (= "sw.js" (key (last files))) "sw.js must be the last app file written")
-    (doseq [[file-name content] files]
-      (write-if-changed! dir file-name content))))
+  place (TASK-277). With `replace?` each is written even when its bytes
+  match (`write-if-changed!`)."
+  ([dir] (copy-app-files! dir false))
+  ([dir replace?]
+   (let [files (app-file-bytes)]
+     (assert (= "sw.js" (key (last files))) "sw.js must be the last app file written")
+     (doseq [[file-name content] files]
+       (write-if-changed! dir file-name content replace?)))))
 
 (defn site-file?
   "True when `rel`, a `/`-separated path below the site folder `root`, is
@@ -574,11 +657,11 @@
     (digest/hex (.digest md))))
 
 (defn copy-image!
-  "Copy the image file `source` to the file `tmp` by streaming, answering
-  the digest of the bytes copied (`stream-image!`)."
-  ^String [^Path source ^Path tmp]
-  (with-open [out (Files/newOutputStream tmp ^"[Ljava.nio.file.OpenOption;" (make-array OpenOption 0))]
-    (stream-image! source out)))
+  "Copy the image file `source` into the OutputStream `out` by streaming,
+  answering the digest of the bytes copied (`stream-image!`). The caller
+  closes `out`."
+  ^String [^Path source ^java.io.OutputStream out]
+  (stream-image! source out))
 
 (defn image-digest
   "The digest of the image `segments` below `book-dir` as a copy of it
@@ -947,6 +1030,13 @@
 
 (def ^:private ellipsis "…")
 
+(defn- hard-cap
+  "How long a block that cannot be cut may be to be kept whole in a preview
+  of `limit` characters: four times `limit`. A passage that starts with a
+  200 KB table must not put all of it in `previews.json`."
+  [limit]
+  (* 4 limit))
+
 (defn- whitespace-at? [^String s i]
   (Character/isWhitespace (.codePointAt s (int i))))
 
@@ -1020,7 +1110,8 @@
   "What of the inline `x`, longer than `left`, fits: a `:str` cut at a
   word (`cut-string`; nil when its first word does not fit, so the cut
   falls at the space before it), a wrapping inline cut inside; any other
-  (maths, code) is dropped -- or, when `hard?`, kept whole."
+  (maths, code) is dropped -- or, when `hard?` (a number, `hard-cap`),
+  kept whole if its text is at most that long."
   [hard? x left]
   (let [t (kind x)]
     (cond
@@ -1028,7 +1119,7 @@
       (contains? inline-containers t)
       (let [[kept] (cut-seq (:inlines x) left (partial cut-inline hard?))]
         (when (seq kept) (assoc x :inlines kept)))
-      hard? x
+      (and hard? (<= (text-length x) hard?)) x
       :else nil)))
 
 (defn- cut-block
@@ -1036,8 +1127,9 @@
   inlines, a section's heading and leading blocks (nothing when the
   heading alone does not fit), a quote's leading blocks, a list's leading
   items. Any other block (a table, code, maths, a directive) cannot be
-  cut: it is dropped -- or, when `hard?`, kept whole. `hard?` also lets
-  a word be cut inside and counts no heading."
+  cut: it is dropped -- or, when `hard?` (nil, or a number: `hard-cap`),
+  kept whole if its text (`text-length`) is at most `hard?` characters.
+  `hard?` also lets a word be cut inside and counts no heading."
   [hard? b left]
   (let [cut (partial cut-block hard?)]
     (case (kind b)
@@ -1053,7 +1145,7 @@
                                     (let [[blocks] (cut-seq item n cut)]
                                       (when (seq blocks) blocks))))]
               (when (seq kept) (assoc b :items kept)))
-      (when hard? b))))
+      (when (and hard? (<= (text-length b) hard?)) b))))
 
 ;; --- previews: the ellipsis, footnotes ---------------------------------------------
 
@@ -1132,8 +1224,8 @@
                          x (field-order x))))]
     [(walk (vec blocks)) @cut?]))
 
-(defn cut-passage
-  "`{:blocks :cut?}`: `blocks` (a passage's) whole when their text
+(defn- cut-passage*
+  "`{:blocks :cut?}`, before `cut-passage` bounds its size: `blocks` (a passage's) whole when their text
   (`node-text`, footnotes included) is at most `limit` characters, else
   cut to about `limit`, with `:cut?` true. The cut is made on the AST,
   before anything is emitted, so the emitter writes every element it
@@ -1147,7 +1239,10 @@
   - Never an empty preview: when that keeps nothing but headings -- the
     first thing is a table, a directive, code or maths longer than
     `limit`, or a single word is -- the cut is made again keeping that
-    block whole, or cutting inside that word (`hard?`).
+    block whole, or cutting inside that word (`hard?`). A block is kept
+    whole only up to `hard-cap` characters (TASK-291); a larger one is
+    left out, and the preview is the headings kept and the ellipsis, or
+    the ellipsis alone.
   - Then the footnotes of what was kept, in order, with what is left of
     `limit` (`cut-notes`). When one is cut or dropped, the body ends with
     an ellipsis too: a cut preview always shows one at its end."
@@ -1160,10 +1255,59 @@
               [blocks false]
               (let [[soft] (cut-seq blocks limit (partial cut-block false))]
                 (if (str/blank? (content-text soft))
-                  [(first (cut-seq blocks limit (partial cut-block true))) true]
+                  [(first (cut-seq blocks limit (partial cut-block (hard-cap limit)))) true]
                   [soft true])))
             [kept notes-cut?] (cut-notes kept (max 0 (- limit (text-length kept))))]
         {:blocks (if (or body-cut? notes-cut?) (with-ellipsis kept) kept) :cut? true}))))
+
+(def ^:private node-overhead
+  "What `serialized-size` counts for each node: about what a node adds to
+  `previews.json` besides its strings (the keys, the braces, the commas)."
+  32)
+
+(defn- serialized-size
+  "About how many characters `x`, an AST node or a vector of them, takes
+  in `previews.json`: every string in it (text, `:url`, `:lang`,
+  attribute values, `:tex`, ...) plus `node-overhead` for each node, so a
+  table of many short cells counts as what it is."
+  [x]
+  (cond
+    (string? x) (count x)
+    (map? x) (reduce-kv (fn [n k v] (+ n (serialized-size k) (serialized-size v))) node-overhead x)
+    (coll? x) (reduce (fn [n v] (+ n (serialized-size v))) 0 x)
+    :else 0))
+
+(defn- size-budget
+  "How large (`serialized-size`) a preview of `limit` characters of text may
+  be: 32 times `limit`, but at least 64 KB (so a tiny `limit`, as the
+  tests use, does not shrink it below one node's worth), 64 KB at the
+  default. A preview is `limit`
+  characters of text and the markup of what holds them -- links, images,
+  a table's rows -- and every preview of the corpus is far below this (the
+  largest is a few KB); what reaches it is carrying something else, a
+  300 KB URL or attribute, a table of thousands of rows."
+  [limit]
+  (max 65536 (* 32 limit)))
+
+(defn cut-passage
+  "`{:blocks :cut?}`: `blocks` (a passage's) cut to about `limit`
+  characters of text (`cut-passage*`), and then bounded (TASK-291): when
+  what that keeps is over `size-budget` (`serialized-size`) -- whatever
+  the text, a block cut whole or not, a huge URL, attribute or heading,
+  many blocks, footnotes -- the preview is the short form, flagged cut: the
+  first heading and an ellipsis when the heading (with its attributes) is
+  at most an eighth of `size-budget` in size, else a paragraph holding
+  only the ellipsis."
+  [blocks limit]
+  (let [{kept :blocks :as result} (cut-passage* blocks limit)]
+    (if (<= (serialized-size kept) (size-budget limit))
+      result
+      (let [heading (first (filter #(= :section (kind %)) (take 1 (vec blocks))))
+            brief (when heading (with-ellipsis [(assoc heading :blocks [])]))]
+        {:blocks (if (and brief (<= (serialized-size brief) (quot (size-budget limit) 8)))
+                   brief
+                   (with-ellipsis []))
+         :cut? true}))))
 
 (defn preview-image-src
   "`(fn [src] src')` for the images of a preview of the book whose page
@@ -1371,6 +1515,65 @@
   [books lib-names]
   (:files (catalog books lib-names {})))
 
+(defn- read-catalog-json
+  "The catalog file `rel` below the site `root`, parsed; throws when it is
+  missing or not JSON."
+  [^File root rel]
+  (let [f (io/file root rel)
+        folders (reductions (fn [^Path p ^String s] (.resolve p s)) (.toPath root) (str/split rel #"/"))]
+    ;; a regular file reached through real folders only: nothing below the
+    ;; site is followed
+    (when-not (and (every? #(Files/isDirectory ^Path % no-follow) (rest (butlast folders)))
+                   (Files/isRegularFile ^Path (last folders) no-follow))
+      (throw (ex-info (str rel " is missing, or is a symbolic link or below one") {:type ::bad-catalog})))
+    (try (json/read-str (slurp f :encoding "UTF-8"))
+         (catch Exception _
+           (throw (ex-info (str rel " is not JSON") {:type ::bad-catalog}))))))
+
+(defn patch-catalog!
+  "TASK-329 (doc-13 section 4): put the books `books` -- `{:id BookId
+  :title text :authors [text] :page path}`, as `catalog` takes them --
+  into the catalog of the site `root` (a real path, `acquire-lock!`'s
+  `:dir`), replacing the entry of an id the catalog has, adding the rest.
+  The affected libraries' pages and `catalog/index.json` are read from
+  the site, their books gathered and the files made by `catalog` -- the
+  one `--build-site` uses -- so the bytes are the ones a build of the
+  same books gives; libraries not named are listed in the index with
+  the counts it already has. Writes (`write-if-changed!`, a rename) only
+  the files whose bytes differ. Answers the relative paths written.
+  Throws `ex-info` `::bad-catalog` when the index or a page it lists is
+  missing or not a catalog, writing nothing."
+  [^File root books]
+  (let [index (read-catalog-json root "catalog/index.json")
+        libs (get index "libraries")
+        count? #(and (integer? %) (not (neg? %)))
+        _ (when-not (and (map? index) (sequential? libs) (every? #(and (map? %) (string? (get % "name"))) libs))
+            (throw (ex-info "catalog/index.json is not a catalog index" {:type ::bad-catalog})))
+        _ (when-not (every? #(and (count? (get % "pages")) (count? (get % "books"))) libs)
+            (throw (ex-info "catalog/index.json: a library's \"books\" or \"pages\" is not a non-negative integer"
+                            {:type ::bad-catalog})))
+        affected (into #{} (map (comp :library :id)) books)
+        in-index (into {} (map (fn [l] [(get l "name") l])) libs)
+        existing (for [lib affected
+                       :let [{n "pages"} (get in-index lib)]
+                       i (range 1 (inc (or n 0)))
+                       :let [rel (str "catalog/" lib "/" i ".json")
+                             page (read-catalog-json root rel)]
+                       e (get page "books")]
+                   (let [parsed (book-ref/parse-book-ref (get e "id"))]
+                     (when-not (:id parsed)
+                       (throw (ex-info (str rel " holds an entry with no book ID") {:type ::bad-catalog})))
+                     {:id (:id parsed) :title (get e "title") :authors (get e "authors") :page (get e "path")}))
+        new-ids (into #{} (map (comp book-ref/format-book-id :id)) books)
+        merged (concat (remove #(contains? new-ids (book-ref/format-book-id (:id %))) existing) books)
+        others (into {} (comp (remove (fn [[lib _]] (contains? affected lib)))
+                              (map (fn [[lib l]] [lib {:books (get l "books") :pages (get l "pages")}])))
+                     in-index)
+        made (:files (catalog merged (vec affected) others))]
+    (into [] (comp (filter (fn [[rel content]] (write-if-changed! root rel content false)))
+                   (map key))
+          made)))
+
 (defn- in-pool
   "`(f x)` for each of `xs` on `threads` threads, answered in the order of
   `xs`. An exception `f` throws is rethrown here."
@@ -1443,14 +1646,58 @@
   (write-under! dir manifest-rel (.getBytes ^String (apply str (map #(str % "\n") (sort site-paths))) "UTF-8"))
   (Files/deleteIfExists (.toPath (io/file dir pending-rel))))
 
-(defn- page-dir-of [page] (subs page 0 (inc (str/last-index-of page "/"))))
+(defn record-image-copies!
+  "Add the site paths `site-paths` (images copied beside a page) to the
+  site `dir`'s images manifest, keeping every path it and the pending
+  list already name, and drop the pending list (its paths are in the
+  manifest now): copies a run that does not sweep made (`--build-doc`,
+  TASK-328), which the sweep of a later build removes once no page
+  copies them any more."
+  [^File dir site-paths]
+  (write-image-manifest! dir (into (read-image-manifest dir) site-paths)))
+
+(defn page-dir-of
+  "The folder of the page `page` (`page-path`), ending in `/`."
+  [page]
+  (subs page 0 (inc (str/last-index-of page "/"))))
+
+(defn page-site
+  "`image-collector`'s `site` for the page `page` (`page-path`):
+  `{:page-dir :page-dir?}`, `page-dirs` being the page folders of every
+  book that has a page path, this one's included."
+  [page page-dirs]
+  (let [page-dir (page-dir-of page)]
+    {:page-dir page-dir
+     :page-dir? (fn [d] (and (not= d page-dir) (contains? page-dirs d)))}))
+
+(defn write-page!
+  "Write the page `page` (`page-path`) of the site `dir` from what a
+  page's `:emit` answered, `{:html :images :image-dir}`: each image is
+  noted in the images pending list, then streamed below the page's
+  folder (`copy-image!`), and the page (`with-reader-app`) is written
+  last, so a page never shows an image that is not there yet. Answers
+  the copies, `{site-path {:dir :path :digest}}`. Throws when a write
+  fails. `write-site!` and `--build-doc` (TASK-328) write pages here."
+  [^File dir page {:keys [html images image-dir]}]
+  (let [page-dir (page-dir-of page)
+        copied (into (sorted-map)
+                     (map (fn [{:keys [path source]}]
+                            (let [site-path (str page-dir path)
+                                  digest (volatile! nil)]
+                              (note-pending-image! dir site-path)
+                              (write-under! dir site-path #(vreset! digest (copy-image! source %)) true)
+                              [site-path {:dir (some-> image-dir str) :path path :digest @digest}])))
+                     images)]
+    (write-under! dir page (.getBytes ^String (with-reader-app html page) "UTF-8") true)
+    copied))
 
 (defn- emit-page!
   "Emit and write the page of `entry` (a `site-books` entry with a book):
   `{:id :page :diagnostics :images :authors :refused-images}` once
   written -- the emit's own warnings, the images copied beside the page,
   `{site-path {:dir :path :digest}}`, the authors it answered, for the
-  catalog, and the `:refused-images` `:emit` answered (TASK-272) -- or
+  catalog, and the `:refused-images` `:emit` answered (TASK-272), plus
+  `:transient? true` when `:emit` answered it (TASK-299) -- or
   `{:id :failed message}`. `emit` is called with
   the book and `{:page-dir :page-dir?}` (`image-collector`'s `site`;
   `page-dirs` is every book's page folder). The images it answers
@@ -1463,22 +1710,13 @@
     (if (nil? page)
       {:id id :failed (str "book " (book-ref/format-book-id id) " has no valid site path")}
       (try
-        (let [page-dir (page-dir-of page)
-              {:keys [html diagnostics images image-dir authors refused-images]}
-              (emit book {:page-dir page-dir
-                          :page-dir? (fn [d] (and (not= d page-dir) (contains? page-dirs d)))})
-              copied (into (sorted-map)
-                           (map (fn [{:keys [path source]}]
-                                  (let [site-path (str page-dir path)
-                                        digest (volatile! nil)]
-                                    (note-pending-image! dir site-path)
-                                    (write-under! dir site-path #(vreset! digest (copy-image! source %)))
-                                    [site-path {:dir (some-> image-dir str) :path path :digest @digest}])))
-                           images)]
-          (write-under! dir page (.getBytes ^String (with-reader-app html page) "UTF-8"))
-          {:id id :page page :diagnostics (vec diagnostics) :images copied
-           :authors (vec (filter string? authors))
-           :refused-images (vec refused-images)})
+        (let [{:keys [diagnostics authors refused-images transient?] :as emitted}
+              (emit book (page-site page page-dirs))
+              copied (write-page! dir page emitted)]
+          (cond-> {:id id :page page :diagnostics (vec diagnostics) :images copied
+                   :authors (vec (filter string? authors))
+                   :refused-images (vec refused-images)}
+            transient? (assoc :transient? true)))
         (catch Exception e
           {:id id :failed (throwable-message e)})
         (catch StackOverflowError _
@@ -1494,12 +1732,21 @@
                    (str/join "|" (sort image-extensions))
                    "))\\.\\d+\\.tmp$")))
 
+(defn- fs-reason
+  "Why a sweep's file system call failed (`e`, an IOException or an
+  UncheckedIOException), in a few words (TASK-310)."
+  [^Throwable e]
+  (let [e (if (instance? java.io.UncheckedIOException e) (or (.getCause e) e) e)]
+    (if (instance? java.nio.file.AccessDeniedException e)
+      "permission denied"
+      (throwable-message e))))
+
 (defn- remove-stale-images!
   "Remove each of `stale` (site paths `books/...` of images an earlier
   build copied and this one did not) that is still a regular file, no
   folder on its way being a symbolic link; a path that could not have
   been copied (`saved-image-path?`) is left alone."
-  [^File dir stale]
+  [^File dir stale problem!]
   (doseq [rel stale
           :let [segments (str/split (str rel) #"/")]
           :when (and (= "books" (first segments)) (< 2 (count segments))
@@ -1508,7 +1755,10 @@
           target (.resolve ^Path (last folders) ^String (last segments))]
       (when (and (every? #(Files/isDirectory ^Path % no-follow) (rest folders))
                  (Files/isRegularFile target no-follow))
-        (Files/deleteIfExists target)))))
+        ;; TASK-310: one that cannot be removed is reported, not thrown
+        (try (Files/deleteIfExists target)
+             (catch IOException e
+               (problem! target (str "cannot be removed: " (fs-reason e)))))))))
 
 (def ^:private data-names
   "The file names of a book's data files, beside its page."
@@ -1520,31 +1770,50 @@
   interrupted write of one left (`.<n>.json.<digits>.tmp`, also beside
   `index.json`) that is not in `written` (site paths), then every
   library folder left empty. Nothing else is touched: a file of any
-  other name stays, and no symbolic link is followed or removed."
+  other name stays, and no symbolic link is followed or removed.
+
+  Answers (TASK-310) the `[site-path what]` of each folder it could not
+  list and each file or folder it could not remove, as `sweep!`'s
+  `:problems` are; it goes on with the rest instead of throwing."
   [dir written]
-  (let [root (io/file dir "catalog")]
+  (let [root (io/file dir "catalog")
+        problems (volatile! [])
+        attempt (fn [^String path what f]
+                  (try (f)
+                       (catch Exception e
+                         (if (or (instance? IOException e) (instance? java.io.UncheckedIOException e))
+                           (vswap! problems conj [path (str what (fs-reason e))])
+                           (throw e)))))
+        children (fn [^File f path]
+                   ;; `.listFiles` answers nil for a folder it cannot list
+                   (if-let [fs (.listFiles f)]
+                     (sort fs)
+                     (do (vswap! problems conj [path "cannot be listed: permission denied"]) [])))]
     (when (real-dir? root)
-      (doseq [^File f (sort (.listFiles root))
+      (doseq [^File f (children root "catalog")
               :let [p (.toPath f)
                     rel (str "catalog/" (.getName f))]]
         (cond
           (and (Files/isRegularFile p no-follow) (re-matches #"\.(?:index|\d+)\.json\.\d+\.tmp" (.getName f)))
-          (Files/deleteIfExists p)
+          (attempt rel "cannot be removed: " #(Files/deleteIfExists p))
 
           (real-dir? f)
-          (do (doseq [^File g (sort (.listFiles f))
+          (do (doseq [^File g (children f rel)
                       :let [q (.toPath g)
                             file-name (.getName g)]
                       :when (and (Files/isRegularFile q no-follow)
                                  (or (and (re-matches #"\d+\.json" file-name)
                                           (not (contains? written (str rel "/" file-name))))
                                      (re-matches #"\.\d+\.json\.\d+\.tmp" file-name)))]
-                (Files/deleteIfExists q))
-              (with-open [s (Files/list p)]
-                (when-not (.hasNext (.iterator s))
-                  (Files/deleteIfExists p))))
+                (attempt (str rel "/" file-name) "cannot be removed: " #(Files/deleteIfExists q)))
+              (attempt rel "cannot be removed: "
+                       #(with-open [s (Files/list p)]
+                          (when-not (.hasNext (.iterator s))
+                            (try (Files/deleteIfExists p)
+                                 (catch java.nio.file.DirectoryNotEmptyException _ nil))))))
 
-          :else nil)))))
+          :else nil)))
+    @problems))
 
 (def ^:private root-temp-re
   "A temporary file `write-atomically!` leaves at the top of the site when
@@ -1594,18 +1863,29 @@
   empty without one) -- what the record of an unchanged site stamps,
   so that anything a sweep would remove shows (TASK-296).
 
+  `:problems` (TASK-310), a volatile holding a vector: each folder the
+  sweep could not list, and each file or folder it could not remove (a
+  permission, say), is conjoined to it as `[site-path what]` instead of
+  aborting the sweep, which goes on with the rest. A folder it could not
+  list is still among `:folders`, as one that holds something unknown.
+
   `:libraries` (TASK-297), library names: only `books/<library>/` of each
   is looked into (`books/` itself is still listed first among
   `:folders`), for a build that leaves every other library as it is and
   knows nothing was added there since its last sweep. Without it, all of
   `books/`."
   ([dir written] (sweep! dir written {}))
-  ([dir written {:keys [images previous-images data folders libraries]}]
+  ([dir written {:keys [images previous-images data folders libraries problems]}]
    (let [root (io/file dir "books")]
      (if-not (real-dir? root)
        (do (when folders (vreset! folders [])) [])
        (let [current (into {} (map (fn [p] [(str/lower-case p) p])) images)
              base-path (.toPath (io/file dir))
+             ;; TASK-310: what the sweep could not do is noted, never thrown
+             problem! (fn [^Path p what]
+                        (when problems
+                          (vswap! problems conj
+                                  [(str/replace (str (.relativize base-path p)) File/separator "/") what])))
              same-file? (fn [a b]
                           (try (Files/isSameFile (.resolve base-path ^String a) (.resolve base-path ^String b))
                                (catch IOException _ false)))
@@ -1617,24 +1897,34 @@
                                                (let [p (str p)
                                                      twin (get current (str/lower-case p))]
                                                  (and twin (same-file? p twin))))
-                                             (remove (set images) previous-images)))
+                                             (remove (set images) previous-images))
+                                     problem!)
              base (.toPath (io/file dir))
              ;; every entry with its type, from the walk's own attributes
              ;; (no link followed), rather than a stat per entry: a site of
              ;; 50,000 books holds over 200,000 (TASK-272)
              entries (let [acc (java.util.ArrayList.)
                            walk! (fn [^Path from]
-                                   (with-open [s (Files/find from Integer/MAX_VALUE
-                                                             (reify java.util.function.BiPredicate
-                                                               (test [_ p attrs]
-                                                                 (let [^java.nio.file.attribute.BasicFileAttributes a attrs]
-                                                                   (.add acc [p (cond (.isRegularFile a) :file
-                                                                                      (.isDirectory a) :dir
-                                                                                      :else :other)])
-                                                                   false)))
-                                                             (make-array java.nio.file.FileVisitOption 0))]
-                                     ;; the predicate keeps nothing: walking is the point
-                                     (dorun (iterator-seq (.iterator s)))))]
+                                   (Files/walkFileTree
+                                    from
+                                    (reify java.nio.file.FileVisitor
+                                      (preVisitDirectory [_ p _]
+                                        (.add acc [p :dir])
+                                        java.nio.file.FileVisitResult/CONTINUE)
+                                      (visitFile [_ p attrs]
+                                        (let [^java.nio.file.attribute.BasicFileAttributes a attrs]
+                                          (.add acc [p (if (.isRegularFile a) :file :other)]))
+                                        java.nio.file.FileVisitResult/CONTINUE)
+                                      ;; TASK-310: a folder that cannot be listed is
+                                      ;; reported, kept in the walk (its stamp is
+                                      ;; recorded) as a folder holding something
+                                      ;; unknown, and the walk goes on
+                                      (visitFileFailed [_ p e]
+                                        (.add acc [p :unlisted])
+                                        (problem! p (str "cannot be listed: " (fs-reason e)))
+                                        java.nio.file.FileVisitResult/CONTINUE)
+                                      (postVisitDirectory [_ _ _]
+                                        java.nio.file.FileVisitResult/CONTINUE))))]
                        (if (nil? libraries)
                          (walk! (.toPath root))
                          ;; TASK-297: books/ itself, then each library's
@@ -1666,8 +1956,12 @@
                                           (and data (contains? data-names file-name)
                                                (not (contains? data rel)))
                                           (re-matches temp-re file-name))]
-                            (do (Files/deleteIfExists p)
-                                [p (when (= "index.html" file-name) (page-id rel))])))
+                            (try (Files/deleteIfExists p)
+                                 [p (when (= "index.html" file-name) (page-id rel))]
+                                 (catch IOException e
+                                   (problem! p (str "cannot be removed: " (fs-reason e)))
+                                   nil))))
+             removed (filterv some? removed)
              ;; the folders that may be empty now: those that were, and
              ;; those a removed file was in
              candidates (into (into #{} (comp (filter empty-dir?) (map #(first (nth entries %)))) (range n))
@@ -1682,17 +1976,24 @@
                            gone #{}]
                       (if-let [^Path p (first queue)]
                         (let [emptied? (and (Files/isDirectory p no-follow)
-                                            (with-open [s (Files/list p)] (not (.hasNext (.iterator s))))
-                                            ;; something written into it meanwhile keeps it
-                                            (try (Files/deleteIfExists p)
-                                                 (catch java.nio.file.DirectoryNotEmptyException _ false)))
+                                            ;; TASK-310: a folder that cannot be listed
+                                            ;; or removed is reported and kept
+                                            (try (and (with-open [s (Files/list p)] (not (.hasNext (.iterator s))))
+                                                      ;; something written into it meanwhile keeps it
+                                                      (try (Files/deleteIfExists p)
+                                                           (catch java.nio.file.DirectoryNotEmptyException _ false)))
+                                                 (catch Exception e
+                                                   (if (or (instance? IOException e) (instance? java.io.UncheckedIOException e))
+                                                     (do (problem! p (str "cannot be removed: " (fs-reason e)))
+                                                         false)
+                                                     (throw e)))))
                               parent (.getParent p)]
                           (recur (cond-> (disj queue p)
                                    (and emptied? (not= parent root-path)) (conj parent))
                                  (cond-> gone emptied? (conj p))))
                         gone))]
            (when folders
-             (vreset! folders (into [] (comp (filter #(= :dir (second %)))
+             (vreset! folders (into [] (comp (filter #(contains? #{:dir :unlisted} (second %)))
                                              (map first)
                                              (remove gone)
                                              (map str))
@@ -1726,15 +2027,25 @@
             :book (book-ref/format-book-id id)
             :library (:library id)}))))
 
+(defn- real-path
+  "The path `f` names with every symbolic link resolved, or, when that
+  cannot be done (it does not exist), as an absolute normalized path."
+  ^Path [f]
+  (let [p (.toPath (io/file f))]
+    (try (.toRealPath p (make-array LinkOption 0))
+         (catch IOException _ (.normalize (.toAbsolutePath p))))))
+
 (defn library-roots
   "`{library-name Path}` of the libraries of the graph `g` that have a root
-  folder (`haselnuss.library.graph/indexed-libraries`); empty for a
-  graph without library records."
+  folder (`haselnuss.library.graph/indexed-libraries`), each as its real
+  path (symbolic links resolved: a library whose `path` is a link, or
+  lies below one, holds files whose real paths are below the real root,
+  TASK-291); empty for a graph without library records."
   [g]
   (if (satisfies? graph/LibraryIndex g)
     (into {} (keep (fn [[lib-name {:keys [root]}]]
                      (when (string? root)
-                       [lib-name (.normalize (.toAbsolutePath (.toPath (io/file root))))])))
+                       [lib-name (real-path root)])))
           (graph/indexed-libraries g))
     {}))
 
@@ -1744,15 +2055,23 @@
   `roots` (`library-roots`) tried with the citing book's library first,
   then the deepest root holding it; nil when no library root holds it.
   Never an absolute path: a site is served to other devices, and the
-  layout of the machine that built it is not theirs to read."
+  layout of the machine that built it is not theirs to read.
+
+  The roots are real paths, so the file is looked for by its real path
+  first, then as written. So a link to a file shows the place the file
+  really is when a root holds that (a link in library A to a file in
+  library B shows `B/...`), else the link's own place when a root holds
+  that; a link that leads out of every root never shows where it leads."
   [roots from-lib file]
   (when (string? file)
-    (let [p (.normalize (.toAbsolutePath (.toPath (io/file file))))
-          hits (filter (fn [[_ ^Path root]] (and (.startsWith p root) (not= p root))) roots)
-          [lib ^Path root] (or (first (filter #(= from-lib (key %)) hits))
-                               (first (sort-by (fn [[n ^Path r]] [(- (.getNameCount r)) n]) hits)))]
-      (when root
-        (str lib "/" (str/join "/" (map str (.relativize root p))))))))
+    (let [candidates [(real-path file) (.normalize (.toAbsolutePath (.toPath (io/file file))))]]
+      (some (fn [^Path p]
+              (let [hits (filter (fn [[_ ^Path root]] (and (.startsWith p root) (not= p root))) roots)
+                    [lib ^Path root] (or (first (filter #(= from-lib (key %)) hits))
+                                         (first (sort-by (fn [[n ^Path r]] [(- (.getNameCount r)) n]) hits)))]
+                (when root
+                  (str lib "/" (str/join "/" (map str (.relativize root p)))))))
+            candidates))))
 
 (defn site-backlinks-report
   "The `--backlinks` report of the book `id` in the graph `g` as a site
@@ -1785,8 +2104,9 @@
 
   `which` (TASK-272) names the files to make, `:backlinks` and/or
   `:previews`; `:preview-failures` is answered only when `previews.json`
-  was among them."
-  [dir {:keys [graph previews]} {:keys [id page images]} which]
+  was among them. `:replace-files?` writes them even when their bytes
+  match (`write-if-changed!`)."
+  [dir {:keys [graph previews replace-files?]} {:keys [id page images]} which]
   (let [page-dir (page-dir-of page)
         backlinks-rel (str page-dir "backlinks.json")
         previews-rel (str page-dir "previews.json")
@@ -1800,14 +2120,118 @@
                          report
                          (assoc backlinks-rel (write-if-changed! dir backlinks-rel
                                                                  (.getBytes ^String (backlinks/render-json report)
-                                                                            "UTF-8")))
+                                                                            "UTF-8")
+                                                                 replace-files?))
                          previews?
-                         (assoc previews-rel (write-if-changed! dir previews-rel (previews-json id (vec shown)))))}
+                         (assoc previews-rel (write-if-changed! dir previews-rel (previews-json id (vec shown))
+                                                                replace-files?)))}
           previews? (assoc :preview-failures (vec failures))))
       (catch Exception e
         {:id id :data-failed (throwable-message e)})
       (catch StackOverflowError _
         {:id id :data-failed "a passage is nested too deeply to preview"}))))
+
+;; --- one book's data files, without the graph (--build-doc, TASK-328) -------------
+
+(defn- read-site-json
+  "The JSON data file `rel` below the site `dir`, as `clojure.data.json`
+  reads it (string keys), when it is a regular file reached through real
+  folders only (`site-file?`); nil when it is not, or does not parse."
+  [^File dir rel]
+  (when (site-file? dir rel)
+    (try (json/read-str (slurp (io/file dir rel) :encoding "UTF-8"))
+         (catch Exception _ nil)
+         (catch StackOverflowError _ nil))))
+
+(defn- whole-book-id
+  "The canonical id text of the book reference `s`, when it is one with
+  no passage; nil for anything else."
+  [s]
+  (when (string? s)
+    (let [parsed (book-ref/parse-book-ref s)]
+      (when-not (or (book-ref/malformed? parsed) (:passage parsed))
+        (book-ref/format-book-id (:id parsed))))))
+
+(defn referring-books
+  "The canonical ids (text) of the books the `backlinks.json` beside the
+  page `page` (`page-path`) of the site `dir` lists as referring to its
+  book -- each edge's `from`; its self-references are not edges --
+  distinct and sorted; empty when there is no such file or it cannot be
+  read. The books `--build-doc` names `stale` (TASK-328): finding them
+  costs no scan."
+  [^File dir page]
+  (let [report (read-site-json dir (str (page-dir-of page) "backlinks.json"))
+        edges (when (map? report) (get report "edges"))]
+    (->> (when (sequential? edges) edges)
+         (keep (fn [e] (when (map? e) (let [from (get e "from")] (when (map? from) (get from "id"))))))
+         (keep whole-book-id)
+         distinct
+         sort
+         vec)))
+
+(defn listed-previews
+  "The passages the `previews.json` beside the page `page` of the book
+  `id` in the site `dir` lists, in its order, as `preview-passages`
+  answers them -- `[{:key :passage}]`, `:passage` parsed from the key
+  (nil for the whole book) -- each key once; a key that does not parse as
+  a passage of the book is left out. Empty when there is no such file or
+  it cannot be read."
+  [^File dir id page]
+  (let [data (read-site-json dir (str (page-dir-of page) "previews.json"))
+        entries (when (map? data) (get data "previews"))
+        id-text (book-ref/format-book-id id)]
+    (->> (when (sequential? entries) entries)
+         (keep (fn [e]
+                 (when (map? e)
+                   (let [k (get e "passage")]
+                     (cond
+                       (nil? k) {:key nil :passage nil}
+                       (string? k) (let [parsed (book-ref/parse-book-ref (str id-text "#" k))]
+                                     (when-not (or (book-ref/malformed? parsed) (nil? (:passage parsed)))
+                                       {:key k :passage (:passage parsed)}))
+                       :else nil)))))
+         (reduce (fn [[seen out] p]
+                   (if (contains? seen (:key p)) [seen out] [(conj seen (:key p)) (conj out p)]))
+                 [#{} []])
+         second)))
+
+(defn empty-backlinks-json
+  "The `backlinks.json` of the book `id` with no reference into it: what
+  `--build-doc` writes beside a book's first page (TASK-328); the next
+  `--build-site` writes the real one."
+  ^bytes [id]
+  (.getBytes ^String (backlinks/render-json {:version backlinks/report-version
+                                             :book (book-ref/format-book-id id)
+                                             :passage nil
+                                             :edges []
+                                             :self []
+                                             :summary {:references 0 :books 0 :self 0}})
+             "UTF-8"))
+
+(defn rewrite-book-data!
+  "The data files `--build-doc` (TASK-328; doc-13, section 4 step 3)
+  writes beside the page `page` of the book `id` it has just written to
+  the site `dir`, each through `write-if-changed!`: `backlinks.json` is
+  kept as it is when it is there (who refers to a book does not change
+  when the book's own file does), else an empty report; `previews.json`
+  is rendered again for the passages the existing one lists
+  (`listed-previews`), read before it is replaced, by `(previews id
+  passages copied)` -- `copied` the images the page copied, relative to
+  its folder -- leaving out each passage it answers `{:key :failed}` for
+  (one that no longer resolves); none when there is no such file.
+  Answers the previews left out, `[{:key :failed}]`. Throws when a write
+  fails."
+  [^File dir id page previews copied]
+  (let [page-dir (page-dir-of page)
+        backlinks-rel (str page-dir "backlinks.json")
+        previews-rel (str page-dir "previews.json")
+        passages (listed-previews dir id page)
+        rendered (if (seq passages) (previews id passages copied) [])
+        {failures true shown false} (group-by #(contains? % :failed) rendered)]
+    (when-not (site-file? dir backlinks-rel)
+      (write-if-changed! dir backlinks-rel (empty-backlinks-json id)))
+    (write-if-changed! dir previews-rel (previews-json id (vec shown)))
+    (vec failures)))
 
 (defn- preview-failure-items
   "One `:preview-failed` warning per preview of the data result `result`
@@ -1825,6 +2249,21 @@
      :canonical nil
      :book (book-ref/format-book-id id)
      :library (:library id)}))
+
+(defn- sweep-problem-items
+  "The `--check`-style error items of what `sweep!` could not do
+  (`:problems`, `[site-path what]`; TASK-310), sorted by path; the
+  library is the folder's below `books/`, when it is in one."
+  [problems]
+  (vec (for [[path what] (reduce (fn [m [p w]] (if (contains? m p) m (assoc m p w)))
+                                 (sorted-map) problems)
+             :let [[_ lib] (re-matches #"books/([^/]+)/.*" path)]]
+         {:type :sweep-failed
+          :level :error
+          :message (str "the site folder or file " path " " what "; stale output there was not swept")
+          :file path :line nil :column nil :ref nil :canonical nil
+          :book nil
+          :library lib})))
 
 (defn- failure-item
   "The `--check`-style item of a book whose page, or (`:data-failed`) whose
@@ -1844,7 +2283,7 @@
    :book (book-ref/format-book-id id)
    :library (:library id)})
 
-(defn- book-lines
+(defn book-lines
   "One message line per book, `verb  id  (reason)`, the ids padded to one
   column."
   [rows]
@@ -1908,17 +2347,42 @@
   [summaries]
   (reduce #(merge-with + %1 %2) no-summary summaries))
 
+(defn problems-text
+  "What a summary counts as outstanding: `no warnings`, or `[E errors,
+  ]W warnings in B books`."
+  [{:keys [errors warnings books]}]
+  (if (zero? (+ errors warnings))
+    "no warnings"
+    (str (when (pos? errors) (str (text/plural errors "error") ", "))
+         (text/plural warnings "warning")
+         ;; TASK-310: a problem of the site's own folders is in no book
+         (when (pos? books) (str " in " (text/plural books "book"))))))
+
 (defn summary-line
   "The summary: `N of M books rebuilt, K up to date[, U not built];
   [E errors, ]W warnings in B books`."
-  [{:keys [rebuilt total up-to-date not-built errors warnings books]}]
+  [{:keys [rebuilt total up-to-date not-built] :as summary}]
   (str rebuilt " of " (text/plural total "book") " rebuilt, " up-to-date " up to date"
        (when (pos? not-built) (str ", " not-built " not built"))
        "; "
-       (if (zero? (+ errors warnings))
-         "no warnings"
-         (str (when (pos? errors) (str (text/plural errors "error") ", "))
-              (text/plural warnings "warning") " in " (text/plural books "book")))))
+       (problems-text summary)))
+
+(def earlier-note
+  "What a line printed again from an earlier build ends with (TASK-308)."
+  " (unchanged since the last build)")
+
+(defn- carried-shown
+  "TASK-308: the items to print of a build that rebuilt only some books:
+  `fresh` (this run's, as they are) and every other of `items` once more,
+  its message ending in `earlier-note`, so a warning in a book this run
+  did not touch is printed beside the count that includes it and a reader
+  can tell it was not found now. Sorted as `--check` sorts."
+  [items fresh]
+  (let [fresh-set (set fresh)]
+    (check/sort-items
+     (concat fresh
+             (for [it items :when (not (contains? fresh-set it))]
+               (update it :message str earlier-note))))))
 
 (defn full-plan
   "The plan of a full build (`write-site!`'s `:plan`) of the `site-books`
@@ -1980,10 +2444,12 @@
   in a page this build did not touch is not forgotten. `:data` names the
   data files of kept books to make again. The answer adds `:shown`, the
   items to print -- all of them on a full build, else those of the books
-  emitted this run and this run's failures -- and `:books`, `{BookId
+  emitted this run and this run's failures as they are, and every other
+  item again with `earlier-note` after its message (TASK-308) -- and `:books`, `{BookId
   {:path :emit-diagnostics :images :refused-images :authors
-  :preview-failures :data-failed?}}` for every page, which the state saves for the next
-  run. `:hook`, a test seam, is called as `(hook stage x)` after each
+  :preview-failures :data-failed? :transient?}}` for every page, which the state saves for the next
+  run (`:transient?`, TASK-299: its build met a failure of that run, so
+  the next one rebuilds it; a preview failure may carry one too). `:hook`, a test seam, is called as `(hook stage x)` after each
   page (`:page`, its result) and data result (`:data`), and before the
   catalog (`:catalog`) and the sweep (`:sweep`): one that throws stands
   for a build killed there.
@@ -2001,11 +2467,20 @@
   of each, `sweep!`'s `:libraries`) and takes everything else of the
   frozen libraries from there: their copies stay in the manifest, their
   catalog files stay and `index.json` counts them, and the summary,
-  items, lines and `:libraries` hold them as well."
+  items, lines and `:libraries` hold them as well.
+
+  `:replace-files?` (TASK-290; `--full`, or a saved state that is
+  missing, unreadable or of another format, but not one that only
+  another Haselnuss version saved): the
+  app files, data files and catalog are written even when their bytes
+  match, as new files, so they take the mode the umask gives now, as the
+  pages and images a full build writes do. No existing file's mode is
+  ever changed in place, and a file the build does not produce is not
+  touched."
   [dir {:keys [directory library-names emit threads report library-diagnostics base-dir reason
-               graph previews plan hook frozen]
+               graph previews plan hook frozen replace-files?]
         :or {reason "full build"}}]
-  (copy-app-files! dir)
+  (copy-app-files! dir replace-files?)
   (let [threads (or threads (.availableProcessors (Runtime/getRuntime)))
         hook (or hook (fn [_ _] nil))
         entries (site-books directory library-names)
@@ -2033,7 +2508,9 @@
         ;; and TASK-272 those of a kept page the plan names
         data-results (if data?
                        (in-pool (fn [[page which]]
-                                  (let [r (write-data! dir {:graph graph :previews previews} page which)]
+                                  (let [r (write-data! dir {:graph graph :previews previews
+                                                            :replace-files? replace-files?}
+                                                       page which)]
                                     (hook :data r)
                                     r))
                                 (concat (map #(vector % #{:backlinks :previews}) written)
@@ -2064,14 +2541,16 @@
                  library-names
                  (update-vals frozen :counts))
         catalog-written (into (sorted-map)
-                              (map (fn [[rel content]] [rel (write-if-changed! dir rel content)]))
+                              (map (fn [[rel content]] [rel (write-if-changed! dir rel content replace-files?)]))
                               catalog-bytes)
         own-copies (set (mapcat (comp keys :images) pages))
         copies (into own-copies (mapcat :copies) (vals frozen))
         _ (hook :sweep nil)
         folders (volatile! nil)
+        sweep-problems (volatile! [])
         removed (sweep! dir (set (map :page pages))
                         (cond-> {:folders folders
+                                 :problems sweep-problems
                                  :images copies
                                  :previous-images (read-image-manifest dir)
                                  :data (when data?
@@ -2081,10 +2560,12 @@
                                                                (map #(str (page-dir-of page) %) data-names))))
                                                pages))}
                           frozen (assoc :libraries library-names)))
-        _ (sweep-catalog! dir (into (set (keys catalog-bytes)) (mapcat (comp keys :catalog)) (vals frozen)))
+        _ (vswap! sweep-problems into
+                  (sweep-catalog! dir (into (set (keys catalog-bytes)) (mapcat (comp keys :catalog)) (vals frozen))))
         _ (sweep-root! dir)
         _ (write-image-manifest! dir copies)
         conflict-items (image-conflicts pages)
+        sweep-items (sweep-problem-items @sweep-problems)
         entry-file (into {} (map (fn [{:keys [id book]}]
                                    [id (when (fs/filesystem-book? book) (fs/entry-file book))]))
                          buildable)
@@ -2102,7 +2583,8 @@
                          d (or diagnostics emit-diagnostics)]
                      (check/book-item d {:book (book-ref/format-book-id id) :lib-name (:library id)
                                          :file (some-> (entry-file id) str) :base-dir base-dir}))
-        own-items (concat (:diagnostics report) emit-items fresh-failures carried-failures conflict-items)
+        own-items (concat (:diagnostics report) emit-items fresh-failures carried-failures conflict-items
+                          sweep-items)
         frozen-libs (vals frozen)
         items (check/sort-items (concat own-items (mapcat :items frozen-libs)))
         all-conflicts (concat conflict-items (mapcat :conflicts frozen-libs))
@@ -2110,11 +2592,11 @@
         emitted (into #{} (map fmt) results)
         ;; doc-12: the diagnostics of the books rebuilt in this run; the
         ;; summary counts them all
-        shown (if full?
-                items
-                (check/sort-items (concat (filter #(contains? emitted (:book %))
-                                                  (concat (:diagnostics report) emit-items))
-                                          fresh-failures all-conflicts)))
+        ;; TASK-308: the others are printed again, marked as earlier
+        fresh-shown (check/sort-items (concat (filter #(contains? emitted (:book %))
+                                                      (concat (:diagnostics report) emit-items))
+                                              fresh-failures all-conflicts sweep-items))
+        shown (if full? items (carried-shown items fresh-shown))
         skipped-rows (concat (map (fn [r] ["skipped" (fmt r) (str (:duplicates r) " books share this id")])
                                   duplicates)
                              (for [{:keys [skipped]} frozen-libs [id why] skipped] ["skipped" id why]))
@@ -2129,7 +2611,9 @@
                                       :kept-pages kept-pages :failed failed :duplicates duplicates
                                       :items own-items :library-diagnostics library-diagnostics})
         summary (sum-summaries (concat (vals summaries) (map :summary frozen-libs)))
-        settled? (and (empty? failed) (empty? data-failed))
+        ;; TASK-310: a sweep that left something undone is tried again, and
+        ;; its items are never kept in the state (found anew every run)
+        settled? (and (empty? failed) (empty? data-failed) (empty? sweep-items))
         catalog-digests (into (sorted-map) (map (fn [[rel content]] [rel (digest/bytes-digest content)])) catalog-bytes)
         by-lib (fn [f xs] (group-by f xs))
         own-items-by-lib (by-lib :library own-items)
@@ -2164,7 +2648,7 @@
      :settled (when settled?
                 {:lines (book-lines (filter #(= "skipped" (first %)) rows))
                  :items items
-                 :shown (check/sort-items all-conflicts)
+                 :shown (carried-shown items (check/sort-items all-conflicts))
                  :summary (sum-summaries (map :summary (vals libraries)))})
      ;; TASK-297: each library's share of that, and what a build that
      ;; leaves the library as it is takes as `:frozen`
@@ -2180,7 +2664,8 @@
      ;; TASK-272: what the saved state keeps of every page, written or
      ;; kept, for the next run
      :books (into {}
-                  (map (fn [{:keys [id page diagnostics emit-diagnostics images authors refused-images] :as p}]
+                  (map (fn [{:keys [id page diagnostics emit-diagnostics images authors refused-images transient?]
+                             :as p}]
                          (let [data (get data-by-id id)
                                data-failed (if data (:data-failed data) (:data-failed p))]
                            [id (cond-> {:path page
@@ -2194,7 +2679,10 @@
                                         ;; TASK-271: the catalog's authors
                                         :authors (vec authors)
                                         :preview-failures (preview-failures id)}
-                                 data-failed (assoc :data-failed data-failed))])))
+                                 data-failed (assoc :data-failed data-failed)
+                                 ;; TASK-299: built with a failure of its run
+                                 ;; (`emit-page!`), which the next one rebuilds
+                                 transient? (assoc :transient? true))])))
                   pages)
      ;; TASK-271: site path -> true when this build wrote the file, false
      ;; when it already held these bytes

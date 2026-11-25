@@ -23,7 +23,9 @@
             [haselnuss.library.graph.check :as check]
             [haselnuss.library.graph.rebuild :as rebuild]
             [haselnuss.library.graph.scan :as scan]
-            [haselnuss.parser :as parser])
+            [haselnuss.parser :as parser]
+            [haselnuss.sandbox :as sandbox]
+            [haselnuss.test-sandbox :as test-sandbox])
   (:import (java.io File)
            (java.nio.file Files LinkOption)
            (java.nio.file.attribute FileAttribute)
@@ -645,3 +647,129 @@
           (spit (io/file root scripture) (str (slurp (io/file root scripture)) "\n;; edited\n"))
           (let [r (refresh! env g1 [scripture])]
             (check-step env g1 r (vec scripture-books) (set scripture-books))))))))
+
+(deftest symlinked-out-of-root-shelf-refresh-test
+  (testing "a fixed shelf.clj in a symlinked, out-of-root generated shelf that lists no books re-lists its library (TASK-286)"
+    (let [root (temp-dir)
+          failing "{:books (fn [_] (throw (ex-info \"no books today\" {})))}\n"
+          fixed (str "{:books (fn [_] [{:slug \"fixed\" :title \"Fixed\"}])\n"
+                     " :document (fn [_ _] {:meta {} :blocks [{:t :para :inlines [{:t :str :text \"ok\"}]}]})}\n")]
+      (write! root "elsewhere/s/shelf.clj" failing)
+      (write! root "lib/one.hdoc" "# One\n")
+      (write! root "other/two.hdoc" "# Two\n")
+      (spit (io/file root "libraries.yaml")
+            (str "- name: p\n  type: filesystem\n  path: lib\n  scripts: true\n"
+                 "- name: q\n  type: filesystem\n  path: other\n"))
+      (if-not (symlink! root "lib/s" (str (io/file root "elsewhere/s")))
+        (is true "symbolic links are not supported here")
+        (let [env {:root root :yaml (str (io/file root "libraries.yaml"))}
+              g0 (scan/scan (context (:yaml env)) nil)
+              shelf (id "p" ["s"] "fixed")
+              relisted (fn [g paths]
+                         (@#'scan/libraries-to-relist (context (:yaml env)) g
+                                                      (set (mapcat scan/lookup-paths paths)) #{}))]
+          (is (some #(= :script-failed (:type %)) (:diagnostics (get (graph/indexed-libraries g0) "p")))
+              "the starting graph is not vacuous: the shelf fails")
+          (is (nil? (get (graph/indexed-books g0) shelf)))
+          (is (= #{"p"} (relisted g0 [(str (io/file root "elsewhere/s/shelf.clj"))])) "by the canonical path")
+          (is (= #{"p"} (relisted g0 [(str (io/file root "lib/s/shelf.clj"))])) "by the link path")
+          (is (= #{} (relisted g0 [(str (io/file root "elsewhere/s/other.clj"))]))
+              "another file in the shelf's folder is not the script")
+          (is (= #{} (relisted g0 [(str (io/file root "elsewhere/unrelated.txt"))]))
+              "nor is an unrelated file outside every root")
+          (is (= #{"q"} (relisted g0 [(str (io/file root "other/two.hdoc"))]))
+              "an ordinary edit re-lists its own library only")
+          (write! root "elsewhere/s/shelf.clj" fixed)
+          (doseq [path ["elsewhere/s/shelf.clj" "lib/s/shelf.clj"]]
+            (let [r (refresh! env g0 [path])
+                  g (check-step env g0 r [shelf] #{shelf})]
+              (is (some? (record-of g shelf)) path)
+              (is (not-any? #(= :script-failed (:type %))
+                            (:diagnostics (get (graph/indexed-libraries g) "p")))
+                  path))))))))
+
+(deftest symlinked-out-of-root-shelf-lifecycle-test
+  (testing "a symlinked, out-of-root shelf.clj is seen created, emptied, listing books and emptied again (TASK-286)"
+    (let [root (temp-dir)
+          empty-shelf "{:books (fn [_] [])}\n"
+          book-shelf (str "{:books (fn [_] [{:slug \"b\" :title \"B\"}])\n"
+                          " :document (fn [_ _] {:meta {} :blocks [{:t :para :inlines [{:t :str :text \"ok\"}]}]})}\n")]
+      (.mkdirs (io/file root "elsewhere/s"))
+      (write! root "lib/one.hdoc" "# One\n")
+      (write! root "other/two.hdoc" "# Two\n")
+      (spit (io/file root "libraries.yaml")
+            (str "- name: p\n  type: filesystem\n  path: lib\n  scripts: true\n"
+                 "- name: q\n  type: filesystem\n  path: other\n"))
+      (if-not (symlink! root "lib/s" (str (io/file root "elsewhere/s")))
+        (is true "symbolic links are not supported here")
+        (let [env {:root root :yaml (str (io/file root "libraries.yaml"))}
+              b (id "p" ["s"] "b")
+              canonical-rel "elsewhere/s/shelf.clj"
+              link-rel "lib/s/shelf.clj"
+              step (fn [g label text path scanned touched]
+                     (write! root canonical-rel text)
+                     (let [r (refresh! env g [path])
+                           g2 (check-step env g r scanned touched)]
+                       (testing label
+                         (is (= (some? (seq scanned)) (some? (record-of g2 b))) label))
+                       g2))
+              g0 (scan/scan (context (:yaml env)) nil)]
+          (is (nil? (record-of g0 b)))
+          (doseq [[path-kind path] [["canonical" canonical-rel] ["link" link-rel]]]
+            (testing path-kind
+              (let [g1 (step g0 "created, valid and empty" empty-shelf path [] #{})
+                    g2 (step g1 "edited to list a book" book-shelf path [b] #{b})
+                    g3 (step g2 "edited back to empty" empty-shelf path [] #{b})
+                    g4 (step g3 "edited to list a book again" book-shelf path [b] #{b})]
+                (is (some? (record-of g4 b)))
+                (io/delete-file (io/file root canonical-rel))
+                (check-step env g4 (refresh! env g4 [path]) [] #{b})))))))))
+
+;; --- a timeout is not saved (TASK-299) -------------------------------------------
+
+(def ^:private timeout-shelf
+  "{:books (fn [_] [{:slug \"g1\" :title \"G1\"} {:slug \"g2\" :title \"G2\"}])
+ :document (fn [_ slug] {:meta {} :blocks [{:t :para :inlines [{:t :str :text slug}]}]})
+ :locate (fn [_ slug loc] {:title (str slug \" \" loc) :blocks [{:t :para :inlines [{:t :str :text loc}]}]})}
+")
+
+(deftest timeout-is-retried-by-the-next-refresh-test
+  (testing "a generated book's :document and a reference's :locate that timed out
+            are scanned and resolved again by the next refresh, though no file
+            changed: the timeout was the run's, not the book's (TASK-299)"
+    (let [root (temp-dir)
+          _ (do (write! root "s/shelf.clj" timeout-shelf)
+                (write! root "a.hdoc" "# A {#sec:a}\n\n!quote t:g1\n\n!quote t:g2#1:1\n")
+                (write! root "b.hdoc" "# B {#sec:b}\n\nB links @{t:a}.\n"))
+          ctx (fn [scans]
+                (scan/context {:directory (library/library-directory
+                                           [(fs/filesystem-library {:name "t" :path (str root) :scripts true})])
+                               :on-scan-book #(swap! scans conj %)}))
+          g0 (with-redefs [sandbox/sci-call! (test-sandbox/timing-out #":document for t:s/g1|:locate for t:s/g2")]
+               (scan/scan (ctx (atom [])) nil))
+          g1-id (id "t" ["s"] "g1")
+          a-id (id "t" "a")]
+      (testing "not vacuous: the first scan saved both timeouts, marked transient"
+        (is (= [[:script-failed true]] (mapv (juxt :type :transient) (:diagnostics (record-of g0 g1-id)))))
+        (is (= [[:script-failed true] [:script-failed true]]
+               (mapv (juxt :type :transient) (:diagnostics (record-of g0 a-id)))))
+        (is (= [:dangling :dangling] (mapv :status (graph/edges-from g0 a-id)))))
+      (let [scans (atom [])
+            {g :graph :keys [changes rebuild]} (scan/refresh (ctx scans) g0 [])
+            fresh (scan/scan (ctx (atom [])) nil)]
+        (is (= (view fresh) (view g)) "the refreshed graph equals a fresh scan")
+        (is (= [] (into [] (mapcat :diagnostics) (vals (graph/indexed-books g)))))
+        (is (= #{g1-id a-id} (set @scans) (:rescanned changes))
+            "only the books holding a timeout are scanned again")
+        (is (contains? (rebuild/narrowed g0 {:graph g :changes changes :rebuild rebuild}) a-id)
+            "and the book quoting them is rebuilt"))
+      (testing "a shelf whose :books timed out lists no books, and the next refresh
+                lists its library again"
+        (let [g0 (with-redefs [sandbox/sci-call! (test-sandbox/timing-out #":books")]
+                   (scan/scan (ctx (atom [])) nil))
+              {g :graph} (scan/refresh (ctx (atom [])) g0 [])]
+          (is (= [[:script-failed true]]
+                 (mapv (juxt :type :transient) (:diagnostics (get (graph/indexed-libraries g0) "t")))))
+          (is (nil? (record-of g0 g1-id)))
+          (is (= (view (scan/scan (ctx (atom [])) nil)) (view g)))
+          (is (some? (record-of g g1-id))))))))

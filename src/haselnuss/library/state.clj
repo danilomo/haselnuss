@@ -162,8 +162,20 @@
   folder link. 8: a book quoting a locator-built passage records the
   references in it as derived edges (`:via`, TASK-287); a format-7 state
   lacks them, and a build trusting it would not rebuild that book when
-  the book such a reference names changes."
-  8)
+  the book such a reference names changes. 9: a book whose front matter
+  `title` is not text (`!!binary`, a list, a map) is listed under its slug
+  with an `:invalid-front-matter` problem (TASK-286); a format-8 state
+  holds the title as the `toString` of what YAML read, and a build
+  trusting it would keep that title, and its page, for an unchanged
+  book. 10: what is saved is the same, but public site files are now
+  written with the umask's mode (TASK-290); a format-9 state belongs to
+  a site whose files are 0600, and a build trusting it would keep them
+  so, where the build that misses it replaces every output with a new
+  file. 11: previews are bounded in size and a library reached through a
+  symbolic link shows its positions' files in `backlinks.json`
+  (TASK-291); a format-10 site keeps the previews and `file: null`
+  values the old build wrote for books it does not rebuild."
+  11)
 
 (def header-name
   "The name of the header file inside `state-dir`."
@@ -811,6 +823,21 @@
   ([dir opts]
    (let [checked (checked-header dir opts)]
      (when (:usable? checked) (:header checked)))))
+
+(defn header-check
+  "What `load-state` of the site in `dir` would decide before it reads a
+  part: `{:usable? true :header h}` -- this Haselnuss version and state
+  format, a valid header and every part present -- or `{:usable? false
+  :reason kw :message string}` with `load-state`'s reasons (`:inputs`
+  given in `opts` compared as it compares them). Reads the header and
+  lists the state folder, nothing more: `--build-doc` (TASK-328) compares
+  a site's inputs without loading its graph."
+  ([dir] (header-check dir {}))
+  ([dir opts]
+   (let [checked (checked-header dir opts)]
+     (if (:usable? checked)
+       {:usable? true :header (:header checked)}
+       checked))))
 
 (defn saved-generation
   "The `:generation` of the header saved for the site in `dir`, or nil

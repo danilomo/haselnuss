@@ -55,8 +55,8 @@
                 "test/fixtures/site/reformed/notas: warning: [duplicate-slug] library \"reformed\" has more "
                 "than one book with slug \"notas\": reformed:notas (" site "/reformed/notas), reformed:notas ("
                 site "/reformed/notas.hdoc)\n"
-                ;; 11 books are checked; the two notas books count once (TASK-285).
-                "2 problems (0 errors, 2 warnings, 0 info) in 10 books\n")
+                ;; 11 book files are checked, both notas books among them (TASK-285).
+                "2 problems (0 errors, 2 warnings, 0 info) in 11 books\n")
            out))
     (is (= 1 status) "warnings found")
     (is (= "" err))))

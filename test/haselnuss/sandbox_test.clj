@@ -5,10 +5,12 @@
   dereferenced on the calling thread. `haselnuss.extensions.sidecar-test`,
   `.rules-test`, `haselnuss.library.generated-test` and
   `haselnuss.cli-test` cover the same through each loader."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [haselnuss.emit.html :as html]
             [haselnuss.emit.latex :as latex]
             [haselnuss.sandbox :as sandbox]
+            [haselnuss.test-sandbox :as test-sandbox]
             [sci.core :as sci]
             [sci.impl.vars :as sci-vars]))
 
@@ -284,22 +286,100 @@
 (deftest caller-wins-the-race-test
   (testing "a worker the caller gave up on that then returns normally (the
             JDK 20+ path, forced here by swallowing the interrupt and the
-            ThreadDeath) is never reused, and its late answer goes nowhere"
+            ThreadDeath) is never reused, and its late answer goes nowhere.
+            The worker waits for a promise the test delivers only once the
+            caller has given up, so the order does not depend on how
+            loaded the machine is (TASK-299)"
     (sandbox/shutdown-idle-workers!)
     (let [late (atom nil)
+          released (atom false)
+          ;; polls rather than waits on a latch: on JDK < 20 the caller's
+          ;; `Thread.stop` throws into whatever the worker is doing, and
+          ;; one thrown inside a latch's wait leaves the latch's queue
+          ;; corrupt, so the worker would wait forever
+          wait-for-release (fn []
+                             (loop []
+                               (when-not @released
+                                 (try (Thread/sleep 5) (catch Throwable _ nil))
+                                 (recur))))
           [t r] (on-worker (fn []
-                             (dotimes [_ 3] (try (Thread/sleep 300) (catch Throwable _ nil)))
+                             (try (wait-for-release) (catch Throwable _ (wait-for-release)))
                              (reset! late :returned)
                              :late)
                            {:timeout-ms 100})
-          [t2 r2] (on-worker (constantly :next))]
+          _ (reset! released true)
+          [t2 r2] (on-worker (constantly :next) {:timeout-ms 60000})]
       (is (= [:threw ::sandbox/timeout] r))
       (is (= :next r2))
       (is (not (identical? t t2)))
       (is (ended? t))
       (is (= :returned @late) "the worker did return normally")
-      (let [[t3] (on-worker (constantly nil))]
+      (let [[t3] (on-worker (constantly nil) {:timeout-ms 60000})]
         (is (not (identical? t t3)) "nor did it enter the pool later")))))
+
+;; --- a stalled process is not a runaway call (TASK-299) ------------------------
+
+(defn- stalled-call
+  "The result of a host call (`on-worker`, `opts` merged over a 500 ms
+  deadline) during which this JVM is stopped for 1.5 s, and which answers
+  `:done` 200 ms after it runs again -- once the caller had already timed
+  out on waking, before TASK-299. The worker polls a flag rather than
+  waiting on a latch: an abandoned worker gets `Thread.stop` on JDK < 20,
+  and one thrown into a latch's wait corrupts the latch."
+  [opts]
+  (sandbox/shutdown-idle-workers!)
+  (let [started (promise)
+        released (atom false)
+        answer (future (on-worker (fn []
+                                    (deliver started true)
+                                    (while (not @released) (try (Thread/sleep 5) (catch Throwable _ nil)))
+                                    :done)
+                                  (merge {:timeout-ms 500} opts)))]
+    (when (deref started 10000 false)
+      (test-sandbox/stall-process! 1500)
+      (Thread/sleep 200)
+      (reset! released true)
+      (second (deref answer 10000 [nil :hung])))))
+
+(deftest stalled-process-is-not-a-runaway-call-test
+  (testing "with a :stall-allowance-ms (a generated shelf's calls), a call whose
+            process stops for longer than its deadline -- a full garbage
+            collection stops every thread, the waiting caller's too -- still
+            answers once the process runs again: the stall is not charged
+            against it (TASK-299)"
+    (is (= :done (stalled-call {:stall-allowance-ms 30000}))))
+  (testing "without one -- --extensions, untrusted ones included, --transform,
+            a sidecar load -- the deadline stays wall-clock, stall or not"
+    (is (= [:threw ::sandbox/timeout] (stalled-call {})))
+    (is (= [:threw ::sandbox/timeout] (stalled-call {:stall-allowance-ms 0}))))
+  (testing "a stall is excused only up to the allowance: past it, the call
+            times out"
+    (is (= [:threw ::sandbox/timeout] (stalled-call {:stall-allowance-ms 300}))))
+  (testing "a script that loops is charged the time it runs: a stall excuses
+            only itself, so the call still times out"
+    (sandbox/shutdown-idle-workers!)
+    (let [ctx (sandbox/fork)
+          answer (future (try (sandbox/sci-call! #(sci/eval-string* ctx "(loop [] (recur))") "spin"
+                                                 {:timeout-ms 500 :stall-allowance-ms 30000})
+                              (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))]
+      (Thread/sleep 100)
+      (test-sandbox/stall-process! 1000)
+      (is (= ::sandbox/timeout (deref answer 10000 :hung))))))
+
+(deftest ^:timing looping-call-costs-its-deadline-test
+  (testing "a script that loops on a process that keeps running costs its
+            deadline, no more, with a stall allowance or without (TASK-299:
+            only a stall is excused, and no call is retried)"
+    (doseq [opts [{} {:stall-allowance-ms 30000}]]
+      (sandbox/shutdown-idle-workers!)
+      (let [ctx (sandbox/fork)
+            start (System/nanoTime)
+            e (try (sandbox/sci-call! #(sci/eval-string* ctx "(loop [] (recur))") "spin"
+                                      (assoc opts :timeout-ms 1000))
+                   (catch clojure.lang.ExceptionInfo e e))
+            took (/ (- (System/nanoTime) start) 1e6)]
+        (is (= ::sandbox/timeout (:type (ex-data e))) (pr-str opts))
+        (is (<= 1000 took 1500) (str (pr-str opts) " took " took " ms"))))))
 
 (deftest failing-bookkeeping-never-hangs-test
   (testing "a throw in the worker's own bookkeeping after it won the race
@@ -313,6 +393,145 @@
       (is (= :ok r))
       (is (ended? t))
       (is (= :ok (second (on-worker (constantly :ok))))))))
+
+;; --- printing and memory (TASK-301) -------------------------------------------
+
+(deftest printing-keeps-nothing-test
+  (testing "what a script prints to *out* and *err* is discarded as it is
+            written, not buffered: printing 128 million characters
+            allocates almost nothing on the worker (it allocated ~255 MB
+            into the StringWriters this replaced)"
+    (let [ctx (sandbox/fork)
+          mx ^com.sun.management.ThreadMXBean (java.lang.management.ManagementFactory/getThreadMXBean)]
+      (sandbox/sci-call! #(sci/eval-string* ctx "(def s (apply str (repeat 1000000 \\x))) nil") "setup" {})
+      (let [allocated (sandbox/sci-call!
+                       (fn []
+                         (let [before (.getCurrentThreadAllocatedBytes mx)]
+                           (sci/eval-string* ctx "(dotimes [_ 64] (print s) (binding [*out* *err*] (println s)))")
+                           (- (.getCurrentThreadAllocatedBytes mx) before)))
+                       "print" {:timeout-ms 20000})]
+        (is (< allocated (* 16 1024 1024)) (str allocated " bytes allocated"))))))
+
+(deftest out-of-memory-is-the-calls-own-failure-test
+  (testing "an OutOfMemoryError on the worker, bare or wrapped as sci wraps a
+            host error, fails that call as ::out-of-memory and retires the
+            worker; the next call runs"
+    (doseq [f [#(throw (OutOfMemoryError. "Java heap space"))
+               #(throw (ex-info "wrapped" {:type :sci/error} (OutOfMemoryError. "Java heap space")))]]
+      (sandbox/shutdown-idle-workers!)
+      (let [[t1 r] (on-worker f)
+            [t2 r2] (on-worker (constantly :next))]
+        (is (= [:threw ::sandbox/out-of-memory] r))
+        (is (= :next r2))
+        (is (not (identical? t1 t2)))
+        (is (ended? t1)))))
+  (testing "the message names the call and the error"
+    (is (= "reuse test ran out of memory (java.lang.OutOfMemoryError: Java heap space)"
+           (try (sandbox/sci-call! #(throw (OutOfMemoryError. "Java heap space")) "reuse test" {})
+                (catch clojure.lang.ExceptionInfo e (ex-message e))))))
+  (testing ":heap-exhausted says whether the error is a full heap (HotSpot's
+            and the native image's messages) or a request no heap could meet"
+    (doseq [[message full?] [["Java heap space" true]
+                             ["GC overhead limit exceeded" true]
+                             ["Garbage-collected heap size exceeded. Consider increasing the maximum Java heap size, for example with '-Xmx'." true]
+                             ["Requested array size exceeds VM limit" false]
+                             ["Array allocation too large." false]]]
+      (let [e (try (sandbox/sci-call! #(throw (OutOfMemoryError. ^String message)) "t" {})
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= ::sandbox/out-of-memory (:type (ex-data e))) message)
+        (is (= full? (:heap-exhausted (ex-data e))) message))))
+  (testing "a script's own array over the VM's size limit is one, and not a
+            full heap"
+    (let [e (thrown "(count (long-array 2147483647))" :data)]
+      (is (= ::sandbox/out-of-memory (:type (ex-data e))))
+      (is (false? (:heap-exhausted (ex-data e))))))
+  (testing "a script cannot pass its own error off as one: ex-data claiming it
+            stays an ::evaluation-error"
+    (is (= ::sandbox/evaluation-error
+           (second (call "(throw (ex-info \"x\" {:type :haselnuss.sandbox/out-of-memory
+                                                 :haselnuss.sandbox/error-class \"java.lang.OutOfMemoryError\"}))"
+                         :data))))))
+
+(defn- oom-then
+  "A stand-in for a call's promise whose first `n` timed waits throw an
+  `OutOfMemoryError`, as a wait does when the heap is full, and whose later
+  ones answer `(answer timeout-val)`; and an atom counting the waits."
+  [n answer]
+  (let [waits (atom 0)]
+    [(reify clojure.lang.IBlockingDeref
+       (deref [_ _ms timeout-val]
+         (if (<= (swap! waits inc) n)
+           (throw (OutOfMemoryError. "Java heap space"))
+           (answer timeout-val))))
+     waits]))
+
+(defn- await-result
+  "`#'sandbox/await-result` on a future, nil (`:hung` fails the test) if it
+  has not answered within 10 s."
+  [p timeout-ms allowance-ms]
+  (let [f (future (#'sandbox/await-result p timeout-ms allowance-ms))
+        r (deref f 10000 :hung)]
+    (when (= :hung r) (future-cancel f))
+    r))
+
+(deftest waiting-caller-survives-out-of-memory-test
+  (testing "an OutOfMemoryError the caller gets while it waits is not the end
+            of the wait: it waits on and gets the answer, with a plain
+            deadline and with a stall allowance (TASK-301, `wait-for`)"
+    (doseq [allowance [0 30000]]
+      (let [[p waits] (oom-then 3 (constantly {:ok :answer}))]
+        (is (= {:ok :answer} (await-result p 5000 allowance)) (str "allowance " allowance))
+        (is (= 4 @waits) (str "allowance " allowance)))))
+  (testing "nor does it stretch the deadline: a call never delivered, its
+            waits failing all along or only at first, still times out"
+    (doseq [allowance [0 30000]
+            n [3 Long/MAX_VALUE]]
+      (let [[p] (oom-then n identity)]
+        (is (= ::sandbox/timeout (await-result p 200 allowance))
+            (str "allowance " allowance ", " n " failing waits"))))))
+
+(def ^:private child-script
+  "Run by `small-heap-test` in a JVM of its own with a 128 MB heap:
+  sandboxed calls printing two billion characters, filling the heap with
+  data the script holds -- with a plain deadline, and three times with a
+  stall allowance, whose caller waits in slices -- then an ordinary call,
+  each printed as `[:ok value]` or `[:threw type]`."
+  (pr-str
+   '(let [_ (require 'haselnuss.sandbox 'sci.core)
+          ctx ((resolve 'haselnuss.sandbox/fork))
+          call! (resolve 'haselnuss.sandbox/sci-call!)
+          eval! (resolve 'sci.core/eval-string*)
+          run (fn [src opts]
+                (try [:ok (call! #(eval! ctx src) "hog" (merge {:timeout-ms 60000} opts))]
+                     (catch clojure.lang.ExceptionInfo e [:threw (:type (ex-data e))])))
+          hog "(loop [v []] (recur (conj v (vec (range 1000)))))"]
+      (prn (run (str "(let [s (apply str (repeat 1000000 \\x))]"
+                     " (dotimes [_ 1000] (print s) (binding [*out* *err*] (print s))) :printed)")
+                {}))
+      (dotimes [_ 3] (prn (run hog {:stall-allowance-ms 30000})))
+      (prn (run hog {}))
+      (prn (run "(count (vec (range 1000000)))" {})))))
+
+(deftest ^:slow small-heap-test
+  (testing "in a JVM whose whole heap is 128 MB, a script that prints two
+            billion characters finishes (the buffered output ran it out of
+            memory before TASK-301), and one that fills the heap with data
+            it holds fails only its own call, as ::out-of-memory: its data
+            goes with its stack, and the next call runs. With a stall
+            allowance, in every run tried before `wait-for`, the error
+            landed on the caller waiting in slices instead, ending the JVM"
+    (let [java (str (System/getProperty "java.home") "/bin/java")
+          args [java "-Xmx128m" "-cp" (System/getProperty "java.class.path") "clojure.main" "-e" child-script]
+          p (.start (doto (ProcessBuilder. ^"[Ljava.lang.String;" (into-array String args))
+                      (.redirectErrorStream true)))
+          out (future (slurp (.getInputStream p)))
+          finished? (.waitFor p 120 java.util.concurrent.TimeUnit/SECONDS)]
+      (when-not finished? (.destroyForcibly p))
+      (is finished? "the child JVM did not finish within 120 s")
+      (let [lines (filter #(re-find #"^\[" %) (str/split-lines (deref out 10000 "")))]
+        (is (= (concat [[:ok :printed]] (repeat 4 [:threw ::sandbox/out-of-memory]) [[:ok 1000000]])
+               (mapv read-string lines))
+            (deref out 0 ""))))))
 
 (deftest nested-calls-test
   (testing "a sandboxed call made from inside one takes another worker rather

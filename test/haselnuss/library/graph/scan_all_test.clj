@@ -17,7 +17,8 @@
             [haselnuss.library.graph.scan :as scan]
             [haselnuss.library.memory :as memory]
             [haselnuss.parser :as parser]
-            [haselnuss.synth :as synth])
+            [haselnuss.synth :as synth]
+            [haselnuss.test-sandbox :as test-sandbox])
   (:import (java.io File)
            (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)))
@@ -520,6 +521,42 @@
           (is (re-find #"StackOverflowError" (:message (first (:diagnostics a)))))
           (is (= :dangling (:status (first (graph/edges-from g (book-ref/book-id "lib" "b")))))
               "the citing book's reference into it dangles, as before"))))))
+
+;; --- a stalled process (TASK-299) -----------------------------------------------------
+
+(def ^:private busy-shelf-script
+  "A shelf of eight books whose `:document` works for a few hundred
+  milliseconds -- well-behaved, far inside the deadline -- and then
+  answers."
+  "{:books (fn [_] (mapv (fn [i] {:slug (str \"b\" i) :title (str \"B\" i)}) (range 8)))
+ :document (fn [_ slug]
+             (let [n (loop [i 0] (if (< i 5000000) (recur (inc i)) i))]
+               {:meta {} :blocks [{:t :para :inlines [{:t :str :text (str slug \" \" n)}]}]}))}
+")
+
+(deftest stalled-scan-keeps-its-generated-books-test
+  (testing "a parallel scan whose process stops for longer than the sandbox
+            deadline while generated documents are being made -- what a full
+            garbage collection of the native image did, ~9 s against 5 s --
+            scans every generated book: the stall is not charged against the
+            scripts (TASK-299; before, each call in flight timed out)"
+    (let [root (temp-dir)
+          _ (write! root "s/shelf.clj" busy-shelf-script)
+          stalled (atom nil)
+          lib (fs/filesystem-library {:name "lib" :path (str root) :scripts true}
+                                     {:timeout-ms 3000
+                                      :on-script-call (fn [kind & _]
+                                                        (when (and (= :document kind)
+                                                                   (compare-and-set! stalled nil :started))
+                                                          ;; lands ~50 ms into the first calls
+                                                          (reset! stalled (test-sandbox/stall-process! 4000 50))))})
+          g (scan/scan (scan/context {:directory (library/library-directory [lib])}) nil {:threads 4})
+          records (vals (graph/indexed-books g))]
+      (.waitFor ^Process @stalled)
+      (testing "not vacuous: the scan was stalled for longer than the deadline"
+        (is (instance? Process @stalled))
+        (is (= 8 (count records))))
+      (is (= [] (into [] (mapcat :diagnostics) records))))))
 
 ;; --- build parity seam --------------------------------------------------------------
 

@@ -2305,10 +2305,18 @@
   never going to be, so counting a reference inside one would warn about
   text that is not in the output."
   [document]
-  (->> (tree-seq coll?
-                 (fn [node] (if (map? node) (vals (dissoc node :fallback)) (seq node)))
-                 document)
-       (filter #(and (map? %) (keyword? (:t %))))))
+  ;; TASK-283: a direct reduce into a transient vector, in the same
+  ;; pre-order the former `tree-seq` + `filter` produced (a node, then its
+  ;; children in `vals` order). The lazy-seq pipeline cost ~0.65 s on 40k
+  ;; paragraphs and ran once per diagnostic pass.
+  (letfn [(walk [acc x]
+            (cond
+              (map? x) (reduce-kv (fn [acc k v] (if (= :fallback k) acc (walk acc v)))
+                                  (if (keyword? (:t x)) (conj! acc x) acc)
+                                  x)
+              (coll? x) (reduce walk acc x)
+              :else acc))]
+    (persistent! (walk (transient []) document))))
 
 (defn unanchored-reference-diagnostics
   "One `{:type :unanchored-reference :id :node-type :message}` warning per
@@ -2460,7 +2468,7 @@
   document containing `==ripen==` plus an overlay highlight covering a
   longer run that includes it -- so neither is hypothetical, and neither
   is silent."
-  [document]
+  [nodes]
   (into []
         (comp (filter #(= :highlight (:t %)))
               (mapcat (fn [highlight]
@@ -2480,7 +2488,7 @@
                                                 " -- it was emitted as a footnote instead, which"
                                                 " takes a footnote number")}))
                              (annotations-inside highlight)))))
-        (ast-nodes document)))
+        nodes))
 
 (defn annotation-diagnostics
   "One diagnostic per `:sticky-note` in `document` (a LOWERED Document)
@@ -2513,23 +2521,25 @@
   separate, pure function a caller runs alongside emission, so
   `emit-document` stays a bare string like every other emitter's."
   [document]
-  (into (nested-annotation-diagnostics document)
-        (comp (filter #(= :sticky-note (:t %)))
-              (keep (fn [sticky-note]
-                      (when-let [reason (sticky-note-degradation-reason sticky-note)]
-                        (let [forced (sticky-note-style (:attr sticky-note))]
-                          {:type :sticky-note-degraded-to-footnote
-                           :reason reason
-                           :style forced
-                           :message
-                           (if (= :annotation forced)
-                             (str "this sticky note asks for style=annotation, but "
-                                  reason " -- it was emitted as a footnote instead,"
-                                  " which takes a footnote number")
-                             (str "this sticky note was emitted as a footnote rather than"
-                                  " a PDF annotation because " reason
-                                  " -- it takes a footnote number as a result"))})))))
-        (ast-nodes document)))
+  ;; One walk shared by both passes (TASK-283).
+  (let [nodes (ast-nodes document)]
+    (into (nested-annotation-diagnostics nodes)
+          (comp (filter #(= :sticky-note (:t %)))
+                (keep (fn [sticky-note]
+                        (when-let [reason (sticky-note-degradation-reason sticky-note)]
+                          (let [forced (sticky-note-style (:attr sticky-note))]
+                            {:type :sticky-note-degraded-to-footnote
+                             :reason reason
+                             :style forced
+                             :message
+                             (if (= :annotation forced)
+                               (str "this sticky note asks for style=annotation, but "
+                                    reason " -- it was emitted as a footnote instead,"
+                                    " which takes a footnote number")
+                               (str "this sticky note was emitted as a footnote rather than"
+                                    " a PDF annotation because " reason
+                                    " -- it takes a footnote number as a result"))})))))
+          nodes)))
 
 (defn- image-path-hazards
   "What, if anything, `src` carries that `\\includegraphics` cannot: a

@@ -108,6 +108,18 @@
     (spit (io/file dir "refs.json") bibliography)
     dir))
 
+(deftest native-too-deep-nesting-test
+  (if-not (binary-present?)
+    (is true "no native binary built")
+    (testing "TASK-306: nesting past the native stack is one error line, not a trace"
+      (let [dir (Files/createTempDirectory "haselnuss-deep" (make-array java.nio.file.attribute.FileAttribute 0))
+            in (str (.resolve dir "q.hdoc"))
+            _ (spit in (str (apply str (repeat 9000 "> ")) "a b\n"))
+            {:keys [exit err]} (run-binary "-t" "html" "-o" "-" in)]
+        (is (= 1 exit))
+        (is (str/includes? err "haselnuss: error: the document is nested too deeply"))
+        (is (= 1 (count (str/split-lines err))))))))
+
 (deftest native-binary-test
   (if-not (binary-present?)
     (testing "no native binary built -- skipping (see this namespace's docstring)"
@@ -276,6 +288,12 @@
                  [2 ["--libraries" fixture-libraries "--check" "nosuch"]]
                  [2 ["--libraries" fixture-libraries "--check" "nosuch" "--format" "json"]]
                  [2 ["--libraries" fixture-libraries "--check" "x.hdoc"]]
+                 ;; TASK-327: named books, a generated one among them, alone
+                 ;; and beside a library; an ID naming no book
+                 [1 ["--libraries" fixture-libraries "--check" "check:cycle-a"]]
+                 [1 ["--libraries" fixture-libraries "--check" "pass" "check:links" "bible:romanos"
+                     "--format" "json"]]
+                 [2 ["--libraries" fixture-libraries "--check" "check:nope"]]
                  ;; grouped by passage, cross-library and dangling edges, the
                  ;; broken library's warning on stderr
                  [0 ["--libraries" fixture-libraries "--backlinks" "pass:nicene"]]
@@ -292,6 +310,29 @@
             (is (= (:err jvm) (:err native)) (pr-str args))
             (is (not (str/blank? (str (:out native) (:err native))))
                 (str (pr-str args) ": the comparison must not be between two empty outputs"))))))))
+
+(deftest native-generated-book-conversion-test
+  (if-not (binary-present?)
+    (testing "no native binary built -- skipping (see this namespace's docstring)"
+      (is true "native-image is opt-in; absence of a binary is not a failure"))
+    (testing "TASK-325: a generated book converts by its ID in the binary -- the
+              shelf script runs in the sandbox -- to the default <slug>.<ext> in
+              the current directory, byte for byte as the JVM writes it"
+      (let [yaml (.getAbsolutePath (io/file "test/fixtures/site/libraries.yaml"))
+            tmp (fn [] (.toFile (Files/createTempDirectory "haselnuss-native-generated"
+                                                           (make-array FileAttribute 0))))]
+        (doseq [[target ext] [["html" ".html"] ["latex" ".tex"] ["hdoc" ".hdoc"] ["json" ".json"]]]
+          (let [native-dir (tmp)
+                jvm-dir (tmp)
+                native (run-binary "--libraries" yaml "bible:joao" "--target" target :dir native-dir)
+                jvm (run-main "--libraries" yaml "bible:joao" "--target" target
+                              "--output" (str (io/file jvm-dir (str "joao" ext))))
+                written (io/file native-dir (str "joao" ext))]
+            (is (= 0 (:exit native)) (:err native))
+            (is (= 0 (:exit jvm)) (:err jvm))
+            (is (.isFile written) target)
+            (is (= (slurp (io/file jvm-dir (str "joao" ext))) (slurp written)) target)
+            (is (str/includes? (slurp written) "Jo") target)))))))
 
 (defn- http
   "`[status body]` of one request to `url` (a `java.net.http` client:
@@ -359,6 +400,21 @@
             (is (= 1 (:exit again)) (:err again))
             (is (str/includes? (:err again) "0 of 11 books rebuilt, 9 up to date") (:err again))
             (is (= native-tree (site-tree native-site)))))
+        (testing "TASK-328: --build-doc runs from the binary -- a filesystem and a generated
+                  book, the header of the saved state read back -- and writes what the
+                  JVM writes"
+          (let [ids ["reformed:catecismo-heidelberg" "bible:romanos"]
+                native-doc (apply run-binary "--libraries" site-libraries "--build-doc"
+                                  (concat ids ["--site" native-site]))
+                jvm-doc (apply run-main "--libraries" site-libraries "--build-doc"
+                               (concat ids ["--site" jvm-site]))]
+            (is (= 0 (:exit native-doc)) (:err native-doc))
+            (is (= (:exit jvm-doc) (:exit native-doc)))
+            (is (= (:err jvm-doc) (:err native-doc)))
+            (is (str/includes? (:err native-doc) "2 books rebuilt") (:err native-doc))
+            (is (= (site-tree jvm-site) (site-tree native-site)))
+            (is (= "page bible:blivre/romanos\npage reformed:catecismo-heidelberg\n"
+                   (slurp (io/file native-site ".haselnuss" "pending"))))))
         (testing "TASK-296: the binary and the jar each know their build identity, so a
                   run after a settled build answers from the record -- which leaves
                   it as it is -- and prints what the long way printed; the other one

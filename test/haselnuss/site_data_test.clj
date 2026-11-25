@@ -6,6 +6,7 @@
   build saved -- written only when their bytes change, and swept when
   stale; and `site/cut-passage`, which cuts a preview on the AST."
   (:require [clojure.data.json :as json]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
@@ -282,6 +283,55 @@
     (is (= "far/a/b.hdoc" (site/site-position-file {"far" (.toPath (io/file "/srv/far"))} "far"
                                                    "/srv/far/a/b.hdoc")))))
 
+(defn- symlink! [link target]
+  (io/make-parents link)
+  (Files/createSymbolicLink (.toPath (io/file link)) (.toPath (io/file target))
+                            (make-array FileAttribute 0)))
+
+(deftest backlinks-through-symlinked-roots-test
+  (let [root (temp-dir)
+        real (io/file root "real/far")
+        _ (write! root "real/far/t.hdoc" "---\ntitle: T\n---\n\n# Alvo {#sec:x}\n\nTexto.\n")
+        _ (write! root "real/far/sub/c.hdoc" "---\ntitle: C\n---\n\nVer @{far:t#sec:x}.\n")
+        _ (write! root "outside/o.hdoc" "---\ntitle: O\n---\n\nVer @{far:t#sec:x}.\n")
+        file-of (fn [yaml-path]
+                  (let [yaml (write! root "conf/libraries.yaml"
+                                     (str "- name: far\n  type: filesystem\n  path: " yaml-path "\n"))
+                        {:keys [dir err]} (build-lib! root yaml)
+                        text (slurp (io/file dir "books/far/t/backlinks.json"))]
+                    {:files (into (sorted-set) (keep #(get-in % ["position" "file"]))
+                                  (get (json/read-str text) "edges"))
+                     :text text :err err}))
+        leaks? (fn [text] (or (str/includes? text (.getCanonicalPath root))
+                              (str/includes? text (.getAbsolutePath root))))]
+    (testing "a root that is a symbolic link"
+      (symlink! (io/file root "link") real)
+      (let [{:keys [files text err]} (file-of (str (io/file root "link")))]
+        (is (= #{"far/sub/c.hdoc"} files) err)
+        (is (not (leaks? text)) text)))
+    (testing "a root below a symbolic link to its parent folder"
+      (symlink! (io/file root "parent-link") (io/file root "real"))
+      (let [{:keys [files text err]} (file-of (str (io/file root "parent-link/far")))]
+        (is (= #{"far/sub/c.hdoc"} files) err)
+        (is (not (leaks? text)) text)))
+    (testing "a book reached through a symbolic link out of the root shows no absolute path"
+      (symlink! (io/file real "escape.hdoc") (io/file root "outside/o.hdoc"))
+      (let [{:keys [files text err]} (file-of (str real))]
+        (is (not (leaks? text)) text)
+        (is (every? #(not (str/starts-with? % "/")) files) err)
+        (is (contains? files "far/sub/c.hdoc"))))
+    (testing "site-position-file: a missing root, equal roots, nested roots"
+      (let [path #(.toPath (io/file %))
+            file (str (io/file real "sub/c.hdoc"))]
+        (is (nil? (site/site-position-file {"gone" (path (io/file root "gone"))} "gone" file)))
+        (is (= "b/sub/c.hdoc" (site/site-position-file {"a" (path real) "b" (path real)} "b" file)))
+        (is (= "a/sub/c.hdoc" (site/site-position-file {"a" (path real) "b" (path real)} "x" file)))
+        (is (= "in/c.hdoc" (site/site-position-file {"out" (path real) "in" (path (io/file real "sub"))}
+                                                    "x" file)))
+        (is (= "far/sub/c.hdoc"
+               (site/site-position-file {"far" (path (.getCanonicalFile (io/file root "link")))} "far"
+                                        (str (io/file root "link/sub/c.hdoc")))))))))
+
 (deftest preview-failures-are-warnings-test
   (testing "a preview that cannot be built is a preview-failed warning; the others are written"
     (let [dir (temp-dir)
@@ -313,11 +363,15 @@
       (Files/setLastModifiedTime (.toPath (io/file dir rel)) old))
     (testing "a rebuild with nothing changed rewrites no data file"
       (spit (io/file dir "books/bible/blivre/genesis/previews.json") "{\"edited\":true}\n")
-      ;; --full: an incremental build (TASK-272) trusts the files it wrote
-      ;; and would not even read this one; a full one writes every file
-      ;; whose bytes differ
-      (let [{:keys [status err]} (build! dir "--full")]
-        (is (= 1 status) err))
+      ;; the saved inputs made to differ: an incremental build (TASK-272)
+      ;; trusts the files it wrote and would not even read this one, and
+      ;; --full replaces them all (TASK-290); a full build from changed
+      ;; inputs writes every file whose bytes differ
+      (let [header (io/file (state/state-dir dir) state/header-name)
+            _ (spit header (pr-str (assoc-in (edn/read-string (slurp header)) [:inputs "edited"] "digest")))
+            {:keys [status err]} (build! dir)]
+        (is (= 1 status) err)
+        (is (str/includes? err "full build: the directory file, --extensions or --transform changed") err))
       (doseq [rel (remove #{"books/bible/blivre/genesis/previews.json"} files)]
         (is (= old (mtime rel)) rel)))
     (testing "and one whose bytes differ is written again"
@@ -408,19 +462,96 @@
 (deftest cut-never-empty-test
   (let [big-table {:t :code-block :text (apply str (repeat 50 "x")) :attr no-attr}
         directive {:t :directive :name "note" :attr no-attr
-                   :blocks [(para (s (str/join " " (repeat 20 "palavra"))))]}]
+                   :blocks [(para (s (str/join " " (repeat 10 "palavra"))))]}]
     (testing "a first block that cannot be cut and is over the limit is kept whole, with an ellipsis after"
       (is (= {:blocks [big-table (para (s "…"))] :cut? true}
-             (site/cut-passage [big-table (para (s "after"))] 10)))
-      (is (= [directive (para (s "…"))] (:blocks (site/cut-passage [directive] 10)))))
+             (site/cut-passage [big-table (para (s "after"))] 30)))
+      (is (= [directive (para (s "…"))] (:blocks (site/cut-passage [directive] 30)))))
     (testing "under a heading, too: the heading alone is no preview"
       (is (= [{:t :section :level 1 :heading [(s "Heading")] :attr no-attr
                :blocks [directive (para (s "…"))]}]
              (:blocks (site/cut-passage [{:t :section :level 1 :heading [(s "Heading")] :attr no-attr
                                           :blocks [directive]}]
-                                        10)))))
+                                        30)))))
     (testing "after other content it is dropped"
       (is (= [(para (s "intro…"))] (:blocks (site/cut-passage [(para (s "intro")) directive] 10)))))))
+
+(deftest whole-block-previews-are-capped-test
+  (let [code (fn [n] {:t :code-block :text (apply str (repeat n "x")) :attr no-attr})
+        section (fn [& blocks] {:t :section :level 1 :heading [(s "Heading")] :attr no-attr :blocks (vec blocks)})
+        quote' (fn [& blocks] {:t :block-quote :blocks (vec blocks)})
+        item-list (fn [& blocks] {:t :list :ordered false :tight true :attr no-attr :items [(vec blocks)]})
+        cut (fn [blocks] (site/cut-passage blocks 10))]
+    (testing "exactly four times the limit is kept whole, one more is not"
+      (is (= {:blocks [(code 40) (para (s "…"))] :cut? true} (cut [(code 40)])))
+      (is (= {:blocks [(para (s "…"))] :cut? true} (cut [(code 41)]))))
+    (testing "without a heading the preview is the ellipsis alone: non-empty, cut, ending in one"
+      (let [{:keys [blocks cut?]} (cut [(code 500) (para (s "after"))])]
+        (is cut?)
+        (is (= [(para (s "…"))] blocks))))
+    (testing "with a heading it is the heading and the ellipsis"
+      (is (= [(assoc (section) :heading [(s "Heading…")])] (:blocks (cut [(section (code 500))])))))
+    (testing "an uncuttable block inside a quote or a list is capped the same way"
+      (is (= [(quote' (code 40) (para (s "…")))] (:blocks (cut [(quote' (code 40))]))))
+      (is (= [(para (s "…"))] (:blocks (cut [(quote' (code 41))]))))
+      (is (= [(para (s "…"))] (:blocks (cut [(item-list (code 41))])))))
+    (testing "a maths inline over the cap in a first word is dropped; one under it is kept"
+      (is (= [(para {:t :math-inline :tex (apply str (repeat 40 "x"))} (s "…"))]
+             (:blocks (cut [(para {:t :math-inline :tex (apply str (repeat 40 "x"))} (s " tail"))]))))
+      (is (= [(para (s "…"))]
+             (:blocks (cut [(para {:t :math-inline :tex (apply str (repeat 41 "x"))} (s " tail"))])))))
+    (testing "a block that is not first is dropped as before, whatever its size"
+      (is (= [(para (s "intro…"))] (:blocks (cut [(para (s "intro")) (code 20)])))))
+    (testing "a huge block puts none of its text in the preview"
+      (let [{:keys [blocks cut?]} (site/cut-passage [(code 200000)] site/preview-limit)]
+        (is cut?)
+        (is (< (count (site/node-text blocks)) 10))))))
+
+(deftest preview-size-is-bounded-test
+  (let [limit site/preview-limit
+        size @#'site/serialized-size
+        budget @#'site/size-budget
+        big (apply str (repeat 300000 "a"))
+        words (para (s (str/join " " (repeat 600 "palavra"))))
+        cell (fn [t] {:blocks [(para (s t))]})
+        table {:t :table :head {:cells [(cell "a") (cell "b")]}
+               :rows (vec (repeat 3900 {:cells [(cell "c") (cell "d")]})) :caption [] :colspec [{} {}]
+               :attr no-attr}
+        section (fn [heading & blocks]
+                  {:t :section :level 1 :heading [(s heading)] :attr no-attr :blocks (vec blocks)})
+        link-para (fn [] (para {:t :link :target (str "http://x/" big) :inlines [(s "l")] :attr no-attr}))
+        cases {"code block with a huge language" [{:t :code-block :lang big :text "a" :attr no-attr} words]
+               "directive with a huge attribute" [{:t :directive :name "note" :blocks []
+                                                   :attr {:classes [] :props {"k" big}}} words]
+               "quote holding an image with a huge URL"
+               [{:t :block-quote :blocks [(para {:t :image :src big :alt "i" :attr no-attr})]} words]
+               "table of thousands of rows" [table words]
+               "paragraph with a huge link URL" [(link-para) words]
+               "huge heading" [(section big (para (s "x"))) words]
+               "huge heading over an uncuttable block" [(section big {:t :code-block :text big :attr no-attr})]
+               "many paragraphs each with a large URL" (vec (repeatedly 40 link-para))
+               "huge URL in a short passage" [(link-para)]
+               "huge footnote attribute" [(para (s "x") {:t :note :blocks [(para (s "n"))]
+                                                         :attr {:classes [] :props {"k" big}}}
+                                                (s (str/join " " (repeat 600 "palavra"))))]}]
+    (doseq [[label blocks] cases
+            :let [{kept :blocks cut? :cut?} (site/cut-passage blocks limit)]]
+      (testing label
+        (is (<= (size kept) (budget limit)) (str (size kept)))
+        (is cut?)
+        (is (seq kept))
+        (is (str/ends-with? (site/node-text kept) "…") (site/node-text kept))
+        (is (not (str/blank? (site/node-text kept))))))
+    (testing "the short form is the heading and the ellipsis when the heading is small"
+      (is (= [(assoc (section "Heading") :heading [(s "Heading…")])]
+             (:blocks (site/cut-passage [(section "Heading" (link-para)) words] limit)))))
+    (testing "otherwise it is the ellipsis alone"
+      (is (= [(para (s "…"))] (:blocks (site/cut-passage [(link-para)] limit)))))
+    (testing "an ordinary preview is far below the budget and is untouched"
+      (let [blocks [(section "Heading" (para (s (str/join " " (repeat 600 "palavra")))))]
+            {kept :blocks} (site/cut-passage blocks limit)]
+        (is (< (* 4 (size kept)) (budget limit)))
+        (is (= kept (:blocks (#'site/cut-passage* blocks limit))))))))
 
 (deftest footnotes-count-after-the-body-test
   (let [note (fn [text] {:t :note :blocks [(para (s text))]})

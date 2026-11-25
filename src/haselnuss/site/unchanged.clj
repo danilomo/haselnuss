@@ -36,6 +36,17 @@
     Haselnuss running (`haselnuss.version/build-identity`: development
     builds all share one version, and another build may report or emit
     otherwise); a build that cannot tell its identity saves no record.
+  - Nothing only that build's run vouched for: a build that met a
+    `haselnuss.library/transient?` failure (a generated shelf's script
+    that ran out of time, TASK-299) saves no record, so the next run
+    tries the script again rather than print the same failure. The price,
+    for a script that always runs out of time (a whole-book shelf slower
+    than its `document-timeout-ms`, a loop): every `--build-site` run
+    pays its deadline again -- and leaves one more abandoned worker,
+    which keeps a CPU busy on JDK 20+ and in the native image -- rebuilds
+    its page and the pages quoting it, and saves no record of an
+    unchanged site for as long as it keeps timing out. Before TASK-299
+    the timeout was saved with the records and paid once.
   - Every file the graph's records claim (their `:files`): its stamp as
     the state saved it -- size, modification time, identity and, for a
     symbolic link, its target (`incremental/check-file`'s stat match) --
@@ -307,14 +318,18 @@
   (let [p (.toPath (io/file path))]
     (if-not (Files/isDirectory p no-follow)
       "none"
-      (with-open [s (Files/newDirectoryStream p)]
-        (str/join "\u0000"
-                  (sort (map (fn [^java.nio.file.Path q]
-                               (str (.getFileName q) "\u0001"
-                                    (cond (Files/isRegularFile q no-follow) "f"
-                                          (Files/isDirectory q no-follow) "d"
-                                          :else "o")))
-                             s)))))))
+      ;; TASK-310: a folder that cannot be listed (the sweep reports it) is
+      ;; not a failure here: it reads as itself, apart from any listing
+      (try
+        (with-open [s (Files/newDirectoryStream p)]
+          (str/join "\u0000"
+                    (sort (map (fn [^java.nio.file.Path q]
+                                 (str (.getFileName q) "\u0001"
+                                      (cond (Files/isRegularFile q no-follow) "f"
+                                            (Files/isDirectory q no-follow) "d"
+                                            :else "o")))
+                               s))))
+        (catch java.io.IOException _ "unlistable")))))
 
 (def ^:private observe
   {"F" file-observation
@@ -521,9 +536,14 @@
   - `:carried`, `{library {:piece :section}}`: the libraries a build left
     as they were, as the record it started from holds them (TASK-297);
   - `:build`, this build's identity (`haselnuss.version/build-identity`;
-    nil when unknown, and then there is no record)."
+    nil when unknown, and then there is no record);
+  - `:transient?`, true when the build left something only its own run
+    can vouch for (`haselnuss.site.incremental/transient-left?`: a
+    generated shelf's script that ran out of time, TASK-299), which the
+    next run must retry rather than skip: then there is no record."
   [{:keys [generation inputs home base-dir trusted-extensions output libraries catalog books lib-names
-           files-by-lib stamps listing walks links books-dir site-entries manifest carried build]}]
+           files-by-lib stamps listing walks links books-dir site-entries manifest carried build
+           transient?]}]
   (let [all-libs (into (set lib-names) (keys carried))
         site-by-lib (group-by (fn [[_ p]] (site-folder-library (str books-dir) all-libs p)) site-entries)
         books-by-lib (group-by (comp :library key) books)
@@ -575,6 +595,7 @@
         own-entries (into (:entries global) (mapcat (comp :entries val)) sections)]
     (cond
       (nil? output) {:ineligible "a page or data file was not written"}
+      transient? {:ineligible "a generated shelf's script ran out of time, which the next run retries"}
       (not (string? build)) {:ineligible "this build does not know its own identity"}
       (empty? site-entries) {:ineligible "the site's books/ folder was not looked at"}
       (not-every? (fn [[_ {:keys [path images]}]] (and (string? path) (every? string? (keys images)))) books)

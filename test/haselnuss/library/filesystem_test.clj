@@ -343,6 +343,48 @@
     (is (str/includes? (:message (first (:diagnostics (one-book "q" "---\nddc: 230.10\n---\n"))))
                        "quoted"))))
 
+(deftest non-text-front-matter-test
+  (testing "a title that is not text is left out with an :invalid-front-matter naming it (TASK-286)"
+    (doseq [[label yaml] [["!!binary" "title: !!binary aGVsbG8="]
+                          ["a !!set" "title: !!set {a, b}"]
+                          ["a list" "title: [a, b]"]
+                          ["a map" "title: {a: 1}"]]]
+      (let [{:keys [entry diagnostics document]} (one-book "bin" (str "---\n" yaml "\n---\n\nBody.\n"))
+            [d & more] diagnostics]
+        (is (= (fm-title "bin") (:title entry)) (str label ": titled by slug, not by toString"))
+        (is (nil? more) label)
+        (is (= :invalid-front-matter (:type d)) label)
+        (is (= :title (:field d)) label)
+        (is (ast/valid? ast/Document @document) label))))
+  (testing "text scalars still list as before: numbers, booleans and dates"
+    (doseq [[yaml shown] [["title: 42" "42"] ["title: true" "true"] ["title: 2026-07-24" "2026-07-24"]
+                          ["title: 'Quoted'" "Quoted"]]]
+      (let [{:keys [entry diagnostics]} (one-book "ok" (str "---\n" yaml "\n---\n"))]
+        (is (= [] diagnostics) yaml)
+        (is (seq (:title entry)) yaml)
+        (is (= (:title (parser/front-matter (str "---\n" yaml "\n---\n"))) (:title entry)) yaml)
+        (when (= "42" shown) (is (= (fm-title "42") (:title entry)))))))
+  (testing "the parser, standalone, gives a located error for a non-text title, date or author"
+    (doseq [[k yaml] [["title" "title: !!binary aGVsbG8="]
+                      ["date" "date: !!binary aGVsbG8="]
+                      ["author" "author: [A, !!binary aGVsbG8=]"]
+                      ["authors" "authors: {a: 1}"]]]
+      (let [e (try (parser/front-matter (str "---\n" yaml "\n---\n") {:source "x.hdoc"})
+                   nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :haselnuss.parser/front-matter-not-a-string (:type (ex-data e))) k)
+        (is (str/includes? (ex-message e) (str "x.hdoc:2: front-matter " k)) k)))
+    (testing "the error names the key the value came from, and its line"
+      (let [e (try (parser/front-matter
+                    "---\nauthors: ~\nauthor: !!binary aGVsbG8=\n---\n" {:source "x.hdoc"})
+                   nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :author (:key (ex-data e))))
+        (is (str/includes? (ex-message e) "x.hdoc:3: front-matter author ")))))
+  (testing "values valid before still parse"
+    (is (= {:title (fm-title "T") :authors ["A" "2"] :date "2026-07-24"}
+           (parser/front-matter "---\ntitle: T\nauthor: [A, 2]\ndate: 2026-07-24\n---\n")))))
+
 (defn- counting-reader
   "A `:open-reader` that counts every character listing reads into `n`,
   over an unbuffered reader so the count is what was consumed."

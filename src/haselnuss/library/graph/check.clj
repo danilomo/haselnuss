@@ -8,10 +8,11 @@
 
   ## What the report holds
 
-  `check-report` reads ONLY the graph -- `indexed-books` and `edges-from`
+  `check-report` reads only the graph -- `indexed-books` and `edges-from`
   of `haselnuss.library.graph/ReferenceGraph`, and `indexed-libraries` of
-  the optional `LibraryIndex` -- and never lists or resolves anything
-  again:
+  the optional `LibraryIndex` -- plus the `:extra` diagnostics its caller
+  hands it (TASK-288: the sanitizer's findings, which are in no record),
+  and never lists or resolves anything again:
 
   - every diagnostic of every book record (its load warnings, its own
     resolver diagnostics, one per dangling reference, `:stale-shelf`
@@ -75,7 +76,10 @@
   depends on nothing but the data.
 
   `:summary` counts `:problems` (every item), `:errors`, `:warnings` and
-  `:info`, and `:books` (the book records in the graph). `exit-status` is
+  `:info`, and `:books` (the book files checked: the book records in the
+  graph, each counted once per distinct file when several books share
+  one canonical id -- `x.hdoc` beside `x/book.hdoc`, a `:duplicate-slug`
+  whose books are one merged record; TASK-285). `exit-status` is
   0 when there is no error or warning -- infos do not count -- else 1.
 
   ## The text form
@@ -750,27 +754,69 @@
   [items]
   (vec (sort-by sort-key items)))
 
+(defn- merged-extra
+  "How many books beyond their records `libraries`' `:duplicate-slug`
+  diagnostics add: books under one canonical id from distinct paths are
+  one merged record in the graph (TASK-285), so each id's distinct
+  paths past the first are counted here. Paths, not listings, so one
+  book reached twice is one."
+  [libraries]
+  (reduce + 0
+          (for [[_ record] libraries
+                d (:diagnostics record)
+                :when (= :duplicate-slug (:type d))
+                :let [pairs (distinct (map vector (:books d) (:paths d)))]
+                [_ group] (group-by first pairs)]
+            (dec (count group)))))
+
 (defn check-report
   "The `--check` report of the graph `g` (see the namespace docstring):
   `{:version :diagnostics [item ...] :summary {...}}`. Pure: reads only
   `g`. `opts`: `:base-dir`, an absolute folder paths are shown relative
-  to (the CLI passes its working directory); nil shows them as recorded."
+  to (the CLI passes its working directory); nil shows them as recorded.
+  `:extra`: further book diagnostics, `[{:id BookId :diagnostic d :file
+  path-or-nil} ...]`, formatted as a record's own and placed at `:file`
+  when they name none (`--check`'s sanitizer findings, TASK-288).
+
+  `:only` (TASK-327, `--check` of named books): `{:libraries #{name}
+  :books #{BookId}}`, what the report is about when `g` holds more -- the
+  books a named book quotes, scanned to follow its quotes. Only the items
+  of those libraries (their library records' and every book's of theirs)
+  and of those books are reported, and only they are counted in
+  `:summary :books`; the quote problems are still derived from all of
+  `g`, but a `:quote-too-deep` is not reported for a book named only by
+  itself: a build of the book never meets its own quote too deep -- the
+  chain starts at a book that quotes it -- and the books above it are
+  not in `g`. nil (default): everything in `g`."
   ([g] (check-report g {}))
-  ([g {:keys [base-dir]}]
+  ([g {:keys [base-dir extra only]}]
    (let [books (graph/indexed-books g)
          libraries (if (satisfies? graph/LibraryIndex g) (graph/indexed-libraries g) {})
+         in-library? (fn [lib-name] (or (nil? only) (contains? (:libraries only) lib-name)))
+         reported? (fn [id] (or (in-library? (:library id)) (contains? (:books only) id)))
          book-items (for [[id record] books
+                          :when (reported? id)
                           d (:diagnostics record)]
                       (item d {:book (book-ref/format-book-id id) :lib-name (:library id)
                                :base-dir base-dir}))
-         derived (for [[id d] (quote-problems g)]
+         derived (for [[id d] (quote-problems g)
+                       :when (if (in-library? (:library id))
+                               true
+                               (and (contains? (:books only) id) (not= :quote-too-deep (:type d))))]
                    (item d {:book (book-ref/format-book-id id) :lib-name (:library id)
                             :base-dir base-dir}))
          library-items (for [[lib-name record] libraries
+                             :when (in-library? lib-name)
                              d (:diagnostics record)]
                          (item d {:lib-name lib-name :fallback-file (:root record)
                                   :base-dir base-dir}))
-         items (sort-items (concat book-items derived library-items))
+         ;; TASK-288: findings the scan's own records do not hold, one
+         ;; `{:id BookId :diagnostic d :file path-or-nil}` each
+         extra-items (for [{:keys [id diagnostic file]} extra
+                           :when (reported? id)]
+                       (book-item diagnostic {:book (book-ref/format-book-id id) :lib-name (:library id)
+                                              :file file :base-dir base-dir}))
+         items (sort-items (concat book-items derived library-items extra-items))
          counts (frequencies (map :level items))]
      {:version report-version
       :diagnostics items
@@ -778,7 +824,8 @@
                 :errors (get counts :error 0)
                 :warnings (get counts :warning 0)
                 :info (get counts :info 0)
-                :books (count books)}})))
+                :books (+ (count (filter reported? (keys books)))
+                          (merged-extra (into {} (filter #(in-library? (key %))) libraries)))}})))
 
 (defn exit-status
   "0 when `report` holds no error or warning (infos do not count), else 1."

@@ -65,7 +65,11 @@
   -- loading a sidecar file's own top-level forms, and every LATER call to
   a renderer/lower rule or transform function it defines -- runs on a
   daemon worker thread under an external wall-clock deadline
-  (`bounded-eval!`); a worker is reused for a later call only when it
+  (`bounded-eval!`; a caller that passes `:stall-allowance-ms` -- only a
+  generated shelf's calls do -- is not charged a stall of the whole
+  process, such as a stop-the-world garbage collection, up to that
+  allowance: the section on the deadline below, TASK-299); a worker is
+  reused for a later call only when it
   finished its last one cleanly (TASK-218, the reusable-workers section
   below has exactly what that takes), never after a timeout; on
   timeout, `.interrupt` is still attempted but the caller gets a timeout
@@ -77,9 +81,15 @@
   such a worker from outliving the JVM process, not from pegging a CPU core
   indefinitely -- an honestly documented residual (see
   \"What this does not cover\" below). `sci/out`/`sci/err` are rebound to
-  fresh `StringWriter`s for the duration of every call, established INSIDE
-  the worker thread's own body (dynamic-var bindings are thread-local and
-  do not propagate to another `Thread`), and simply discarded.
+  fresh writers that keep nothing (`discarding-writer`, TASK-301) for the
+  duration of every call, established INSIDE the worker thread's own body
+  (dynamic-var bindings are thread-local and do not propagate to another
+  `Thread`): what a script prints is dropped as it is written, so a
+  printing loop costs time, never memory. (They were `StringWriter`s that
+  nothing read, growing with everything a call printed until it ended.)
+  The print functions work as before; Java methods called on `*out*`/
+  `*err*` themselves, and `(str *out*)` as a way to read back what was
+  printed, do not (`sci-call!`, step 1).
 
   A call's return value is SETTLED on the worker too, under the same
   deadline (TASK-211; `settle`): copied into fresh plain data
@@ -125,6 +135,49 @@
   deliberately adversarial input. Withstanding one needs a process boundary
   that can be killed from outside the JVM entirely, out of scope here.
 
+  MEMORY (TASK-301). Bounded: what a call PRINTS (discarded as written,
+  above) and what it RETURNS (`plain-copy` counts its values against the
+  output cap and `check-size!` measures it without building the printed
+  text). NOT bounded: what a script ALLOCATES while it runs -- a vector it
+  keeps growing, a huge string, `with-out-str`'s own buffer -- which can
+  take the whole process's heap. Why not: the JVM can measure a thread's
+  cumulative allocation (`com.sun.management.ThreadMXBean`, which the
+  native image supports too) but not the live data it holds, and ordinary
+  work allocates garbage fast (measured: an interpreted loop building
+  strings, ~0.4 GB a second on HotSpot 17 -- tens of gigabytes over a
+  two-minute generated `:document` -- and host code such as `str` or
+  `pr-str` far more), so a cap on allocation either fails ordinary work or
+  comes long after a script holding its data has filled the heap; and a
+  call found over any cap could
+  not be stopped where it matters -- `Thread.stop` is unsupported in the
+  native image and from JDK 20 -- only abandoned while it goes on
+  allocating. What happens instead -- for a MISTAKE, a script that does
+  not mean to hold the heap: a script that fills the heap is, allocating
+  as it is, usually the thread the `OutOfMemoryError` is thrown on. Its
+  call then fails as `::out-of-memory` (its own error, which a generated
+  shelf reports as a transient diagnostic when the heap was full), the
+  worker retires, and whatever the script held only on its stack is
+  garbage again, so the build goes on. A script set on holding the heap is
+  not covered: it can catch the error itself (`(catch Object e ...)` --
+  sci's default classes include `Object`; so could the script before
+  TASK-301), keep its data and carry on or return normally while the
+  errors land on other threads. The caller waiting for that call allocates a little too,
+  and got the error instead often enough to end the build in every run
+  tried (on 128-256 MB heaps, waiting in slices with a stall allowance), so
+  it now waits on through one (`wait-for`). The residual risk, honestly:
+  the error can land on any other thread allocating while the heap is full
+  -- a parallel scan's, a `--serve` request's -- and fail that work instead
+  of, or as well as, the script's call; before it does, the process grows to its
+  maximum heap (the native binary's default is 80% of RAM; `-Xmx` lowers
+  it) and collects again and again, which a generated shelf's stall
+  allowance excuses for up to its 30 s (the deadline section below); data a
+  script keeps in its own state (a `def`, an atom) outlives the call, as
+  long as its fork does, and keeps the heap full; and a call that times out
+  before the error is abandoned, and where `Thread.stop` does not work goes
+  on allocating until the error ends it on its own thread. Bounding memory
+  reliably takes a process with a heap limit of its own: the same process
+  boundary as above.
+
   A WARNING FOR ANYONE ITERATING ON THIS CODE VIA THE NREPL: the abandoned-
   worker-thread residual above is not only a production/build concern. The
   persistent, shared dev nREPL this project's own README/CLAUDE.md points
@@ -143,7 +196,9 @@
 (def default-timeout-ms
   "How long, in wall-clock milliseconds, one sandboxed call (loading a
   sidecar file's own top-level forms, or one later call to a function it
-  defines) is allowed to run before `sci-call!` gives up on it -- generous
+  defines) is allowed to run before `sci-call!` gives up on it -- not
+  counting a stall of the whole process when the caller passes a
+  `:stall-allowance-ms` (`await-result`, TASK-299) -- generous
   enough for real work, short enough that a build using this sandbox does
   not sit hung on a mistake. Public so both loaders can use it as their own
   `:timeout-ms` default without duplicating the number."
@@ -260,6 +315,117 @@
   "How long a caller whose call finished exactly at its deadline waits for
   the result the worker is already delivering, before giving up on it."
   1000)
+
+;; --- the deadline, and a stalled process (TASK-299) ----------------------------
+;;
+;; By default a call's deadline is plain wall-clock time, as it always was:
+;; `--extensions` (untrusted ones included), `--transform` and loading a
+;; sidecar file get no more than `timeout-ms` from the moment the call starts.
+;;
+;; A caller may pass `:stall-allowance-ms` (only `haselnuss.library.generated`
+;; does, for a shelf script's `:books`, `:document` and `:locate`): its
+;; deadline is then wall-clock time the PROCESS runs, up to that allowance. A
+;; stop-the-world garbage collection stops every thread -- the worker and the
+;; caller waiting for it alike -- and the native image's full collections were
+;; seen to last ~9 s under a parallel site scan, longer than the 5 s default:
+;; a well-behaved script then timed out at random, and the timeout was cached
+;; for the build and saved with its records. So such a caller waits in short
+;; slices (`wait-slice-ms`) and checks how long each really took: a slice that
+;; returns more than `stall-threshold-ms` later than it asked for means the
+;; caller was not running -- the process was stopped, or at least this thread
+;; was -- and that overshoot is not charged against the call, until the
+;; allowance is used up. Everything else is: a script that loops on a process
+;; that keeps running is charged every millisecond and times out exactly as
+;; before, at the deadline, with no retry and no second worker. A stall
+;; excuses only itself, so a call is charged its deadline within its deadline
+;; plus the allowance of wall-clock time the process runs; a stall longer
+;; than the allowance left still delays the caller's waking by however long
+;; the process was stopped, as it always did.
+;;
+;; What the allowance exposes, and why it is not for untrusted code: a script
+;; can cause the stalls itself. One that keeps a large live heap and allocates
+;; in a loop makes the collector stop the process again and again, and each
+;; stop is excused: a call can then last its deadline plus the whole allowance
+;; (measured on HotSpot with a 420 MB serial-GC heap, a 3 s call took 8.2 s;
+;; in the native image, whose full collections take ~9 s, about deadline +
+;; 30 s). A shelf script only runs when the library's own directory entry says
+;; `scripts: true`, and its timeouts are now transient (`haselnuss.library/
+;; transient?`), so this is the trade made there and nowhere else. The
+;; allocation itself is bounded by nothing but the heap (the namespace
+;; docstring, MEMORY, TASK-301): a script that fills it gets, usually, an
+;; `::out-of-memory` failure of its own call, after up to the allowance of
+;; excused collections on the way there.
+;;
+;; Not detected: a worker starved of CPU while the caller keeps waking on time
+;; (more runnable threads than cores, with no stall). Measuring the worker's
+;; own CPU time would catch that, but needs `ThreadMXBean` CPU times of
+;; another thread in the native image, and a script blocked on `@(promise)`
+;; uses no CPU at all; such a timeout is instead marked transient by the
+;; callers that save results (`haselnuss.library.generated`), so a later run
+;; tries again.
+
+(def ^:private wait-slice-ms
+  "How long `await-result` waits at a time before it checks the clock."
+  100)
+
+(def ^:private stall-threshold-ms
+  "How much later than it asked a wait slice may return and still be
+  charged in full: ordinary scheduling delay and short collections stay
+  well below it, so a running call's deadline is not stretched by them."
+  200)
+
+(defn- wait-for
+  "What `p` delivers within `ms` milliseconds, `::timeout` when it does
+  not, or `::oom` when this thread got an `OutOfMemoryError` while it
+  waited (TASK-301). Waiting allocates a little -- the boxed timeout, the
+  latch's queue node -- and while a script fills the heap that little can
+  be the allocation the collector gives up on: the waiting caller, not the
+  script's worker, would then get the error, and it would end the build
+  (it did, before this, on a 256 MB heap). The caller has done nothing,
+  so it waits on instead; the worker gets its own error soon after. `ms`
+  is a primitive, boxed inside the `try`."
+  [p ^long ms]
+  (try (deref p ms ::timeout)
+       (catch OutOfMemoryError _ ::oom)))
+
+(defn- ms-ceil
+  "`nanos`, at least 1, as whole milliseconds rounded up."
+  ^long [^long nanos]
+  (max 1 (quot (+ nanos 999999) 1000000)))
+
+(defn- await-result
+  "What the promise `p` delivers, or `::timeout` once the call has been
+  charged `timeout-ms` (see the section comment). With a zero
+  `allowance-ms`, the default, a plain wall-clock wait. Otherwise every
+  slice of waiting counts in full, except a stall's overshoot, until
+  `allowance-ms` of it has been excused. Either way an `OutOfMemoryError`
+  this thread gets while it waits is not the end of the wait
+  (`wait-for`): the time it took is charged as any other."
+  [p timeout-ms allowance-ms]
+  (let [ms 1000000]
+    (if-not (pos? (long allowance-ms))
+      (let [end (+ (System/nanoTime) (* ms (long timeout-ms)))]
+        (loop []
+          (let [left (- end (System/nanoTime))
+                result (if (pos? left) (wait-for p (ms-ceil left)) ::timeout)]
+            (if (identical? ::oom result) (recur) result))))
+      (let [budget (* ms (long timeout-ms))
+            slice (* ms (long wait-slice-ms))
+            threshold (* ms (long stall-threshold-ms))
+            allowance (* ms (long allowance-ms))]
+        (loop [charged 0 excused 0]
+          (let [left (- budget charged)]
+            (if (<= left 0)
+              ::timeout
+              (let [asked (min left slice)
+                    start (System/nanoTime)
+                    result (wait-for p (ms-ceil asked))
+                    took (- (System/nanoTime) start)]
+                (if-not (or (identical? ::timeout result) (identical? ::oom result))
+                  result
+                  (let [late (- took asked)
+                        excuse (long (if (> late threshold) (min late (- allowance excused)) 0))]
+                    (recur (+ charged (- took excuse)) (+ excused excuse))))))))))))
 
 (def ^:private ^:const running 0)
 (def ^:private ^:const done 1)
@@ -400,8 +566,10 @@
 (defn- bounded-eval!
   "Runs `thunk` on a worker thread named after `describe` -- an idle one
   from the pool, or a new one (`acquire-worker!`, TASK-218) -- bounded by
-  `timeout-ms` wall-clock milliseconds --
-  the external half of this namespace's own layered resource bound (its
+  `timeout-ms` wall-clock milliseconds -- or, with a positive
+  `allowance-ms`, `timeout-ms` of the process running, a stall of the
+  whole process not charged until `allowance-ms` of it has been excused
+  (`await-result`, TASK-299) -- the external half of this namespace's own layered resource bound (its
   own docstring has the full reasoning for why this cannot be delegated to
   anything inside sci itself). Returns `{:ok value}`, `{:error throwable}`,
   or `{:timeout true}`.
@@ -413,12 +581,12 @@
   from hanging regardless of whether that worker thread ever actually
   stops. Marking the call abandoned first means that worker never returns
   to the pool, even if it does finish."
-  [thunk describe timeout-ms]
+  [thunk describe timeout-ms allowance-ms]
   (let [p (promise)
         state (java.util.concurrent.atomic.AtomicInteger. running)
         worker (acquire-worker!)]
     (.offer ^java.util.concurrent.BlockingQueue (:inbox worker) {:thunk thunk :describe describe :p p :state state})
-    (let [result (deref p timeout-ms ::timeout)]
+    (let [result (await-result p timeout-ms allowance-ms)]
       (cond
         (not= ::timeout result) result
         ;; Won the race: the worker can no longer deliver or be reused.
@@ -426,9 +594,10 @@
                                                      {:timeout true})
         ;; Lost it: the worker finished at the deadline and is delivering
         ;; (`run-job!` does so in a `finally`). Still bounded, so no path
-        ;; here waits without limit.
-        :else (let [late (deref p late-delivery-ms ::lost)]
-                (if (= ::lost late)
+        ;; here waits without limit: a plain wall-clock wait, which waits
+        ;; on through an OutOfMemoryError like any other (`wait-for`).
+        :else (let [late (await-result p late-delivery-ms 0)]
+                (if (identical? ::timeout late)
                   {:error (IllegalStateException. "the sandbox worker finished but never handed back its result")}
                   late))))))
 
@@ -636,24 +805,98 @@
           cause' (when (and cause (pos? depth)) (sanitize-error cause (dec depth)))
           class-name (.getName (class t))
           ^Throwable copy (if (instance? clojure.lang.IExceptionInfo t)
-                            (ex-info (or (bounded-message t) "") (scalar-entries (ex-data t)) cause')
+                            (ex-info (or (bounded-message t) "")
+                                     ;; Only this function names a class: a script's
+                                     ;; own ::error-class is not carried over.
+                                     (dissoc (scalar-entries (ex-data t)) ::error-class)
+                                     cause')
                             (ex-info (or (bounded-message t) class-name)
                                      {::error-class class-name} cause'))]
       (.setStackTrace copy (.getStackTrace t))
       copy)))
 
+(defn- out-of-memory
+  "The first `OutOfMemoryError` among the first `max-cause-depth` links of
+  `t`'s cause chain, or nil. Read from the throwable itself, never from
+  ex-data, which a script can fill with whatever keys it likes."
+  [^Throwable t]
+  (loop [^Throwable c t n max-cause-depth]
+    (cond (nil? c) nil
+          (instance? OutOfMemoryError c) c
+          (zero? n) nil
+          :else (recur (.getCause c) (dec n)))))
+
+(defn- oom-detail
+  "`oom`, an `OutOfMemoryError`, as `class: message`."
+  [^Throwable oom]
+  (str (.getName (class oom)) (some->> (bounded-message oom) (str ": "))))
+
+(def ^:private heap-exhausted-messages
+  "How an `OutOfMemoryError` for a full heap begins: HotSpot's two, then
+  the native image's. Others say the request alone was impossible --
+  HotSpot's \"Requested array size exceeds VM limit\", the native image's
+  \"Array allocation too large.\" (any array larger than its heap, probed
+  on GraalVM 21) -- and would fail the same way on any run."
+  ["Java heap space" "GC overhead limit exceeded" "Garbage-collected heap size exceeded"])
+
+(defn- heap-exhausted?
+  "True when `oom`'s message says the heap was full (`heap-exhausted-
+  messages`), which another thread's allocation can cause, as against a
+  request no heap could meet. HotSpot says \"Java heap space\" for an
+  array larger than the whole heap too (`(object-array 2147483000)` on a
+  small one), so that case reads as a full heap there."
+  [^Throwable oom]
+  (let [m (str (.getMessage oom))]
+    (boolean (some #(.startsWith m ^String %) heap-exhausted-messages))))
+
+(defn- error-reason
+  "What to print after \"raised an error:\" for `error`, a
+  `sanitize-error` copy (TASK-318): its own message, else the first
+  non-blank message down its cause chain (sci wraps a host error in an
+  `ExceptionInfo` whose message is \"\", and `sanitize-error` keeps that),
+  else the first `::error-class` along the chain -- so a
+  `StackOverflowError` reads as one -- else the copy's own class name."
+  [^Throwable error]
+  (let [chain (take (inc max-cause-depth) (take-while some? (iterate ex-cause error)))
+        reason (or (some #(let [m (ex-message %)] (when (and m (seq (.trim ^String m))) m)) chain)
+                   (some #(let [c (::error-class (ex-data %))] (when (string? c) c)) chain)
+                   (.getName (class error)))]
+    ;; Defence in depth: never longer than `max-message-length`.
+    (if (> (count reason) max-message-length)
+      (str (subs reason 0 max-message-length) "...")
+      reason)))
+
 (defn- sanitized-call
   "`(g)`, with any throwable it raises replaced by `sanitize-error`'s copy
   -- or, should reading that throwable itself fail, by a plain one saying
-  so, so the failure of the sanitising never lets the original through."
+  so, so the failure of the sanitising never lets the original through.
+  One with an `OutOfMemoryError` in its cause chain (sci wraps a host
+  error in its own located one) is replaced by an `::out-of-memory`
+  failure instead (TASK-301), marked with `failure-token` so a script
+  cannot forge one, and carrying `:heap-exhausted` (`heap-exhausted?`)."
   [g]
   (try
     (g)
     (catch Throwable t
       (throw (try
-               (sanitize-error t max-cause-depth)
+               (if-let [oom (out-of-memory t)]
+                 (result-failure ::out-of-memory (oom-detail oom) {:heap-exhausted (heap-exhausted? oom)})
+                 (sanitize-error t max-cause-depth))
                (catch Throwable _
                  (RuntimeException. (str (.getName (class t)) " (its details could not be read)"))))))))
+
+(defn- discarding-writer
+  "What a sandboxed call's `*out*` and `*err*` are bound to (TASK-301): a
+  fresh `Writer` that keeps nothing it is given, so printing costs no
+  memory however much a script prints. Nothing has ever read a script's
+  output -- it went into `StringWriter`s that were dropped after the call,
+  growing without bound while it ran. Fresh per call. Its class is not one
+  sci lets a script call methods on, so `(.write *out* \"x\")` is refused
+  where it worked on a `StringWriter` (a subclass of that would be
+  refused too: sci allows the exact class); the print functions, which
+  write through Clojure itself, are unaffected (`sci-call!`, step 1)."
+  ^java.io.Writer []
+  (java.io.Writer/nullWriter))
 
 (defn sci-call!
   "The one protected-call primitive every sandboxed evaluation goes
@@ -663,10 +906,16 @@
   effect (see this namespace's own docstring for why each one is here and
   what it does and does not cover):
 
-  1. `sci/out`/`sci/err` rebound to fresh, per-call `StringWriter`s --
-     established INSIDE the worker thread `bounded-eval!` runs it on,
-     since `sci/binding` is thread-local and does not propagate to another
-     `Thread`. Captured text is discarded.
+  1. `sci/out`/`sci/err` rebound to fresh, per-call writers that keep
+     nothing (`discarding-writer`, TASK-301) -- established INSIDE the
+     worker thread `bounded-eval!` runs it on, since `sci/binding` is
+     thread-local and does not propagate to another `Thread`. What a
+     script prints is dropped as it is written. `print`, `println`,
+     `printf`, `prn`, `pr`, `flush` and `newline` work as ever; a Java
+     method called on `*out*`/`*err*` directly (`.write`, `.append`,
+     `.flush`, `.close`) is refused by sci, whose default classes allowed
+     them on the `StringWriter` this replaced, and `(str *out*)` no longer
+     returns what was printed.
   2. `(f)`, and then `settle` on its result -- `plain-copy` (as `kind`)
      and, unless `kind` is `:spec`, `check-size!` -- both FROM INSIDE that
      same `sci/binding` form's own body, and inside `opts`' `:scope` when
@@ -676,7 +925,8 @@
      `ClassCastException`; outside `wrap-fn`'s `ctx-store/with-ctx`, a
      `require` in it fails with \"No context found\" -- both regressions a
      review once caught.)
-  3. `bounded-eval!`'s own wall-clock deadline, which everything above,
+  3. `bounded-eval!`'s own deadline -- wall-clock, unless `opts` give a
+     `:stall-allowance-ms` (see below) -- which everything above,
      the copy and the measuring included, is inside of, not exempt from: a
      call that TIMES OUT while still trying to compute an oversized value
      reports as a timeout, and nothing a script made is realised, printed
@@ -697,34 +947,62 @@
   `:timeout-ms`/`:output-limit`, both defaulting to this namespace's own
   `default-timeout-ms`/`default-output-limit`; `:scope`, a function of a
   thunk that runs it inside the caller's own dynamic scope (`wrap-fn`'s
-  `ctx-store/with-ctx`), applied around both `(f)` and `settle`.
+  `ctx-store/with-ctx`), applied around both `(f)` and `settle`;
+  `:stall-allowance-ms`, default 0, how much of a stall of the whole
+  process the call is not charged (the deadline section above,
+  TASK-299). Leave it at 0 for anything an untrusted file defines: a
+  script can cause such stalls itself, by its own allocation, and so
+  stretch its own call by up to the allowance. Only
+  `haselnuss.library.generated` passes one. With it, the `::timeout`
+  message's \"did not finish within Nms\" counts the N milliseconds the
+  call was charged, which can be later than N wall-clock milliseconds.
 
   Every `ex-info` this raises is namespaced under THIS namespace
   (`::timeout`/`::evaluation-error`/`::oversized-output`/
-  `::unsupported-result`), shared by every caller -- a sandboxed call
+  `::unsupported-result`/`::out-of-memory`), shared by every caller --
+  `::out-of-memory` (TASK-301) when an `OutOfMemoryError` ended the call
+  on its worker, which may mean the script filled the heap or that
+  something else in the process did (the namespace docstring, MEMORY);
+  read from the error itself, never from a script's ex-data. Its
+  `:heap-exhausted` is true when the error says the heap was full, false
+  when it says the request alone was impossible (`heap-exhausted?`): only
+  the first can depend on the run. A sandboxed call
   timing out means the same thing regardless of whether `--extensions` or
   `--transform` triggered it, so there is one name for it, not one per
   loader."
   ([f describe opts] (sci-call! f describe opts :data))
-  ([f describe {:keys [timeout-ms output-limit scope]
-                :or {timeout-ms default-timeout-ms output-limit default-output-limit}}
+  ([f describe {:keys [timeout-ms output-limit scope stall-allowance-ms]
+                :or {timeout-ms default-timeout-ms output-limit default-output-limit
+                     stall-allowance-ms 0}}
     kind]
    {:pre [(contains? kind-allows kind)]}
-   (let [out (java.io.StringWriter.)
-         err (java.io.StringWriter.)
+   (let [out (discarding-writer)
+         err (discarding-writer)
          scope (or scope (fn [g] (g)))
          result (bounded-eval! (fn []
                                  (sanitized-call
                                   #(sci/binding [sci/out out sci/err err]
                                      (scope (fn [] (settle (f) output-limit kind))))))
-                               describe timeout-ms)
+                               describe timeout-ms stall-allowance-ms)
          error (:error result)
-         failure (when (identical? failure-token (::token (ex-data error)))
-                   (::failure (ex-data error)))]
+         failure (cond (identical? failure-token (::token (ex-data error))) (::failure (ex-data error))
+                       ;; Raised by the worker's own bookkeeping, past
+                       ;; `sanitized-call`: the JVM's, so no script data.
+                       (instance? OutOfMemoryError error) ::out-of-memory)]
      (cond
        (:timeout result)
        (throw (ex-info (str describe " did not finish within " timeout-ms "ms")
                        {:type ::timeout :describe describe :timeout-ms timeout-ms}))
+
+       (= ::out-of-memory failure)
+       (let [raw? (instance? OutOfMemoryError error)]
+         (throw (ex-info (str describe " ran out of memory ("
+                              (if raw? (oom-detail error) (ex-message error))
+                              ")")
+                         {:type ::out-of-memory :describe describe
+                          :heap-exhausted (if raw?
+                                            (heap-exhausted? error)
+                                            (true? (:heap-exhausted (ex-data error))))})))
 
        (= ::oversized-output failure)
        (throw (ex-info (str describe "'s own output is over this build's " output-limit
@@ -741,8 +1019,7 @@
        ;; class rather than end the sentence on nothing (TASK-158 review).
        ;; `error` is `sanitize-error`'s copy, never the script's own
        ;; exception, so its ex-data is safe to print (TASK-214).
-       (throw (ex-info (str describe " raised an error: "
-                            (or (ex-message error) (.getName (class error))))
+       (throw (ex-info (str describe " raised an error: " (error-reason error))
                        {:type ::evaluation-error :describe describe}
                        error))
 

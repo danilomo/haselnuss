@@ -246,6 +246,46 @@ else
 fi
 barrier="$run_dir/barrier"
 
+# TASK-311: every JVM the shards start puts its temp files under one folder
+# of the run: -Djava.io.tmpdir, handed over in JVM_OPTS (which Leiningen adds
+# to the project JVM's flags, keeping its defaults; a :jvm-opts key in
+# project.clj would replace them, and setting the property from an injection
+# is too late for classes that read it early), and TMPDIR for the child
+# processes (pdflatex, Chrome, mktemp). It is removed when the script exits,
+# however it exits, so a passing run leaves nothing behind in /tmp. A test
+# that chmods a folder to 000 is handled by restoring permissions first.
+# HASELNUSS_TEST_KEEP_TMP=1 keeps the folder (and the logs) for a post-mortem.
+# Leiningen splits JVM_OPTS on whitespace, so the folder lives on a path
+# without any: under $TMPDIR (else /tmp), never under --log-dir.
+test_tmp=""
+if [ "$dry" -eq 0 ]; then
+  tmp_base="${TMPDIR:-/tmp}"
+  case "$tmp_base" in *[[:space:]]*) tmp_base=/tmp ;; esac
+  test_tmp=$(mktemp -d "${tmp_base%/}/haselnuss-test-tmp.XXXXXX") || exit 2
+fi
+# Set to 1 once a run has passed: a passing run's logs have nothing left to
+# say, so they go too, unless --log-dir named where they should be kept. A
+# failed run keeps its logs (one folder), minus the temp files.
+passed=0
+cleanup_tmp() {
+  [ "$dry" -eq 1 ] && return 0
+  [ "${HASELNUSS_TEST_KEEP_TMP:-}" = "1" ] && return 0
+  local waited=0 pid alive
+  # an interrupted run's JVMs get a moment to die before their files go
+  while [ "$waited" -lt 20 ]; do
+    alive=0
+    for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [ "$alive" -eq 0 ] && break
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  chmod -R u+rwx "$test_tmp" 2>/dev/null
+  rm -rf "$test_tmp"
+  if [ "$passed" -eq 1 ] && [ -z "$log_parent" ]; then
+    rm -rf "$run_dir"
+  fi
+}
+
 pids=()
 gated=()
 labels=()
@@ -270,6 +310,8 @@ launch() {
       HASELNUSS_TEST_PLAN="$run_dir/plan.tsv" HASELNUSS_TEST_PHASE=timing
       HASELNUSS_TEST_BARRIER="$barrier" HASELNUSS_TEST_BARRIER_OWNER="$$")
   fi
+  # The shards' and the timing phase's JVMs alike (TASK-311).
+  env_extra+=(JVM_OPTS="${JVM_OPTS:+$JVM_OPTS }-Djava.io.tmpdir=$test_tmp" TMPDIR="$test_tmp")
   # One JVM (the first) also checks the namespace list itself.
   [ "$i" -eq 0 ] && env_extra+=(HASELNUSS_TEST_CHECK_DISCOVERY=1)
   printf '%s\n' "$@" >"$run_dir/shard-$i.namespaces"
@@ -329,7 +371,7 @@ if [ "$dry" -eq 0 ]; then
   }
   trap 'stop_all; echo "bin/test: interrupted; stopped its JVMs" >&2; exit 130' INT
   trap 'stop_all; echo "bin/test: terminated; stopped its JVMs" >&2; exit 143' TERM
-  trap 'stop_all' EXIT
+  trap 'stop_all; cleanup_tmp' EXIT
 fi
 
 started=$SECONDS
@@ -461,9 +503,11 @@ echo "Wall time: $((SECONDS - started)) s (timing phase released at $released s)
 # The last line says it outright: a crashed JVM's tests are missing from the
 # counts above, which can otherwise read as a clean run.
 if [ "$status" -eq 0 ] && [ "$failures" -eq 0 ] && [ "$errors" -eq 0 ]; then
+  passed=1
   echo "bin/test: PASSED -- $tests tests, $assertions assertions, 0 failures, 0 errors, ${#pids[@]} JVMs"
   exit 0
 fi
 echo "bin/test: FAILED -- $tests tests, $assertions assertions, $failures failures, $errors errors," \
   "$crashed of ${#pids[@]} JVMs crashed or failed outside a test"
+echo "bin/test: logs of the failed run kept in $run_dir (its temp files are removed)"
 exit 1

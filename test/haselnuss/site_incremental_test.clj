@@ -22,9 +22,11 @@
             [haselnuss.library.graph :as graph]
             [haselnuss.library.graph.scan :as scan]
             [haselnuss.library.state :as state]
+            [haselnuss.sandbox :as sandbox]
             [haselnuss.site :as site]
             [haselnuss.site.incremental :as incremental]
             [haselnuss.site.unchanged :as unchanged]
+            [haselnuss.test-sandbox :as test-sandbox]
             [haselnuss.version :as version])
   (:import (java.io File StringWriter)
            (java.nio.file CopyOption Files LinkOption)
@@ -71,6 +73,16 @@
         (io/copy f target)
         (touch! target)))
     root))
+
+(defn- earlier-lines
+  "The lines of `err` marked as printed from an earlier build (TASK-308)."
+  [err]
+  (filterv #(str/ends-with? % site/earlier-note) (str/split-lines err)))
+
+(defn- without-earlier
+  "`err` without the lines marked as from an earlier build."
+  [err]
+  (apply str (map #(str % "\n") (remove #(str/ends-with? % site/earlier-note) (str/split-lines err)))))
 
 (defn- build!
   "Build the libraries of `root`'s `libraries.yaml` into the site `dir`:
@@ -173,7 +185,8 @@
       (is (= 1 (:status second-run)) (:err second-run))
       (is (= (str "skipped  reformed:notas  (2 books share this id)\n"
                   "0 of 11 books rebuilt, 9 up to date, 2 not built; 2 warnings in 3 books\n")
-             (:err second-run)))
+             (without-earlier (:err second-run))))
+      (is (= 2 (count (earlier-lines (:err second-run)))) "each warning it counts is printed, as from earlier")
       (is (= (:err second-run) (:err third-run)) "and so does a third"))
     (testing "and writes no file of the site: every modification time is as it was"
       (is (= before (mtimes dir))))
@@ -538,7 +551,7 @@
 ;; --- AC #4: warnings in books not rebuilt still count -----------------------------
 
 (deftest warnings-of-kept-books-count-test
-  (testing "a warning only emitting a page finds is counted while the page is kept, but not printed again"
+  (testing "a warning only emitting a page finds is counted while the page is kept, and printed again as from an earlier build"
     (let [root (temp-dir)
           _ (write-file! root "lib/a.hdoc" "---\ntitle: A\n---\n\nFine.\n")
           _ (write-file! root "lib/b.hdoc" "---\ntitle: B\n---\n\nSee [x](javascript:alert(1)).\n")
@@ -551,7 +564,27 @@
       (is (= 1 status) err)
       (is (= (str "rebuilt  lib:a  (source changed)\n"
                   "1 of 2 books rebuilt, 1 up to date; 1 warning in 1 book\n")
-             err))))
+             (without-earlier err)))
+      (is (= [(str "lib/b.hdoc: warning: [unsafe-url] Dropped the link to \"javascript:alert(1)\": "
+                   "only http, https, mailto and relative URLs are kept." site/earlier-note)]
+             (earlier-lines err))
+          "printed again, marked as from an earlier build")))
+  (testing "a repeat build of an unchanged library prints the warning its summary counts (TASK-308)"
+    (let [root (temp-dir)
+          _ (write-file! root "lib/b.hdoc" "---\ntitle: B\n---\n\nSee [x](javascript:alert(1)).\n")
+          _ (write-file! root "libraries.yaml" "- name: lib\n  type: filesystem\n  path: lib\n")
+          dir (io/file root "site")
+          first-run (build! root dir)
+          repeat-run (build! root dir)
+          third-run (build! root dir)]
+      (is (not (str/includes? (:err first-run) site/earlier-note)) "a full build says nothing of earlier")
+      (is (= 1 (count (re-seq #"\[unsafe-url\]" (:err first-run)))))
+      (is (= (str "lib/b.hdoc: warning: [unsafe-url] Dropped the link to \"javascript:alert(1)\": "
+                  "only http, https, mailto and relative URLs are kept." site/earlier-note "\n"
+                  "0 of 1 book rebuilt, 1 up to date; 1 warning in 1 book\n")
+             (:err repeat-run)))
+      (is (= (:err repeat-run) (:err third-run)))
+      (is (= 1 (:status repeat-run)))))
   (testing "a preview that could not be built is counted while its previews.json is kept"
     (let [root (fixture-copy)
           dir (io/file (temp-dir) "site")
@@ -570,7 +603,8 @@
       (write-file! root "reformed/dangling.hdoc" (str (read-file root "reformed/dangling.hdoc") "\nMore.\n"))
       (let [{:keys [err]} (build! root dir)]
         (is (= {"reformed:dangling" "source changed"} (rebuilt-ids err)) err)
-        (is (not (str/includes? err "[preview-failed]")) "not printed: romanos was not rebuilt")
+        (is (= 2 (count (filter #(str/includes? % "[preview-failed]") (earlier-lines err))))
+            "printed again, as from earlier: romanos was not rebuilt")
         (is (str/ends-with? err "1 of 11 books rebuilt, 8 up to date, 2 not built; 4 warnings in 4 books\n")
             err))
       (testing "and while only its backlinks.json is written again (a new quote of it needs no preview)"
@@ -634,7 +668,7 @@
                 "the stopped build wrote the new page")
           _ (write-file! root "reformed/catecismo-heidelberg.hdoc" original)
           rerun (build! root dir)]
-      (is (= "an earlier build stopped before it was done"
+      (is (= "left pending by an earlier run"
              (get (rebuilt-ids (:err rerun)) "reformed:catecismo-heidelberg"))
           (:err rerun))
       (same-as-clean? root dir rerun "undo the edit after the stop"))))
@@ -839,7 +873,8 @@
          (is (= (:status slow) (:status again)))
          (is (= (str "skipped  reformed:notas  (2 books share this id)\n"
                      "0 of 11 books rebuilt, 9 up to date, 2 not built; 2 warnings in 3 books\n")
-                (:err again))))
+                (without-earlier (:err again))))
+         (is (= 2 (count (earlier-lines (:err again))))))
        (testing "and writing no file of the site"
          (is (= before (mtimes dir))))
        (testing "the long way saves the record again"
@@ -907,7 +942,7 @@
        (testing "a build that stopped partway: its pending lists"
          (settled! "a pending list")
          (write-file! dir ".haselnuss/pending" "page reformed:catkins\n")
-         (is (= {"reformed:catkins" "an earlier build stopped before it was done"}
+         (is (= {"reformed:catkins" "left pending by an earlier run"}
                 (rebuilt-ids (:err (long-way "a pending list")))))
          (settled! "an images pending list")
          (write-file! dir ".haselnuss/images.pending" "books/reformed/catkins/catkins.png\n")
@@ -1074,6 +1109,138 @@
          (let [r (build-seen! root dir :opts {:haselnuss.cli/build-identity nil})]
            (is (not (:unchanged? r)))
            (is (not (has-record? dir)))))))))
+
+;; --- TASK-299: a timeout is not saved ---------------------------------------------
+
+(deftest timeout-is-retried-by-the-next-build-test
+  (testing "a generated book's :document and a passage's :locate that ran out of
+            time in one build -- a stalled or starved process, not the script --
+            are tried again by the next, though no file changed: it builds what
+            met them, leaves the site a clean build's, and only then answers from
+            the record of an unchanged site"
+    (without-racy-window
+     (fn []
+       (let [root (fixture-copy)
+             dir (io/file (temp-dir) "site")
+             timed-out (with-redefs [sandbox/sci-call! (test-sandbox/timing-out
+                                                        #":document for bible:blivre/romanos|:locate for bible:blivre/joao")]
+                         (build-seen! root dir))]
+         (testing "not vacuous: the first build met both timeouts, and failed the page of romanos"
+           (is (str/includes? (:err timed-out) ":document for bible:blivre/romanos did not finish") (:err timed-out))
+           (is (str/includes? (:err timed-out) ":locate for bible:blivre/joao did not finish") (:err timed-out))
+           (is (re-find #"(?m)^failed +bible:blivre/romanos" (:err timed-out)) (:err timed-out)))
+         (testing "it leaves no record of an unchanged site, and saves the pages that met one as such"
+           (is (not (has-record? dir)))
+           (is (some :transient? (vals (:books (state/load-state dir))))))
+         (let [retried (build-seen! root dir)]
+           (is (not (:unchanged? retried)))
+           (is (not (str/includes? (:err retried) "did not finish")) (:err retried))
+           (testing "the next build makes the page that failed and the pages that quote it"
+             (is (= #{"bible:blivre/romanos" "reformed:catecismo-heidelberg"}
+                    (set/intersection #{"bible:blivre/romanos" "reformed:catecismo-heidelberg"}
+                                      (set (keys (rebuilt-ids (:err retried))))))
+                 (:err retried)))
+           (same-as-clean? root dir retried "after a timeout"))
+         (testing "and once settled, a later build answers from the record again"
+           (is (:unchanged? (settle! root dir)))))))))
+
+;; --- TASK-313: a timed-out :books keeps the shelf's pages -------------------------
+
+(defn- bible-tree
+  "`site-tree` of `dir`, only the Bible library's pages and catalog."
+  [dir]
+  (into (sorted-map)
+        (filter #(or (str/starts-with? (key %) "books/bible") (str/starts-with? (key %) "catalog/bible")))
+        (site-tree dir)))
+
+(deftest timed-out-books-keeps-the-shelfs-pages-test
+  (without-racy-window
+   (fn []
+     (let [root (fixture-copy)
+           dir (io/file (temp-dir) "site")
+           _ (is (:unchanged? (do (build! root dir) (settle! root dir))))
+           before (site-tree dir)
+           bible-before (bible-tree dir)
+           saved-before (select-keys (:books (state/load-state dir))
+                                     (filter #(= "bible" (:library %)) (keys (:books (state/load-state dir)))))
+           generation (state/saved-generation dir)
+           ;; the script is edited, and the process cannot run it in time
+           _ (write-file! root "bible/blivre/shelf.clj"
+                          (str (read-file root "bible/blivre/shelf.clj") "\n;; edited\n"))
+           timed-out (with-redefs [sandbox/sci-call! (test-sandbox/timing-out #"shelf.clj :books")]
+                       (build-seen! root dir))]
+       (testing "not vacuous: the first run met the timeout, and the shelf had books to lose"
+         (is (str/includes? (:err timed-out) ":books did not finish") (:err timed-out))
+         (is (seq bible-before))
+         (is (seq saved-before)))
+       (testing "the shelf's pages, data files and catalog stay, and nothing is removed or rebuilt"
+         (is (= bible-before (bible-tree dir)) (str (vec (tree-diff bible-before (bible-tree dir)))))
+         (is (= before (site-tree dir)) (str (vec (tree-diff before (site-tree dir)))))
+         (is (not (re-find #"(?m)^removed " (:err timed-out))) (:err timed-out))
+         ;; only the page whose own diagnostic names the failure (a link to a
+         ;; book the shelf never had) is made again
+         (is (= #{"reformed:dangling"} (set (keys (rebuilt-ids (:err timed-out))))) (:err timed-out)))
+       (testing "the books that quote the shelf's books still resolve them"
+         (is (not (str/includes? (:err timed-out) "not-found")))
+         (is (= saved-before
+                (select-keys (:books (state/load-state dir)) (keys saved-before)))
+             "the state keeps the shelf's records"))
+       (testing "the run is not settled: no record of an unchanged site, and the failure is reported"
+         (is (not (has-record? dir)))
+         (is (not (:unchanged? timed-out)))
+         (is (some? generation)))
+       (let [retried (build-seen! root dir)]
+         (testing "the next run calls :books again and rebuilds only what changed"
+           (is (not (:unchanged? retried)))
+           (is (not (str/includes? (:err retried) "did not finish")) (:err retried))
+           (is (= #{"reformed:dangling"} (set (keys (rebuilt-ids (:err retried))))) (:err retried))
+           (is (= before (site-tree dir)))
+           (same-as-clean? root dir retried "after a timed-out :books"))
+         (testing "and once settled, a later build answers from the record again"
+           (is (:unchanged? (settle! root dir)))))
+       (testing "an empty answer is not a failure: the shelf's pages are removed"
+         (write-file! root "bible/blivre/blivre.json" "[]")
+         (let [r (build! root dir)]
+           (is (re-find #"(?m)^removed +bible:blivre/" (:err r)) (:err r))
+           (is (empty? (filter #(str/starts-with? % "books/bible/blivre/") (keys (site-tree dir)))))))))))
+
+(deftest two-timed-out-books-in-a-row-keep-the-shelfs-pages-test
+  (without-racy-window
+   (fn []
+     (let [root (fixture-copy)
+           dir (io/file (temp-dir) "site")
+           _ (build! root dir)
+           _ (settle! root dir)
+           before (site-tree dir)
+           data (bible root)
+           i (first (keep-indexed #(when (= "romanos" (get %2 "slug")) %1) data))
+           edited (update-in data [i "verses" 0 2] str " (edited)")
+           fail! #(with-redefs [sandbox/sci-call! (test-sandbox/timing-out #"shelf.clj :books")]
+                    (build-seen! root dir))]
+       (bible! root edited)
+       (doseq [n [1 2]]
+         (let [r (fail!)]
+           (testing (str "failure " n ": the shelf's pages stay and nothing is removed")
+             (is (str/includes? (:err r) ":books did not finish") (:err r))
+             (is (not (re-find #"(?m)^removed " (:err r))) (:err r))
+             ;; the edited book's own page is made again (its document does not
+             ;; depend on :books); no other page of the shelf changes
+             (is (empty? (remove #(str/starts-with? % "books/bible/blivre/romanos/")
+                                 (filter #(str/starts-with? % "books/bible/") (tree-diff before (site-tree dir)))))
+                 (str (vec (tree-diff before (site-tree dir)))))
+             (is (= 5 (count (filter #(re-find #"^books/bible/blivre/[^/]+/index\.html$" %)
+                                     (keys (site-tree dir))))))
+             (is (not (has-record? dir))))))
+       (let [recovered (build-seen! root dir)
+             ids (set (keys (rebuilt-ids (:err recovered))))]
+         (testing "the run that recovers rebuilds no book of the shelf: none is new"
+           (is (not (re-find #"new book" (:err recovered))) (:err recovered))
+           (is (not (re-find #"(?m)^removed " (:err recovered))) (:err recovered))
+           (is (empty? (filter #(str/starts-with? % "bible:") ids)) (:err recovered))
+           (is (str/includes? (read-file dir "books/bible/blivre/romanos/index.html") "(edited)"))
+           (same-as-clean? root dir recovered "after two timed-out :books"))
+         (testing "and once settled, a later build answers from the record again"
+           (is (:unchanged? (settle! root dir)))))))))
 
 (deftest code-replaced-mid-run-test
   (testing "the record names the build that ran, not the code on disk when it was saved:
@@ -1435,7 +1602,7 @@
                    (build-seen! root dir))]
            (is @fired "the build of only solo started")
            (is @fell-back "and fell back to the whole build")
-           (is (= "an earlier build stopped before it was done" (get (rebuilt-ids (:err r)) "reformed:dangling"))
+           (is (= "left pending by an earlier run" (get (rebuilt-ids (:err r)) "reformed:dangling"))
                (:err r))
            (same-as-clean? root dir r "a build died between the check and the build")))))))
 
@@ -1475,3 +1642,88 @@
              (like-the-long-way? a ra b rb "edit a book of the library that shares the file")
              (is (= (part-files-of b) (part-files-of a)) "each part holds the stamps the whole build's does")
              (is (not (contains? (get (part-files-of a) "zz") shared))))))))))
+
+;; --- TASK-310: a folder under books/ the sweep cannot read ----------------------------
+
+(defn- chmod! [^File f perms]
+  (Files/setPosixFilePermissions (.toPath f) (java.nio.file.attribute.PosixFilePermissions/fromString perms)))
+
+(deftest unreadable-folder-under-books-test
+  (let [root (temp-dir)
+        dir (io/file root "site")
+        locked (io/file dir "books/lib/locked")]
+    (write-file! root "libraries.yaml" "- name: lib\n  type: filesystem\n  path: lib\n")
+    (write-file! root "lib/a.hdoc" "---\ntitle: A\n---\n\nFirst.\n")
+    (write-file! root "lib/b.hdoc" "---\ntitle: B\n---\n\nSecond.\n")
+    (build! root dir)
+    (write-file! dir "books/lib/locked/stale.txt" "kept")
+    (try
+      (chmod! locked "---------")
+      (if (.canRead locked)
+        (println "skipped: permissions do not apply to this user (root?)")
+        (do
+          (testing "an unreadable folder is reported, the build goes on, the status is non-zero"
+            (write-file! root "lib/a.hdoc" "---\ntitle: A\n---\n\nFirst, edited.\n")
+            (let [{:keys [status err]} (build! root dir)]
+              (is (= 1 status) err)
+              (is (str/includes? err "books/lib/locked") err)
+              (is (str/includes? err "error") err)
+              (is (str/includes? err "1 error") err)
+              (is (str/includes? (read-file dir "books/lib/a/index.html") "First, edited.")
+                  "the other books are still built")))
+          (testing "a repeat build reports it again, as found now"
+            (let [{:keys [status err]} (build! root dir)]
+              (is (= 1 status) err)
+              (is (str/includes? err "books/lib/locked") err)
+              (is (not (str/includes? err site/earlier-note)) err)))
+          (testing "readable again, nothing is carried over"
+            (chmod! locked "rwxr-xr-x")
+            (let [{:keys [status err]} (build! root dir)]
+              (is (= 0 status) err)
+              (is (not (str/includes? err "locked")) err)
+              (is (= "kept" (read-file dir "books/lib/locked/stale.txt")))))
+          (testing "a folder that cannot be written is reported where a stale page cannot be removed"
+            (write-file! dir "books/lib/gone/index.html" "stale")
+            (chmod! (io/file dir "books/lib/gone") "r-xr-xr-x")
+            (let [{:keys [status err]} (build! root dir)]
+              (is (= 1 status) err)
+              (is (str/includes? err "books/lib/gone/index.html") err))
+            (chmod! (io/file dir "books/lib/gone") "rwxr-xr-x")
+            (let [{:keys [status err]} (build! root dir)]
+              (is (= 0 status) err)
+              (is (not (.exists (io/file dir "books/lib/gone"))))))))
+      (finally
+        ;; the folders chmodded above by name: `file-seq` cannot list a 000 one
+        (doseq [^File f [locked (io/file dir "books/lib/gone")] :when (.exists f)]
+          (chmod! f "rwxr-xr-x"))))))
+
+(deftest unreadable-catalog-folder-test
+  (let [root (temp-dir)
+        dir (io/file root "site")
+        catalog-lib (io/file dir "catalog/lib")]
+    (write-file! root "libraries.yaml" "- name: lib\n  type: filesystem\n  path: lib\n")
+    (write-file! root "lib/a.hdoc" "---\ntitle: A\n---\n\nFirst.\n")
+    (build! root dir)
+    (try
+      (write-file! dir "catalog/lib/9999.json" "[]")
+      (chmod! catalog-lib "r-xr-xr-x")
+      (if (.canWrite catalog-lib)
+        (println "skipped: permissions do not apply to this user (root?)")
+        (do
+          (testing "a stale catalog page that cannot be removed is reported (the unchanged-site shortcut gives way)"
+            (let [{:keys [status err]} (build! root dir)]
+              (is (= 1 status) err)
+              (is (str/includes? err "catalog/lib/9999.json") err)
+              (is (.exists (io/file dir "catalog/lib/9999.json")))))
+          (testing "a catalog folder that cannot be listed is answered, not thrown (a build cannot
+                    write its catalog pages there either, which is a failure of its own)"
+            (chmod! catalog-lib "---------")
+            (let [found (site/sweep-catalog! dir #{})]
+              (is (= #{"catalog/lib"} (set (map first found))) (pr-str found))))
+          (testing "readable and writable again: swept, exit 0"
+            (chmod! catalog-lib "rwxr-xr-x")
+            (let [{:keys [status err]} (build! root dir)]
+              (is (= 0 status) err)
+              (is (not (.exists (io/file dir "catalog/lib/9999.json"))))))))
+      (finally
+        (when (.exists catalog-lib) (chmod! catalog-lib "rwxr-xr-x"))))))

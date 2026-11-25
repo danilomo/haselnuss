@@ -64,6 +64,10 @@
   `cond`/`instance?` dispatch per node class; an unrecognized node class
   throws a catchable `ex-info` rather than silently mis-converting, per this
   codebase's established error-handling ethos (see `haselnuss.json`).
+  One place deliberately departs from flexmark and from CommonMark's own
+  algorithm (TASK-314): a whitespace-only line of a code block inside a
+  list item or a footnote keeps the whitespace past the container's
+  indentation instead of coming out empty -- see `code-block-text`.
 
   Figures and pipe tables (TASK-8, sec5.8/5.9) build on flexmark's own GFM
   pipe-table extension (`TablesExtension`, registered on `cm-parser`
@@ -3464,6 +3468,213 @@
 
 (declare convert-blocks)
 
+;; --- Whitespace-only code lines inside a list item (TASK-314) ----------------
+;;
+;; flexmark's `ListItemParser.tryContinue` (and `FootnoteBlockParser`'s) takes
+;; a line that is blank from where the item sees it and continues at the next
+;; non-space index -- that is, it swallows the whole line, however much
+;; whitespace it holds. For a paragraph that is harmless, but a fenced or
+;; indented code block inside the item then gets that line as a bare "\n":
+;; `   \t ` written inside a fence inside `- Item` came out empty. Nonblank
+;; lines lose only the item's content indentation. The raw line is still in
+;; the text flexmark parsed (each content line's base sequence), so the
+;; functions below replay the container prefixes -- the same rule a nonblank
+;; line meets -- on that raw line and keep what is left.
+;;
+;; A prefix walk is a vector `[i col pad]`: the index into the line, the
+;; column reached, and the columns still owed by a tab that was only partly
+;; consumed (CommonMark: tab stops of 4, and a tab split by a container
+;; boundary leaves its remaining columns as spaces).
+
+(defn- take-columns
+  "The walk `state` over `line` advanced by up to `n` columns of spaces and
+  tabs: it stops early at anything else or at the end of the line. A tab is
+  turned into the columns it spans to the next tab stop, of which only as
+  many as are wanted are consumed; the rest stay in `pad`."
+  [^String line [i col pad] n]
+  (loop [i (long i) col (long col) pad (long pad) n (long n)]
+    (cond
+      (<= n 0) [i col pad]
+      (pos? pad) (let [k (min pad n)] (recur i (+ col k) (- pad k) (- n k)))
+      (>= i (.length line)) [i col pad]
+      (= \space (.charAt line (int i))) (recur (inc i) (inc col) 0 (dec n))
+      (= \tab (.charAt line (int i))) (recur (inc i) col (- 4 (rem col 4)) n)
+      :else [i col pad])))
+
+(defn- column-at
+  "The column of index `k` of `line` (tabs expanded to stops of 4)."
+  [^String line k]
+  (loop [i 0 col 0]
+    (if (< i (long k))
+      (recur (inc i) (if (= \tab (.charAt line (int i))) (+ col (- 4 (rem col 4))) (inc col)))
+      col)))
+
+(defn- list-item-content-offset
+  "The columns a list item's content starts after its marker, which ends
+  at index `end` of `line`: the whitespace there, 1 to 4 columns, or 1
+  when the rest of the line is blank or when there are 5 or more columns
+  of it (the rest is then an indented code block's)."
+  [^String line end]
+  (let [from (column-at line end)
+        [_ col] (take-columns line [end from 0] Long/MAX_VALUE)
+        w (- (long col) from)]
+    (if (or (str/blank? (subs line end)) (>= w 5)) 1 w)))
+
+(defn- raw-line
+  "`[text start]`: the whole source line that holds offset `off` of `base`,
+  without its line break, and where it starts in `base`. Scans `base` (a
+  CharSequence, the document's base sequence) from `off` rather than
+  turning it into a String: that copy, made once per code block, made a
+  document of many such blocks quadratic."
+  [^CharSequence base off]
+  (let [n (.length base)
+        start (loop [k (long off)]
+                (if (and (pos? k) (not= \newline (.charAt base (int (dec k))))) (recur (dec k)) k))
+        end (loop [k (long start)]
+              (if (and (< k n) (not= \newline (.charAt base (int k)))) (recur (inc k)) k))]
+    [(str (.subSequence base (int start) (int end))) start]))
+
+(defn- walk-containers
+  "The walk over raw source `line` (starting at `line-start` of its
+  document's base sequence) after the prefixes of every container in
+  `containers` (outermost first) have been taken off, or nil where the line
+  does not fit them (no `>` for a quote) or a container is of a kind this
+  does not know. A list item whose own marker is on this line is passed
+  over to its content column; on any other line it takes up to its content
+  indentation, `(indent-of item)` -- see `content-indents`."
+  [indent-of ^String line line-start containers]
+  (reduce
+   (fn [state ^Node c]
+     (cond
+       (instance? BlockQuote c)
+       (let [[i col pad] (take-columns line state 3)]
+         (if (and (zero? pad) (< i (.length line)) (= \> (.charAt line (int i))))
+           (take-columns line [(inc i) (inc col) 0] 1)
+           (reduced nil)))
+
+       (instance? ListItem c)
+       (let [marker (.getOpeningMarker ^ListItem c)
+             at (- (.getStartOffset marker) line-start)]
+         (if (and (<= 0 at) (< at (.length line)))
+           (let [end (+ at (.length marker))]
+             (take-columns line [end (column-at line end) 0] (list-item-content-offset line end)))
+           (if-let [indent (indent-of c)]
+             (take-columns line state indent)
+             (reduced nil))))
+
+       ;; Where a footnote's own `[^n]:` line leaves its content is not
+       ;; worked out here: nothing is recovered on that line.
+       (instance? FootnoteBlock c)
+       (if (<= line-start (.getStartOffset c) (+ (long line-start) (.length line)))
+         (reduced nil)
+         (take-columns line state 4))
+
+       (instance? ListBlock c) state
+       :else (reduced nil)))
+   [0 0 0]
+   containers))
+
+(defn- containers-of
+  "The block containers around `node`, outermost first (the Document
+  excluded)."
+  [^Node node]
+  (->> (iterate #(.getParent ^Node %) (.getParent node))
+       (take-while #(and (some? %) (not (instance? Document %))))
+       reverse
+       vec))
+
+(defn- marker-indent
+  "The columns of whitespace before `marker` (a node's opening marker in
+  `base`) on its line, counted from where `node`'s containers leave that
+  line -- a list item's marker indent, a fence's opener indent; nil when
+  the line does not fit the containers. (flexmark's own
+  `FencedCodeBlock.getFenceIndent` is 0 inside a list item.)"
+  [^CharSequence base indent-of ^Node node ^BasedSequence marker]
+  (let [[line start] (raw-line base (.getStartOffset marker))]
+    (when-let [[_ col] (walk-containers indent-of line start (containers-of node))]
+      (- (long (column-at line (- (.getStartOffset marker) (long start)))) (long col)))))
+
+(defn- list-item-content-indent
+  "The columns list item `item` takes off a continuation line -- as
+  flexmark counts them, from where the item sees the line: the marker's
+  own indentation, its width and the whitespace after it. Read from the
+  item's first line in `base`; nil when that line does not fit its outer
+  containers, whose own indents come from `indent-of`."
+  [^CharSequence base indent-of ^ListItem item]
+  (let [marker (.getOpeningMarker item)]
+    (when-let [indent (marker-indent base indent-of item marker)]
+      (let [[line start] (raw-line base (.getStartOffset marker))]
+        (+ (long indent)
+           (.length marker)
+           (list-item-content-offset line (+ (- (.getStartOffset marker) (long start)) (.length marker))))))))
+
+(defn- content-indents
+  "`indent-of`: a function from a list item of the document whose base
+  sequence is `base` to its `list-item-content-indent`, worked out once per
+  item. Each item's indent needs its outer items' indents (to walk its
+  marker line), so without the memo every enclosing item was worked out
+  again for every item inside it -- 2^depth walks per line, minutes for
+  a list nested twenty-odd deep (TASK-314 review). With it, a code block
+  costs one marker-line walk per enclosing item."
+  [^CharSequence base]
+  (let [memo (java.util.IdentityHashMap.)]
+    (fn indent-of [item]
+      (if (.containsKey memo item)
+        (.get memo item)
+        (let [indent (list-item-content-indent base indent-of item)]
+          (.put memo item indent)
+          indent)))))
+
+(defn- recovered-blank-line
+  "The whitespace a line of a code block holds once only its `containers`'
+  prefixes and the block's `own` indentation (columns) are taken off, read
+  from `base`, the text flexmark parsed; nil unless `content-line`, the
+  bare line break flexmark gave for it, sits at the end of that line and
+  what is left is whitespace."
+  [^CharSequence base indent-of containers own ^BasedSequence content-line]
+  (let [off (.getStartOffset content-line)
+        [^String line start] (raw-line base off)]
+    (when (= off (+ (long start) (.length line)))
+      (when-let [state (walk-containers indent-of line start containers)]
+        (let [[i _ pad] (take-columns line state own)
+              kept (str (str/join (repeat pad \space)) (subs line i))]
+          (when (re-matches #"[ \t]*" kept) kept))))))
+
+(defn- code-block-text
+  "The literal text of code block `node`: flexmark's content text, except
+  that inside a list item or a footnote a whitespace-only line keeps the
+  whitespace past its containers' indentation and the block's own (see
+  the section comment above). Elsewhere flexmark already keeps it, and the
+  text is exactly `getContentChars`.
+
+  Only a bare line whose source line holds something is looked at: an
+  empty source line has nothing to recover, and the ordinary empty line
+  of a code block then costs no walk at all."
+  [^Block node]
+  (let [text (.toString (.getContentChars node))
+        lines (vec (.getContentLines node))
+        base (.getBaseSequence (.getChars node))
+        candidate? (fn [^BasedSequence line]
+                     (let [off (.getStartOffset line)]
+                       (and (contains? #{"\n" ""} (str line))
+                            (pos? off)
+                            (not= \newline (.charAt base (int (dec off)))))))
+        containers (containers-of node)]
+    (if-not (and (some candidate? lines)
+                 (some #(or (instance? ListItem %) (instance? FootnoteBlock %)) containers))
+      text
+      (let [indent-of (content-indents base)
+            own (if (instance? FencedCodeBlock node)
+                  (marker-indent base indent-of node (.getOpeningMarker ^FencedCodeBlock node))
+                  4)
+            fixed (mapv (fn [^BasedSequence line]
+                          (if-let [kept (and own (candidate? line)
+                                             (recovered-blank-line base indent-of containers own line))]
+                            (str kept line)
+                            (str line)))
+                        lines)]
+        (if (= (map str lines) fixed) text (str/join fixed))))))
+
 (defn- code-block
   "A `:code-block` Block from `node` (a Fenced- or IndentedCodeBlock), whose
   literal text is read via `getContentChars` -- unlike the raw `getChars`
@@ -3473,9 +3684,16 @@
   ancestor of Fenced- and IndentedCodeBlock that declares
   `getContentChars`, since a single param can't carry both concrete
   types) so this resolves without reflection on every code block
-  converted."
+  converted.
+
+  One deliberate difference from flexmark, and from CommonMark's own
+  algorithm (TASK-314): inside a list item or a footnote, a line of the
+  block that holds only whitespace keeps whatever lies past the
+  container's indentation and the block's own (a fence's opener indent,
+  an indented block's four columns) -- the same amount a nonblank line
+  loses -- where flexmark empties it. See `code-block-text`."
   [^Block node lang]
-  (cond-> {:t :code-block :text (.toString (.getContentChars node)) :attr default-attr}
+  (cond-> {:t :code-block :text (code-block-text node) :attr default-attr}
     lang (assoc :lang lang)))
 
 (defn- fenced-lang
@@ -4087,9 +4305,9 @@
   "A backtick/tilde code fence's *opening* line (CommonMark sec4.5): up to 3
   leading spaces, then a run of 3+ of the same fence character. Only the
   captured run's character and length are used (to recognize this fence's
-  own later closing line) -- the rest of the line (an optional info string)
-  is not otherwise needed here."
-  #"^ {0,3}(`{3,}|~{3,}).*$")
+  own later closing line), and the info string only to reject a backtick
+  one that holds a backtick."
+  #"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 (defn- code-fence-close-re
   "A compiled regex matching a line that closes a code fence previously
@@ -4104,13 +4322,154 @@
   [fence-char fence-len]
   (re-pattern (str "^ {0,3}" (java.util.regex.Pattern/quote (str fence-char)) "{" fence-len ",}\\s*$")))
 
+(def ^:private list-marker-re
+  "A list marker at the start of a string, followed by a space, a tab or
+  the end of it: `[_ marker]`."
+  #"^([-+*]|\d{1,9}[.)])(?=[ \t]|$)")
+
 (defn- code-fence-open
-  "The compiled closing-fence regex (see `code-fence-close-re`) if `line`
-  opens a backtick/tilde code fence (see `code-fence-open-re`), nil
-  otherwise."
-  [line]
-  (when-let [[_ run] (re-matches code-fence-open-re line)]
-    (code-fence-close-re (first run) (count run))))
+  "The compiled closing-fence regex (see `code-fence-close-re`) if `text`
+  -- a line with its containers' prefixes already taken off -- opens a
+  backtick/tilde code fence (see `code-fence-open-re`), nil otherwise. A
+  backtick fence's info string cannot contain a backtick (CommonMark
+  sec4.5): such a line is a paragraph of inline code."
+  [text]
+  (when-let [[_ run info] (re-matches code-fence-open-re text)]
+    (when-not (and (= \` (first run)) (str/includes? info "`"))
+      (code-fence-close-re (first run) (count run)))))
+
+;; --- Containers around a fence (TASK-321) ------------------------------------
+;;
+;; Whether a line opens or closes a fence depends on the list items and block
+;; quotes around it: `- a\n  ```\nx` leaves the item before `x`, so the fence
+;; ends there; `- ```\n  x\n\n   ```` closes in the item. The scan keeps a
+;; stack of containers, `{:kind :quote}` and `{:kind :list :w width}` (the
+;; columns an item's content is indented, from its parent's content start),
+;; and works out for each line, as CommonMark's block algorithm does: which
+;; open containers the line continues, whether it opens new ones (`>`, a list
+;; marker), and then what the rest of the line is. Only what decides where a
+;; fence is is modelled -- no paragraph content, no HTML blocks, no footnotes
+;; -- plus whether a paragraph is open, since that decides lazy continuation
+;; (`> a\nb` stays in the quote) and which list markers may interrupt it
+;; (not `7.`, not an empty item).
+
+(def ^:private thematic-break-re #"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+(def ^:private atx-heading-re #"^ {0,3}#{1,6}(?:[ \t]|$)")
+(def ^:private setext-underline-re #"^ {0,3}(?:=+|-+)[ \t]*$")
+
+(defn- continue-containers
+  "`[n state]`: how many of `containers` (outermost first) the raw `line`
+  continues, and the walk state after their prefixes. A quote needs its `>`
+  (up to 3 spaces before it), a list item its full content indent -- or a
+  blank line, which every item continues. An item that began with a blank
+  line and met another (flexmark: `-\n\n  * a` nests the list, `-\n\n  a`
+  does not) is continued by a line that opens a list item only."
+  [^String line containers]
+  (let [blank? (str/blank? line)
+        len (.length line)]
+    (loop [k 0 state [0 0 0]]
+      (if (= k (count containers))
+        [k state]
+        (let [{:keys [kind w] :as c} (nth containers k)
+              [i col pad] state]
+          (if (= :quote kind)
+            (let [[i col pad] (take-columns line state 3)]
+              (if (and (zero? pad) (< (long i) len) (= \> (.charAt line (int i))))
+                (recur (inc k) (take-columns line [(inc (long i)) (inc (long col)) 0] 1))
+                [k state]))
+            (if blank?
+              (recur (inc k) state)
+              (let [[i' col' pad'] (take-columns line state w)]
+                (if (and (= (long w) (- (long col') (long col)))
+                         ;; flexmark: an item that began with a blank line and
+                         ;; met another stays open for a nested list item only
+                         (or (not (and (:empty? c) (:blank? c)))
+                             (re-find list-marker-re (str/triml (subs line (long i'))))))
+                  (recur (inc k) [i' col' pad'])
+                  [k [i col pad]])))))))))
+
+(defn- open-containers
+  "`[new-containers state]`: the containers the line opens at walk `state` --
+  quotes and list items, nested ones too -- and the state after their
+  markers. `interrupt?` is true where a paragraph the line would continue is
+  open: an empty item and an ordered one not starting at 1 then do not open."
+  [^String line state interrupt?]
+  (loop [state state opened []]
+    (let [[i col pad] state
+          [i' col'] (take-columns line [i col pad] Long/MAX_VALUE)
+          indent (- (long col') (long col))
+          len (.length line)]
+      (if (or (>= (long indent) 4) (>= (long i') len))
+        [opened state]
+        (let [c (.charAt line (int i'))
+              text (subs line i')]
+          (cond
+            (= \> c)
+            (recur (take-columns line [(inc (long i')) (inc (long col')) 0] 1)
+                   (conj opened {:kind :quote}))
+
+            (and (re-find list-marker-re text) (not (re-matches thematic-break-re text)))
+            (let [marker (first (re-find list-marker-re text))
+                  end (+ (long i') (count marker))
+                  blank-rest? (str/blank? (subs line end))]
+              (if (and interrupt? (empty? opened)
+                       (or blank-rest? (and (Character/isDigit (.charAt ^String marker 0))
+                                            (not= 1 (parse-long (subs marker 0 (dec (count marker))))))))
+                [opened state]
+                (let [off (list-item-content-offset line end)]
+                  (recur (take-columns line [end (column-at line end) 0] off)
+                         (conj opened {:kind :list :w (+ indent (count marker) off) :empty? blank-rest?})))))
+
+            :else [opened state]))))))
+
+(declare directive-fence-re)
+
+(defn- scan-fence-line
+  "`[scan inside?]`: the scan state `scan` (`{:cs containers :fence close-re
+  :para? bool}`) after `line`, and whether `line` is inside an open fence --
+  strictly after its opener, through its closer."
+  [{:keys [cs fence para?] :as scan} ^String line]
+  (let [[m state] (continue-containers line cs)
+        all? (= (long m) (count cs))
+        [i _ pad] state
+        text (str (apply str (repeat pad \space)) (subs line i))]
+    (cond
+      (and fence all?)
+      [(cond-> scan (re-matches fence text) (assoc :fence nil)) true]
+
+      ;; a directive's own fence line ends everything around it
+      (re-matches directive-fence-re line)
+      [{:cs [] :fence nil :para? false} false]
+
+      :else
+      (let [cs (cond-> cs (not all?) (subvec 0 m))
+            ;; an item continued by a line with content is no longer empty
+            cs (mapv #(cond-> %
+                        (and (:empty? %) (str/blank? line)) (assoc :blank? true)
+                        (and (:empty? %) (not (str/blank? line))) (assoc :empty? false))
+                     cs)
+            para? (and para? (not fence))
+            setext? (and para? all? (re-matches setext-underline-re text))]
+        (if setext?
+          [{:cs cs :fence nil :para? false} false]
+          (let [[opened [i' col' pad']] (open-containers line state (and para? all?))
+                rest-text (str (apply str (repeat pad' \space)) (subs line i'))
+                [_ col1] (take-columns line [i' col' pad'] Long/MAX_VALUE)
+                indented? (>= (- (long col1) (long col')) 4)
+                cs' (into cs opened)
+                close-re (when-not indented? (code-fence-open rest-text))
+                plain? (and (not (str/blank? rest-text)) (not close-re)
+                            (not (re-find atx-heading-re rest-text))
+                            (not (re-matches thematic-break-re rest-text)))
+                lazy? (and (not all?) para? (empty? opened) plain?)]
+            (cond
+              lazy? [{:cs (into cs (subvec (vec (:cs scan)) m)) :fence nil :para? true} false]
+              close-re [{:cs cs' :fence close-re :para? false} false]
+              (and plain? indented? (seq opened)) [{:cs cs' :fence nil :para? false} false]
+              plain? [{:cs cs' :fence nil
+                       :para? (or (not indented?) (and para? all? (empty? opened)))}
+                      false]
+              :else [{:cs cs' :fence nil :para? false} false])))))))
 
 (defn- annotate-code-fences
   "`lines` (the whole document body's raw lines) paired one-for-one with a
@@ -4123,13 +4482,25 @@
   skip a colon run that is really code-block content rather than a genuine
   directive fence."
   [lines]
-  (loop [i 0 open nil acc []]
+  (loop [i 0 scan {:cs [] :fence nil :para? false} acc []]
     (if (>= i (count lines))
       acc
-      (let [line (nth lines i)]
-        (if open
-          (recur (inc i) (when-not (re-matches open line) open) (conj acc [line true]))
-          (recur (inc i) (code-fence-open line) (conj acc [line false])))))))
+      (let [line (nth lines i)
+            [scan' inside?] (scan-fence-line scan line)]
+        (recur (inc i) scan' (conj acc [line inside?]))))))
+
+(defn- unclosed-code-fence-line
+  "The 1-based line (of `lines`, the document body's raw lines) on which the
+  code fence still open at the end of them was opened, nil when none is.
+  Only run to word an error, so it rescans rather than being kept by
+  `annotate-code-fences`."
+  [lines]
+  (loop [i 0 scan {:cs [] :fence nil :para? false} opened nil]
+    (if (>= i (count lines))
+      (when (:fence scan) opened)
+      (let [scan' (first (scan-fence-line scan (nth lines i)))]
+        (recur (inc i) scan'
+               (if (and (:fence scan') (not (:fence scan))) (inc i) opened))))))
 
 (def ^:private directive-fence-re
   "A directive fence line (sec5.5): up to 3 leading spaces (mirroring
@@ -4722,8 +5093,13 @@
                                  segs))]
       (if (>= i (count lines))
         (if open-len
-          (throw (ex-info "unterminated directive fence: no matching closing fence found"
-                          {:type ::unterminated-directive :open-line open-line :body-line open-line}))
+          (let [code-line (unclosed-code-fence-line (mapv first lines))]
+            (throw (ex-info (str "unterminated directive fence: no matching closing fence found"
+                                 (when code-line
+                                   (str " (the code fence opened on body line " code-line
+                                        " is never closed and swallowed the closing colon run)")))
+                            (cond-> {:type ::unterminated-directive :open-line open-line :body-line open-line}
+                              code-line (assoc :code-fence-line code-line)))))
           [(flush-text segments) i])
         (let [[line shielded?] (nth lines i)]
           (if-let [[len header] (and (not shielded?) (fence-line line))]
@@ -5385,6 +5761,21 @@
     (inst? data) "a date"
     :else "some other kind of value"))
 
+(defn text-scalar?
+  "True when the YAML value `v` reads as text: a string, or a scalar that
+  reads as text through `str` (a number, a boolean, a date -- an unquoted
+  `title: 2026` has always been the title \"2026\"), or a YAML null. A
+  `!!binary` byte array, a `!!set`, a map or a list is not (TASK-286:
+  `str` of those gave `[B@1b2c3d`, `#{...}`, ... as the title). Public for
+  `haselnuss.library.filesystem`, whose listing reports the same values."
+  [v]
+  (or (nil? v) (string? v) (number? v) (boolean? v) (inst? v)))
+
+(defn- text-values?
+  "`text-scalar?` of `v`, or, for an `author` list, of each element."
+  [v]
+  (if (sequential? v) (every? text-scalar? v) (text-scalar? v)))
+
 (defn- yaml-root-line
   "The line, in the whole file, where the YAML document `yaml-text`'s
   root value starts -- past any leading comments or blank lines -- or the
@@ -5498,6 +5889,23 @@
                     "; quote it to use it as a string"))
              {:key k :value v}))))
 
+(defn- front-matter-text
+  "Meta `cond->` step for the front-matter field `k` (a keyword) whose
+  value `v` is text written as `meta-key` by `(coerce v)` (`title`, `date`,
+  `author`/`authors`; TASK-286). A value that is not text (`ok?` says so:
+  `text-scalar?`, or `text-values?` for the authors)
+  is the located `::front-matter-not-a-string` error, or, with `omit?`,
+  left out of Meta for a caller that reports it itself."
+  [m k meta-key v ok? coerce yaml-text source omit?]
+  (cond
+    (ok? v) (assoc m meta-key (coerce v))
+    omit? m
+    :else (located-front-matter-error!
+           yaml-text (name k) source ::front-matter-not-a-string
+           (str "front-matter " (name k) " must be text, but this one is "
+                (cond (bytes? v) "binary data (!!binary)" (set? v) "a set" :else (yaml-kind v)))
+           {:key k :value v})))
+
 (defn- front-matter-top-level-division
   "Meta `cond->` step for the front-matter `topLevelDivision`: its Meta
   keyword, or an unknown value's located `::unknown-top-level-division`
@@ -5576,10 +5984,16 @@
        (when-not (or (nil? data) (map? data))
          (front-matter-not-a-map! yaml-text data source))
        (cond-> {}
-         (contains? data :title) (assoc :title (text->inlines (str (:title data))))
+         (contains? data :title)
+         (front-matter-text :title :title (:title data) text-scalar? #(text->inlines (str %))
+                            yaml-text source omit-invalid-front-matter?)
          (or (contains? data :author) (contains? data :authors))
-         (assoc :authors (coerce-authors (or (:authors data) (:author data))))
-         (contains? data :date) (assoc :date (coerce-date (:date data)))
+         (front-matter-text (if (:authors data) :authors :author) :authors
+                            (or (:authors data) (:author data)) text-values? coerce-authors
+                            yaml-text source omit-invalid-front-matter?)
+         (contains? data :date)
+         (front-matter-text :date :date (:date data) text-scalar? coerce-date
+                            yaml-text source omit-invalid-front-matter?)
          (contains? data :bibliography)
          (front-matter-bibliography data yaml-text source
                                     (or omit-non-path-bibliography? omit-invalid-front-matter?))

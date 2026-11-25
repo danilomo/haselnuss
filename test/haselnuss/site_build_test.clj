@@ -456,3 +456,43 @@
     (doseq [r more]
       (is (= (:files one) (:files r)) "byte-identical files")
       (is (= (:err one) (:err r)) "and the same messages"))))
+
+(deftest symlinked-out-of-root-shelf-rebuild-test
+  (testing "an edited shelf.clj behind a symlink out of the library root is seen by the next --build-site (TASK-286)"
+    (let [root (temp-dir)
+          pages (fn [dir] (tree (io/file dir "books") (constantly false)))
+          shelf-with (fn [slug]
+                       (str "{:books (fn [_] [" (when slug (str "{:slug \"" slug "\" :title \"T\"}")) "])\n"
+                            " :document (fn [_ _] {:meta {} :blocks [{:t :para :inlines [{:t :str :text \"ok\"}]}]})}\n"))
+          yaml (write! root "libraries.yaml" "- name: lib\n  type: filesystem\n  path: lib\n  scripts: true\n")
+          site-dir (io/file root "site")
+          build! (fn [dir] (main-run {} "--libraries" (str yaml) "--build-site" (str dir)))]
+      (write! root "lib/plain.hdoc" "---\ntitle: Plain\n---\n\nText.\n")
+      (write! root "elsewhere/s/shelf.clj" (shelf-with nil))
+      (let [p (.toPath (io/file root "lib/s"))
+            linked? (try (Files/createSymbolicLink p (.toPath (io/file root "elsewhere/s")) (make-array FileAttribute 0))
+                         true
+                         (catch UnsupportedOperationException _ false)
+                         (catch java.io.IOException _ false))]
+        (if-not linked?
+          (is true "symbolic links are not supported here")
+          (do
+            (is (= 0 (:status (build! site-dir))))
+            (is (not-any? #(str/includes? % "/s/") (keys (pages site-dir))) "no shelf books yet")
+            (testing "no edit: the no-change path"
+              (let [{:keys [status err]} (build! site-dir)]
+                (is (= 0 status) err)
+                (is (str/includes? err "0 of 1 book rebuilt") err)))
+            (doseq [[label slug] [["a book listed" "b"] ["emptied again" nil] ["a book listed again" "c"]]]
+              (testing label
+                ;; the file must differ in size or time from what the stamps saw
+                (Thread/sleep 1100)
+                (write! root "elsewhere/s/shelf.clj" (shelf-with slug))
+                (let [{:keys [status err]} (build! site-dir)
+                      fresh-dir (io/file root (str "fresh-" label))]
+                  (is (= 0 status) err)
+                  (is (= 0 (:status (build! fresh-dir))))
+                  (is (= (pages fresh-dir) (pages site-dir)) "the same pages as a fresh build")
+                  (is (= (some? slug)
+                         (contains? (pages site-dir) (str "lib/s/" slug "/index.html")))
+                      (str label ": " (keys (pages site-dir)))))))))))))

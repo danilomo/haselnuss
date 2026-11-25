@@ -246,16 +246,6 @@
                       (re-seq #"\[\^(\d+)\]:" src)))
        (boolean (some (fn [[n _]] (and (= :list (:t n)) (some empty? (:items n)))) (nodes doc)))))
 
-(defn- directive-after-list-code?
-  "NEW-4: a directive block right after a list whose last item ends in a fenced
-  block: written `\\n\\n!name`, it reads back as a paragraph."
-  [_src doc]
-  (boolean (some (fn [[n _]]
-                   (some (fn [[a b]] (and (= :list (:t a)) (= :directive (:t b))
-                                          (some #(= :code-block (:t %)) (last (:items a)))))
-                         (partition 2 1 (:blocks n))))
-                 (nodes doc))))
-
 (def known-gaps
   "Each gap: `:id`, `:ref` (where it is recorded), `:pred` over `[src doc]`
   (narrow: it must name the shape, not the symptom), `:repro` (a source that
@@ -272,8 +262,10 @@
     :repro "| h | i |\n|---|---|\n| \r | b |\n" :min 10}
    {:id :unreferenced-definition :ref "DRAFT-1 (4)/(5)" :pred unreferenced-definition?
     :repro "- a\n  - [^2]:\n" :min 0}
-   {:id :directive-after-list-code :ref "TASK-236 notes, NEW-4" :pred directive-after-list-code?
-    :repro "- ```\n  \n!aa\n  ```\n" :min 0}])
+   ;; NEW-4 (a `!name` line after a list item's fenced block read back as a
+   ;; paragraph) was the directive scanner not seeing a fence opened on a
+   ;; list marker's line; TASK-315 fixed it and its entry is gone.
+   ])
 
 (defn- gaps-of
   "Every gap whose predicate claims the failure (all of them, so an overlap is

@@ -968,6 +968,11 @@ A `filesystem` library is a folder tree, and the folder path is the book's shelf
 - The slug comes from the name on disk, never from front matter, and must be unique in the
   whole library (two books sharing one are a `duplicate-slug` warning, and a reference to
   that slug fails as `ambiguous-book`). Listing a library reads only front matter.
+- Front-matter `title`, `date` and `author`/`authors` must be text (a string, number,
+  boolean or date, or a list of those for authors); a `!!binary`, set, map or list is an
+  error when the document is parsed (so `--build-site` gives that book an `emit-failed`
+  error and still builds the others), and an `invalid-front-matter` problem when listing,
+  where the book is titled by its slug.
 
 A book's canonical ID is `library:shelf/.../slug`, e.g. `reformed:confessions/reformed/
 heidelberg`, but a reference only needs `library:slug`; a shelf path that no longer
@@ -995,6 +1000,27 @@ file, network or process access, a 5 s timeout, output caps), every result is ch
 against the AST schema, and a failure costs only that shelf (`script-failed`,
 `invalid-generated-book`). The sandbox has no `parse-long`; parse digits with
 `read-string`.
+
+What a script prints is thrown away as it is printed, so a stray `println` in a loop
+costs time, never memory. (`print`, `println`, `printf`, `prn` and `flush` work; Java
+methods on `*out*` itself, such as `(.write *out* "x")`, are refused.) What it
+*allocates* while it runs is not bounded by the sandbox, only by the process's heap. This
+covers a mistake, not a script set on holding memory: a script that keeps building data
+until the heap is full is usually the one the out-of-memory error lands on, and then that
+call alone fails (`script-failed`, "... ran out of memory") -- kept for the build like a
+timeout, never saved -- and the build goes on. (An array over the VM's size limit fails
+the same way every run, so that failure is saved like any other.) But the error can just as
+well hit whatever else was allocating at that moment (another book of a parallel scan, a
+`--serve` request) and fail that instead; a script can even catch the error itself and
+keep the heap full while other work fails. Before the error comes, the process grows to
+its maximum heap -- 80% of RAM by default in the native binary -- collecting all the
+while. Data a script keeps in a `def` or an atom stays for the rest of the build. A heap
+limit makes a runaway script fail sooner and keeps the machine responsive meanwhile: give
+the native binary (`haselnuss -Xmx<size> --build-site ...`) or `java` a cap comfortably
+above what your builds themselves need -- a large site build holds several GB (see
+"Memory" under "Native binary"), and a cap below that fails the build. Bounding a script's
+memory reliably would take a separate process, which the sandbox is not (see "What this
+does and does not protect against" under "Author-defined extensions").
 
 Scripts are **off by default**. Only the library's own entry can switch them on --
 no document can:
@@ -1105,14 +1131,16 @@ A broken reference otherwise only shows when someone builds the book holding it.
 ```
 haselnuss --libraries libs.yaml --check                  # every library of the directory
 haselnuss --libraries libs.yaml --check reformed bible   # only these
+haselnuss --libraries libs.yaml --check reformed:heidelberg bible:romanos   # only these books
 haselnuss --libraries libs.yaml --check --format json    # for CI and tools
 ```
 
-It takes no input file. Each book is parsed and resolved exactly as an `html` build of it
-would be -- the same parse vocabulary, numbering and directives, and the same
-`--extensions` and `--transform` files when given (a transform rewrites each checked book,
-never the books it quotes or links to, as in a build) -- but nothing is lowered or
-emitted. It reports:
+It takes no input file. Its arguments are library names and book IDs, short or canonical,
+in any mix (an ID has a colon, a library name never does). Each book is parsed and
+resolved exactly as an `html` build of it would be -- the same parse vocabulary, numbering
+and directives, and the same `--extensions` and `--transform` files when given (a
+transform rewrites each checked book, never the books it quotes or links to, as in a
+build) -- but nothing is lowered or emitted. It reports:
 
 - the libraries' own problems: `duplicate-slug`, `invalid-book-name`, `scripts-disabled`,
   `script-failed`, `invalid-generated-book`, a library that failed to load
@@ -1123,7 +1151,38 @@ emitted. It reports:
   `ambiguous-book`, `unknown-label`, `bad-label-range`, `locator-unsupported`,
   `bad-locator`, `unavailable-library`, ..., and `quote-cycle` and `quote-too-deep` for
   quotes that nest back into themselves or deeper than 8 levels;
-- `stale-shelf` notes, at info level.
+- `stale-shelf` notes, at info level;
+- `unsafe-url` and `event-handler-attribute` warnings: a link, image or poster, a URL
+  attribute (`[t]{href="javascript:1"}`), or an `on*` attribute, that the sanitizer would
+  drop from the book's own text (`[x](javascript:1)`), found by running the sanitizer's
+  pass over each book's resolved document. A book that has book links or quotes is also
+  run through the build's own expansion of them first (`@{...}` given the URL of its
+  library's `url:` template, `!quote` given the quoted passage and its source URL), so the
+  pass also finds a book link or a quote's source link whose template gives an unsafe URL
+  (`url: "javascript:alert('{slug}')"`) -- as building the book does; a site build links
+  its own pages and never reads `url:` -- and a link inside a quoted passage (and in the
+  passages that one quotes in turn, as deep as a build quotes, 8 levels, each passage
+  looked at once however many books quote it). Nothing is emitted and no extension runs.
+  They are placed at the book's entry file (a generated book's script), with no line.
+  Each drop is reported once per book however many quotes or links bring it, and a drop
+  written in a book's own text is reported at that book. A book that quotes it reports it
+  too only when the book it is written in is not in the same check (a check scoped away
+  from that library): when it is, that book reports it, and the quoting book does not
+  repeat it. The URL a template gives a `!quote` is written in the book that wrote the
+  `!quote`, so a book quoting a passage that holds such a quote does not repeat it either.
+  If that pass itself fails for a book, the book gets a `sanitize-failed` error instead,
+  so it never looks clean.
+
+`--check` does **not** report:
+
+- what an extension's output loses to the sanitizer, or any other warning only lowering
+  and emitting find, such as an image path a LaTeX build cannot typeset. Emitting runs
+  extension code and costs about as much as the scan again (a 3,000-book collection: scan
+  8 s, scan and emit 20 s), which a read-only check does not do.
+
+Build the book (`haselnuss lib:book`) or the site (`--build-site`) to see those. A clean
+`--check` is not a safety verdict: for LaTeX, `$\input{/etc/passwd}$` passes it, and a
+LaTeX build writes it verbatim unless `--untrusted` is given.
 
 The output is one line per problem, sorted by file then line, and a summary:
 
@@ -1177,11 +1236,44 @@ to load -- show only as far as the citing reference shows them (`book-failed`,
 `unavailable-library`), and fully when that library is checked itself. A cycle or chain of
 quotes through a book outside the named libraries is not followed either.
 
+**A named book** reports only its own problems: those of its source and included files, of
+its references, its sanitizer findings, and the quote cycles placed at its quotes -- the
+items `--check <its library>` reports for that book, with the two differences below.
+Problems of the books that refer to it are not reported (that is `--backlinks`), nor those
+of the books it only quotes or links to. Only the book and the books it quotes,
+transitively, are scanned; the books its links reach are read only as far as resolving
+them needs, so checking one book of a large collection costs about what building it does.
+The two differences: a link the sanitizer would drop from a passage it quotes is reported
+at the named book whenever the book the link is written in is not itself checked -- also
+when it is in the same library, where `--check <its library>` reports it at that book
+instead; and a quote nested too deep at the book's own `!quote` is left out, since only a
+build of a book that quotes it meets that chain, and finding it would mean scanning every
+book (`--check <its library>` reports it).
+
+A cycle or a chain of quotes too deep is placed at the `!quote` where a build meets it. So
+one that a build of the named book meets inside a book it quotes is placed at that book, and
+`--check <id>` does not report it: check that book, or the library (`--check <its
+library>` reports it). The build of the named book warns about it all the same.
+
+Named together with libraries, the libraries' books are checked in full as before, with
+two additions from the named books: a link dropped from a passage of a named book is
+reported at that book rather than at the library's books quoting it, and the quote cycles
+are found over the library's books together with the books the quotes of all the checked
+books reach in the named books' libraries. That finds every cycle `--check` of both
+libraries places at the checked books, but not a chain too deep that starts at a book of
+the named book's library the checked books' quotes never reach. A named book whose library is also named is
+checked with its library. The summary counts only what was named, the same book named
+twice (or by itself and through its library) once. An ID whose shelf path is stale checks
+the book, with an info on stderr; an ID with a passage (`reformed:heidelberg#sec:q1`), a
+malformed one, or one naming an unknown library, no book or several books (a shared slug)
+is exit 2, and nothing is checked.
+
 **Exit codes:** 0 when nothing worse than info was found, 1 when at least one warning or
 error was, and 2 when the check could not run: no library directory, one that cannot be
 read or is invalid, an `--extensions`/`--transform` file that cannot be loaded, an input
-file given (`--check takes no input file, only library names`), or a library the directory
-does not have (`unknown library "x"; known: a, b`). Build options a check does not use
+file given (`--check takes no input file, only library names and book IDs`), a library the
+directory does not have (`unknown library "x"; known: a, b`), or a book ID that names no one
+book. Build options a check does not use
 (`--target`, `--output`, ...) are warned about on stderr as having no effect.
 
 **`--format json`** prints one line (wrapped here for reading), a versioned envelope -- a
@@ -1413,7 +1505,9 @@ DIR/
   A preview that cannot be built is left out with a `preview-failed`
   warning. The preview is made from the linked book alone, so editing that book's text
   changes only its own `previews.json`, never the pages that link to it.
-- **A data file is written only when its bytes change**, so an unchanged `catalog/`,
+- **A data file is written only when its bytes change** (a build with `--full`, or whose
+  saved state is missing, unreadable or of another format, writes them all), so an
+  unchanged `catalog/`,
   `backlinks.json` or `previews.json` keeps its modification time, and one this build did
   not write (a book's that is gone, a catalog page beyond the last) is removed. Any other
   file under `catalog/` is left alone.
@@ -1473,15 +1567,28 @@ DIR/
   was given or withdrawn (an untrusted extension's output is sanitized, a trusted one's
   is not). `--full` is also the way
   past what stamps cannot see: a file edited and then given back its old size and
-  modification time (`touch -r`), or a file of the site edited by hand.
+  modification time (`touch -r`), or a file of the site edited by hand. To change the
+  modes of a site's files, run `--full` under the new umask: it replaces every file the
+  build writes with a new one, while folders and anything the build does not write keep
+  their modes.
+- **The first build after upgrading from a version that wrote owner-only (0600) site
+  files** replaces the existing outputs with files that have the umask's mode and your
+  default group, so a site that relied on narrower hand-set modes or a particular group
+  should set its umask or restrict a parent folder first.
 - **An interrupted build** (killed, or stopped by an error) leaves the previous state,
   and the list of the books it was rebuilding in `.haselnuss/pending`, so the next build
-  does its work again and the site ends up as an uninterrupted build would leave it.
+  does its work again and the site ends up as an uninterrupted build would leave it. File
+  modes are the exception for `--full`: plain builds do not finish what a killed `--full`
+  started, so some files keep their old mode until you run `--full` again. An interrupted
+  first build after the upgrade above needs no such step: the next build replaces every
+  output.
 
 It prints, on stderr, one line per book rebuilt or removed with the reason (and the
 books left unbuilt), the problems of the books it rebuilt exactly as `--check` prints
-them, and a summary that counts the warnings of every book, so a warning in a book this
-build did not touch is not forgotten (`--check` lists them all). A first build:
+them, and a summary that counts the warnings of every book. A warning in a book this
+build did not touch is still true, so it is printed again, its message ending in
+`(unchanged since the last build)`, and a repeat build of an unchanged library shows the
+warnings its summary counts (`--check` lists them all). A first build:
 
 ```
 rebuilt  bible:blivre/romanos           (full build)
@@ -1500,6 +1607,8 @@ rebuilt  bible:blivre/romanos           (source changed)
 rebuilt  reformed:catecismo-heidelberg  (a book it refers to changed)
 rebuilt  reformed:estudos/queda         (a book it refers to changed)
 skipped  reformed:notas                 (2 books share this id)
+test/fixtures/site/reformed/dangling.hdoc:9:1: warning: [unknown-book] bible:tobias#1:1: library "bible" has no book "tobias" (unchanged since the last build)
+reformed/notas: warning: [duplicate-slug] library "reformed" has more than one book with slug "notas": ... (unchanged since the last build)
 3 of 11 books rebuilt, 6 up to date, 2 not built; 2 warnings in 3 books
 ```
 
@@ -1520,6 +1629,55 @@ file that cannot be loaded; an input file given. A build that stops partway (the
 app's files or the state cannot be written) is 2 as well; a page that cannot be written
 is that book's `emit-failed` error. Build options a page does not use (`--target`, `--output`,
 `--no-stylesheet`, ...) are warned about on stderr as having no effect.
+
+#### Rebuilding one book: `--build-doc`
+
+While writing a book, `--build-doc` rebuilds only its page, faster than an incremental
+`--build-site`, which lists every library again and rebuilds every book that depends on it:
+
+```
+haselnuss --build-doc recipes:lasagna --site ~/haselnuss-site
+haselnuss --build-doc recipes:lasagna garden:potatoes --site ~/haselnuss-site
+
+export HASELNUSS_SITE=~/haselnuss-site
+haselnuss --build-doc recipes:lasagna
+```
+
+The arguments are book IDs, short or canonical, of filesystem or generated books; the same
+book named twice is built once. `--site DIR` names the site, `$HASELNUSS_SITE` stands in
+for it (and `--site` wins). The site must be one `--build-site` built, with the same
+library directory file, `--extensions`, `--transform` and `--trusted-extensions`, by the
+same Haselnuss version: otherwise the page would not match the rest of the site, and it
+is refused. Each page is built exactly as `--build-site` builds it, then written with its
+copied images (recorded in `.haselnuss/images`) under the build lock, each file by rename.
+Its `backlinks.json` is kept -- who refers to a book does not change when the book does --
+and its `previews.json` made again for the passages it already lists (one that no longer
+resolves is left out, with an info line); a book with no page yet gets empty ones. The
+catalog is left as it is.
+
+It never reads or writes the saved state. Each book it writes goes into
+`.haselnuss/pending` instead, and the record of an unchanged site is removed, so the next
+`--build-site` rebuilds that page and every book that depends on it, whatever the files
+say -- an edit undone in between included -- and the site is then byte for byte a clean
+build's. Until then, the books referring to a rebuilt one keep their old pages: each is
+printed as `stale`, from the book's own `backlinks.json`. It prints the problems a
+conversion of the book by its ID reports (not the whole `--check`; run `--check <ID>` for
+that), as `--check` prints them, and a summary:
+
+```
+rebuilt  bible:blivre/romanos           (requested)
+stale    reformed:catecismo-heidelberg  (refers to this book)
+1 book rebuilt, 1 dependent book not rebuilt; no warnings
+```
+
+**Exit codes:** 0 when every page was written with no warnings; 1 when a book has a
+warning or error -- a book whose page cannot be built is a `failed` line and an
+`emit-failed` error, keeps its old page and is not made pending, and the others are still
+written; 2 when it could not run, and nothing was written: no `--site` or
+`$HASELNUSS_SITE`, a folder that is not a site, no saved state, another version or other
+inputs than the site's, another build holding the lock, an unknown library or book, a
+slug two books share, a passage, an `--extensions`/`--transform` file that cannot be
+loaded.
 
 #### Serving a site
 
@@ -1566,23 +1724,8 @@ and port (another site, another port such as `http://localhost:3000`, or `null`;
 left out is the scheme's default) answers `403` -- so a reverse proxy in front of the
 server must pass `Host` on unchanged, as `tailscale serve` does.
 
-It runs until stopped (Ctrl-C, or the service manager); as a systemd user service,
-`~/.config/systemd/user/haselnuss.service`:
-
-```
-[Unit]
-Description=Haselnuss library server
-
-[Service]
-ExecStart=%h/bin/haselnuss --serve %h/haselnuss-site --port 8080 --host home.tailnet-name.ts.net
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-then `systemctl --user enable --now haselnuss` and `tailscale serve --bg 8080`
-(`tailscale status` shows the machine's name; replace `home.tailnet-name.ts.net` with it).
+It runs until stopped (Ctrl-C, or the service manager). "Hosting at home" below runs it
+as a systemd user service behind `tailscale serve`.
 
 **Memory.** The server keeps the catalog in memory for the search, about 28 MB for 50,000
 books (on the JVM; key names and repeated values such as the library are held once), and
@@ -1694,6 +1837,88 @@ in the middle of a page or a reading session.
 `.haselnuss/state/` or no `catalog/index.json`; run `--build-site` first), or the address
 cannot be listened on. Options it does not use (`--libraries`, `--target`, ...) are warned
 about; `--port` and `--bind` without `--serve` are usage errors.
+
+#### Hosting at home
+
+One always-on machine runs `--serve` behind `tailscale serve`, which gives it an HTTPS
+name that every family device on the tailnet can install the reader from, at home or
+away. The site folder is all the build and the server share, so building never needs the
+server stopped.
+
+**1. Tailscale.** [Install Tailscale](https://tailscale.com/download) on the home machine
+and on each device. Sign the devices in to your account, or invite family members and
+share the machine with them. In the admin console's
+[DNS page](https://console.tailscale.com/admin/dns), enable MagicDNS and, under HTTPS
+Certificates, Enable HTTPS. **That publishes the machine's name and the tailnet's name in
+the public Certificate Transparency log**, so rename a machine whose name says something
+private first. `tailscale status` shows the name; below it is `home.tailnet-name.ts.net`.
+
+**2. Install and build once.** From this repository (`bin/native` needs GraalVM, see
+"Native binary"), with your libraries in `~/.config/haselnuss/libraries.yaml` (if they
+live elsewhere, add `--libraries path/to/libraries.yaml` to every `--build-site` below, or
+set `$HASELNUSS_LIBRARIES`; `--serve` does not read them):
+
+```sh
+./bin/native
+install -D dist/haselnuss ~/bin/haselnuss
+~/bin/haselnuss --build-site ~/haselnuss-site
+```
+
+**3. Run the server as a user service.** Write
+`~/.config/systemd/user/haselnuss.service`, with your machine's name after `--host`:
+
+```ini
+[Unit]
+Description=Haselnuss library server
+
+[Service]
+ExecStart=%h/bin/haselnuss --serve %h/haselnuss-site --port 8080 --host home.tailnet-name.ts.net
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now haselnuss
+loginctl enable-linger "$USER"     # start at boot and keep running after you log out
+systemctl --user status haselnuss  # its log: journalctl --user -u haselnuss
+```
+
+Without `enable-linger` a user service starts only when you log in and stops when you log
+out. No heap flag is needed (see "Memory" above).
+
+**4. Put HTTPS in front.**
+
+```sh
+tailscale serve --bg 8080
+tailscale serve status
+```
+
+`--bg` keeps it across reboots. Forwarding a port does not need root, but Tailscale may
+refuse until your user is its operator: `sudo tailscale set --operator="$USER"`.
+
+**5. Install it on each device.** Open `https://home.tailnet-name.ts.net` and install from
+that home page, the cover grid, not from inside a book: a book page does not yet carry the
+app's manifest, so Chrome says "This app cannot be installed" there and iOS saves a plain
+bookmark. On an iPhone or iPad, in Safari: Share, then Add to Home Screen. On Android, in
+Chrome: the menu, then Install app. A device keeps a book for offline reading once it has opened that book while
+connected.
+
+**Afterwards.** Run `~/bin/haselnuss --build-site ~/haselnuss-site` whenever the books
+change; the server picks the new build up by itself. After building a new binary, run
+`install -D dist/haselnuss ~/bin/haselnuss` and `systemctl --user restart haselnuss`.
+
+**Without Tailscale.** `--bind 0.0.0.0` serves the LAN over plain HTTP, by the machine's
+address (`http://192.168.1.5:8080/`) or by a name given with `--host` (`--host pi.local`).
+Family members can browse and keep their place, but phones will **not install the app or
+keep books offline**, which need HTTPS. Use it only on a network you trust: nothing is
+encrypted, anyone on it can read every book and pick any reader, and with no proxy in
+front the server reads a request line into memory with no size limit, so one client
+sending an endless line can hold memory on each of its 8 threads for up to 30 seconds at
+a time.
 
 ### Overlays
 
@@ -2013,7 +2238,11 @@ The file is evaluated in a sandbox with **no host interop, no file reads, no pro
 execution, and no `require` reaching anything on this machine's classpath** — an attempt
 at any of these is refused, and a build that never terminates is stopped rather than left
 to hang. Output a directive's renderer produces is capped in size, and anything the file
-itself prints during evaluation is captured rather than mixed into the build's own output.
+itself prints during evaluation is discarded as it is printed: never mixed into the build's
+own output, and never held in memory. The print functions (`print`, `println`, `printf`,
+`prn`, `pr`, `flush`, `newline`) work as usual; Java methods called on `*out*` or `*err*`
+directly (`.write`, `.append`, `.flush`, `.close`) are refused, and `(str *out*)` does not
+give back what was printed.
 An extension entry that does not match the expected shape is refused with an error naming
 the file.
 
@@ -2109,7 +2338,13 @@ their own file: it is built to catch a mistake — a typo that tries to read a f
 copy-pasted loop that never terminates, a stray debug `println` — not to withstand a
 determined attacker. It does not run in a separate, killable process, so a single runaway
 computation inside the sandbox is stopped from hanging the *build*, but is not guaranteed
-to be reclaimed instantly. Treat `--extensions` the way you would treat running someone
+to be reclaimed instantly. Nor is memory bounded: the sandbox caps what a call prints
+(discarded) and returns (the size caps), not what it allocates while it runs, so a file
+that keeps building a larger and larger value can take the whole process's heap. When
+that is a mistake, the out-of-memory error that ends it usually lands on that call, which
+then fails the build with an error naming it ("... ran out of memory"), but it can land on
+any other thread allocating at that moment instead -- and a file set on holding the heap
+can catch the error itself and carry on. Treat `--extensions` the way you would treat running someone
 else's script directly: fine for your own files, or a collaborator's; not a boundary for
 converting a document from someone you do not trust.
 
@@ -2198,7 +2433,8 @@ same atomicity and refusal guarantees `--in-place` above already has, unchanged 
 The sidecar file runs in the identical sandbox `--extensions` uses — shared as one forked
 context per build when a run passes both flags — so the same bounds apply verbatim: no host
 interop, no file reads, no process execution, no `require` reaching this machine's
-classpath, a wall-clock timeout, and captured, size-capped output. `--trusted-extensions`
+classpath, a wall-clock timeout, size-capped results, printed output discarded, and no
+bound on what a rule allocates beyond the process's heap. `--trusted-extensions`
 grants a `--transform` rule nothing at all: a rule's return value is plain AST data only — a
 node, `nil`, or a sequence of nodes — never `haselnuss.ext/raw`'s verbatim escape hatch, so
 there is nothing here for that flag to gate. **What this does and does not protect against**
@@ -2207,7 +2443,9 @@ for an author running their own file: it is built to catch a mistake — a typo 
 read a file, a copy-pasted loop that never terminates, a stray debug `println` — not to
 withstand a determined attacker. It does not run in a separate, killable process, so a
 single runaway computation inside the sandbox is stopped from hanging the *build*, but is
-not guaranteed to be reclaimed instantly. Treat `--transform` the way you would treat
+not guaranteed to be reclaimed instantly, and a rule that fills the heap fails the build
+with "... ran out of memory" only when the error lands on the rule's own call rather than
+on another thread, and the rule does not catch it itself. Treat `--transform` the way you would treat
 running someone else's script directly: fine for your own files, or a collaborator's; not a
 boundary for converting a document from someone you do not trust.
 

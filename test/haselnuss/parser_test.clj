@@ -83,6 +83,7 @@
   each resolving to their own correct definition (AC #3)."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [haselnuss.ast :as ast]
             [haselnuss.parser :as parser]
             [haselnuss.resolver :as resolver]))
@@ -3914,3 +3915,236 @@
       (is (< 8000 (count (filter #(and (lookalike? %) (not (heading-line? %))) firsts)))
           "heading lookalikes answered by the pre-check")
       (is (< 10000 (count (remove lookalike? firsts))) "other lines answered by the pre-check"))))
+
+;; --- TASK-315: a fence opened on a list marker's line, inside a directive -----
+
+(defn- in-directive
+  "`body` wrapped in a `note` directive."
+  [^String body]
+  (str ":::{note}\n" body ":::\n"))
+
+(defn- directive-blocks [doc] (:blocks (first (:blocks doc))))
+
+(defn- same-blocks?
+  "Whether two block vectors are equal, a code block's final line break
+  aside: a fence left open at the end of the text ends without one, and a
+  directive's body ends where the directive does (pre-existing, and the same
+  for a top-level fence)."
+  [a b]
+  (let [norm (fn norm [x]
+               (cond
+                 (and (map? x) (= :code-block (:t x))) (update x :text str/replace #"\n+$" "")
+                 (map? x) (update-vals x norm)
+                 (sequential? x) (mapv norm x)
+                 :else x))]
+    (= (norm a) (norm b))))
+
+(defn- code-blocks
+  "Every `:code-block` node anywhere in `x`, in document order."
+  [x]
+  (cond
+    (map? x) (if (= :code-block (:t x)) [x] (mapcat code-blocks (vals x)))
+    (sequential? x) (mapcat code-blocks x)
+    :else nil))
+
+(deftest list-item-fence-inside-directive-test
+  (testing "TASK-315: a fence opened on a list marker's line parses inside a directive exactly as outside it"
+    (doseq [[label body]
+            [["bullet -" "- ```text\n  x\n  ```\n"]
+             ["bullet *" "* ```text\n  x\n  ```\n"]
+             ["bullet +" "+ ```text\n  x\n  ```\n"]
+             ["ordered 1." "1. ```text\n   x\n   ```\n"]
+             ["ordered 1)" "1) ```text\n   x\n   ```\n"]
+             ["2 spaces after marker" "-  ```text\n   x\n   ```\n"]
+             ["4 spaces after marker" "-    ```text\n     x\n     ```\n"]
+             ["tab after marker" "-\t```text\n    x\n    ```\n"]
+             ["tilde fence" "- ~~~\n  x\n  ~~~\n"]
+             ["longer fence" "- ````\n  ```\n  x\n  ````\n"]
+             ["closing fence indented 3 past content" "- ```\n  x\n     ```\n"]
+             ["nested lists" "- a\n  - ```text\n    x\n    ```\n  - b\n"]
+             ["marker on marker" "- - ```text\n    x\n    ```\n"]
+             ["ordered in bullet" "- 1. ```\n     x\n     ```\n"]
+             ["colon run inside the code" "- ```\n  :::\n  ```\n"]
+             ["colon run after a blank line in the code" "- ```\n  a\n\n  :::\n  ```\n"]
+             ["list item in a quote" "> - ```text\n>   x\n>   ```\n"]
+             ["quote in a list item" "- > ```text\n  > x\n  > ```\n"]
+             ["fence ended by dedent" "- ```\n  x\n\ntext\n"]
+             ["closing fence with too few backticks" "- ````\n  x\n  ```\n  y\n  ````\n"]
+             ["backtick in the info string" "- ```a`b\n  x\n"]
+             ["indented code, not a fence" "-      ```\n       x\n"]]]
+      (let [outside (parser/parse body)
+            inside (parser/parse (in-directive body))]
+        (is (same-blocks? (:blocks outside) (directive-blocks inside)) label))))
+  (testing "the code block is inside the list item inside the directive"
+    (let [d (parser/parse (in-directive "- ```text\n  x\n  ```\n"))
+          item (-> d directive-blocks first :items first)]
+      (is (= :directive (:t (first (:blocks d)))))
+      (is (= [{:t :code-block :text "x\n" :lang "text"}]
+             (map #(select-keys % [:t :text :lang]) item)))))
+  (testing "a directive nested in a directive, a list-item fence in the inner one"
+    (let [d (parser/parse "::::{note}\n:::{warning}\n1. ```\n   :::\n   ```\n:::\n::::\n")
+          inner (first (:blocks (first (:blocks d))))]
+      (is (= :directive (:t inner)))
+      (is (= [":::\n"] (map :text (code-blocks inner))))))
+  (testing "a closing colon run after a dedent still closes the directive"
+    (let [d (parser/parse (in-directive "- ```\n  x\n"))]
+      (is (= ["x"] (map :text (code-blocks (:blocks d)))))))
+  (testing "what CommonMark does not read as a fence still shows a directive fence"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (parser/parse ":::{note}\n- ```a`b\n:::\n:::\n")))
+    ;; indented code: the marker line is not an opener, so the colon line closes
+    (is (= 1 (count (:blocks (parser/parse (in-directive "-      ```\n       :::\n"))))))))
+
+(deftest container-fence-inside-directive-test
+  (testing "TASK-321: where a fence opens and closes follows the list items and quotes around it"
+    (doseq [[label body]
+            [["fence line in an item that did not open it, ended by a dedent" "- a\n  ```\nx\n"]
+             ["the same, after text in the fence" "- a\n  ```\n  x\ny\n"]
+             ["blank line then a fence line in the item" "- ```\n  x\n\n   ```\n"]
+             ["quote fence closed by a blank line, then a list-indented fence line" "- > ```\n  > x\n\n  ```\n"]
+             ["`7.` is no list start after a paragraph" "para\n7. ```\nx\n"]
+             ["`7.` is one at the top" "7. ```\n   x\n   ```\n"]
+             ["a quote fence ended by a dedent" "> ```\n> x\ny\n"]
+             ["a quote fence with colons, a lazy line" "> ```\n> :::\n> ```\n"]
+             ["a lazy line keeps the quote" "> a\nb\n> ```\n> x\n> ```\n"]
+             ["tab after the marker, content indented by a tab" "-\t```\n\tx\n\t```\n"]
+             ["tab after the marker, content dedented under it" "-\t```\n    x\n    ```\n"]
+             ["sibling item ends the fence" "- ```\n  x\n- y\n"]
+             ["a heading before a `7.` that cannot interrupt a paragraph" "# h\n7. ```\n   x\n   ```\n"]
+             ["an empty item, a blank line, then a nested list opening a fence" "-\n  \n  * ```\n    x\n    ```\n"]
+             ["setext underline is no list marker" "para\n-\n```\nx\n```\n"]]]
+      (let [outside (parser/parse body)
+            inside (parser/parse (in-directive body))]
+        (is (same-blocks? (:blocks outside) (directive-blocks inside)) label))))
+  (testing "a fence the container does not end still swallows the directive's closing colon run"
+    ;; the task's repros (3) and (4): the indented fence line opens a fence of
+    ;; its own, and the unwrapped text holds one that runs to the end
+    (doseq [body ["para\n7. ```\n\n   ```\n" "-\t```\n  x\n  ```\n" "-\n  \n  ```\n  x\n"]]
+      (is (thrown? clojure.lang.ExceptionInfo (parser/parse (in-directive body))) (pr-str body))
+      (is (seq (code-blocks (:blocks (parser/parse body)))) (pr-str body))))
+  (testing "a dedented fence line after a heading in an item opens a fence that swallows the closing colon run"
+    (let [body "- # h\ntext\n  ```\n  x\n"
+          e (try (parser/parse (in-directive body)) nil (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? e))
+      (is (= 4 (:code-fence-line (ex-data e))) "the fence opens on line 4 of the document, after `:::{note}`")
+      (is (re-find #"code fence opened on body line 4 .*swallowed" (ex-message e)))))
+  (testing "an empty item followed by a blank line is closed: the fence after it is the top level's"
+    (let [body "***\n-\n  \n  ````\n+ ```x\n-\t```x\n      :::\n"]
+      (is (thrown? clojure.lang.ExceptionInfo (parser/parse (in-directive body))))
+      (is (some? (parser/parse body))))))
+
+(defn- fence-fuzz-docs
+  "`n` seeded documents: a nest of 0-3 containers (bullet, ordered or quote
+  marker; 1-5 spaces or a tab after a list marker; an ordered marker that may
+  not start at 1) opening a fence on the last marker's line, maybe after a
+  paragraph line, a few body lines (`QQQ` stands for a colon run, which the
+  test puts back only in the document it wraps in a directive) each prefixed
+  to stay in the containers, to leave all or some of them, or to be indented
+  a little too far or short, a closing fence of random length and prefix or
+  none, and maybe more lines after it (TASK-321 generates the dedented,
+  partly dedented, tab and `7.` shapes TASK-315's version avoided)."
+  [seed n]
+  (let [r (java.util.Random. seed)
+        pick (fn [xs] (nth xs (.nextInt r (count xs))))
+        coin (fn [p] (< (.nextDouble r) p))
+        spaces (fn [k] (apply str (repeat k \space)))]
+    (vec
+     (for [_ (range n)]
+       (let [levels (vec (repeatedly (.nextInt r 4)
+                                     #(case (int (.nextInt r 3))
+                                        0 {:open (pick ["-" "*" "+"]) :sp (pick [1 1 2 3 4 5 :tab])}
+                                        1 {:open (pick ["1." "1)" "7." "10."]) :sp (pick [1 1 2 3 4 :tab])}
+                                        2 {:open ">" :sp 1})))
+             indent0 (pick [0 0 0 1 2 3])
+             ;; each level's opener text and the columns its content is indented,
+             ;; tab stops of 4 counted from column 0
+             widths (loop [ls levels col indent0 acc []]
+                      (if-let [{:keys [open sp]} (first ls)]
+                        (let [len (count open)
+                              [text w] (cond
+                                         (= ">" open) ["> " 2]
+                                         (= :tab sp) (let [c (+ col len)] ["\t" (+ len (- 4 (rem c 4)))])
+                                         :else [(spaces sp) (+ len (if (>= sp 5) 1 sp))])]
+                          (recur (rest ls) (+ col w) (conj acc {:open open :text (str open text) :w w :quote? (= ">" open)})))
+                        acc))
+             lead (pick ["" "" "para\n" "para\n" "# h\n" "-\n" "-\n  \n" "***\n" "para\n---\n" "para\n===\n" "- a\n\n"])
+             opener (str (spaces indent0) (apply str (map :text widths)))
+             prefix-of (fn [ws] (str (spaces indent0)
+                                     (apply str (for [{:keys [w quote?]} ws] (if quote? "> " (spaces w))))))
+             cont (prefix-of widths)
+             ;; what a line starts with: the containers' own prefix, none of
+             ;; it, only the first few levels', a column too many or too few
+             line-prefix (fn []
+                           (case (int (.nextInt r 8))
+                             (0 1 2 3) cont
+                             4 ""
+                             5 (prefix-of (take (.nextInt r (inc (count widths))) widths))
+                             6 (str cont (spaces (inc (.nextInt r 3))))
+                             7 (if (str/ends-with? cont " ") (subs cont 0 (dec (count cont))) cont)))
+             ch (pick ["`" "~"])
+             len (+ 3 (.nextInt r 3))
+             fence (apply str (repeat len ch))
+             info (pick ["" "" "text" " clj" "a`b"])
+             other (apply str (repeat 3 (if (= ch "`") "~" "`")))
+             body (for [_ (range (.nextInt r 5))]
+                    (if (coin 0.15)
+                      (pick ["" "" " " (prefix-of (take 1 widths))])
+                      (str (line-prefix) (pick ["x" "QQQ" "QQQ" "  y" "``" fence other "   ```" "# h" "---" "===" "***" "-" "+" "1." "7." (if (= "a`b" info) "~~" other)]))))
+             ;; no closing line after a backtick info string that is no info
+             ;; string (the opener is then a paragraph)
+             close (when (and (coin 0.8) (not= "a`b" info))
+                     (str (line-prefix)
+                          (spaces (.nextInt r 4))
+                          (apply str (repeat (+ (dec len) (.nextInt r 3)) ch))))
+             after (pick [nil nil "\ntext" "\n- item" "\n7. item" "\n> q"])]
+         (str lead opener fence info "\n"
+              (apply str (map #(str % "\n") body))
+              (when close (str close "\n"))
+              (when after (str after "\n"))))))))
+
+(deftest list-item-fence-inside-directive-fuzz-test
+  (testing "TASK-315: over a seeded fuzz of fence-in-container documents, wrapping one in a
+            directive changes nothing: the same blocks inside, an unterminated directive
+            exactly when a fence still open at the end of the document (as flexmark sees
+            it, with a sentinel line after it) swallows the closing colon run"
+    (let [bad (atom [])
+          hits (atom {:list-fence 0 :swallowed 0 :compared 0 :quote 0 :colons-in-code 0 :tab 0 :lazy-ordered 0 :heading 0 :empty-item 0})]
+      (doseq [d (fence-fuzz-docs 321 6000)]
+        (let [outside (parser/parse d)
+              ;; a fence that is open at the end of the input holds the sentinel
+              swallowed? (some #(str/includes? (:text %) "SENTINEL")
+                               (code-blocks (:blocks (parser/parse (str d "SENTINEL\n")))))
+              colons (str/replace d "QQQ" ":::")
+              inside (try (parser/parse (in-directive colons))
+                          (catch clojure.lang.ExceptionInfo e e))
+              ;; the placeholder reads as a colon run only inside code
+              in-code? (= (count (re-seq #"QQQ" (pr-str (:blocks outside))))
+                          (count (re-seq #"QQQ" (pr-str (map :text (code-blocks (:blocks outside)))))))]
+          (cond
+            (not in-code?) nil
+            swallowed? (when-not (instance? clojure.lang.ExceptionInfo inside) (swap! bad conj d))
+            (instance? Exception inside) (swap! bad conj d)
+            (not (same-blocks? (walk/postwalk #(if (string? %) (str/replace % "QQQ" ":::") %) (:blocks outside))
+                               (directive-blocks inside)))
+            (swap! bad conj d))
+          (when (re-find #"(?m)^[>\s]*(?:(?:[-*+]|\d[.)])\s+)+[`~]{3}" d)
+            (swap! hits update :list-fence inc))
+          (when swallowed? (swap! hits update :swallowed inc))
+          (when (and (not swallowed?) in-code?)
+            (swap! hits update :compared inc)
+            (when (str/includes? d "QQQ") (swap! hits update :colons-in-code inc)))
+          (when (re-find #"(?m)^>" d) (swap! hits update :quote inc))
+          (when (re-find #"(?m)^[^\n]*[-*+.)]\t[`~]{3}" d) (swap! hits update :tab inc))
+          (when (re-find #"(?m)^[^\n]*(?:# h|---|===|\*\*\*)$" d) (swap! hits update :heading inc))
+          (when (re-find #"(?m)^[ >]*(?:[-+]|\d[.)])\s*\n" d) (swap! hits update :empty-item inc))
+          (when (re-find #"(?m)^para\n[^\n]*\d[.)] +[`~]{3}" d) (swap! hits update :lazy-ordered inc))))
+      (is (empty? @bad) (str "first mismatch: " (pr-str (first @bad))))
+      (is (< 500 (:list-fence @hits)) (pr-str @hits))
+      (is (< 100 (:swallowed @hits)) (pr-str @hits))
+      (is (< 1500 (:compared @hits)) (pr-str @hits))
+      (is (< 300 (:quote @hits)) (pr-str @hits))
+      (is (< 300 (:colons-in-code @hits)) (pr-str @hits))
+      (is (< 100 (:tab @hits)) (pr-str @hits))
+      (is (< 100 (:lazy-ordered @hits)) (pr-str @hits))
+      (is (< 300 (:heading @hits)) (pr-str @hits))
+      (is (< 300 (:empty-item @hits)) (pr-str @hits)))))

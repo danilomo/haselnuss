@@ -395,12 +395,12 @@
   (testing "a copy is streamed with its digest, and stops at the limit if the file grew"
     (let [dir (temp-dir)
           src (write! dir "a.png" png-a)
-          out (.toPath (io/file dir "out.png"))]
-      (is (= (:digest (state/file-stamp src)) (site/copy-image! (.toPath src) out)))
-      (is (bytes= src (.toFile out)))
+          out (io/file dir "out.png")
+          copy! #(with-open [o (io/output-stream out)] (site/copy-image! (.toPath src) o))]
+      (is (= (:digest (state/file-stamp src)) (copy!)))
+      (is (bytes= src out))
       (with-redefs [site/max-image-bytes 5]
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"grew past 5 bytes"
-                              (site/copy-image! (.toPath src) out)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"grew past 5 bytes" (copy!)))
         (is (nil? (site/image-digest dir ["a.png"])) "and is not digested")))))
 
 (deftest changed-image-books-test

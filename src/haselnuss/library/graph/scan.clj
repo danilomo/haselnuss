@@ -145,6 +145,10 @@
   scope still resolve -- the directory holds every library -- so a
   dangling cross-library reference is caught on the citing book.
 
+  `with-quoted-books` (TASK-327) adds to such a graph the records of
+  named books and of every book they quote, transitively, without
+  scanning their libraries: `--check` of a book.
+
   The result also satisfies `haselnuss.library.graph/LibraryIndex`
   (`haselnuss.library.graph.libraries/library-indexed`), and the
   library-level diagnostics live in the library records -- not in a pseudo
@@ -368,6 +372,19 @@
   - `:on-scan-book`, a test seam: a fn called with the BookId of each book
     `scan-book` scans in this context, before it is scanned (TASK-244
     counts what `refresh` rescans with it).
+  - `:on-resolved`, a hook a caller may `assoc` onto the context
+    (`--check`, TASK-288, collects the sanitizer's findings with it): a fn
+    called with the BookId, the resolved document map
+    (`passage/resolved-book`'s), the book's entry file (`book-file`: a
+    filesystem book's entry file, a generated book's script, else nil)
+    and (TASK-307) `{:books :references}` -- the context's `:books` option
+    (what a build resolves quotes and book links with) and the book's
+    references (`outline`'s, `{:node :kind :label :order}`) -- of
+    each book `scan-book` scans successfully. A book read twice calls it
+    twice; a caller keying on the book replaces the earlier call with the
+    later one -- but a later read that fails never calls it, so the
+    earlier call stands beside the book's `:book-failed`. Its answer is ignored
+    and it must not throw.
   - `:directory-file`, with `:directory`: the path of the directory file
     it was loaded from, if any. With `:directory-opts` the context finds
     it itself. Kept, canonical, as `:directory-file`: a change to that
@@ -1036,6 +1053,8 @@
         {refs :references label-spans :label-spans} (outline document)
         scanned (mapv #(resolve-reference ctx id %) refs)
         {:keys [canonical links]} (book-files book)
+        _ (when-let [on-resolved (:on-resolved ctx)]
+            (on-resolved id resolved (book-file book) {:books (:books ctx) :references refs}))
         doc-hash (document-hash book document)]
     (cond-> {:id id
              :hash (files-hash canonical (book-digests book) document)
@@ -1383,6 +1402,72 @@
               [(libraries/library-indexed (registry/new-graph reg backend config)) records]
               listings)))))
 
+(defn- listed-book
+  "The Book `id` names in `ctx`'s scanned directory, found by library and
+  slug as a reference finds it, or nil when no one book is (an unknown
+  library or book, an ambiguous slug)."
+  [ctx id]
+  (let [dir (scan-directory ctx)
+        lib (when (and dir (string? (:library id))) (library/find-library dir (:library id)))
+        found (when (and (satisfies? library/Library lib) (string? (:slug id)))
+                (library/find-book lib (:slug id)))]
+    (when (satisfies? library/Book found) found)))
+
+(defn- quoted-ids
+  "The BookIds the `:quote` edges of `record` name: a resolved quote's
+  target (a derived one's too), a dangling one's when the scan knows its
+  book (`:unknown-label`, ...), else the one book listed under the library
+  and slug it writes -- the book a build checks such a quote against for a
+  cycle (`haselnuss.library.graph.check`'s `on-stack-candidates`)."
+  [ctx record]
+  (for [edge (:edges record)
+        :when (= :quote (:kind edge))
+        :let [id (or (get-in edge [:to :id])
+                     (let [parsed (book-ref/parse-book-ref (get-in edge [:to :written]))]
+                       (when-not (book-ref/malformed? parsed)
+                         (some-> (listed-book ctx (:id parsed)) library/book-entry :id))))]
+        :when id]
+    id))
+
+(defn with-quoted-books
+  "`g`, a graph scanned in `ctx` (`scan`'s), with the record of each book
+  `ids` names and of every book those quote, transitively (TASK-327:
+  `--check` of named books, doc-13 section 3): what `haselnuss.library.
+  graph.check/quote-problems` needs to find the quote cycles through
+  them, and no more. A book whose record `g` holds already is not scanned
+  again; its edges are followed all the same. Each book is found by
+  library and slug in the scanned directory (`listed-book`); an id none
+  is listed under is skipped. The quotes followed are `quoted-ids`',
+  level by level, `:threads` books at a time (`scan`'s option).
+
+  `opts`' `:keep?`, a predicate on a BookId (default: every one), says
+  whose records are written into `g`: a book it rejects is still scanned,
+  so its quotes are followed past it, but `g` does not get its record.
+  `--check` keeps only the books of the libraries it checks, so that the
+  graph holds what a check of those libraries holds of them."
+  ([ctx g ids] (with-quoted-books ctx g ids {}))
+  ([ctx g ids {:keys [keep?] :or {keep? (constantly true)} :as opts}]
+   (let [in-graph (graph/indexed-books g)
+         threads (scan-threads opts)]
+     (loop [g g
+            frontier (vec (distinct ids))
+            seen (set frontier)]
+       (if (empty? frontier)
+         g
+         (let [found (into [] (keep #(if (contains? in-graph %)
+                                       ;; what `quoted-ids` reads of it
+                                       {:id % :edges (graph/edges-from g %)}
+                                       (listed-book ctx %)))
+                           frontier)
+               records (in-parallel #(if (satisfies? library/Book %) (scan-book ctx %) %) found threads)
+               g (reduce (fn [g record]
+                           (if (and (not (contains? in-graph (:id record))) (keep? (:id record)))
+                             (graph/with-book g record)
+                             g))
+                         g records)
+               next-ids (into [] (comp (mapcat #(quoted-ids ctx %)) (remove seen) (distinct)) records)]
+           (recur g next-ids (into seen next-ids))))))))
+
 (defn listing-caches
   "`{library-name cache}`: the listing cache (`haselnuss.library.filesystem/
   listing-cache`) of every filesystem library of `ctx`'s scanned
@@ -1429,17 +1514,51 @@
         lib (when dir (library/find-library dir lib-name))]
     (when (satisfies? library/Library lib) (library-root lib))))
 
+(defn- script-changed?
+  "True when one of the library diagnostics `diagnostics` is about a
+  `shelf.clj` (`:script`) that is one of `paths`, in either form
+  (`lookup-paths`). A generated shelf reached through a symbolic link that
+  leads out of the library root has a script no root contains, and one
+  that lists no books has no book claiming it; its failure (or its
+  disabled scripts) is what remembers it (TASK-286)."
+  [diagnostics paths]
+  (some (fn [d]
+          (let [script (:script d)]
+            (and (string? script) (some #(contains? paths %) (lookup-paths script)))))
+        diagnostics))
+
 (defn- libraries-to-relist
   "The names of the libraries `refresh` lists again: the library of every
-  book in `claimed`, and every recorded library whose root -- the one its
+  book in `claimed`, every recorded library whose root -- the one its
   record holds, or the one it has in `ctx`'s fresh directory (an
-  `:unavailable` record holds none) -- contains one of `paths`."
+  `:unavailable` record holds none) -- contains one of `paths`, and every
+  recorded library with a diagnostic about a generated shelf's script
+  that is one of `paths` (`script-changed?`)."
   [ctx g paths claimed]
-  (let [recorded (graph/indexed-libraries g)]
+  (let [recorded (graph/indexed-libraries g)
+        path-set (set paths)
+        roots-of (fn [lib-name]
+                   (keep identity [(:root (get recorded lib-name)) (fresh-root ctx lib-name)]))
+        all-roots (mapcat roots-of (keys recorded))
+        ;; TASK-286: a `shelf.clj` outside every library root, claimed by
+        ;; no book, may be a symlinked generated shelf that lists no books
+        ;; (valid and empty, or new), which nothing remembers; its library
+        ;; is not known, so every filesystem library is listed again
+        stray-script? (some (fn [^String p]
+                              (and (= generated/script-file-name (.getName (File. p)))
+                                   (not-any? #(under? % p) all-roots)))
+                            (remove #(or (seq (graph/books-for-file g %))
+                                         ;; a recorded failure remembers it
+                                         (some (fn [r] (script-changed? (:diagnostics r) #{%}))
+                                               (vals recorded)))
+                                    paths))]
     (into (into #{} (map :library) claimed)
           (for [lib-name (keys recorded)
-                :let [roots (keep identity [(:root (get recorded lib-name)) (fresh-root ctx lib-name)])]
-                :when (some (fn [p] (some #(under? % p) roots)) paths)]
+                :let [record (get recorded lib-name)
+                      roots (roots-of lib-name)]
+                :when (or (some (fn [p] (some #(under? % p) roots)) paths)
+                          (script-changed? (:diagnostics record) path-set)
+                          (and stray-script? (seq roots)))]
             lib-name))))
 
 (defn- relist
@@ -1607,11 +1726,31 @@
             {:graph g :rewritten #{}}
             candidates)))
 
+(defn- transient-books
+  "The books of `g` whose record holds a `library/transient?` diagnostic
+  (TASK-299) -- their own failure, or a reference's -- which `refresh`
+  scans again whatever their files say."
+  [g]
+  (into #{}
+        (keep (fn [[id record]] (when (some library/transient? (:diagnostics record)) id)))
+        (graph/indexed-books g)))
+
+(defn- transient-libraries
+  "The libraries of `g` whose record holds a `library/transient?`
+  diagnostic (a generated shelf whose script timed out listing), which
+  `refresh` lists again."
+  [g]
+  (into #{}
+        (keep (fn [[lib-name record]] (when (some library/transient? (:diagnostics record)) lib-name)))
+        (graph/indexed-libraries g)))
+
 (defn- refresh-files
   "`refresh` for the canonical `paths`, none of them the directory file."
   [ctx g paths]
-  (let [claimed (into #{} (mapcat #(graph/books-for-file g %)) paths)
-        relisted (libraries-to-relist ctx g paths claimed)
+  (let [claimed (-> #{}
+                    (into (mapcat #(graph/books-for-file g %)) paths)
+                    (into (transient-books g)))
+        relisted (into (libraries-to-relist ctx g paths claimed) (transient-libraries g))
         in-order (concat (filter relisted (directory-library-names (scan-directory ctx)))
                          (sort (remove (set (directory-library-names (scan-directory ctx))) relisted)))
         {g2 :graph :keys [rescanned vanished listing-changed status-changed?]}
@@ -1661,6 +1800,10 @@
      without scanning the book: so the refreshed graph is the one a
      fresh `scan` of the same files gives (a link into a deleted book
      dangles, a dangling one into a new book resolves).
+  3a. A record or library record holding a `library/transient?`
+     diagnostic (TASK-299: a generated shelf's script that timed out) is
+     scanned or listed again as if one of its files had changed: that
+     failure belonged to the run that met it, not to the book.
   4. `:rebuild` is `rebuild/affected-by` of the rescanned and removed
      books on the old graph merged with the same on the new one: the
      dependents of a deleted book, and the quoters of a book that just

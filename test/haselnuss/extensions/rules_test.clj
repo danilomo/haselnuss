@@ -18,6 +18,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [haselnuss.ast :as ast]
             [haselnuss.extensions.rules :as rules]
             [haselnuss.sandbox :as sandbox]
             [haselnuss.transform :as transform])
@@ -214,6 +215,176 @@
                                       "(require 'clojure.set) (clojure.set/union #{1} #{2}))}"))
           [rule] (rules/load-transforms [path])]
       (is (= #{1 2} ((:transform rule) minimal-node {}))))))
+
+(deftest task309-positions-survive-sandboxed-transform-test
+  (let [src (fn [n line] (ast/with-source n "a.hdoc" line 1))
+        para (fn [s line] (src {:t :para :inlines [{:t :str :text s}]} line))
+        section (src {:t :section :level 1 :heading [{:t :str :text "H"}]
+                      :blocks [(para "one" 3) (para "two" 5)]
+                      :attr {:classes [] :props {}}}
+                     1)
+        load-rule (fn [code]
+                    (let [dir (scratch-dir!)
+                          path (write-rule-file! dir "r.clj"
+                                                 (str "{:select :section :transform " code "}"))]
+                      (:transform (first (rules/load-transforms [path])))))
+        lines (fn [n] (mapv (comp :line ast/source) (:blocks n)))]
+    (testing "a no-op transform returns the node with every position"
+      (let [out ((load-rule "(fn [n _] n)") section {})]
+        (is (= section out))
+        (is (= 1 (:line (ast/source out))))
+        (is (= [3 5] (lines out)))))
+    (testing "a rewrite keeps the node's and the untouched children's positions; new nodes have none"
+      (let [out ((load-rule "(fn [n _] (-> n (assoc :level 2) (update :blocks #(into [{:t :para :inlines []}] %))))")
+                 section {})]
+        (is (= 2 (:level out)))
+        (is (= 1 (:line (ast/source out))))
+        (is (= [nil 3 5] (lines out)))))
+    (testing "a sequence: the one element equal to the input is the input, the new one has no position"
+      (let [[new-para out] ((load-rule "(fn [n _] [{:t :para :inlines []} n])") section {})]
+        (is (nil? (ast/source new-para)))
+        (is (= 1 (:line (ast/source out))))
+        (is (= [3 5] (lines out)))))
+    (testing "a script cannot forge a position with its own metadata"
+      (let [out ((load-rule "(fn [n _] (assoc n :blocks [(with-meta {:t :para :inlines []} {:haselnuss.ast/source {:line 99}})]))")
+                 section {})]
+        (is (= [nil] (lines out)))))))
+
+(defn- para-at
+  "A paragraph of one word `s`, parsed at `line` of a.hdoc (nil: no position)."
+  [s line]
+  (cond-> {:t :para :inlines [{:t :str :text s}]}
+    line (ast/with-source "a.hdoc" line 1)))
+
+(defn- positions-fixture
+  "[section run] for a section of paragraphs `texts` at lines 3, 5, 7...:
+  `(run code)` is `[texts lines]` of the blocks the sandboxed `:transform`
+  `code` makes of it."
+  [texts]
+  (let [blocks (vec (map-indexed (fn [i s] (para-at s (+ 3 (* 2 i)))) texts))
+        section (-> {:t :section :level 1 :heading [] :attr {:classes [] :props {}} :blocks blocks}
+                    (ast/with-source "a.hdoc" 1 1))
+        load-rule (fn [code]
+                    (let [path (write-rule-file! (scratch-dir!) "r.clj"
+                                                 (str "{:select :section :transform " code "}"))]
+                      (:transform (first (rules/load-transforms [path])))))]
+    [section (fn [code]
+               (let [out ((load-rule code) section {})]
+                 [(mapv #(-> % :inlines first :text) (:blocks out))
+                  (mapv (comp :line ast/source) (:blocks out))]))]))
+
+(deftest task309-reordered-blocks-keep-their-own-positions-test
+  (let [[_ run] (positions-fixture ["aa" "bb" "cc" "dd" "ee"])]
+    (testing "reversed: every block keeps its own line, none its neighbour's"
+      (is (= [["ee" "dd" "cc" "bb" "aa"] [11 9 7 5 3]]
+             (run "(fn [n _] (update n :blocks #(vec (reverse %))))"))))
+    (testing "the last block moved first"
+      (is (= [["ee" "aa" "bb" "cc" "dd"] [11 3 5 7 9]]
+             (run "(fn [n _] (update n :blocks #(into [(peek %)] (pop %))))"))))
+    (testing "sorted descending"
+      (is (= [["ee" "dd" "cc" "bb" "aa"] [11 9 7 5 3]]
+             (run "(fn [n _] (update n :blocks #(vec (sort-by (comp :text first :inlines) (fn [a b] (compare b a)) %))))"))))))
+
+(deftest task309-ambiguous-matches-get-no-position-test
+  (testing "a new block does not take the position of an old one that is still used"
+    (let [[_ run] (positions-fixture ["alpha" "beta"])]
+      (is (= [["beta" "NEW"] [5 nil]]
+             (run "(fn [n _] (assoc n :blocks [(second (:blocks n)) {:t :para :inlines [{:t :str :text \"NEW\"}]}]))")))))
+  (testing "dropping the first of two equal blocks leaves the survivor its own line"
+    (let [[_ run] (positions-fixture ["alpha" "beta" "alpha"])]
+      (is (= [["beta" "alpha"] [5 7]] (run "(fn [n _] (update n :blocks #(vec (rest %))))")))))
+  (testing "which of two equal blocks survived is a guess: no position"
+    (let [[_ run] (positions-fixture ["x" "alpha" "alpha"])]
+      (is (= [["alpha"] [nil]] (run "(fn [n _] (assoc n :blocks [(last (:blocks n))]))"))))
+    (let [[_ run] (positions-fixture ["a" "a" "b"])]
+      (is (= [["a" "b"] [nil 7]] (run "(fn [n _] (update n :blocks #(vec (rest %))))")))))
+  (testing "equal blocks that all survive, shifted, keep their lines in order"
+    (let [[_ run] (positions-fixture ["a" "a" "b"])]
+      (is (= [[nil "a" "a" "b"] [nil 3 5 7]]
+             (run "(fn [n _] (update n :blocks #(into [{:t :para :inlines []}] %)))")))))
+  (testing "a rewritten block has no position, even at its old index"
+    (let [[_ run] (positions-fixture ["a" "b" "c"])]
+      (is (= [["a" "B" "c"] [3 nil 7]]
+             (run "(fn [n _] (assoc-in n [:blocks 1 :inlines 0 :text] \"B\"))"))))))
+
+(deftest task309-match-vector-fuzz-test
+  (testing "seeded fuzz (seed 309) of the vector matching: an element only ever
+            gets an old element equal to it, no old element twice, and every
+            element whose value is unique in both vectors keeps its own"
+    (let [match-vector @#'rules/match-vector
+          rnd (java.util.Random. 309)
+          words ["a" "b" "c" "d" "e" "f" "g" "h"]
+          pick (fn [v] (nth v (.nextInt rnd (count v))))
+          edit (fn [ws]
+                 (case (.nextInt rnd 7)
+                   0 (let [l (java.util.ArrayList. ^java.util.Collection ws)]
+                       (java.util.Collections/shuffle l rnd)
+                       (vec l))
+                   1 (if (seq ws) (let [i (.nextInt rnd (count ws))] (into (subvec ws 0 i) (subvec ws (inc i)))) ws)
+                   2 (let [i (.nextInt rnd (inc (count ws)))] (into (conj (subvec ws 0 i) (pick words)) (subvec ws i)))
+                   3 (if (seq ws) (assoc ws (.nextInt rnd (count ws)) (str "new" (.nextInt rnd 3))) ws)
+                   4 (vec (reverse ws))
+                   5 (if (seq ws) (conj ws (pick ws)) ws)
+                   6 ws))
+          stats (volatile! {:cases 0 :kept 0 :moved 0})]
+      (dotimes [_ 3000]
+        (let [old-words (vec (repeatedly (.nextInt rnd 12) #(pick words)))
+              old-v (vec (map-indexed (fn [i w] (para-at w (inc i))) old-words))
+              new-words (nth (iterate edit old-words) (inc (.nextInt rnd 3)))
+              new-v (mapv #(para-at % nil) new-words)
+              out (match-vector old-v new-v)
+              kept (filter ast/source out)
+              freq-old (frequencies old-words)
+              freq-new (frequencies new-words)]
+          (vswap! stats update :cases inc)
+          (vswap! stats update :kept + (count kept))
+          (vswap! stats update :moved + (count (filter (fn [[j x]] (some-> (ast/source x) :line (not= (inc j))))
+                                                       (map-indexed vector out))))
+          (is (= new-v out) "the content is the rule's")
+          (is (every? (fn [x] (some #(identical? x %) old-v)) kept) "a position only from an old element")
+          (let [lines (map #(:line (ast/source %)) kept)]
+            (is (= (count lines) (count (set lines))) "no old element twice"))
+          (doseq [[j w] (map-indexed vector new-words)
+                  :when (= 1 (freq-old w 0) (freq-new w))]
+            (is (= (inc (.indexOf ^java.util.List old-words w)) (:line (ast/source (nth out j))))
+                "a value unique in both keeps its own position"))
+          (when (= old-words new-words)
+            (is (every? true? (map identical? old-v out)) "unchanged: everything kept"))))
+      (is (= 3000 (:cases @stats)))
+      (is (< 5000 (:kept @stats)) (str "not vacuous: " @stats))
+      (is (< 1000 (:moved @stats)) (str "moved elements matched: " @stats)))))
+
+(defn- colliding-words
+  "`n` distinct words of one `String.hashCode` (and so one Clojure hash):
+  strings of \"Aa\" and \"BB\" pairs, which hash alike."
+  [n]
+  (let [k (long (Math/ceil (/ (Math/log n) (Math/log 2))))]
+    (map (fn [i] (apply str (map #(if (bit-test i %) "BB" "Aa") (range k)))) (range n))))
+
+(deftest ^:timing task309-reattach-work-is-bounded-test
+  (testing "reattachment runs after the sandboxed call, outside its timeout,
+            so it must stay linear on shapes chosen to defeat it"
+    (testing "20000 paragraphs, 3000 of them returned reversed with their inlines rewritten"
+      (let [[_ run] (positions-fixture (map #(str "w" %) (range 20000)))
+            start (System/nanoTime)
+            [texts lines] (run "(fn [n _] (update n :blocks #(mapv (fn [b] (assoc b :inlines [{:t :str :text \"x\"}])) (take 3000 (reverse %)))))")]
+        (is (< (/ (- (System/nanoTime) start) 1e6) 5000))
+        (is (= (repeat 3000 "x") texts))
+        (is (= (repeat 3000 nil) lines) "rewritten: no positions")))
+    (testing "20000 paragraphs whose words all collide in hash, the first 1000 (or those reversed) returned"
+      (let [words (colliding-words 20000)
+            line-of (zipmap words (iterate #(+ 2 %) 3))
+            [_ run] (positions-fixture words)]
+        (is (= 20000 (count (distinct words))))
+        (is (= 1 (count (distinct (map hash words)))) "the shape is what it claims")
+        (doseq [code ["(fn [n _] (update n :blocks #(vec (take 1000 %))))"
+                      "(fn [n _] (update n :blocks #(vec (reverse (take 1000 %)))))"]]
+          (let [start (System/nanoTime)
+                [texts lines] (run code)]
+            (is (< (/ (- (System/nanoTime) start) 1e6) 5000) code)
+            (is (= 1000 (count texts)))
+            (is (every? true? (map (fn [t l] (or (nil? l) (= l (line-of t)))) texts lines))
+                "any position kept is the block's own")))))))
 
 (deftest ^:timing ac6-non-terminating-transform-stopped-test
   (testing "AC #6: a :transform function that does not terminate is

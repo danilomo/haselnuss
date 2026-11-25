@@ -42,6 +42,47 @@
     return urls;
   }
 
+  // ---- a network that neither answers nor fails (TASK-322) -----------------------------
+  //
+  // Offline behind a VPN that stays up -- Tailscale in airplane mode answers
+  // its own DNS and takes the connection into a tunnel with nothing behind it
+  // -- a request neither answers nor fails, for minutes. A refused connection
+  // fails at once; this does not. So what has a copy on the device to fall
+  // back on gives the network NET_WAIT, as sw.js gives book pages BOOK_WAIT.
+  var NET_WAIT = 4000;
+  var LATE = {};   // what the NET_WAIT timer resolves with
+  function lateAfter(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms, LATE); });
+  }
+
+  // The JSON at `url`, network first, kept in the cache `cachePromise` gives
+  // (or null: no cache). The kept copy when the network fails, or when it has
+  // not answered in NET_WAIT (it may still answer, and its answer is kept);
+  // with no kept copy, whatever the network does in the end.
+  function networkFirstJson(url, cachePromise) {
+    var network = fetch(url).then(function (r) {
+      if (!r.ok) throw new Error(url + ": " + r.status);
+      var copy = r.clone();
+      return cachePromise.then(function (c) {
+        if (c) c.put(url, copy).catch(function () {});
+      }).then(function () { return r.json(); });
+    });
+    network.catch(function () {});   // a late failure after the kept copy was used
+    function kept() {
+      return cachePromise.then(function (c) { return c ? c.match(url) : null; })
+        .then(null, function () { return null; });
+    }
+    return Promise.race([network, lateAfter(NET_WAIT)]).then(function (got) {
+      if (got !== LATE) return got;
+      return kept().then(function (hit) { return hit ? hit.json() : network; });
+    }, function (err) {
+      return kept().then(function (hit) {
+        if (!hit) throw err;
+        return hit.json();
+      });
+    });
+  }
+
   // ---- reading positions: kept on the device until the server has them ----------------
   //
   // One record per reader and book in IndexedDB, {key, reader, book, position,
@@ -452,19 +493,7 @@
     function fetchJson(url) {
       var p = loaded.get(url);
       if (p) return p;
-      var cache = cacheFor(url);
-      p = fetch(url).then(function (r) {
-        if (!r.ok) throw new Error(url + ": " + r.status);
-        var copy = r.clone();
-        return cache.then(function (c) {
-          if (c) c.put(url, copy).catch(function () {});
-        }).then(function () { return r.json(); });
-      }).catch(function (err) {
-        return cache.then(function (c) { return c ? c.match(url) : null; }).then(function (hit) {
-          if (!hit) throw err;
-          return hit.json();
-        });
-      });
+      p = networkFirstJson(url, cacheFor(url));
       p.catch(function () { loaded.delete(url); });   // try again next time
       loaded.set(url, p);
       return p;
@@ -1348,6 +1377,10 @@
       }).then(function (a) {
         return a && a.position && typeof a.position === "object" ? a.position : null;
       }, function () { return null; });
+      // a network that hangs: the record on the device, rather than nothing at RESTORE_WAIT
+      fromServer = Promise.race([fromServer, lateAfter(NET_WAIT)]).then(function (got) {
+        return got === LATE ? null : got;
+      });
       var onDevice = localRecord(reader.id, bookId).then(recordPosition, function () { return null; });
       // a server or storage that never answers must not keep the reader from
       // saving: after RESTORE_WAIT the book stays where it is
@@ -1442,22 +1475,9 @@
       ? caches.open(CATALOG_CACHE).catch(function () { return null; })
       : Promise.resolve(null);
 
-    // Network first; the copy kept on the device when the network fails.
+    // Network first; the copy kept on the device when the network fails or hangs.
     function fetchCatalogJson(url) {
-      return fetch(url).then(function (r) {
-        if (!r.ok) throw new Error(url + ": " + r.status);
-        var copy = r.clone();
-        return cachePromise.then(function (c) {
-          if (c) c.put(url, copy).catch(function () {});
-        }).then(function () { return r.json(); });
-      }).catch(function (err) {
-        return cachePromise.then(function (c) {
-          return c ? c.match(url) : null;
-        }).then(function (hit) {
-          if (!hit) throw err;
-          return hit.json();
-        });
-      });
+      return networkFirstJson(url, cachePromise);
     }
     function pageUrl(lib, n) {
       return "catalog/" + encodeURIComponent(lib.name) + "/" + n + ".json";
@@ -1928,19 +1948,26 @@
       var q = $("search-input").value.trim();
       var mine = ++searchSeq;
       if (!q) { showResults({ books: [] }, ""); $("search-status").textContent = ""; return; }
+      var answered = false, searchedHere = false;
+      // offline, or no answer in NET_WAIT: the catalog pages already on this
+      // device; an answer from the server that comes later still replaces them
+      function offline() {
+        if (answered || searchedHere) return;
+        searchedHere = true;
+        localSearch(q).then(function (res) {
+          if (mine !== searchSeq || answered) return;
+          showResults(res, "Offline: searched the " + res.pages + " catalog page" + (res.pages === 1 ? "" : "s") + " on this device.");
+          $("search-status").setAttribute("data-mode", "offline");
+        });
+      }
       fetch("api/search?q=" + encodeURIComponent(q)).then(function (r) {
         if (!r.ok) throw new Error(String(r.status));
         return r.json();
       }).then(function (res) {
+        answered = true;
         if (mine === searchSeq) { showResults(res, ""); $("search-status").setAttribute("data-mode", "online"); }
-      }, function () {
-        // offline: the catalog pages already on this device
-        localSearch(q).then(function (res) {
-          if (mine !== searchSeq) return;
-          showResults(res, "Offline: searched the " + res.pages + " catalog page" + (res.pages === 1 ? "" : "s") + " on this device.");
-          $("search-status").setAttribute("data-mode", "offline");
-        });
-      });
+      }, offline);
+      lateAfter(NET_WAIT).then(offline);
     }
     $("search-input").addEventListener("input", function () {
       clearTimeout(searchTimer);

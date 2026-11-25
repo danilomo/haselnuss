@@ -1348,17 +1348,27 @@
               {:type ::hdoc/lossy-role-span :t :sup :path [:blocks 0 :inlines 1]}]
              diagnostics))))
   (testing "TASK-137: a :strike is NOT lossy -- it round-trips as ~~...~~ --
-            except one nested inside another, which is reported"
+            and since TASK-305 nor is one nested inside another that `~~` can
+            spell; only a nesting it cannot is written as a role span, and
+            reported"
     (let [plain {:meta {} :blocks [{:t :para :inlines [{:t :strike :inlines [(str-inline "a")]}]}]}
           nested {:meta {} :blocks [{:t :para
                                      :inlines [{:t :strike
-                                                :inlines [{:t :strike :inlines [(str-inline "a")]}]}]}]}]
+                                                :inlines [{:t :strike :inlines [(str-inline "a")]}]}]}]}
+          ;; `~~a~~b~~~~` closes after `a`: no `~~` spelling at all
+          unspellable {:meta {} :blocks [{:t :para
+                                          :inlines [{:t :strike
+                                                     :inlines [(str-inline "a")
+                                                               {:t :strike :inlines [(str-inline "b")]}]}]}]}]
       (is (empty? (hdoc/lossy-role-span-diagnostics plain)))
+      (is (empty? (hdoc/lossy-role-span-diagnostics nested)))
       (is (= [{:type ::hdoc/lossy-role-span :t :strike :path [:blocks 0 :inlines 0]}]
-             (hdoc/lossy-role-span-diagnostics nested)))
+             (hdoc/lossy-role-span-diagnostics unspellable)))
       (is (= plain (parser/parse (hdoc/emit-document plain))))
       (is (str/includes? (hdoc/emit-document plain) "~~a~~"))
-      (is (str/includes? (hdoc/emit-document nested) "[a]{.strike}"))))
+      (is (= "~~~~a~~~~\n" (hdoc/emit-document nested)))
+      (is (= nested (parser/parse (hdoc/emit-document nested))))
+      (is (= "~~a[b]{.strike}~~\n" (hdoc/emit-document unspellable)))))
   (testing "a document with none of the four reports no diagnostics"
     (let [document (parser/parse "Ordinary *emph* text.\n")]
       (is (empty? (hdoc/lossy-role-span-diagnostics document))))))
@@ -3135,13 +3145,16 @@
 (deftest caption-block-lead-in-fuzz-test
   (testing "TASK-281 fuzz: a caption line opening with block syntax, or empty with
             more lines after it, parses without an exception to one captioned
-            table, and the hdoc written for it reads back as the same document --
-            except where the caption holds a `|`, which the writer does not escape
-            on a caption line (a separate, pre-existing limit)"
+            table, and the hdoc written for it reads back as the same document,
+            a literal `|` in the caption (TASK-282) included"
     (let [r (java.util.Random. 281)
           pick (fn [v] (nth v (.nextInt r (count v))))
           leads ["" "" "- " "+ " "* " "# " "### " "> " "```" "~~~" "1. " "2) " "***" "---" "[a]: " "<div>" "#"]
-          texts ["x" "*y*" "@tbl:q" "" "a b" "`c`"]
+          texts ["x" "*y*" "@tbl:q" "" "a b" "`c`"
+                 ;; TASK-282: a literal `|`, plain, in code, in emphasis and
+                 ;; in a link target (a bare one is a table row, not a
+                 ;; caption: `table-caption-pipe-test` pins those)
+                 "a \\| b" "`c\\|d`" "*i\\|j*" "[l](http://x/a\\|b)"]
           rest-lines ["" "" "" "\n| b |" "\n|---|" "\n    code" "\n2. z" "\nmore" "\n==="]
           groups ["" "" " {#tbl:a}" " {#tbl:b .c}"]
           ;; Table and caption at the top level, in a quote or in a list
@@ -3168,10 +3181,14 @@
                               (when (= [:table] (map :t (:blocks q))) (first (:blocks q))))
                        "- " (let [[l] (:blocks document)]
                               (when (= [[:table]] (map #(map :t %) (:items l))) (ffirst (:items l))))))
-          checked (filter (fn [[_ _ caption document]] (and (map? document) (not (str/includes? caption "|")))) parsed)]
+          checked (filter (fn [[_ _ _ document]] (map? document)) parsed)]
       (is (< 2000 (count checked)) "enough documents get the round-trip check")
       (is (< 500 (count (filter (fn [[_ c _ document]] (seq (:caption (table-of c document)))) checked)))
           "enough of them have a non-empty caption")
+      (is (< 100 (count (filter (fn [[_ c _ document]]
+                                  (str/includes? (pr-str (:caption (table-of c document))) "|"))
+                                checked)))
+          "enough of them have a caption holding a `|`")
       (is (< 50 (count (filter (fn [[_ c caption document]]
                                  (and (str/ends-with? caption "===") (:id (:attr (table-of c document)))))
                                checked)))
@@ -3182,6 +3199,106 @@
           (is (some? (table-of container document)) (pr-str d))))
       (doseq [[d _ _ document] checked]
         (is (= document (parser/parse (hdoc/emit-document document))) (pr-str d))))))
+
+(defn- nested-strike-count
+  "How many `:strike` nodes in `x` hold another `:strike` somewhere inside."
+  [x]
+  (count (filter (fn [n] (and (map? n) (= :strike (:t n))
+                              (some #(and (map? %) (= :strike (:t %))) (rest (tree-seq coll? seq n)))))
+                 (tree-seq coll? seq x))))
+
+(deftest nested-strike-round-trip-test
+  (testing "TASK-305: a strike the parser nests inside another (`~~~~a~~~~`,
+            `~~a ~~b~~ c~~`) is written back with nested `~~` delimiters, not as a
+            `[..]{.strike}` span, so it reads back as the same nested strike -- on a
+            table caption (the report's case: two literal backslashes) and in a
+            paragraph"
+    (doseq [body ["~~~~\\\\~~{~~" "~~~~a~~~~" "~~~~{~~~~" "~~a ~~b~~ c~~" "~~a.~~b~~~~"
+                  "~~~~a~~ b~~" "~~a ~~~~b~~ c~~ d~~"]
+            src [(str "| a |\n|---|\n: " body "\n") (str body "\n")]]
+      (testing (pr-str src)
+        (let [document (parser/parse src)
+              text (hdoc/emit-document document)]
+          (is (pos? (nested-strike-count document)) "the case holds a nested strike")
+          (is (not (str/includes? text "{.strike}")) text)
+          (is (= document (parser/parse text)) text)
+          (is (= text (hdoc/emit-document (parser/parse text))))
+          (is (empty? (hdoc/lossy-role-span-diagnostics document)))))))
+  (testing "review: an inner strike that would begin a line as `~~~~!` (a tilde
+            code fence) is not reported, since the writer judges only the
+            outermost one; and a nesting that does not open a line is re-read
+            where it stands, so `x ==~~~~!` is not a fence and needs no
+            fallback"
+    (doseq [src ["~~b ~~~~!\nc~~~~ d~~\n" "x ==~~~~!\nc~~~~==\n" "x *~~~~!\nc~~~~*\n"]]
+      (testing (pr-str src)
+        (let [document (parser/parse src)
+              text (hdoc/emit-document document)]
+          (is (pos? (nested-strike-count document)))
+          (is (= src text))
+          (is (= document (parser/parse text)))
+          (is (empty? (hdoc/lossy-role-span-diagnostics document)))))))
+  (testing "review: a footnote's own strike is not nested in the strike its
+            marker sits in -- on a fallback it stays `~~z~~`, and only the
+            outermost strike that fell back is reported, wherever it sits"
+    (let [strike (fn [& xs] {:t :strike :inlines (vec xs)})
+          note {:t :note :blocks [{:t :para :inlines [(strike (str-inline "z"))]}]}
+          ;; `~~\~b~~a~~` closes after `b`: no `~~` spelling
+          fallback (strike (str-inline "~b") (strike (str-inline "a")) note)
+          document {:meta {} :blocks [{:t :para :inlines [fallback]}]}
+          text (hdoc/emit-document document)]
+      (is (str/includes? text "[a]{.strike}") text)
+      (is (str/includes? text "[^1]: ~~z~~") text)
+      (is (not (str/includes? text "[z]{.strike}")) text)
+      (is (= [{:type ::hdoc/lossy-role-span :t :strike :path [:blocks 0 :inlines 0]}]
+             (hdoc/lossy-role-span-diagnostics document)))
+      (let [in-note {:meta {} :blocks [{:t :para
+                                        :inlines [(str-inline "x")
+                                                  {:t :note :blocks [{:t :para :inlines [fallback]}]}]}]}]
+        (is (= [{:type ::hdoc/lossy-role-span :t :strike
+                 :path [:blocks 0 :inlines 1 :blocks 0 :inlines 0]}]
+               (hdoc/lossy-role-span-diagnostics in-note))))))
+  (testing "seeded fuzz (seed 305) over strike-shaped runs on a caption and in a
+            paragraph: every document round-trips, and the fuzz reaches nested strikes"
+    (let [rnd (java.util.Random. 305)
+          alphabet ["~~~~" "~~~~" "~~" "~~" "~~" "~" "a" "a" " " "{" "\\\\" "." "*"]
+          nested (atom 0)]
+      (dotimes [_ 1200]
+        (let [s (apply str (repeatedly (+ 2 (.nextInt rnd 7))
+                                       #(nth alphabet (.nextInt rnd (count alphabet)))))]
+          (doseq [src [(str "| a |\n|---|\n: " s "\n") (str s "\n")]]
+            ;; `{.` opens an attribute group the parser refuses unclosed
+            (when-let [document (try (parser/parse src) (catch clojure.lang.ExceptionInfo _ nil))]
+              (swap! nested + (nested-strike-count document))
+              (let [text (hdoc/emit-document document)]
+                (is (= document (parser/parse text)) (pr-str src))
+                ;; the diagnostic reports a strike exactly when one is role-spanned
+                (is (= (str/includes? text "{.strike}")
+                       (boolean (seq (hdoc/lossy-role-span-diagnostics document))))
+                    (pr-str src)))))))
+      (is (< 200 @nested) (str "the fuzz reaches nested strikes: " @nested)))))
+
+(deftest table-caption-pipe-test
+  (testing "TASK-282: a literal `|` on a table caption line is written escaped, so
+            the line stays a caption and does not become a body row"
+    (let [document (parser/parse "| a |\n|---|\n: a \\| b\n")
+          text (hdoc/emit-document document)]
+      (is (str/includes? text ": a \\| b"))
+      (is (= document (parser/parse text)))))
+  (doseq [caption ["a \\| b" "`c\\|d`" "`c|d`" "$e|f$" "@{g|h}" "*i\\|j*" "**i \\| j**"
+                   "[l](http://x/a\\|b)" "<http://x/a|b>" "a \\\\\\| b" "x \\| y {#tbl:a}"
+                   "[a \\| <http://x/a|b>](http://y)" "[*<http://x/a|b>*](http://y)"]]
+    (testing (pr-str caption)
+      (is (fixed-point? (str "| a |\n|---|\n: " caption "\n")))))
+  (testing "TASK-282: an autolink nested in link text keeps its `|` bare on a caption
+            line (an escaped one would stay a backslash in the URI)"
+    (let [document (parser/parse "| a |\n|---|\n: [<http://x/a|b>](http://y)\n")
+          text (hdoc/emit-document document)]
+      (is (= [:table] (map :t (:blocks document))))
+      (is (str/includes? text ": [<http://x/a|b>](http://y)"))
+      (is (= document (parser/parse text)))))
+  (testing "a caption without a `|` is written as before"
+    (is (= "| a |\n| --- |\n: a *b* {#tbl:a}\n"
+           (hdoc/emit-document (parser/parse "| a |\n|---|\n: a *b* {#tbl:a}\n"))))))
 
 (deftest table-round-trip-test
   (testing "TASK-97 AC #4: alignments, column widths and a trailing caption line
@@ -3633,15 +3750,16 @@
       (is (= "Hazelnuts ripen in early autumn and drop."
              (select/flatten-text (first (:blocks back))))
           (str "not one character invented or lost: " (pr-str emitted)))
-      (is (= 1 (count (filter #(= :highlight (:t %)) (tree-seq coll? seq (:blocks back)))))
-          "the outer highlight survives as a highlight")
-      (is (= 1 (count (filter #(and (= :span (:t %))
-                                    (contains? (set (:classes (:attr %))) "highlight"))
-                              (tree-seq coll? seq (:blocks back)))))
-          "and the inner one as a role span, content-preserving and kind-lossy")
-      (is (= [:haselnuss.emit.hdoc/lossy-nested-highlight]
-             (mapv :type (hdoc/lossy-role-span-diagnostics document)))
-          "reported the same way every other kind-lossy round trip is")))
+      ;; TASK-316: the parser DOES read `==a ==b== c==` as a nested pair, so
+      ;; the writer spells it that way and it is no longer kind-lossy; the
+      ;; fallback to a role span (reported) is pinned in
+      ;; `nested-highlight-round-trip-test`.
+      (is (str/includes? emitted "==ripen ==in early== autumn=="))
+      (is (= 2 (count (filter #(= :highlight (:t %)) (tree-seq coll? seq (:blocks back)))))
+          "both highlights survive as highlights")
+      (is (empty? (filter #(= :span (:t %)) (tree-seq coll? seq (:blocks back)))))
+      (is (empty? (hdoc/lossy-role-span-diagnostics document))
+          "the writer did not fall back, so nothing is reported")))
   (testing "a highlight with no highlight inside it is NOT diagnosed --
             it is an exact round trip, and a warning would be noise"
     (is (= [] (hdoc/lossy-role-span-diagnostics
@@ -3649,6 +3767,303 @@
                                    :inlines [{:t :highlight
                                               :inlines [(str-inline "x")]
                                               :attr {:classes [] :props {}}}]}]})))))
+
+(defn- nested-highlight-count
+  "How many `:highlight` nodes in `x` hold another `:highlight` somewhere inside."
+  [x]
+  (count (filter (fn [n] (and (map? n) (= :highlight (:t n))
+                              (some #(and (map? %) (= :highlight (:t %))) (rest (tree-seq coll? seq n)))))
+                 (tree-seq coll? seq x))))
+
+(defn- highlight-role-span?
+  "True when `text` holds a `[..]{.highlight}` role span, whatever other
+  classes its group carries."
+  [text]
+  (boolean (re-find #"\{[^}]*\.highlight[ }]" text)))
+
+(deftest nested-highlight-round-trip-test
+  (testing "TASK-316: a highlight the parser nests inside another is written back with
+            nested `==` delimiters, not a `[..]{.highlight}` span, so it reads back as the
+            same document -- in a paragraph and on a table caption, attributes included"
+    (doseq [body ["====a====" "==a ==b== c==" "==a ==b=={.x} c=={.y}" "====a=={.x}=={.y}"
+                  "x ==~~==a==~~== y" "==a ====b==== c==" "====a====={.k=v}"]
+            src [(str body "\n") (str "| a |\n|---|\n: " body "\n")]]
+      (testing (pr-str src)
+        (when-let [document (try (parser/parse src) (catch clojure.lang.ExceptionInfo _ nil))]
+          (let [text (hdoc/emit-document document)]
+            (is (not (highlight-role-span? text)) text)
+            (is (= document (parser/parse text)) text)
+            (is (= text (hdoc/emit-document (parser/parse text))))
+            (is (empty? (hdoc/lossy-role-span-diagnostics document))))))))
+  (testing "the pinned source itself"
+    (let [document (parser/parse "====a====\n")]
+      (is (= 1 (nested-highlight-count document)))
+      (is (= "====a====\n" (hdoc/emit-document document)))))
+  (testing "a nesting no `==` spelling reads back as is written as a role span and
+            reported -- exactly the fallback"
+    (let [hl (fn [& xs] {:t :highlight :attr {:classes [] :props {}} :inlines (vec xs)})
+          document {:meta {} :blocks [{:t :para :inlines [(hl (str-inline "a") (hl (str-inline "b")))]}]}]
+      (is (= "==a[b]{.highlight}==\n" (hdoc/emit-document document)))
+      (is (= [{:type ::hdoc/lossy-nested-highlight :t :highlight :path [:blocks 0 :inlines 0]}]
+             (mapv #(select-keys % [:type :t :path]) (hdoc/lossy-role-span-diagnostics document))))))
+  (testing "a footnote's own highlight is not nested in the highlight its marker sits
+            in: on a fallback it stays `==z==`, and only the outermost one is reported"
+    (let [hl (fn [& xs] {:t :highlight :attr {:classes [] :props {}} :inlines (vec xs)})
+          note {:t :note :blocks [{:t :para :inlines [(hl (str-inline "z"))]}]}
+          fallback (hl (str-inline "a") (hl (str-inline "b")) note)
+          document {:meta {} :blocks [{:t :para :inlines [fallback]}]}
+          text (hdoc/emit-document document)]
+      (is (str/includes? text "[b]{.highlight}") text)
+      (is (str/includes? text "[^1]: ==z==") text)
+      (is (not (str/includes? text "[z]{.highlight}")) text)
+      (is (= 1 (count (hdoc/lossy-role-span-diagnostics document))))))
+  (testing "seeded fuzz (seed 316) over highlight-shaped runs: every document round-trips
+            or the diagnostic fires exactly when a `{.highlight}` role span was written,
+            and the fuzz reaches nested highlights"
+    (let [rnd (java.util.Random. 316)
+          alphabet ["====" "====" "==" "==" "==" "=" "a" "a" " " "{.x}" "{" "\\\\" "." "*" "~~" "[^1]"]
+          nested (atom 0)]
+      (dotimes [_ 3000]
+        (let [s (apply str (repeatedly (+ 2 (.nextInt rnd 7))
+                                       #(nth alphabet (.nextInt rnd (count alphabet)))))]
+          (doseq [src [(str "| a |\n|---|\n: " s "\n\n[^1]: n\n") (str s "\n\n[^1]: n\n")]]
+            (when-let [document (try (parser/parse src) (catch clojure.lang.ExceptionInfo _ nil))]
+              (swap! nested + (nested-highlight-count document))
+              (when-let [text (try (hdoc/emit-document document) (catch clojure.lang.ExceptionInfo _ nil))]
+                (is (= document (parser/parse text)) (pr-str src))
+                (is (= (highlight-role-span? text)
+                       (boolean (seq (hdoc/lossy-role-span-diagnostics document))))
+                    (pr-str src)))))))
+      (is (< 200 @nested) (str "the fuzz reaches nested highlights: " @nested))))
+  (testing "seeded fuzz (seed 316) over hand-built highlight trees, which no `==` spelling
+            always reads back: the diagnostic fires exactly when the output holds a
+            `{.highlight}` role span, and both outcomes are reached"
+    (let [rnd (java.util.Random. 3160)
+          ;; Written as the parser reads it: words, a :space between
+          ;; neighbours, none at an edge, so a text neighbour of a
+          ;; highlight is always a space (the re-read judges a nesting
+          ;; with a blank before it, like `tilde-nesting-reads-back?`).
+          words ["a" "=b" "c=" "="]
+          leaf #(str-inline (nth words (.nextInt rnd (count words))))
+          tree (fn tree [depth]
+                 (let [items (vec (repeatedly (+ 1 (.nextInt rnd 3))
+                                              #(if (and (pos? depth) (zero? (.nextInt rnd 2)))
+                                                 {:t :highlight
+                                                  :attr {:classes (if (zero? (.nextInt rnd 3)) ["k"] []) :props {}}
+                                                  :inlines (tree (dec depth))}
+                                                 (leaf))))]
+                   ;; a blank between neighbours, except sometimes between a
+                   ;; word and a highlight (two words would merge)
+                   (vec (cons (first items)
+                              (mapcat (fn [prev item]
+                                        (if (and (not= :highlight (:t prev)) (not= :highlight (:t item)))
+                                          [{:t :space} item]
+                                          (if (zero? (.nextInt rnd 3)) [item] [{:t :space} item])))
+                                      items (rest items))))))
+          fell (atom 0)
+          spelled (atom 0)]
+      (dotimes [_ 1500]
+        (let [document {:meta {} :blocks [{:t :para :inlines [(str-inline "p") {:t :space}
+                                                              {:t :highlight :attr {:classes [] :props {}}
+                                                               :inlines (tree 3)}
+                                                              {:t :space} (str-inline "q")]}]}]
+          (when (pos? (nested-highlight-count document))
+            (when-let [text (try (hdoc/emit-document document) (catch clojure.lang.ExceptionInfo _ nil))]
+              (let [role-span? (highlight-role-span? text)]
+                (is (= role-span? (boolean (seq (hdoc/lossy-role-span-diagnostics document))))
+                    (pr-str text))
+                (if role-span? (swap! fell inc) (do (swap! spelled inc)
+                                                    (is (= document (parser/parse text)) (pr-str text)))))))))
+      (is (< 50 @fell) (str "falls back: " @fell))
+      (is (< 50 @spelled) (str "spelled with `==`: " @spelled)))))
+
+(deftest strike-neighbour-tilde-test
+  (testing "TASK-317: a lone `~` at the edge of a text run, next to a strike delimiter,
+            keeps its escape (the report's inputs, odd tilde runs included)"
+    (doseq [src ["~~^~~\\~b\n" "~~{~~\\~a\n" "a\\~~~{~~\n" "x *~~~~~_@a_~~a_~~~~ ~~~~\\\\*\n"
+                 "==a==\\=b\n" "a\\===b==\n"]]
+      (testing (pr-str src)
+        (let [document (parser/parse src)
+              text (hdoc/emit-document document)]
+          (is (= document (parser/parse text)) text)
+          (is (= text (hdoc/emit-document (parser/parse text))))
+          (is (empty? (hdoc/lossy-role-span-diagnostics document)))))))
+  (testing "the escapes written"
+    (is (= "~~^~~\\~b\n" (hdoc/emit-document (parser/parse "~~^~~\\~b\n"))))
+    (is (= "a\\~~~{~~\n" (hdoc/emit-document (parser/parse "a\\~~~{~~\n"))))))
+
+(defn- para-of [& inlines] {:meta {} :blocks [{:t :para :inlines (vec inlines)}]})
+
+(defn- para-of-seq [inlines] (apply para-of inlines))
+
+(defn- delimited [kind & inlines]
+  (cond-> {:t kind :inlines (vec inlines)} (= :highlight kind) (assoc :attr {:classes [] :props {}})))
+
+(deftest strike-highlight-beside-a-word-test
+  (testing "TASK-317: a strike or highlight beside a word that its flanking cannot
+            open or close against is written as a role span and reported, rather than
+            written so that it reads back as something else with no diagnostic"
+    (doseq [[document text]
+            [[(para-of (str-inline "x") (delimited :strike (str-inline ".a"))) "x[.a]{.strike}\n"]
+             [(para-of (str-inline "x") (delimited :strike (str-inline "a") (delimited :strike (str-inline ".b"))))
+              "x[a[.b]{.strike}]{.strike}\n"]
+             [(para-of (str-inline "p") (delimited :highlight (str-inline "a") (delimited :highlight (str-inline "b"))))
+              "p==a[b]{.highlight}==\n"]
+             [(para-of (delimited :highlight (str-inline "a") (delimited :highlight (str-inline "b"))) (str-inline "q"))
+              "[a[b]{.highlight}]{.highlight}q\n"]
+             [(para-of (str-inline "x") (delimited :highlight (str-inline ".a"))) "x[.a]{.highlight}\n"]]]
+      (testing text
+        (is (= text (hdoc/emit-document document)))
+        (is (= 1 (count (hdoc/lossy-role-span-diagnostics document)))))))
+  (testing "beside a word it can be written next to, it stays a delimiter pair"
+    (doseq [[document text]
+            [[(para-of (str-inline "x") (delimited :strike (str-inline "a"))) "x~~a~~\n"]
+             [(para-of (delimited :strike (str-inline "a")) (str-inline "x")) "~~a~~x\n"]
+             [(para-of (str-inline "x") (delimited :highlight (str-inline "a")) (str-inline "y")) "x==a==y\n"]]]
+      (testing text
+        (is (= text (hdoc/emit-document document)))
+        (is (= document (parser/parse text)))
+        (is (empty? (hdoc/lossy-role-span-diagnostics document)))))))
+
+(defn- splice-delimiters
+  "`inlines` with every strike and highlight replaced by what it holds, adjacent
+  words merged: the tree a plain-emphasis flanking failure shows up in without them."
+  [inlines]
+  (let [flat (vec (mapcat (fn [x] (cond (contains? #{:strike :highlight} (:t x)) (splice-delimiters (:inlines x))
+                                        (:inlines x) [(update x :inlines splice-delimiters)]
+                                        :else [x]))
+                          inlines))]
+    (vec (reduce (fn [acc y] (if (and (= :str (:t y)) (= :str (:t (peek acc))))
+                               (conj (pop acc) (update (peek acc) :text str (:text y)))
+                               (conj acc y)))
+                 [] flat))))
+
+(defn- reads-back-or-refused?
+  "True when `document` emits to something that parses back to it, or the emitter
+  refuses it (an exception)."
+  [document]
+  (let [text (try (hdoc/emit-document document) (catch clojure.lang.ExceptionInfo _ ::refused))]
+    (or (= ::refused text) (= document (try (parser/parse text) (catch Exception _ nil))))))
+
+(deftest strike-highlight-hand-built-fuzz-test
+  (testing "seeded fuzz (seed 323) over hand-built trees of strikes, highlights, emphasis
+            and strong with words, tildes, equals signs, asterisks and punctuation at
+            their edges, same-kind delimiters directly adjacent, and a word directly
+            against a delimiter or a space: every tree round-trips, is reported
+            (`lossy-role-span-diagnostics`) or is refused, except one that fails
+            without its strikes and highlights too (plain emphasis flanking, a
+            separate matter), and each outcome is reached"
+    (let [rnd (java.util.Random. 323)
+          words ["a" "b" "~" "~b" "a~" "." ".a" "=" "=a" "b=" "x." "*" "*a" "a*"]
+          pick #(nth % (.nextInt rnd (count %)))
+          items (fn items [depth]
+                  (let [node (fn []
+                               (if (and (pos? depth) (< (.nextInt rnd 5) 2))
+                                 (let [kind (pick [:strike :highlight :emph :strong])]
+                                   (if (contains? #{:emph :strong} kind)
+                                     {:t kind :inlines (items (dec depth))}
+                                     (apply delimited kind (items (dec depth)))))
+                                 (str-inline (pick words))))
+                        xs (vec (repeatedly (inc (.nextInt rnd 3)) node))]
+                    (vec (cons (first xs)
+                               (mapcat (fn [p x]
+                                         ;; two words need a blank; any other pair may touch
+                                         (if (or (and (= :str (:t p)) (= :str (:t x)))
+                                                 (zero? (.nextInt rnd 4)))
+                                           [(pick [{:t :space} {:t :soft-break} {:t :line-break}]) x]
+                                           [x]))
+                                       xs (rest xs))))))
+          delim? #(contains? #{:strike :highlight} (:t %))
+          outcomes (atom {:ok 0 :reported 0 :refused 0 :against-word 0 :adjacent-same-kind 0
+                          :emphasis-around-delimiter 0 :plain-emphasis 0})]
+      (dotimes [_ 4000]
+        (let [inlines (items 3)
+              document (para-of-seq inlines)
+              nodes (tree-seq coll? seq inlines)
+              text (try (hdoc/emit-document document) (catch clojure.lang.ExceptionInfo _ nil))]
+          (when (some (fn [xs] (some (fn [[a b]] (and (delim? a) (= (:t a) (:t b)))) (partition 2 1 xs)))
+                      (filter sequential? nodes))
+            (swap! outcomes update :adjacent-same-kind inc))
+          (when (some #(and (map? %) (contains? #{:emph :strong} (:t %))
+                            (some (fn [y] (and (map? y) (delim? y))) (rest (tree-seq coll? seq (:inlines %)))))
+                      nodes)
+            (swap! outcomes update :emphasis-around-delimiter inc))
+          (if-not text
+            (swap! outcomes update :refused inc)
+            (do
+              (when (some (fn [[a b]] (and (not= :space (:t a)) (not= :space (:t b))
+                                           (or (delim? a) (delim? b))))
+                          (partition 2 1 inlines))
+                (swap! outcomes update :against-word inc))
+              (cond (= document (try (parser/parse text) (catch Exception _ nil)))
+                    (swap! outcomes update :ok inc)
+                    (seq (hdoc/lossy-role-span-diagnostics document))
+                    (swap! outcomes update :reported inc)
+                    ;; not a strike or highlight failure: the same words in plain emphasis fail too
+                    (not (reads-back-or-refused? (para-of-seq (splice-delimiters inlines))))
+                    (swap! outcomes update :plain-emphasis inc)
+                    :else (is false (str "silent failure: " (pr-str inlines) " -> " (pr-str text))))))))
+      (is (< 1000 (:ok @outcomes)) (pr-str @outcomes))
+      (is (< 200 (:reported @outcomes)) (pr-str @outcomes))
+      (is (< 200 (:refused @outcomes)) (pr-str @outcomes))
+      (is (< 200 (:against-word @outcomes)) (pr-str @outcomes))
+      (is (< 100 (:adjacent-same-kind @outcomes)) (pr-str @outcomes))
+      (is (< 100 (:emphasis-around-delimiter @outcomes)) (pr-str @outcomes)))))
+
+(deftest adjacent-same-kind-delimiters-and-emphasis-around-them-test
+  (testing "TASK-323: a strike or highlight written right after one of its kind reads back
+            or is reported, instead of fusing with its closing run"
+    (doseq [[document text]
+            [[(para-of (delimited :strike (str-inline "a")) (delimited :strike (str-inline "~b")))
+              "~~a~~[~b]{.strike}\n"]
+             [(para-of (delimited :highlight (str-inline "a")) (delimited :highlight (str-inline "=b")))
+              "==a==[=b]{.highlight}\n"]]]
+      (testing text
+        (is (= text (hdoc/emit-document document)))
+        (is (= 1 (count (hdoc/lossy-role-span-diagnostics document)))))))
+  (testing "adjacent ones that do read back stay delimiters, byte for byte"
+    (doseq [src ["~~a~~~~b~~\n" "==a====b==\n" "~~a~~ ~~b~~\n" "~~{~~~~..~~\n"]]
+      (let [document (parser/parse src)
+            text (hdoc/emit-document document)]
+        (is (= document (parser/parse text)) src)
+        (is (empty? (hdoc/lossy-role-span-diagnostics document)) src))))
+  (testing "emphasis around a delimiter that its flanking cannot close or open against is refused"
+    (doseq [document [(para-of {:t :emph :inlines [(delimited :strike (str-inline "a"))]} (str-inline "x."))
+                      (para-of (str-inline "a") {:t :strong :inlines [(delimited :highlight (str-inline "a"))]})]]
+      (is (thrown? clojure.lang.ExceptionInfo (hdoc/emit-document document)) (pr-str document))))
+  (testing "emphasis around a delimiter that reads back is unchanged"
+    (doseq [src ["*~~a~~*\n" "x **==a==** y\n" "*~~a~~* and ==b==\n"]]
+      (let [document (parser/parse src)
+            text (hdoc/emit-document document)]
+        (is (= document (parser/parse text)) src)
+        (is (= src text))))))
+
+(deftest emphasis-reread-with-footnotes-test
+  (testing "TASK-316: emphasis in emphasis holding a footnote marker is re-read with its
+            definition, so the `*`/`_` choice is judged and the output reads back"
+    (doseq [src ["x *_a[^1]_*\n\n[^1]: n\n"
+                 "x *_a[^1]~~~~==~~~~!\n[^1]  `c`_*\n\n[^1]: n\n"
+                 "*_a[^1] b_*\n\n[^1]: n\n"]]
+      (let [document (parser/parse src)
+            text (hdoc/emit-document document)]
+        (is (= document (parser/parse text)) (pr-str src))
+        (is (not (str/includes? text "**")) text)))))
+
+(deftest ^:timing emphasis-reread-footnotes-bounded-test
+  (testing "TASK-316 review: the emphasis re-read defines only the block's own footnotes,
+            so many risky paragraphs with many definitions stay linear (13 s at 800
+            when it re-parsed every definition so far, under 1 s bounded)"
+    (let [n 800
+          src (str (str/join "\n\n" (map #(str "x *_a[^f" % "]_* ==y==") (range n)))
+                   "\n\n"
+                   (str/join "\n\n" (map #(str "[^f" % "]: n") (range n)))
+                   "\n")
+          document (parser/parse src)
+          start (System/nanoTime)
+          text (hdoc/emit-document document)
+          ms (/ (- (System/nanoTime) start) 1e6)]
+      (is (= document (parser/parse text)))
+      (is (< ms 6000) (str "emitting took " ms " ms")))))
 
 (deftest sticky-note-attr-loss-is-named-test
   (testing "TASK-123 review: sec4.3 gives :note no :attr at all, so the

@@ -42,8 +42,11 @@
   and each `:locate` -- goes through `haselnuss.sandbox/sci-call!`, the
   bound `--extensions` and `--transform` use: the same locked SCI
   context (no interop, no `slurp`, no `require` of a host namespace), the
-  same wall-clock timeout, and the same abandoned-worker handling
-  (TASK-147) when a call times out. Each script gets its own fork of that
+  same timeout, and the same abandoned-worker handling
+  (TASK-147) when a call times out. The timeout is wall-clock time, except
+  that a `:books`, `:document` or `:locate` call is not charged a stall of
+  the whole process, up to `stall-allowance-ms` (TASK-299): a garbage
+  collection of a busy build must not fail a well-behaved script. Each script gets its own fork of that
   context, so nothing one script defines is visible to another or to a
   build's `--extensions`. The output cap is `sandbox/default-output-limit`
   for `:books` and `:locate`, and `default-document-output-limit` (ten
@@ -118,7 +121,10 @@
     is refused or cannot be read or parsed; or `:books` did not answer a
     sequence of maps. When it concerns the whole shelf the shelf lists no
     books, and when it concerns one book's `:document` it is what that
-    book's `document` answers.
+    book's `document` answers. One for a call that timed out (TASK-299) or
+    ran out of memory on a full heap (TASK-301) carries `:transient true`
+    (`haselnuss.library/transient?`): kept for the build, never saved as
+    lasting.
   - `:invalid-generated-book` (`:book`) -- a `:document` result that is
     not a valid `haselnuss.ast` Document, or that names a
     `meta.bibliography` (the host would read that file for the script),
@@ -200,10 +206,26 @@
         (take-while some? (iterate ex-cause t))))
 
 (defn- script-failed
-  "The `:script-failed` diagnostic for the sandboxed failure `t`."
+  "The `:script-failed` diagnostic for the sandboxed failure `t`. A
+  timeout is `:transient` (`haselnuss.library/transient?`, TASK-299): a
+  busy process can starve a well-behaved script past its deadline as
+  surely as a loop runs into it, so the build keeps it for this run but
+  saves nothing that would make a later run trust it. So is running out
+  of memory on a full heap (TASK-301): the heap is the whole process's,
+  and another thread's allocation can leave the script's call the one
+  that finds it full. An out-of-memory error that says the request alone
+  was impossible (`:heap-exhausted` false: an array over the VM's size
+  limit) fails the same way every run, so it is saved like any other
+  failure rather than rescanned on every build. (On HotSpot an array
+  larger than the whole heap still reads as a full heap; that one is
+  transient, as a timeout a loop always reaches is.)"
   [shelf ^Throwable t & {:as extra}]
-  (apply diagnostic :script-failed shelf (throwable-message t)
-         (mapcat identity (assoc extra :line (error-line t)))))
+  (let [{error-type :type :keys [heap-exhausted]} (ex-data t)]
+    (apply diagnostic :script-failed shelf (throwable-message t)
+           (mapcat identity (cond-> (assoc extra :line (error-line t))
+                              (or (= ::sandbox/timeout error-type)
+                                  (and (= ::sandbox/out-of-memory error-type) heap-exhausted))
+                              (assoc :transient true))))))
 
 ;; --- calling the script ------------------------------------------------------
 
@@ -224,7 +246,11 @@
   12-core desktop), against the sandbox's 5 s default; two minutes is
   eight times that, room for a machine several times slower or a busy
   build, and still a bound: a script that loops costs that library's
-  build at most two minutes per book it is asked for, never a hang."
+  build two minutes of the process running per book it is asked for,
+  never a hang. Wall-clock, that is two minutes plus whatever stalls of
+  the process are excused (`stall-allowance-ms`, TASK-299) -- up to 30 s
+  more, which the script itself can cause by allocating against a large
+  live heap."
   120000)
 
 (def max-document-output-limit
@@ -247,15 +273,28 @@
     (binding [sci-utils/*in-try* :sci/error]
       (if ctx (ctx-store/with-ctx ctx (g)) (g)))))
 
+(def stall-allowance-ms
+  "How much of a stall of the whole process -- a stop-the-world garbage
+  collection, ~9 s at worst seen in the native image under a parallel
+  site scan -- one `:books`, `:document` or `:locate` call is not charged
+  against its timeout (`sandbox/sci-call!`'s `:stall-allowance-ms`,
+  TASK-299), in milliseconds: several times that pause, and a bound. The
+  script can cause such stalls itself, by allocating against a large live
+  heap, and so make one call last up to its timeout plus this; the
+  sandbox's other callers (`--extensions`, `--transform`) get none."
+  30000)
+
 (defn- call!
   "`(f & args)`, a fn the script defined, called through the sandbox:
-  `sandbox/sci-call!`'s timeout, the script's own context re-established,
+  `sandbox/sci-call!`'s timeout, with `stall-allowance-ms` of a stalled
+  process not charged, the script's own context re-established,
   and -- on the worker, under that timeout -- the result copied as plain
   data and measured against `limit` (`sci-call!`'s `:data` kind). `describe`
   names the call in a failure. Throws `sci-call!`'s `ex-info`."
   [{:keys [ctx sandbox-opts]} limit describe f & args]
   (sandbox/sci-call! #(apply f args) describe
-                     (assoc sandbox-opts :output-limit limit :scope (located-scope ctx))
+                     (assoc sandbox-opts :output-limit limit :scope (located-scope ctx)
+                            :stall-allowance-ms stall-allowance-ms)
                      :data))
 
 (defn- notify!
@@ -691,6 +730,44 @@
         (boolean? (:locate? entry))
         (cache-files-unchanged? dir entry))))
 
+(defn- stale-listing?
+  "True when the previous run's cache entry `entry` is a listing of this
+  shelf (`shelf-ctx`: the same library and shelf, items that are maps) --
+  whether or not its files and bounds still stand."
+  [{:keys [lib-name shelf]} entry]
+  (boolean
+   (and (map? entry)
+        (= lib-name (:library entry))
+        (= shelf (:shelf entry))
+        (vector? (:items entry)) (every? map? (:items entry)) (seq (:items entry))
+        (vector? (:data-files entry)) (map? (:digests entry))
+        (boolean? (:locate? entry)))))
+
+(defn- stale-listing
+  "`load-shelf`'s answer when listing the shelf met the transient `failure`
+  (TASK-313): the books of the previous run's cache entry `entry`, as they
+  were then, with the failure reported as ever -- a timeout says nothing of
+  the books, so the shelf's pages and records stand for this run. No
+  `:cache` is answered, so the next run calls `:books` again; the books
+  carry the digests of the run that listed them, so only what changed
+  then is built. The entry itself is answered as `:carried`, for the
+  caller to save as it was, so a second failure in a row still finds it.
+  Like the listing, the entry is trusted without `cache-hit?`'s checks of
+  the script's stamp and the sandbox bounds: a `:books` edited since still
+  lists the old items, which is safe, as their old digests make the
+  recovering run rebuild whatever the edit changed."
+  [shelf-ctx entry failure]
+  (let [loaded (delay (load-source shelf-ctx))]
+    (assoc (books-from-items shelf-ctx
+                             {:source #(deref loaded)
+                              :locate? (:locate? entry)
+                              :data-files (:data-files entry)
+                              :digests (:digests entry)}
+                             (:items entry))
+           :diagnostics [failure]
+           :failure failure
+           :carried entry)))
+
 (defn load-shelf
   "The books of the generated shelf in the folder `dir`, on shelf `shelf`
   (a vector of names) of the library `lib-name`: `{:books [Book ...]
@@ -715,7 +792,14 @@
   nil when this listing cannot be cached -- a shelf that listed no books,
   a file modified too recently to trust its stamp
   (`haselnuss.library.digest/trusted-stamp`), items that would not come
-  back from EDN as they are. Given `:cache`, the previous run's entry,
+  back from EDN as they are. When listing meets a transient failure
+  (`haselnuss.library/transient?`: a timeout or a full heap) and `:cache`
+  is the previous run's entry for the shelf, the shelf lists that entry's
+  books, as they were, with the failure still in `:diagnostics` and
+  `:failure` and no `:cache` of its own (TASK-313: its pages stand for the
+  run and the next one calls `:books` again). Any other failure -- the
+  script throws, answers badly -- or no previous entry lists no books, as
+  before. Given `:cache`, the previous run's entry,
   that is still good (its `shelf.clj` and every `:data` file stamped as
   before, same library, shelf and sandbox bounds; stats only), the
   script is NOT run to list: the books come from the cached items, and
@@ -764,7 +848,9 @@
               ctx (:shelf-ctx loaded)
               called (when ctx (call-books ctx))]
           (if-let [failure (or (:failure loaded) (:failure called))]
-            (fail failure)
+            (if (and (library/transient? failure) (stale-listing? shelf-ctx cache))
+              (stale-listing shelf-ctx cache failure)
+              (fail failure))
             (cond-> (assoc (books-from-items ctx
                                              {:source (constantly loaded)
                                               :locate? (some? (:locate (:spec ctx)))

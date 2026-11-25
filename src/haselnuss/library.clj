@@ -75,7 +75,11 @@
     load.
 
   A `:locate` fn that throws is reported as doc-10's `:bad-locator`, with
-  the exception's own message: that is the book rejecting the locator."
+  the exception's own message: that is the book rejecting the locator.
+
+  A diagnostic with `:transient true` (`transient?`, TASK-299) is a
+  failure of the run rather than of the book -- a generated shelf's script
+  that ran out of time -- and is never saved as the book's lasting state."
   (:require [haselnuss.ast :as ast]
             [haselnuss.book-ref :as book-ref]
             [haselnuss.library.url :as url]))
@@ -162,6 +166,19 @@
   `:message`."
   [x]
   (and (map? x) (keyword? (:type x)) (string? (:message x))))
+
+(defn transient?
+  "True when the diagnostic `d` carries `:transient true`: a failure that
+  says nothing lasting about what it concerns, only about the run that met
+  it -- a generated shelf's sandboxed call that ran out of time
+  (`haselnuss.library.generated`, TASK-299), which a busy or stalled
+  process can cause, or out of memory on a full heap (TASK-301), which
+  another thread's allocation can. A build keeps the answer for its own run, so every
+  reference does not pay for it again, but saves nothing that would let a
+  later run trust it: the reference graph's `refresh` scans such a book
+  again, and `--build-site` rebuilds a page that met one."
+  [d]
+  (and (map? d) (true? (:transient d))))
 
 (defn valid-book-id?
   "True when `id` is a well-formed BookId: library, shelf segments and slug

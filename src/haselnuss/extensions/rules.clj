@@ -51,6 +51,7 @@
   `haselnuss.ast` before ever being spliced in) rather than reaching an
   emitter as verbatim, unescaped output by another name."
   (:require [clojure.java.io :as io]
+            [haselnuss.ast :as ast]
             [haselnuss.sandbox :as sandbox]
             [haselnuss.select :as select]
             [sci.core :as sci]))
@@ -217,6 +218,211 @@
 
       :else (sandboxed select))))
 
+;; Source positions on a sandboxed `:transform`'s result (TASK-309).
+;;
+;; The sandbox's `plain-copy` drops all metadata from what a script
+;; returns, so that a script cannot forge a source position -- and with it
+;; every `::ast/source` the rule's own input carried, so even a no-op rule
+;; left backlinks and positions without a line. `keep-positions` puts them
+;; back HOST-SIDE, from the rule's own input node only: nothing the script
+;; returns is ever read as metadata, and only `::ast/source` is copied.
+;;
+;; No position beats a wrong one (an editor jump to the wrong paragraph),
+;; so the matching is deliberately conservative:
+;;
+;; - The rule's input node keeps its position when the result has the
+;;   same `:t` (it is the node the rule was called on); its map-valued
+;;   keys are treated the same way, its vector-valued keys element-wise.
+;; - A vector element is never recursed into. It gets an old element --
+;;   that element itself, with every position inside it -- only when it is
+;;   `=` to it and nothing else could claim it (`match-vector`): same
+;;   index in a vector of unchanged length, a value occurring once in each
+;;   vector wherever it moved, or a repeated value occurring as often in
+;;   the old stretch as in the new between the matched elements around it.
+;;   Every other element (rewritten, new, or ambiguous) has no position,
+;;   and no old element is given to two new ones. So a position always
+;;   describes content equal to the node's own and is held by no other
+;;   node of the result.
+;;
+;; This runs after the sandboxed call has returned, outside its timeout,
+;; so the work is bounded by the result's size, which the sandbox caps
+;; (`sandbox/default-output-limit` values): equality is looked up through
+;; hash buckets (`hash-buckets`), runs only between elements whose hashes
+;; agree, and gives up past `bucket-cap` -- a document can hold any number
+;; of distinct paragraphs with one hash (Clojure hashes a string by
+;; `String.hashCode`, which is easy to collide), and a deep `=` against
+;; each of them is what made an earlier version quadratic. Each element of
+;; the result is compared against a bounded number of others, at its own
+;; level only, so the `=` work is at most a constant times the result's
+;; size; the rest is linear in the lengths of the input's vectors (plus
+;; hashing the input once: Clojure caches a collection's hash).
+
+(def ^:private bucket-cap
+  "The most elements of one hash a stretch of a vector may hold for any of
+  them to be matched by value (`match-vector`, steps 2 and 3). Real
+  documents repeat a block a few times at most (an empty paragraph, a
+  separator); a bigger bucket is either many equal elements, which a value
+  match could not tell apart anyway, or a hash collision."
+  8)
+
+(defn- same-value?
+  "`=`, checking the (cached) hashes first."
+  [a b]
+  (and (== (hash a) (hash b)) (= a b)))
+
+(defn- hash-buckets
+  "`v`'s indices grouped by the hash of the element at each, each group in
+  ascending order."
+  ^java.util.HashMap [v]
+  (let [buckets (java.util.HashMap.)]
+    (dotimes [i (count v)]
+      (let [h (hash (nth v i))
+            ^java.util.ArrayList bucket (.get buckets h)]
+        (if bucket
+          (.add bucket i)
+          (.put buckets h (doto (java.util.ArrayList.) (.add i))))))
+    buckets))
+
+(defn- first-above
+  "The position in ascending index list `bucket` of its first index above
+  `i` (its size when there is none)."
+  ^long [^java.util.ArrayList bucket ^long i]
+  (let [r (java.util.Collections/binarySearch bucket (Long/valueOf (inc i)))]
+    (if (neg? r) (- (inc r)) r)))
+
+(defn- equal-indices
+  "The indices i of `v`, `lo` < i < `hi` and `(ok? i)`, whose element is
+  `=` to `x`, found through `buckets` (`v`'s `hash-buckets`); nil when more
+  than `bucket-cap` indices in that range share `x`'s hash."
+  [v ^java.util.HashMap buckets x lo hi ok?]
+  (if-let [^java.util.ArrayList bucket (.get buckets (hash x))]
+    (let [from (first-above bucket lo)
+          to (first-above bucket (dec hi))]
+      (when (<= (- to from) (long bucket-cap))
+        (into [] (filter #(and (ok? %) (= x (nth v %)))) (.subList bucket from to))))
+    []))
+
+(defn- match-vector
+  "`new-v`, a rewritten copy of vector `old-v`, with each element that is
+  `=` to an element of `old-v` replaced by that element itself (so it
+  keeps every source position in it), in three steps:
+
+  1. when the two are the same length, the element at the same index (an
+     unchanged vector, or one edited in place, whatever it repeats);
+  2. else the one equal element, when the value occurs exactly once in
+     each vector -- wherever it moved, so a reordering keeps positions;
+  3. else, for a value that repeats: between the nearest elements before
+     and after it that steps 1-2 matched (the vector's ends counting as
+     matched), when their old elements are in order, the value's
+     occurrences in that stretch of `new-v` take its free occurrences in
+     the same stretch of `old-v` in order -- only when there are as many
+     of each. So dropping the first of [alpha beta alpha] leaves the
+     second alpha its own line, but dropping one of two adjacent equal
+     blocks leaves the survivor none: which of them went is a guess.
+
+  Each old element is matched at most once; everything else is left as it
+  is, without a position."
+  [old-v new-v]
+  (let [n (count old-v)
+        m (count new-v)
+        match (long-array m -1)
+        taken (boolean-array n)
+        take! (fn [j i]
+                (when-not (aget taken (int i))
+                  (aset match (int j) (long i))
+                  (aset taken (int i) true)))
+        old-buckets (hash-buckets old-v)
+        new-buckets (hash-buckets new-v)]
+    (when (== n m)
+      (dotimes [j m]
+        (when (same-value? (nth new-v j) (nth old-v j))
+          (take! j j))))
+    (dotimes [j m]
+      (when (neg? (aget match j))
+        (let [x (nth new-v j)
+              olds (equal-indices old-v old-buckets x -1 n any?)
+              news (equal-indices new-v new-buckets x -1 m any?)]
+          (when (and (= 1 (count olds)) (= 1 (count news)))
+            (take! j (first olds))))))
+    (let [anchors (aclone match)
+          taken-before (aclone taken)
+          free? (fn [i] (not (aget taken-before (int i))))
+          before (long-array m)
+          after (long-array m)]
+      (loop [j 0 p -1]
+        (when (< j m)
+          (aset before j p)
+          (recur (inc j) (if (neg? (aget anchors j)) p j))))
+      (loop [j (dec m) q m]
+        (when (>= j 0)
+          (aset after j q)
+          (recur (dec j) (if (neg? (aget anchors j)) q j))))
+      (dotimes [j m]
+        (when (neg? (aget anchors j))
+          (let [p (aget before j)
+                q (aget after j)
+                lo (if (neg? p) -1 (aget anchors p))
+                hi (if (== q m) n (aget anchors q))
+                x (nth new-v j)]
+            (when (< lo hi)
+              (let [olds (equal-indices old-v old-buckets x lo hi free?)
+                    news (equal-indices new-v new-buckets x p q any?)]
+                (when (and (seq olds) (= (count olds) (count news)))
+                  (take! j (nth olds (.indexOf ^java.util.List news j))))))))))
+    (into []
+          (map-indexed (fn [j x]
+                         (let [i (aget match j)]
+                           (if (neg? i) x (nth old-v i)))))
+          new-v)))
+
+(declare reattach-value)
+
+(defn- reattach-map
+  "`new-m`, a rewritten copy of map `old-m`: when both have the same `:t`
+  (nil included), with `old-m`'s source position and each of its values
+  reattached against `old-m`'s value under the same key
+  (`reattach-value`); otherwise `new-m` as it is."
+  [old-m new-m]
+  (if (= (:t old-m) (:t new-m))
+    (cond-> (reduce-kv (fn [acc k v]
+                         (if-let [[_ old-v] (find old-m k)]
+                           (assoc acc k (reattach-value old-v v))
+                           acc))
+                       new-m new-m)
+      (ast/source old-m) (with-meta {::ast/source (ast/source old-m)}))
+    new-m))
+
+(defn- reattach-value
+  "`new-v`, rewritten from `old-v`, with source positions put back from
+  `old-v`: a map by `reattach-map`, a vector by `match-vector`."
+  [old-v new-v]
+  (cond
+    (and (map? old-v) (map? new-v)) (reattach-map old-v new-v)
+    (and (vector? old-v) (vector? new-v)) (match-vector old-v new-v)
+    :else new-v))
+
+(defn- reattach-result
+  "A sandboxed `:transform`'s answer (a node, nil, or a sequential of
+  nodes) with source positions put back from the `node` it was called on:
+  a node, or the only node of a sequential, as its rewrite
+  (`reattach-value`); several nodes as a vector rewritten from `[node]`
+  (`match-vector`), so the one equal to `node`, if exactly one is, is
+  `node` itself."
+  [node result]
+  (cond
+    (map? result) (reattach-value node result)
+    (and (sequential? result) (= 1 (count result))) [(reattach-value node (first result))]
+    (sequential? result) (match-vector [node] (vec result))
+    :else result))
+
+(defn- keep-positions
+  "`transform-fn` (sandboxed) as a function that restores the input node's
+  source positions on whatever it returns (`reattach-result`; the comment
+  above `bucket-cap` has the rules)."
+  [transform-fn]
+  (fn [node ctx]
+    (reattach-result node (transform-fn node ctx))))
+
 (defn- normalize-rule
   "Validated rule map `entry` (from a sidecar file, `path`'s own source,
   named `label` -- `rule-entries`' own, so a later `sci-call!` failure
@@ -248,7 +454,9 @@
                                                       ctx (str label " (" path ")'s :select") opts)))]
     (cond-> (-> entry
                 (dissoc :matcher)
-                (update :transform sandbox/wrap-fn ctx (str label " (" path ")'s :transform") opts))
+                (update :transform (fn [f]
+                                     (keep-positions
+                                      (sandbox/wrap-fn f ctx (str label " (" path ")'s :transform") opts)))))
       matcher (assoc :matcher matcher))))
 
 (defn load-transforms

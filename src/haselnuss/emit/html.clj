@@ -1013,12 +1013,17 @@
         (concat-rendered (fn [row footnotes] (render-row ctx "td" colspec row footnotes))
                          footnotes''
                          rows)]
-    [(str "<table" (attr-attrs attr) ">"
+    ;; TASK-312: a wrapper that scrolls sideways, so a cell with a long
+    ;; unbroken word (whose min-content width `overflow-wrap` cannot
+    ;; lower) stays inside it instead of widening the page. A wrapper
+    ;; rather than `display:block` on the table keeps its table role.
+    [(str "<div class=\"table-scroll\">"
+          "<table" (attr-attrs attr) ">"
           (when caption-text (str "<caption>" caption-text "</caption>"))
           (render-colgroup colspec)
           "<thead>" head-html "</thead>"
           "<tbody>" rows-html "</tbody>"
-          "</table>")
+          "</table></div>")
      footnotes''']))
 
 (defn- render-toc-entries
@@ -2125,11 +2130,24 @@
    [":root{color-scheme:light dark}"
     "body{max-width:42rem;margin:2rem auto;padding:0 1rem;"
     "line-height:1.6;font-family:Georgia,'Times New Roman',serif}"
+    ;; TASK-293: a long unbroken word (a URL) used to be the widest thing
+    ;; on the page, and a phone's layout viewport grew to fit it, zooming
+    ;; the whole page out. Inherited by everything below; `pre` resets it
+    ;; (its lines are not reflowable and scroll instead).
+    "body{overflow-wrap:break-word}"
+    "pre,.math.display{overflow-wrap:normal}"
     "h1,h2,h3,h4,h5,h6{line-height:1.25;margin:2rem 0 .5rem}"
     ".section-number{opacity:.65;margin-right:.4em}"
     ;; Tables: the gap TASK-29's side-by-side reading made concrete --
     ;; the PDF had rules and aligned columns, the HTML neither.
     "table{border-collapse:collapse;width:100%;margin:1.5rem 0}"
+    ;; TASK-312: see `render-table`. Scrolls only when a table is wider
+    ;; than the page; ordinary words are not broken.
+    ;; The wrapper is a block formatting context, so the table's own
+    ;; margin would no longer collapse with its neighbours: the margin
+    ;; lives on the wrapper, which does.
+    "div.table-scroll{overflow-x:auto;max-width:100%;margin:1.5rem 0}"
+    "div.table-scroll table{margin:0}"
     "caption{caption-side:top;text-align:left;font-style:italic;"
     "padding-bottom:.5rem;opacity:.85}"
     "th,td{border:1px solid rgba(128,128,128,.4);padding:.4rem .6rem;vertical-align:top}"
@@ -2193,6 +2211,10 @@
     ;; output as XML, where a bare `>` inside <style> is invalid. The
     ;; only figures inside a row are its own panels anyway.
     "div.subfigure-row figure{margin:.5rem 0}"
+    ;; TASK-312: a grid item's automatic minimum width is its min-content
+    ;; width, which `overflow-wrap` does not lower; without this a panel
+    ;; caption of one long word widens the track and the page.
+    "div.subfigure-row figure{min-width:0}"
     "figure.subfigure figcaption{text-align:center}"
     ;; TASK-59: the three derived lists. The entries print their own
     ;; numbers, so the browser's list markers would set a second,

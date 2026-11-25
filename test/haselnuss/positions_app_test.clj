@@ -526,6 +526,8 @@
                  (open-book! b book)
                  (scroll-to! b "P5-2" 0.5)
                  (wait-server-position base "bia" "lib:plain" "Bia's save" some?)
+                 ;; the server has the save before the page has handled its answer
+                 (wait-for b "Bia's save answered" (str queued-js ".then(q => q && q.length === 2 && q[1][1] === false)"))
                  (is (= [["ana\nlib:plain" true] ["bia\nlib:plain" false]] (js b queued-js))
                      "Ana's is still kept for later"))))))))))
 

@@ -316,10 +316,21 @@
       (let [fm (parser/front-matter (str parser/front-matter-opening "\n" yaml-text "\n---\n")
                                     {:source (str file) :omit-invalid-front-matter? true})
             data (yaml/parse-string yaml-text)
-            [fields problems] (metadata-fields (if (map? data) data {}))]
+            data (if (map? data) data {})
+            [fields problems] (metadata-fields data)
+            title (:title data)]
         {:fields (cond-> fields
                    (seq (:title fm)) (assoc :title (:title fm)))
-         :problems problems}))))
+         ;; TASK-286: a title that is not text (`!!binary`, a list, a map)
+         ;; is left out of the listing with a problem, not listed as the
+         ;; `toString` of what YAML read.
+         :problems (cond-> problems
+                     (and (contains? data :title) (not (parser/text-scalar? title)))
+                     (conj (field-problem :title (str "title must be text, got "
+                                                      (if (bytes? title)
+                                                        "binary data (!!binary)"
+                                                        (binding [*print-length* 8 *print-level* 3]
+                                                          (pr-str title)))))))}))))
 
 ;; --- books -------------------------------------------------------------------
 
@@ -683,7 +694,7 @@
   script's books, its diagnostics, and under `:unusable` the diagnostic
   that says why it listed no books at all, when it did not."
   [lib-name ^File dir shelf opts]
-  (let [{:keys [books diagnostics failure cache]}
+  (let [{:keys [books diagnostics failure cache carried]}
         (generated/load-shelf lib-name shelf dir
                               (cond-> (:generated opts)
                                 (:cache? opts)
@@ -692,7 +703,12 @@
     (cond-> {:books books
              :diagnostics diagnostics
              :unusable (if failure [failure] [])}
-      cache (assoc-in [:cache :shelves (str dir)] cache))))
+      cache (assoc-in [:cache :shelves (str dir)] cache)
+      ;; TASK-313: the entry of a listing a transient failure replaced is
+      ;; saved as it was, so the next failure finds it too; it is no fresh
+      ;; listing, so the walk stays incomplete (`walk`)
+      carried (assoc-in [:cache :shelves (str dir)] carried)
+      carried (assoc :carried? true))))
 
 ;; --- the walk record (TASK-296) -------------------------------------------------
 
@@ -769,7 +785,7 @@
                    ;; cache, may list otherwise next time; one whose
                    ;; scripts are disabled lists none while the folder
                    ;; and the directory file stay as they are
-                   (with-walk result (or (some? cache) (= [:scripts-disabled] (mapv :type unusable)))))
+                   (with-walk result (or (and (some? cache) (not (:carried? result))) (= [:scripts-disabled] (mapv :type unusable)))))
       (nil? children)
       (with-walk {:books []
                   :diagnostics [{:type :unreadable-shelf

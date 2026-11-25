@@ -14,6 +14,7 @@
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [haselnuss.cli :as cli]
             [haselnuss.json :as json]
             [haselnuss.parser :as parser]
@@ -232,6 +233,42 @@
              (filterv #(= :book-ref (:t %)) nodes)))
       (is (= [{:t :book-quote :ref "reformed:heidelberg#sec:q1..sec:q3"}]
              (filterv #(= :book-quote (:t %)) nodes))))))
+
+(deftest coalesce-prose-matches-postwalk-reference-test
+  (testing "TASK-283: the single-pass `coalesce-prose` equals the `postwalk`
+            of the per-vector run-folding it replaced, on nested vectors, a
+            glueable node as a bare map value, lists, sets and `:fallback`"
+    (let [reference (fn [d] (walk/postwalk
+                             (fn [x]
+                               (if (vector? x)
+                                 (into []
+                                       (mapcat (fn [group]
+                                                 (if (and (map? (first group))
+                                                          (contains? @#'cli/glueable-inline-tags
+                                                                     (:t (first group))))
+                                                   [{:t :str :text (#'cli/glue-text group)}]
+                                                   group)))
+                                       (partition-by #(and (map? %)
+                                                           (contains? @#'cli/glueable-inline-tags
+                                                                      (:t %)))
+                                                     x))
+                                 x))
+                             d))
+          s {:t :str :text "a"}
+          sp {:t :space}
+          sb {:t :soft-break}
+          doc {:t :document
+               :blocks [{:t :para :inlines [s sp s {:t :emph :inlines [s sb sp s]} s s
+                                            {:t :line-break} sp s]}
+                        {:t :x :fallback [{:t :para :inlines [s sp s]}] :one sp :n [[s sp] [sp]]}
+                        {:t :y :items (list [s sp s] {:t :para :inlines [s s]})
+                         :set #{[s sp s]}}]}
+          cases [doc [] [s] [sp sp] {:inlines [[sp]]} (list [s sp s])]]
+      (is (every? #(= (reference %) (#'cli/coalesce-prose %)) cases))
+      (is (= {:t :str :text "a a"}
+             (get-in (#'cli/coalesce-prose doc) [:blocks 0 :inlines 0]))
+          "not vacuous: runs are actually folded")
+      (is (not= doc (#'cli/coalesce-prose doc))))))
 
 (deftest json-target-coalesces-prose-test
   (testing "AC #1/#5 (TASK-81): a plain-prose paragraph decodes
@@ -1847,6 +1884,30 @@
                   holds every other LaTeX-producing feature to"
           (let [[ok? detail] (compiles? dir output)]
             (is ok? detail))))))
+  (testing "TASK-318: a renderer that recurses without end is an error that
+            names what went wrong, not one ending on nothing"
+    (let [dir (fixture-dir! ":::{callout}\nx\n:::\n")
+          ext (write-file! dir "e.clj"
+                           (str "{:name \"callout\"\n"
+                                " :emit {:html (fn [d ctx] ((fn f [n] (inc (f n))) 1))}}"))
+          {:keys [status err]} (main-run "--extensions" ext (str (io/file dir "doc.hdoc")))]
+      (is (= 1 status))
+      (is (str/includes? err ":html renderer raised an error: "))
+      (is (re-find #"raised an error: \S" err) err)
+      (is (str/includes? err "StackOverflowError") err))
+    (testing "a script's own :haselnuss.sandbox/error-class is neither
+              printed unbounded nor trusted"
+      (doseq [v ["(apply str (repeat 100000 \"x\"))" "42"]]
+        (let [dir (fixture-dir! ":::{callout}\nx\n:::\n")
+              ext (write-file! dir "e.clj"
+                               (str "{:name \"callout\"\n :emit {:html (fn [d ctx] (throw (ex-info \"\" {:haselnuss.sandbox/error-class "
+                                    v "})))}}"))
+              {:keys [status err]} (main-run "--extensions" ext (str (io/file dir "doc.hdoc")))]
+          (is (= 1 status))
+          (is (str/includes? err ":html renderer raised an error: clojure.lang.ExceptionInfo") err)
+          (is (< (count err) 1000) (count err))
+          (is (not (str/includes? err "xxxxxxxx")))
+          (is (not (str/includes? err "error: 42")))))))
   (testing "omitting --extensions entirely leaves an unrelated build
             byte-for-byte unaffected, and the same directive name is still
             reported as unknown -- --extensions is additive, not a global
@@ -3725,7 +3786,36 @@
     (testing "--in-place is refused with a book ID: it would rewrite a library's book"
       (let [{:keys [status err]} (main-run "--libraries" yaml "--in-place" "lib:heidelberg")]
         (is (= 2 status))
-        (is (str/includes? err "--in-place needs a file input, not a book ID") err)))))
+        (is (str/includes? err "--in-place needs a file input, not a book ID") err)))
+    (testing "TASK-326: --doc converts the named book, whatever its other options"
+      (let [{:keys [status err]} (main-run "--libraries" yaml "--doc" "lib:heidelberg" "-o" (out "d.html"))]
+        (is (= 0 status) err)
+        (is (str/includes? (slurp (out "d.html")) "Only comfort.")))
+      (let [{:keys [status err]} (main-run "--libraries" yaml "--doc=lib:nowhere" "-o" (out "y.html"))]
+        (is (= 1 status))
+        (is (str/includes? err "(--doc): library \"lib\" has no book \"nowhere\"") err)))
+    (testing "TASK-326: a --doc value that is no whole-book ID is a usage error"
+      (doseq [v ["heidelberg" "lib:" "lib:heidelberg#sec:q1" "doc.hdoc"]]
+        (let [{:keys [status err]} (main-run "--libraries" yaml "--doc" v)]
+          (is (= 2 status) v)
+          (is (str/includes? err "--doc takes") (str v ": " err)))))
+    (testing "TASK-326: --doc conflicts are usage errors naming the conflict"
+      (doseq [[args expected]
+              [[["--doc" "lib:a" "--doc" "lib:b"] "--doc given more than once"]
+               [["--doc" "lib:a" "x.hdoc"] "--doc cannot be combined with an input argument"]
+               [["x.hdoc" "--doc" "lib:a"] "--doc cannot be combined with an input argument"]
+               [["--doc" "lib:a" "--check"] "--doc cannot be combined with --check"]
+               [["--doc" "lib:a" "--backlinks" "lib:b"] "--doc cannot be combined with --backlinks"]
+               [["--doc" "lib:a" "--list-books" "lib"] "--doc cannot be combined with --list-books"]
+               [["--doc" "lib:a" "--build-site" "d"] "--doc cannot be combined with --build-site"]
+               [["--doc" "lib:a" "--serve" "d"] "--doc cannot be combined with --serve"]
+               [["--doc"] "option --doc requires a value"]
+               [["--doc" "lib:heidelberg" "--in-place"] "--in-place needs a file input"]]]
+        (let [{:keys [status err]} (apply main-run "--libraries" yaml args)]
+          (is (= 2 status) (pr-str args))
+          (is (str/includes? err expected) (str (pr-str args) ": " err)))))
+    (testing "--help documents --doc"
+      (is (str/includes? (:out (main-run "--help")) "--doc BOOK-ID")))))
 
 (deftest ^:slow book-id-input-writes-into-working-directory-test
   (testing "AC #3: with no --output, a book ID writes <slug>.<ext> in the current
@@ -3739,6 +3829,8 @@
           yaml (yaml-path libs)
           runs [["--libraries" yaml "lib:heidelberg" "--target" "latex"]
                 ["lib:apostles"]
+                ;; TASK-326: --doc skips the file test
+                ["--libraries" yaml "--doc" "lib:apostles"]
                 ;; TASK-157 review: the default output exists already --
                 ;; the user's own file, or an earlier build -- so it is
                 ;; refused on every target, until --output names it.
@@ -3754,7 +3846,7 @@
                                            "clojure.main" "-e" form
                                            :dir (str cwd))]
       (is (= 0 exit) err)
-      (is (= "0\n0\n1\n1\n0\n" out) err)
+      (is (= "0\n0\n0\n1\n1\n0\n" out) err)
       (is (str/includes? (slurp (io/file cwd "heidelberg.tex")) "Only comfort."))
       (is (str/includes? err "haselnuss: wrote heidelberg.tex") err)
       (is (str/includes? (slurp (io/file cwd "lib:apostles.html")) "A file, not the book"))
@@ -3764,7 +3856,9 @@
                                   " exists, with book lib:nicene -- pass --output nicene.hdoc"))
           err)
       (is (str/includes? err "refusing to overwrite heidelberg.tex, which already exists") err)
-      (is (= #{"heidelberg.tex" "lib:apostles" "lib:apostles.html" "nicene.hdoc"}
+      (is (str/includes? (slurp (io/file cwd "apostles.html")) "I believe.")
+          "--doc converted the book although a file named lib:apostles exists")
+      (is (= #{"heidelberg.tex" "lib:apostles" "lib:apostles.html" "apostles.html" "nicene.hdoc"}
              (set (.list cwd)))
           "nothing written beside the book inside the library"))))
 
@@ -3964,3 +4058,24 @@
               err)))))
   (testing "--help describes it"
     (is (str/includes? (:out (main-run "--help")) "--untrusted"))))
+
+(defn deep-list-document
+  "TASK-314's recipe: `d` nested items, each `<2k spaces>- iK` then a blank
+  line, then a fence at indent 2d."
+  [d]
+  (str (apply str (for [k (range d)] (str (apply str (repeat (* 2 k) " ")) "- i" k "\n\n")))
+       (apply str (repeat (* 2 d) " ")) "```\ncode\n```\n"))
+
+(deftest too-deep-nesting-is-a-diagnostic-test
+  (testing "TASK-306: a document nested past the stack is one error line and
+            status 1, not a StackOverflowError trace"
+    (doseq [[label text] [["blockquote" (str (apply str (repeat 6000 "> ")) "a b\n")]
+                          ["list" (deep-list-document 300)]]]
+      (let [dir (java.nio.file.Files/createTempDirectory "deep" (make-array java.nio.file.attribute.FileAttribute 0))
+            in (io/file (.toFile dir) "q.hdoc")
+            _ (spit in text)
+            {:keys [status err]} (main-run "-t" "html" "-o" "-" (str in))]
+        (is (= 1 status) label)
+        (is (str/includes? err "haselnuss: error: the document is nested too deeply") label)
+        (is (= 1 (count (str/split-lines err))) label)
+        (is (not (str/includes? err "StackOverflowError")) label)))))
