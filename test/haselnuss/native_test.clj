@@ -415,6 +415,29 @@
             (is (= (site-tree jvm-site) (site-tree native-site)))
             (is (= "page bible:blivre/romanos\npage reformed:catecismo-heidelberg\n"
                    (slurp (io/file native-site ".haselnuss" "pending"))))))
+        (testing "TASK-330: a partial site from the binary -- --build-doc makes one of an
+                  absent folder, --build-site keeps its chosen books, --all-books makes
+                  it full -- as the JVM makes it"
+          (let [native-partial (str (io/file tmp "native-partial"))
+                jvm-partial (str (io/file tmp "jvm-partial"))
+                ;; each step's arguments after --libraries, the site last
+                steps [["--build-doc" "reformed:estudos/queda" "bible:genesis" "--site"]
+                       ["--build-site"]
+                       ["--build-doc" "reformed:catecismo-heidelberg" "--site"]
+                       ["--all-books" "--build-site"]]]
+            (doseq [step steps
+                    :let [native-run (apply run-binary "--libraries" site-libraries (conj step native-partial))
+                          jvm-run (apply run-main "--libraries" site-libraries (conj step jvm-partial))]]
+              (is (= (:exit jvm-run) (:exit native-run)) (str step (:err native-run)))
+              (is (= (:err jvm-run) (:err native-run)) (str step))
+              (is (= (site-tree jvm-partial) (site-tree native-partial)) (str step))
+              (when (= ["--build-site"] step)
+                (is (not (some #(str/starts-with? % "books/reformed/catkins/") (keys (site-tree native-partial))))
+                    "an unchosen book has no page")
+                (is (.isFile (io/file native-partial ".haselnuss" "chosen")))))
+            (is (not (.exists (io/file native-partial ".haselnuss" "chosen"))) "full at the end")
+            (let [pages #(set (filter (fn [rel] (str/ends-with? rel "/index.html")) (keys (site-tree %))))]
+              (is (= (pages native-site) (pages native-partial)) "and then every page a full build has"))))
         (testing "TASK-296: the binary and the jar each know their build identity, so a
                   run after a settled build answers from the record -- which leaves
                   it as it is -- and prints what the long way printed; the other one

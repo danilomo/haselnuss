@@ -2776,6 +2776,57 @@
         (map? x) (some #(when (coll? %) (some-sibling-seq pred %)) (vals x))
         :else nil))
 
+(defn- edge-char
+  "The first (`last?` false) or last character of the text `x` starts or ends
+  with as a code point, looking through emphasis; `::opaque` for any other
+  inline (a code span, a link: written with a delimiter of its own at the
+  edge), nil for empty text (TASK-324)."
+  [x last?]
+  (case (:t x)
+    :str (let [^String t (:text x)]
+           (when (seq t) (if last? (.codePointBefore t (.length t)) (.codePointAt t 0))))
+    (:emph :strong) (if-let [c (if last? (peek (:inlines x)) (first (:inlines x)))] (edge-char c last?) nil)
+    ::opaque))
+
+(defn- flank-space?
+  "Whether code point `cp` is whitespace to the parser's flanking rules: Java
+  whitespace or a Unicode space separator (U+00A0 and the like)."
+  [cp]
+  (or (Character/isWhitespace (int cp)) (= Character/SPACE_SEPARATOR (Character/getType (int cp)))))
+
+(defn- flank-punct?
+  "Whether code point `cp` is punctuation to the parser's flanking rules
+  (flexmark 0.64.8, checked over U+0021-U+2FFF): ASCII punctuation and
+  symbols, and the Unicode P categories. Other Unicode symbols (`€`,
+  `©`, `°`, `×`) are word characters to it."
+  [cp]
+  (let [cp (int cp)]
+    (or (<= 33 cp 47) (<= 58 cp 64) (<= 91 cp 96) (<= 123 cp 126)
+        (contains? #{Character/CONNECTOR_PUNCTUATION Character/DASH_PUNCTUATION
+                     Character/START_PUNCTUATION Character/END_PUNCTUATION
+                     Character/INITIAL_QUOTE_PUNCTUATION Character/FINAL_QUOTE_PUNCTUATION
+                     Character/OTHER_PUNCTUATION}
+                   (byte (Character/getType cp))))))
+
+(defn- flank-edge-risky?
+  "TASK-324: whether the emphasis `x`, between siblings `before` and `after`
+  (nil at an end), has punctuation on its inner side of a delimiter run with
+  something other than a blank or punctuation on the outer side: the shape
+  where `*` stops being left- or right-flanking (`*b=*x.`, `.a**=a**`). Both
+  sides use the parser's own punctuation and blank (`flank-punct?`,
+  `flank-space?`): a non-ASCII symbol is a word character. An inner edge that
+  is another inline (a code span, `a*`x`*b`) counts as punctuation; one that
+  is a letter, a digit, a symbol or a blank is never flagged."
+  [before x after]
+  (let [punct? (fn [c] (or (= ::opaque c) (and c (flank-punct? c))))
+        outer-word? (fn [y last?]
+                      (and y (not (contains? #{:space :soft-break :line-break} (:t y)))
+                           (let [c (edge-char y last?)]
+                             (or (nil? c) (= ::opaque c)
+                                 (not (or (flank-space? c) (flank-punct? c)))))))]
+    (boolean (or (and (punct? (edge-char x false)) (outer-word? before true))
+                 (and (punct? (edge-char x true)) (outer-word? after false))))))
+
 (defn- emphasis-risky?
   "TASK-237: whether any `:emph`/`:strong` in `inlines` (at any depth) is
   next to another emphasis or holds one as a direct child, the only places
@@ -2787,7 +2838,11 @@
   (let [em? (fn [x] (and (map? x) (contains? #{:emph :strong} (:t x))))
         dl? (fn [x] (and (map? x) (contains? #{:strike :highlight} (:t x))))
         risky-siblings? (fn [xs]
-                          (or (some (fn [[a b]] (or (and (em? a) (em? b))
+                          (or (let [v (vec xs)]
+                                (some (fn [i] (and (em? (nth v i))
+                                                   (flank-edge-risky? (get v (dec i)) (nth v i) (get v (inc i)))))
+                                      (range (count v))))
+                              (some (fn [[a b]] (or (and (em? a) (em? b))
                                                     ;; TASK-323: a delimiter run beside the emphasis's
                                                     (and (em? a) (dl? b)) (and (dl? a) (em? b))))
                                     (partition 2 1 xs))

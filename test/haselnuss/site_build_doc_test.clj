@@ -377,14 +377,13 @@
 (deftest refusals-write-nothing-test
   (let [[root dir] (built-site)
         site (str dir)]
-    (testing "a folder that is not a site: empty, absent, or holding other files"
-      (let [empty-dir (temp-dir)]
-        (refused? root empty-dir "not a Haselnuss site" "--build-doc" "reformed:catkins" "--site" (str empty-dir))
-        (let [absent (io/file empty-dir "absent")]
-          (refused? root empty-dir "not a Haselnuss site" "--build-doc" "reformed:catkins" "--site" (str absent))
-          (is (not (.exists absent))))
-        (write-file! empty-dir "notes.txt" "mine")
-        (refused? root empty-dir "not a Haselnuss site" "--build-doc" "reformed:catkins" "--site" (str empty-dir))))
+    ;; (an empty or absent folder becomes a partial site, TASK-330:
+    ;; haselnuss.site-partial-test)
+    (testing "a folder that is not a site, holding other files"
+      (let [other-dir (temp-dir)]
+        (write-file! other-dir "notes.txt" "mine")
+        (refused? root other-dir "neither empty nor a Haselnuss site" "--build-doc" "reformed:catkins"
+                  "--site" (str other-dir))))
     (testing "an unknown library or book, an ambiguous one, a passage"
       (refused? root dir "the library directory has no library \"nowhere\"" "--build-doc" "nowhere:x" "--site" site)
       (refused? root dir "library \"reformed\" has no book \"nothing\""

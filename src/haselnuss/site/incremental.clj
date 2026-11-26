@@ -378,9 +378,24 @@
   - `:saved`, the saved state's `:books`;
   - `:pending`, `read-pending` of the site.
 
+  A partial site (TASK-330; doc-13, section 5): `:chosen`, a set of
+  BookIds, limits the plan to those books -- every other book is neither
+  rebuilt nor kept -- and the data files, which count references from
+  chosen books only (`site/preview-passages`' `from?`), are compared
+  between the saved and the new graph through those references alone.
+  `entries` are still every book's, so a book added beside or below a
+  chosen one is seen. `:partial? true` says the site is partial, or was
+  until this build (`--all-books`): the books whose references count may
+  then have changed since the saved state -- a book `--build-doc` chose,
+  every book when the site turns full, a chosen book dropped or not found
+  -- so a kept book that a book in scope with no saved page (one that
+  joined) refers to now, or a saved page out of scope (one that left)
+  referred to then, has both its data files made again. (The comparison
+  of the two graphs above sees the scope as it is now on both sides.)
+
   Answers `{:rebuild {BookId reason} :kept {BookId saved} :data {BookId
   #{:backlinks :previews}}}`."
-  [entries {:keys [dir old-graph refresh narrowed saved pending]}]
+  [entries {:keys [dir old-graph refresh narrowed saved pending chosen partial?]}]
   (let [site-file? (site-file-checker (io/file dir))
         g0 old-graph
         g1 (:graph refresh)
@@ -388,13 +403,17 @@
         rescanned (set rescanned)
         before (graph/indexed-books g0)
         after (graph/indexed-books g1)
-        buildable (into [] (comp (filter :book) (map :id)) entries)
+        from? (when chosen #(contains? chosen %))
+        in-scope? (or from? (constantly true))
+        scoped-edges-to (fn [g t] (cond->> (graph/edges-to g t) from? (filter #(from? (:id (:from %))))))
+        buildable (into [] (comp (filter :book) (map :id) (filter in-scope?)) entries)
         narrowed (set narrowed)
         pending-pages (set (:pages pending))
         pending-data (set (:data pending))
         appeared-or-vanished (concat (remove #(contains? before %) (map :id entries)) vanished)
         nested (if (empty? appeared-or-vanished)
                  #{}
+                 ;; every book's folder counts; only a chosen owner is rebuilt
                  (let [dir-owner (into {} (keep (fn [id] (some-> (page-dir id) (vector id)))) buildable)]
                    (into #{} (comp (keep page-dir) (mapcat ancestor-dirs) (keep dir-owner))
                          appeared-or-vanished)))
@@ -425,8 +444,23 @@
         edges-changed (into #{}
                             (filter (fn [t]
                                       (and (contains? delta (book-ref/book-key t))
-                                           (not= (set (graph/edges-to g0 t)) (set (graph/edges-to g1 t))))))
+                                           (not= (set (scoped-edges-to g0 t)) (set (scoped-edges-to g1 t))))))
                             (keys kept))
+        ;; TASK-330: the books that joined the scope of a partial site since
+        ;; the saved state, and those that left it (a chosen book dropped or
+        ;; not found), and the books they refer to now and referred to then
+        joined-keys (if partial?
+                      (-> #{}
+                          (into ;; (a shared id has no page, yet its references count)
+                           (comp (filter #(and (in-scope? (:id %)) (not (contains? saved (:id %)))))
+                                 (mapcat #(graph/edges-from g1 (:id %)))
+                                 (keep graph/target-key))
+                           entries)
+                          (into (comp (remove in-scope?)
+                                      (mapcat #(graph/edges-from g0 %))
+                                      (keep graph/target-key))
+                                (keys saved)))
+                      #{})
         data (into {}
                    (par-mapcat (fn [[id saved-page]]
                                  (let [redo? (or (contains? pending-data id) (some? (:data-failed saved-page)))
@@ -438,9 +472,11 @@
                                                (conj :previews)
                                                (contains? edges-changed id) (conj :backlinks)
                                                (and (contains? edges-changed id)
-                                                    (not= (site/preview-passages g0 id)
-                                                          (site/preview-passages g1 id)))
-                                               (conj :previews))]
+                                                    (not= (site/preview-passages g0 id from?)
+                                                          (site/preview-passages g1 id from?)))
+                                               (conj :previews)
+                                               (contains? joined-keys (book-ref/book-key id))
+                                               (into [:backlinks :previews]))]
                                    (when (seq which) [[id which]])))
                                (vec kept)))]
     {:full? false :rebuild rebuild :kept kept :data data}))

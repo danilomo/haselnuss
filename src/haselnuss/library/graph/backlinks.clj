@@ -193,11 +193,15 @@
   is `{:id BookId :passage? Passage-or-string}` -- the book's current
   canonical id -- or a bare BookId. Pure: reads only `edges-to`. `opts`:
   `:base-dir`, an absolute folder paths are shown relative to (the CLI
-  passes its working directory); nil shows them as recorded."
+  passes its working directory); nil shows them as recorded. `:from?`
+  (TASK-330), a predicate of a BookId: only the edges from books it holds
+  for are reported -- a partial site's `backlinks.json` covers its chosen
+  books only; nil, every edge."
   ([g target] (backlinks-report g target {}))
-  ([g target {:keys [base-dir]}]
+  ([g target {:keys [base-dir from?]}]
    (let [{:keys [id passage]} (graph/parse-target target)
-         edges (remove graph/derived? (graph/edges-to g target))
+         edges (cond->> (remove graph/derived? (graph/edges-to g target))
+                 from? (filter #(from? (:id (:from %)))))
          {self true others false} (group-by #(boolean (self-edge? id %)) edges)
          others (sort-entries (map #(entry % base-dir) others))
          self (sort-entries (map #(entry % base-dir) self))]

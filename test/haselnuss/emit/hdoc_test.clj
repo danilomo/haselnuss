@@ -3925,19 +3925,6 @@
         (is (= document (parser/parse text)))
         (is (empty? (hdoc/lossy-role-span-diagnostics document)))))))
 
-(defn- splice-delimiters
-  "`inlines` with every strike and highlight replaced by what it holds, adjacent
-  words merged: the tree a plain-emphasis flanking failure shows up in without them."
-  [inlines]
-  (let [flat (vec (mapcat (fn [x] (cond (contains? #{:strike :highlight} (:t x)) (splice-delimiters (:inlines x))
-                                        (:inlines x) [(update x :inlines splice-delimiters)]
-                                        :else [x]))
-                          inlines))]
-    (vec (reduce (fn [acc y] (if (and (= :str (:t y)) (= :str (:t (peek acc))))
-                               (conj (pop acc) (update (peek acc) :text str (:text y)))
-                               (conj acc y)))
-                 [] flat))))
-
 (defn- reads-back-or-refused?
   "True when `document` emits to something that parses back to it, or the emitter
   refuses it (an exception)."
@@ -3950,9 +3937,8 @@
             and strong with words, tildes, equals signs, asterisks and punctuation at
             their edges, same-kind delimiters directly adjacent, and a word directly
             against a delimiter or a space: every tree round-trips, is reported
-            (`lossy-role-span-diagnostics`) or is refused, except one that fails
-            without its strikes and highlights too (plain emphasis flanking, a
-            separate matter), and each outcome is reached"
+            (`lossy-role-span-diagnostics`) or is refused, with no exception
+            (TASK-324), and each outcome is reached"
     (let [rnd (java.util.Random. 323)
           words ["a" "b" "~" "~b" "a~" "." ".a" "=" "=a" "b=" "x." "*" "*a" "a*"]
           pick #(nth % (.nextInt rnd (count %)))
@@ -3975,7 +3961,7 @@
                                        xs (rest xs))))))
           delim? #(contains? #{:strike :highlight} (:t %))
           outcomes (atom {:ok 0 :reported 0 :refused 0 :against-word 0 :adjacent-same-kind 0
-                          :emphasis-around-delimiter 0 :plain-emphasis 0})]
+                          :emphasis-around-delimiter 0})]
       (dotimes [_ 4000]
         (let [inlines (items 3)
               document (para-of-seq inlines)
@@ -3999,9 +3985,6 @@
                     (swap! outcomes update :ok inc)
                     (seq (hdoc/lossy-role-span-diagnostics document))
                     (swap! outcomes update :reported inc)
-                    ;; not a strike or highlight failure: the same words in plain emphasis fail too
-                    (not (reads-back-or-refused? (para-of-seq (splice-delimiters inlines))))
-                    (swap! outcomes update :plain-emphasis inc)
                     :else (is false (str "silent failure: " (pr-str inlines) " -> " (pr-str text))))))))
       (is (< 1000 (:ok @outcomes)) (pr-str @outcomes))
       (is (< 200 (:reported @outcomes)) (pr-str @outcomes))
@@ -4009,6 +3992,46 @@
       (is (< 200 (:against-word @outcomes)) (pr-str @outcomes))
       (is (< 100 (:adjacent-same-kind @outcomes)) (pr-str @outcomes))
       (is (< 100 (:emphasis-around-delimiter @outcomes)) (pr-str @outcomes)))))
+
+(deftest plain-emphasis-flanking-test
+  (testing "TASK-324: emphasis whose edge punctuation breaks flanking reads back or is refused"
+    (doseq [document [(para-of {:t :emph :inlines [(str-inline "b=")]} (str-inline "x."))
+                      (para-of (str-inline ".a") {:t :strong :inlines [(str-inline "=a")]})
+                      (para-of (str-inline "a~") {:t :strong :inlines [(str-inline ".")]} (str-inline "x."))
+                      (para-of {:t :strong :inlines [(str-inline ")")]} (str-inline "b="))
+                      (para-of {:t :strong :inlines [(str-inline "a_")]} (str-inline "a"))
+                      (para-of (str-inline "b") {:t :strong :inlines [(str-inline "=")]} (str-inline "1"))
+                      ;; a code span at the inner edge, a non-ASCII symbol (a word character) outside
+                      (para-of (str-inline "a") {:t :emph :inlines [{:t :code :text "x"}]} (str-inline "b"))
+                      (para-of {:t :strong :inlines [{:t :code :text "x"}]} (str-inline "b"))
+                      (para-of (str-inline "€") {:t :emph :inlines [(str-inline ".")]})
+                      (para-of {:t :emph :inlines [(str-inline ".")]} (str-inline "°"))]]
+      (is (reads-back-or-refused? document) (pr-str document))
+      (is (try (hdoc/emit-document document) true
+               (catch clojure.lang.ExceptionInfo e (= ::hdoc/unrepresentable-emphasis (:type (ex-data e)))))
+          (pr-str document))))
+  (testing "seeded fuzz (seed 324) over plain emphasis with punctuation at its edges"
+    (let [rnd (java.util.Random. 324)
+          words ["a" "b" "." "=" ")" "a_" "_a" "x." ".a" "b=" "1" "€" "°" "×a"]
+          pick #(nth % (.nextInt rnd (count %)))
+          hits (atom 0)
+          leaf #(if (zero? (.nextInt rnd 5)) {:t :code :text "x"} (str-inline (pick words)))]
+      (dotimes [_ 3000]
+        (let [node #(if (zero? (.nextInt rnd 2))
+                      {:t (pick [:emph :strong]) :inlines [(leaf)]}
+                      (leaf))
+              xs (vec (repeatedly (inc (.nextInt rnd 3)) node))
+              inlines (vec (cons (first xs) (mapcat (fn [p x] (if (and (contains? #{:str :code} (:t p)) (contains? #{:str :code} (:t x)))
+                                                                [{:t :space} x]
+                                                                [x]))
+                                                    xs (rest xs))))
+              document (para-of-seq inlines)
+              text (try (hdoc/emit-document document) (catch clojure.lang.ExceptionInfo _ ::refused))]
+          (when (and (not= ::refused text) (not= document (try (parser/parse text) (catch Exception _ nil))))
+            (is false (str "silent failure: " (pr-str inlines) " -> " (pr-str text))))
+          (when (or (= ::refused text) (re-find #"[=.)_`]\*+[a-z0-9€°×]|[a-z0-9€°×]\*+[=.)_`]" text))
+            (swap! hits inc))))
+      (is (< 100 @hits) (str @hits)))))
 
 (deftest adjacent-same-kind-delimiters-and-emphasis-around-them-test
   (testing "TASK-323: a strike or highlight written right after one of its kind reads back

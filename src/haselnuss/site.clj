@@ -1347,20 +1347,24 @@
   whitespace; nil for the whole book) -- `{:key :passage}`, `:passage`
   the parsed passage of the first such edge by what was written --
   ordered as `--backlinks` orders its groups (`backlinks/passage-order`).
-  Quotes need no preview: they copy the passage into the quoting page."
-  [g id]
-  (->> (graph/edges-to g id)
-       (filter #(and (= :link (:kind %)) (= :resolved (:status %))
-                     (not= id (:id (:from %)))))
-       (group-by graph/edge-passage-key)
-       (map (fn [[k edges]]
-              (let [edge (first (sort-by (comp :written :to) edges))
-                    parsed (book-ref/parse-book-ref (:written (:to edge)))]
-                {:key k
-                 :passage (or (:passage (:to edge))
-                              (when-not (book-ref/malformed? parsed) (:passage parsed)))})))
-       (sort (fn [a b] (backlinks/passage-order (:key a) (:key b))))
-       vec))
+  Quotes need no preview: they copy the passage into the quoting page.
+  `from?` (TASK-330), a predicate of a BookId: only the links from books
+  it holds for count -- a partial site's chosen books; nil, every book."
+  ([g id] (preview-passages g id nil))
+  ([g id from?]
+   (->> (graph/edges-to g id)
+        (filter #(and (= :link (:kind %)) (= :resolved (:status %))
+                      (not= id (:id (:from %)))
+                      (or (nil? from?) (from? (:id (:from %))))))
+        (group-by graph/edge-passage-key)
+        (map (fn [[k edges]]
+               (let [edge (first (sort-by (comp :written :to) edges))
+                     parsed (book-ref/parse-book-ref (:written (:to edge)))]
+                 {:key k
+                  :passage (or (:passage (:to edge))
+                               (when-not (book-ref/malformed? parsed) (:passage parsed)))})))
+        (sort (fn [a b] (backlinks/passage-order (:key a) (:key b))))
+        vec)))
 
 (def previews-version
   "The `version` of `previews.json`; changes only when a field is
@@ -2076,19 +2080,22 @@
 (defn site-backlinks-report
   "The `--backlinks` report of the book `id` in the graph `g` as a site
   writes it to `backlinks.json`: each position's `:file` as
-  `site-position-file` shows it (nil when no library root holds it)."
-  [g id]
-  (let [roots (library-roots g)
-        fix (fn [entry]
-              (if (:position entry)
-                (update-in entry [:position :file]
-                           #(site-position-file roots (some-> (get-in entry [:from :id]) book-ref/parse-book-ref
-                                                              :id :library)
-                                                %))
-                entry))]
-    (-> (backlinks/backlinks-report g id {:base-dir nil})
-        (update :edges #(mapv fix %))
-        (update :self #(mapv fix %)))))
+  `site-position-file` shows it (nil when no library root holds it).
+  `from?` (TASK-330): only the references from books it holds for, as
+  `backlinks/backlinks-report` takes it."
+  ([g id] (site-backlinks-report g id nil))
+  ([g id from?]
+   (let [roots (library-roots g)
+         fix (fn [entry]
+               (if (:position entry)
+                 (update-in entry [:position :file]
+                            #(site-position-file roots (some-> (get-in entry [:from :id]) book-ref/parse-book-ref
+                                                               :id :library)
+                                                 %))
+                 entry))]
+     (-> (backlinks/backlinks-report g id (cond-> {:base-dir nil} from? (assoc :from? from?)))
+         (update :edges #(mapv fix %))
+         (update :self #(mapv fix %))))))
 
 (defn- write-data!
   "Write the data files of the book whose page `written` (an `emit-page!`
@@ -2105,15 +2112,16 @@
   `which` (TASK-272) names the files to make, `:backlinks` and/or
   `:previews`; `:preview-failures` is answered only when `previews.json`
   was among them. `:replace-files?` writes them even when their bytes
-  match (`write-if-changed!`)."
-  [dir {:keys [graph previews replace-files?]} {:keys [id page images]} which]
+  match (`write-if-changed!`). `:from?` (TASK-330, a partial site's
+  chosen books): only the references from those books count."
+  [dir {:keys [graph previews replace-files? from?]} {:keys [id page images]} which]
   (let [page-dir (page-dir-of page)
         backlinks-rel (str page-dir "backlinks.json")
         previews-rel (str page-dir "previews.json")
         previews? (contains? which :previews)]
     (try
-      (let [report (when (contains? which :backlinks) (site-backlinks-report graph id))
-            rendered (when previews? (previews id (preview-passages graph id) (keep :path (vals images))))
+      (let [report (when (contains? which :backlinks) (site-backlinks-report graph id from?))
+            rendered (when previews? (previews id (preview-passages graph id from?) (keep :path (vals images))))
             {failures true shown false} (group-by #(contains? % :failed) rendered)]
         (cond-> {:id id
                  :data (cond-> {}
@@ -2476,21 +2484,40 @@
   match, as new files, so they take the mode the umask gives now, as the
   pages and images a full build writes do. No existing file's mode is
   ever changed in place, and a file the build does not produce is not
-  touched."
+  touched.
+
+  A partial site (TASK-330; doc-13, section 5): `:chosen`, a set of
+  BookIds, limits everything the build makes to those books -- only they
+  are planned (`:plan` is still handed every `site-books` entry, so
+  `site.incremental/plan`'s rule about nested page folders sees them all,
+  and so does `image-collector`'s page-folder check), emitted, kept,
+  counted, cataloged and given data files, and those data files count
+  references from chosen books only (`write-data!`'s `:from?`); every
+  other page is swept. The catalog then lists only the libraries that
+  have a page. `:retained`, `[{:id :page :images}]`, are pages of chosen
+  books this build could not find but must not drop (their library is
+  unavailable, say): their page, data files and copied images survive the
+  sweep, and nothing else of them is made. nil `:chosen` (a full site)
+  changes nothing. (A \"not in this site\" page for an unchosen book a
+  page links to, doc-13's stub, is TASK-331: it would be written and
+  kept by the sweep beside `:retained`.)"
   [dir {:keys [directory library-names emit threads report library-diagnostics base-dir reason
-               graph previews plan hook frozen replace-files?]
+               graph previews plan hook frozen replace-files? chosen retained]
         :or {reason "full build"}}]
   (copy-app-files! dir replace-files?)
   (let [threads (or threads (.availableProcessors (Runtime/getRuntime)))
         hook (or hook (fn [_ _] nil))
-        entries (site-books directory library-names)
+        all-entries (site-books directory library-names)
+        ;; TASK-330: a partial site builds its chosen books only
+        entries (if chosen (filterv #(contains? chosen (:id %)) all-entries) all-entries)
         buildable (filterv :book entries)
         duplicates (filterv :duplicates entries)
         ;; every book's page folder, the unbuilt ones' too: a folder no
         ;; image of another book may be copied into
-        page-dirs (into #{} (keep #(some-> (page-path (:id %)) page-dir-of)) entries)
+        page-dirs (into #{} (keep #(some-> (page-path (:id %)) page-dir-of)) all-entries)
         ;; TASK-272: what to emit, and the pages kept as they are
-        {:keys [rebuild kept full?] data-plan :data} (if plan (plan entries) (full-plan entries reason))
+        {:keys [rebuild kept full?] data-plan :data} (if plan (plan all-entries) (full-plan entries reason))
+        from? (when chosen #(contains? chosen %))
         results (in-pool (fn [entry]
                            (let [r (emit-page! dir emit page-dirs entry)]
                              (hook :page r)
@@ -2500,6 +2527,7 @@
         written (filterv :page results)
         failed (filterv :failed results)
         kept-pages (->> kept
+                        (filter (fn [[id]] (or (nil? chosen) (contains? chosen id))))
                         (map (fn [[id saved]] (assoc saved :id id :page (:path saved))))
                         (sort-by-key (comp book-ref/format-book-id :id)))
         pages (into written kept-pages)
@@ -2509,7 +2537,8 @@
         data-results (if data?
                        (in-pool (fn [[page which]]
                                   (let [r (write-data! dir {:graph graph :previews previews
-                                                            :replace-files? replace-files?}
+                                                            :replace-files? replace-files?
+                                                            :from? from?}
                                                        page which)]
                                     (hook :data r)
                                     r))
@@ -2538,17 +2567,24 @@
         (catalog (map (fn [{:keys [id page authors]}]
                         {:id id :title (titles id) :authors authors :page page})
                       pages)
-                 library-names
-                 (update-vals frozen :counts))
+                 ;; TASK-330: a partial site lists the libraries it has pages of
+                 (if chosen
+                   (vec (distinct (map (comp :library :id) pages)))
+                   library-names)
+                 ;; (a frozen library of a partial site with no page has no count)
+                 (into {} (keep (fn [[lib piece]] (some->> (:counts piece) (vector lib)))) frozen))
         catalog-written (into (sorted-map)
                               (map (fn [[rel content]] [rel (write-if-changed! dir rel content replace-files?)]))
                               catalog-bytes)
         own-copies (set (mapcat (comp keys :images) pages))
-        copies (into own-copies (mapcat :copies) (vals frozen))
+        copies (-> own-copies
+                   (into (mapcat :copies) (vals frozen))
+                   ;; TASK-330: a chosen book kept though not found keeps its copies
+                   (into (mapcat (comp keys :images)) retained))
         _ (hook :sweep nil)
         folders (volatile! nil)
         sweep-problems (volatile! [])
-        removed (sweep! dir (set (map :page pages))
+        removed (sweep! dir (into (set (map :page pages)) (keep :page) retained)
                         (cond-> {:folders folders
                                  :problems sweep-problems
                                  :images copies
@@ -2558,7 +2594,7 @@
                                                (comp (remove #(:data-failed (get data-by-id (:id %))))
                                                      (mapcat (fn [{:keys [page]}]
                                                                (map #(str (page-dir-of page) %) data-names))))
-                                               pages))}
+                                               (concat pages (filter :page retained))))}
                           frozen (assoc :libraries library-names)))
         _ (vswap! sweep-problems into
                   (sweep-catalog! dir (into (set (keys catalog-bytes)) (mapcat (comp keys :catalog)) (vals frozen))))
@@ -2604,7 +2640,11 @@
                       (concat (map (fn [r] ["rebuilt" (fmt r) (get rebuild (:id r) reason)]) written)
                               (map (fn [r] ["failed" (fmt r) "its page could not be emitted"]) failed)
                               skipped-rows))
-        removed-rows (map (fn [id] ["removed" id "no longer in the libraries"]) removed)
+        ;; TASK-334: a book that failed still exists; its stale page is swept
+        ;; (as always), but it is not "no longer in the libraries"
+        failed-page-ids (into #{} (keep #(some-> (page-path (:id %)) page-id)) failed)
+        removed-rows (for [id removed :when (not (contains? failed-page-ids id))]
+                       ["removed" id "no longer in the libraries"])
         ;; TASK-297: counted per library, the frozen ones as they were
         ;; left; the site's summary is the sum
         summaries (library-summaries {:lib-names library-names :entries entries :written written

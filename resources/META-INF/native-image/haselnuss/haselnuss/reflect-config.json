@@ -978,6 +978,9 @@
   "name":"haselnuss.serve__init"
 },
 {
+  "name":"haselnuss.site.chosen__init"
+},
+{
   "name":"haselnuss.site.incremental__init"
 },
 {

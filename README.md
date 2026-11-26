@@ -1400,10 +1400,11 @@ haselnuss --libraries libs.yaml --build-site ~/haselnuss-site
 haselnuss --build-site ~/haselnuss-site --extensions directives.clj --transform rules.clj
 ```
 
-It takes no input file and no library names: cross-library links make a partial site
-wrong, so it always builds every library the directory file names (`--libraries`,
-`$HASELNUSS_LIBRARIES` or `~/.config/haselnuss/libraries.yaml`, as every command finds it).
-The folder it writes:
+It takes no input file and no library names: it always reads every library the directory
+file names (`--libraries`, `$HASELNUSS_LIBRARIES` or `~/.config/haselnuss/libraries.yaml`,
+as every command finds it), since a book's links and quotes can reach any of them. It
+builds every book of them -- unless the site is a partial one, which holds only the books
+chosen for it (see "Partial sites" below). The folder it writes:
 
 ```
 DIR/
@@ -1420,6 +1421,7 @@ DIR/
   .haselnuss/images                                          the image copies the last build made
   .haselnuss/pending                                         what an interrupted build was rebuilding
   .haselnuss/unchanged                                       what tells the next build nothing changed
+  .haselnuss/chosen                                          a partial site's chosen books
 ```
 
 - **A page** is the book's normal `html` build -- what `haselnuss <book-id>` writes, with
@@ -1648,12 +1650,15 @@ book named twice is built once. `--site DIR` names the site, `$HASELNUSS_SITE` s
 for it (and `--site` wins). The site must be one `--build-site` built, with the same
 library directory file, `--extensions`, `--transform` and `--trusted-extensions`, by the
 same Haselnuss version: otherwise the page would not match the rest of the site, and it
-is refused. Each page is built exactly as `--build-site` builds it, then written with its
-copied images (recorded in `.haselnuss/images`) under the build lock, each file by rename.
-Its `backlinks.json` is kept -- who refers to a book does not change when the book does --
-and its `previews.json` made again for the passages it already lists (one that no longer
-resolves is left out, with an info line); a book with no page yet gets empty ones. The
-catalog is left as it is.
+is refused. (A partial site that no `--build-site` has built yet is compared with its
+`.haselnuss/chosen` instead; an empty or absent folder becomes a new partial site -- see
+"Partial sites" below.) Each page is built exactly as `--build-site` builds it, then
+written with its copied images (recorded in `.haselnuss/images`) under the build lock,
+each file by rename. Its `backlinks.json` is kept -- who refers to a book does not change
+when the book does -- and its `previews.json` made again for the passages it already lists
+(one that no longer resolves is left out, with an info line); a book with no page yet gets
+empty ones. Its entry in the catalog is written in place, so the reader app finds it
+before the next `--build-site`.
 
 It never reads or writes the saved state. Each book it writes goes into
 `.haselnuss/pending` instead, and the record of an unchanged site is removed, so the next
@@ -1674,10 +1679,53 @@ stale    reformed:catecismo-heidelberg  (refers to this book)
 warning or error -- a book whose page cannot be built is a `failed` line and an
 `emit-failed` error, keeps its old page and is not made pending, and the others are still
 written; 2 when it could not run, and nothing was written: no `--site` or
-`$HASELNUSS_SITE`, a folder that is not a site, no saved state, another version or other
-inputs than the site's, another build holding the lock, an unknown library or book, a
-slug two books share, a passage, an `--extensions`/`--transform` file that cannot be
-loaded.
+`$HASELNUSS_SITE`, a folder that is neither empty nor a site, a full site with no saved
+state, another version or other inputs than the site's, a partial site's
+`.haselnuss/chosen` that cannot be read, another build holding the lock, an unknown
+library or book, a slug two books share, a passage, an `--extensions`/`--transform` file
+that cannot be loaded.
+
+#### Partial sites
+
+A partial site holds pages only for the books chosen for it, so books nobody will read
+take no disk space. It has a full site's layout plus `.haselnuss/chosen`, whose presence
+is what makes it partial: the canonical IDs of its chosen books, one a line, below a
+header with the Haselnuss version and the inputs (directory file, `--extensions`,
+`--transform`, `--trusted-extensions`) it was last built with.
+
+```
+haselnuss --build-doc reformed:catecismo-heidelberg --site ~/partial-site   # makes it
+haselnuss --build-doc bible:romanos --site ~/partial-site                   # adds a book
+haselnuss --build-site ~/partial-site                                       # keeps it up to date
+haselnuss --build-site ~/partial-site --all-books                           # makes it full
+```
+
+- **`--build-doc` on an empty or absent folder** makes a partial site -- the reader app,
+  `.haselnuss/state/`, `.haselnuss/chosen` and an empty catalog -- holding the named books,
+  then builds them as above. On a partial site, the named books join its chosen books
+  (built or not), then are built. `--build-site` on an empty folder still makes a full
+  site.
+- **`--build-site` on a partial site** is the incremental build of a full site, limited to
+  the chosen books: only they are built, kept, cataloged, swept and counted in the
+  summary, and the problems it prints are theirs (and their libraries' own). Every other
+  book is read only to resolve links and quotes, and gets no page, no data file and no
+  catalog entry; a link to it still points at its page's path. `backlinks.json`,
+  `previews.json` and `--build-doc`'s `stale` lines count chosen books only (`--backlinks`
+  on the command line still answers across all libraries). The catalog lists the
+  libraries that have a page. The build rewrites the header of `.haselnuss/chosen`.
+- **A chosen book whose shelf moved** is rewritten to its canonical ID, with an info line.
+- **Chosen books stay for good**: there is no way to remove one. A chosen book is dropped
+  -- an info line, and its page swept -- only when it is definitely gone: its library is
+  in the directory file and available, it lists no book of that slug, and the listing was
+  complete, with no failure of this run (a generated shelf's script running out of time).
+  Otherwise -- the library missing from the directory file or unavailable, a slug that now
+  names several books, a shelf that could not list -- it stays chosen, its page, data
+  files and copied images are kept, and every build prints a warning naming the book and
+  why, until it is found again.
+- **`--build-site --all-books`** builds every book of a partial site and removes
+  `.haselnuss/chosen`: the site is full from then on, and there is no way back. A plain
+  `--build-site` never does this. On a full site `--all-books` changes nothing; without
+  `--build-site` it is a usage error.
 
 #### Serving a site
 

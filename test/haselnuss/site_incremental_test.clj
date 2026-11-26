@@ -17,6 +17,7 @@
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [haselnuss.book-ref :as book-ref]
             [haselnuss.cli :as cli]
             [haselnuss.library.digest :as digest]
             [haselnuss.library.graph :as graph]
@@ -24,6 +25,7 @@
             [haselnuss.library.state :as state]
             [haselnuss.sandbox :as sandbox]
             [haselnuss.site :as site]
+            [haselnuss.site.chosen :as chosen]
             [haselnuss.site.incremental :as incremental]
             [haselnuss.site.unchanged :as unchanged]
             [haselnuss.test-sandbox :as test-sandbox]
@@ -527,6 +529,28 @@
       (is (not (str/includes? (slurp (io/file dir "catalog/reformed/1.json")) "catecismo"))))
     (testing "exactly as a clean build"
       (same-as-clean? root dir result "delete the catechism"))))
+
+;; TASK-334: a book that still exists but fails is not "no longer in the libraries"
+(deftest failing-book-is-not-removed-test
+  (let [root (fixture-copy)
+        dir (io/file (temp-dir) "site")
+        page (io/file dir "books/reformed/dangling/index.html")
+        _ (build! root dir)
+        _ (is (.exists page) "precondition: the book had a page")
+        src (read-file root "reformed/dangling.hdoc")
+        _ (write-file! root "reformed/dangling.hdoc" (str/replace-first src "lang: en" "lang: en\nbibliography: missing.json"))
+        {:keys [err]} (build! root dir)]
+    (testing "the failing book has its failed line and no removed line"
+      (is (re-find #"(?m)^failed +reformed:dangling" err) err)
+      (is (not (re-find #"(?m)^removed +reformed:dangling" err)) err)
+      (is (not (str/includes? err "(no longer in the libraries)")) err))
+    (testing "its old page is swept, as before this fix (unchanged behaviour)"
+      (is (not (.exists page))))
+    (testing "a book that really left still gets the removed line"
+      (.delete (io/file root "reformed/catecismo-heidelberg.hdoc"))
+      (let [{:keys [err]} (build! root dir)]
+        (is (str/includes? err "removed  reformed:catecismo-heidelberg  (no longer in the libraries)\n") err)
+        (is (not (re-find #"(?m)^removed +reformed:dangling" err)) err)))))
 
 (deftest moved-book-test
   (let [root (fixture-copy)
@@ -1727,3 +1751,160 @@
               (is (not (.exists (io/file dir "catalog/lib/9999.json"))))))))
       (finally
         (when (.exists catalog-lib) (chmod! catalog-lib "rwxr-xr-x"))))))
+
+;; --- TASK-330: the edit sequence on a partial site ----------------------------------
+
+(defn- chosen-of
+  "The ids the chosen list of the partial site `dir` names, as text."
+  [dir]
+  (mapv book-ref/format-book-id (:ids (chosen/read-chosen dir))))
+
+(defn- fresh-partial
+  "A new partial site holding nothing yet but the chosen list `ids` (texts):
+  what a clean build of a partial site starts from."
+  ^File [ids]
+  (let [dir (io/file (temp-dir) "site")]
+    (.mkdirs (state/state-dir dir))
+    (chosen/write-chosen! dir {} (map (comp :id book-ref/parse-book-ref) ids))
+    dir))
+
+(defn- same-as-clean-partial?
+  "`same-as-clean?` for the partial site `dir`: byte for byte a clean build
+  of a fresh partial site with the same chosen list, with its status, the
+  problems its summary counts and its book count."
+  [^File root ^File dir result what]
+  (let [clean-dir (fresh-partial (chosen-of dir))
+        clean-result (build! root clean-dir)
+        clean (site-tree clean-dir)
+        tree (site-tree dir)]
+    (is (= clean tree) (str what ": differs from a clean partial build at " (vec (tree-diff clean tree))
+                            "\n" (:err result)))
+    (is (= (:status clean-result) (:status result)) what)
+    (is (= (problems (summary (:err clean-result))) (problems (summary (:err result))))
+        (str what "\nclean: " (:err clean-result) "\nincremental: " (:err result)))
+    (is (= (second (summary-counts (summary (:err clean-result))))
+           (second (summary-counts (summary (:err result)))))
+        (str what ": the same book count"))
+    (is (= (chosen-of clean-dir) (chosen-of dir)) (str what ": the same chosen list"))))
+
+(defn- book-ids-now
+  "The canonical id of every book of `root` as its files are now."
+  [^File root]
+  (concat (for [rel (books-of root "reformed")]
+            (str "reformed:" (-> rel (subs (count "reformed/")) (str/replace #"\.hdoc$" "") (str/replace #"/book$" ""))))
+          (for [b (bible root)] (str "bible:blivre/" (get b "slug")))))
+
+(def ^:private partial-seed
+  "The seed of the partial site's edit sequence: the task number."
+  330)
+
+(defn- build-doc-into!
+  "`--build-doc id` of `root`'s libraries into the site `dir`: its status."
+  [^File root dir id]
+  (binding [*err* (StringWriter.) *out* (StringWriter.)]
+    (cli/main* ["--libraries" (str (io/file root "libraries.yaml")) "--build-doc" id "--site" (str dir)]
+               {:library-env {} :library-home "/nonexistent/haselnuss-test-home"
+                :haselnuss.cli/check-base-dir (.getCanonicalPath root)})))
+
+(deftest partial-edit-sequence-matches-clean-builds-test
+  (testing "TASK-330 AC #4: on a partial site, every TASK-272 edit kind -- and choosing a book with
+            --build-doc -- rebuilds only affected chosen books, a no-change run answers from the
+            record, and the site is a clean build's of a fresh partial site with the same chosen list"
+    (without-racy-window
+     (fn []
+       (let [rnd (Random. partial-seed)
+             root (fixture-copy)
+             dir (io/file (temp-dir) "site")
+             choose (fn [^Random rnd root _]
+                      (when-let [id (pick rnd (remove (set (chosen-of dir)) (book-ids-now root)))]
+                        (when (not= 2 (build-doc-into! root dir id))
+                          (str "choose " id " with --build-doc"))))
+             ;; a chosen book's file moved to another shelf, so its chosen id
+             ;; is rewritten (the TASK-272 moves pick any book)
+             move-chosen (fn [^Random rnd root _]
+                           (when-let [rel (pick rnd (for [id (chosen-of dir)
+                                                          :when (str/starts-with? id "reformed:")
+                                                          :let [rel (str "reformed/" (subs id (count "reformed:")) ".hdoc")]
+                                                          :when (exists? root rel)]
+                                                      rel))]
+                             (let [file-name (.getName (io/file rel))
+                                   target (if (= "reformed" (.getParent (io/file rel)))
+                                            (str "reformed/chosen-moved/" file-name)
+                                            (str "reformed/" file-name))]
+                               (when-not (.exists (io/file root target))
+                                 (io/make-parents (io/file root target))
+                                 (Files/move (.toPath (io/file root rel)) (.toPath (io/file root target))
+                                             (make-array CopyOption 0))
+                                 (str "move the chosen " rel " to " target)))))
+             all-edits (assoc edits :choose choose :move-chosen move-chosen)
+             kinds (let [l (java.util.ArrayList. ^java.util.Collection (vec (mapcat (fn [_] (sort (keys all-edits)))
+                                                                                    (range 3))))]
+                     (java.util.Collections/shuffle l rnd)
+                     (vec l))
+             stats (atom {:applied {} :kept 0 :rebuilt 0 :partial-steps 0 :hits 0 :deltas 0 :dropped 0 :moved 0})]
+         ;; the first chosen books, made by --build-doc into an absent folder
+         (doseq [id ["reformed:estudos/queda" "bible:blivre/genesis" "reformed:dangling" "bible:blivre/romanos"
+                     "reformed:catecismo-heidelberg"]]
+           (is (not= 2 (build-doc-into! root dir id)) id))
+         (same-as-clean-partial? root dir (build! root dir) "the first build")
+         (doseq [[n kind] (map-indexed vector kinds)]
+           (when-let [what ((get all-edits kind) rnd root n)]
+             (let [result (build-seen! root dir)
+                   [rebuilt _ kept] (summary-counts (summary (:err result)))
+                   chosen (set (chosen-of dir))]
+               (swap! stats #(-> %
+                                 (update-in [:applied kind] (fnil inc 0))
+                                 (update :kept + (or kept 0))
+                                 (update :rebuilt + (or rebuilt 0))
+                                 (cond-> (and kept (pos? kept)) (update :partial-steps inc))
+                                 (cond-> (:unchanged? result) (update :hits inc))
+                                 (cond-> (:delta result) (update :deltas inc))
+                                 (cond-> (str/includes? (:err result) "is no longer in its library") (update :dropped inc))
+                                 (cond-> (str/includes? (:err result) "is now at") (update :moved inc))))
+               (is (every? chosen (keys (rebuilt-ids (:err result))))
+                   (str "step " n ": " what ": only chosen books are rebuilt\n" (:err result)))
+               (is (every? (fn [rel] (some #(str/starts-with? rel (str "books/" (str/replace % ":" "/") "/")) chosen))
+                           (filter #(re-find #"^books/.*/index\.html$" %) (keys (site-tree dir))))
+                   (str "step " n ": " what ": only chosen books have a page"))
+               (same-as-clean-partial? root dir result (str "step " n ": " what))
+               ;; and once more with no change: answered from the record once settled
+               (when (= :no-change kind)
+                 (let [again (build-seen! root dir)]
+                   (when (:unchanged? again) (swap! stats update :hits inc))
+                   (same-as-clean-partial? root dir again (str "step " n ": no change, again")))))))
+         (testing (str "not vacuous: every edit kind ran, most steps kept pages, no-change runs were"
+                       " answered from the record, and chosen books moved and were dropped")
+           (is (= (set (keys all-edits)) (set (keys (:applied @stats)))) (pr-str (:applied @stats)))
+           (is (< 30 (:partial-steps @stats)) (pr-str @stats))
+           (is (< (:rebuilt @stats) (:kept @stats)) (pr-str @stats))
+           (is (pos? (:hits @stats)) (pr-str @stats))
+           (is (pos? (:deltas @stats)) (pr-str @stats))
+           (is (pos? (:dropped @stats)) (pr-str @stats))
+           (is (pos? (:moved @stats)) (pr-str @stats))))))))
+
+(deftest partial-site-delta-builds-test
+  (testing "TASK-330 review: on a partial site of three libraries, one referring to neither other,
+            an edit there builds that library alone (TASK-297), and the site is a clean partial build's"
+    (without-racy-window
+     (fn []
+       (let [root (three-library-copy)
+             dir (io/file (temp-dir) "site")]
+         (doseq [id ["solo:a" "solo:pic" "reformed:catkins" "bible:genesis"]]
+           (is (not= 2 (build-doc-into! root dir id)) id))
+         (build! root dir)
+         (is (:unchanged? (settle! root dir)) "settled")
+         (doseq [[what edit!] [["edit the chosen solo:a"
+                                #(write-file! root "solo/a.hdoc" (str (read-file root "solo/a.hdoc") "\nMore.\n"))]
+                               ["edit the unchosen solo:b, which quotes solo:a"
+                                #(write-file! root "solo/b.hdoc" (str (read-file root "solo/b.hdoc") "\nMore.\n"))]
+                               ["add an unchosen book to solo"
+                                #(write-file! root "solo/c.hdoc" "---\ntitle: C\n---\n\nSee @{solo:a#sec:a}.\n")]
+                               ["delete the chosen solo:pic"
+                                #(.delete (io/file root "solo/pic/book.hdoc"))]]]
+           (edit!)
+           (let [r (build-seen! root dir)]
+             (is (= #{"solo"} (:delta r)) (str what ": built solo alone\n" (:err r)))
+             (same-as-clean-partial? root dir r what))
+           (is (:unchanged? (settle! root dir)) (str what ": settled again")))
+         (is (= ["bible:blivre/genesis" "reformed:catkins" "solo:a"] (chosen-of dir))
+             "the deleted chosen book was dropped"))))))

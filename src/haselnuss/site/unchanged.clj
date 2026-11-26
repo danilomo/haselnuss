@@ -540,10 +540,14 @@
   - `:transient?`, true when the build left something only its own run
     can vouch for (`haselnuss.site.incremental/transient-left?`: a
     generated shelf's script that ran out of time, TASK-299), which the
-    next run must retry rather than skip: then there is no record."
+    next run must retry rather than skip: then there is no record;
+  - `:chosen` (TASK-330), the digest of a partial site's chosen list as
+    the build left it (`haselnuss.site.chosen/chosen-digest`), nil for a
+    full site: `examine` compares it with the run's own, so a list changed
+    since, or `--all-books`, is never answered from the record."
   [{:keys [generation inputs home base-dir trusted-extensions output libraries catalog books lib-names
            files-by-lib stamps listing walks links books-dir site-entries manifest carried build
-           transient?]}]
+           transient? chosen]}]
   (let [all-libs (into (set lib-names) (keys carried))
         site-by-lib (group-by (fn [[_ p]] (site-folder-library (str books-dir) all-libs p)) site-entries)
         books-by-lib (group-by (comp :library key) books)
@@ -580,18 +584,20 @@
                                            :pages (pages-of lib)}}])))
                   lib-names)
         everything (merge carried own)
-        head {:generation generation
-              :inputs inputs
-              :home home
-              :base-dir base-dir
-              :trusted-extensions (boolean trusted-extensions)
-              :output output
-              :index (get catalog "catalog/index.json")
-              :global (when (not-any? (comp nil? #(nth % 2)) (:entries global))
-                        (stats-digest (:entries global) #(nth % 2)))
-              :libraries (into (sorted-map) (map (fn [[lib {:keys [piece]}]] [lib piece])) everything)
-              :manifest manifest
-              :build build}
+        head (cond-> {:generation generation
+                      :inputs inputs
+                      :home home
+                      :base-dir base-dir
+                      :trusted-extensions (boolean trusted-extensions)
+                      :output output
+                      :index (get catalog "catalog/index.json")
+                      :global (when (not-any? (comp nil? #(nth % 2)) (:entries global))
+                                (stats-digest (:entries global) #(nth % 2)))
+                      :libraries (into (sorted-map) (map (fn [[lib {:keys [piece]}]] [lib piece])) everything)
+                      :manifest manifest
+                      :build build}
+               ;; TASK-330: a partial site's chosen list, as this build left it
+               (some? chosen) (assoc :chosen chosen))
         own-entries (into (:entries global) (mapcat (comp :entries val)) sections)]
     (cond
       (nil? output) {:ineligible "a page or data file was not written"}
@@ -819,17 +825,21 @@
   lists, the images manifest, `catalog/index.json` and the global
   section, and every other library's section (TASK-297); else nil.
   `env`: this run's `:inputs` (input digests), `:home`, `:base-dir`,
-  `:trusted-extensions` and `:build` (nil, unknown: never a hit). Reads
+  `:trusted-extensions`, `:build` (nil, unknown: never a hit) and
+  `:chosen` (TASK-330: a partial site's chosen list's digest, else nil). Reads
   the state's header and the record, stats every stamped path and page,
   lists the site folders whose stamps were racy, and reads the catalog,
   the images manifest and every image a page shows; writes nothing."
-  [^File dir {:keys [inputs home base-dir trusted-extensions build]}]
+  [^File dir {:keys [inputs home base-dir trusted-extensions build chosen]}]
   (when-let [{:keys [head sections] :as r} (read-record dir)]
     (let [header (state/usable-header dir {:inputs inputs})
           [global & libs] sections]
       (when (and header
                  (string? build)
                  (= build (:build head))
+                 ;; TASK-330: the digest of a partial site's chosen list
+                 ;; (nil for a full site, and for --all-books)
+                 (= chosen (:chosen head))
                  (= (:generation header) (:generation head))
                  (= (manifest-digest dir) (:manifest head))
                  (= (state/plain inputs) (:inputs head))

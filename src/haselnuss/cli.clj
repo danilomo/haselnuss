@@ -114,6 +114,7 @@
             [haselnuss.sanitize :as sanitize]
             [haselnuss.serve :as serve]
             [haselnuss.site :as site]
+            [haselnuss.site.chosen :as chosen]
             [haselnuss.site.incremental :as incremental]
             [haselnuss.site.unchanged :as unchanged]
             [haselnuss.transform :as transform]
@@ -446,7 +447,7 @@
     "       haselnuss [--libraries PATH] --list-books LIBRARY"
     "       haselnuss [--libraries PATH] --check [LIBRARY|ID ...] [--format json]"
     "       haselnuss [--libraries PATH] --backlinks BOOK-REF [--format json]"
-    "       haselnuss [--libraries PATH] --build-site DIR [--full]"
+    "       haselnuss [--libraries PATH] --build-site DIR [--full] [--all-books]"
     "       haselnuss [--libraries PATH] --build-doc ID... [--site DIR]"
     "       haselnuss --serve DIR [--port PORT] [--bind ADDRESS] [--host NAME ...]"
     ""
@@ -502,6 +503,8 @@
     "                          \"--build-site\" below"
     "      --full              --build-site only: rebuild every book, ignoring what"
     "                          the last build saved"
+    "      --all-books         --build-site only: build every book into a partial"
+    "                          site, which is a full site from then on"
     "      --build-doc ID...   rebuild only the pages of the books ID... (book IDs,"
     "                          short or canonical) in the site --site names, and"
     "                          exit; takes no input file. See \"--build-doc\" below"
@@ -723,6 +726,15 @@
     "Build options a page does not use (--target, --output, ...) are warned"
     "about. See README \"Building a site\"."
     ""
+    "A partial site holds pages only for its chosen books, listed in"
+    "DIR/.haselnuss/chosen: --build-doc makes one of an empty or absent folder"
+    "and adds the books it builds. --build-site keeps a partial site's chosen"
+    "books up to date and builds no other book (they are read only to resolve"
+    "links and quotes); the catalog, backlinks.json and previews.json cover"
+    "the chosen books only. A chosen book is dropped only when it is gone from"
+    "a library that listed completely; otherwise it keeps its page, with a"
+    "warning. --all-books builds every book and makes the site full."
+    ""
     "--build-doc ID... rebuilds the pages of the named books -- filesystem or"
     "generated, each once -- in the site --site DIR names, or $HASELNUSS_SITE"
     "when --site is not given, faster than --build-site after a one-book edit:"
@@ -733,8 +745,8 @@
     "rebuilds it and the books that depend on it. It rebuilds no other book:"
     "the books referring to a rebuilt one keep their pages until then, and"
     "each is listed as stale. A book's backlinks.json is kept and its"
-    "previews.json made again for the passages it lists; the catalog is left"
-    "as it is. It prints, on stderr, a line per book, the problems a"
+    "previews.json made again for the passages it lists; its catalog entry is"
+    "written. It prints, on stderr, a line per book, the problems a"
     "conversion of the book by its ID reports, as --check prints them, and a"
     "summary:"
     ""
@@ -742,8 +754,10 @@
     "  stale    garden:vegetables/growing-tomatoes  (refers to this book)"
     "  1 book rebuilt, 1 dependent book not rebuilt; no warnings"
     ""
-    "DIR must be a site --build-site built. A book whose page cannot be built"
-    "keeps its old one; the others are still written."
+    "DIR must be a site --build-site built, or a partial site, whose chosen"
+    "books the named ones join; an empty or absent DIR becomes a new partial"
+    "site holding them. A book whose page cannot be built keeps its old one;"
+    "the others are still written."
     ""
     "--serve DIR answers HTTP requests for the files of the site in DIR"
     "(never .haselnuss/ or readers/, nor anything outside DIR) and the"
@@ -922,7 +936,8 @@
           _ (when (and inline-value
                        (contains? #{"--help" "--version" "--computed-numbers"
                                     "--no-stylesheet" "--fragment" "--trusted-extensions"
-                                    "--in-place" "--untrusted" "--check" "--full" "--build-doc"}
+                                    "--in-place" "--untrusted" "--check" "--full" "--build-doc"
+                                    "--all-books"}
                                   arg))
               ;; A value on a flag that takes none must be an error, not
               ;; silently discarded: `--computed-numbers=false` turned
@@ -997,6 +1012,9 @@
                           {:type ::usage-error}))
           (and (:full opts) (not (:build-site opts)))
           (throw (ex-info "--full applies only to --build-site" {:type ::usage-error}))
+          ;; TASK-330: turning a partial site full is a site build's
+          (and (:all-books opts) (not (:build-site opts)))
+          (throw (ex-info "--all-books applies only to --build-site" {:type ::usage-error}))
           (and (contains? opts :site) (not (:build-doc opts)))
           (throw (ex-info "--site applies only to --build-doc" {:type ::usage-error}))
           ;; TASK-328 (doc-13 section 4): the books to rebuild are the
@@ -1188,6 +1206,10 @@
 
         (and (not literal?) (= "--full" arg))
         (recur more (assoc opts :full true) literal?)
+
+        ;; TASK-330: build every book of a partial site, which becomes full
+        (and (not literal?) (= "--all-books" arg))
+        (recur more (assoc opts :all-books true) literal?)
 
         ;; TASK-328: the books to rebuild are the positional arguments
         ;; (below), as --check's libraries are.
@@ -4093,6 +4115,130 @@
       "a book refers to a library left as it was"
       :else nil)))
 
+(defn- listing-incomplete
+  "Why the listing of the library `lib` (loaded, as the build's scan
+  listed it) or its record in the graph `g` cannot vouch that a book it
+  does not list is gone (TASK-330), or nil when it can: a folder that
+  could not be listed or a scan that failed (`:unreadable-shelf`), a
+  failure of this run (`library/transient?`, TASK-299) -- or a listing
+  of no book at all (review): a library that lists none (an unmounted
+  disk leaves its folder there, empty; a folder that cannot be searched
+  lists as empty), or a generated shelf, the one the chosen `id` names,
+  that lists none. Either may be gone for good, but a wrong drop cannot
+  be undone, and a repeated warning can."
+  [lib g lib-name id]
+  (let [diagnostics (concat (when (satisfies? library/LibraryDiagnostics lib) (library/library-diagnostics lib))
+                            (when (satisfies? graph/LibraryIndex g)
+                              (:diagnostics (get (graph/indexed-libraries g) lib-name))))
+        listed (try (vec (library/list-books lib)) (catch Exception _ nil))
+        shelf-dir (when (and (fs/filesystem-library? lib) (seq (:shelf id)))
+                    (apply io/file (fs/library-root lib) (:shelf id)))]
+    (cond
+      (some library/transient? diagnostics)
+      (str "its library met a failure of this run: " (:message (first (filter library/transient? diagnostics))))
+      (some #(= :unreadable-shelf (:type %)) diagnostics)
+      (str "its library could not be listed completely: "
+           (:message (first (filter #(= :unreadable-shelf (:type %)) diagnostics))))
+      (nil? listed) "its library could not be listed"
+      (empty? listed) "its library lists no books at all; is its folder there and mounted?"
+      (and shelf-dir (generated/generated-shelf? shelf-dir)
+           (not-any? #(= (:shelf id) (:shelf (:id %))) listed))
+      (str "its generated shelf " (pr-str (str/join "/" (:shelf id))) " lists no books at all")
+      :else nil)))
+
+(defn- resolve-chosen
+  "What a `--build-site` of a partial site (TASK-330; doc-13, section 5)
+  makes of its chosen ids `ids` (BookIds, as `.haselnuss/chosen` holds
+  them) in the loaded directory `dir`, scanned into the graph `g`. Each id
+  names a book the library lists under it exactly, or else under its slug
+  (a book whose shelf moved: the id is rewritten to the book's canonical
+  one). An id is dropped only when it is definitely gone: its library is
+  in the directory and available, it lists no book of that slug, and its
+  listing is complete with no failure of this run (`listing-incomplete`).
+  Otherwise -- the library missing from the directory file or
+  unavailable, the slug now naming several books, a generated shelf that
+  could not list, an incomplete listing -- it stays as it is, and its page
+  is kept (`:retained`). Answers `{:chosen #{BookId} :retained [{:id
+  :reason}] :dropped [BookId] :ids [BookId] :diagnostics [...]}`:
+  `:chosen` the books to build, `:ids` what the list holds after this
+  build, and an info per id dropped or rewritten and a warning per id
+  retained."
+  [dir g ids]
+  (let [results
+        (for [id ids
+              :let [text (book-ref/format-book-id id)
+                    lib (library/find-library dir (:library id))
+                    keep! (fn [reason] {:retained {:id id :reason reason}})]]
+          (cond
+            (nil? lib) (keep! (str "the library directory has no library " (pr-str (:library id))))
+            (library/diagnostic? lib) (keep! (str "its library is unavailable: " (:message lib)))
+            :else
+            (let [book (library/find-book lib (:slug id))]
+              (cond
+                (satisfies? library/Book book)
+                (let [current (:id (library/book-entry book))]
+                  (cond-> {:chosen current}
+                    (not= current id) (assoc :moved [id current])))
+
+                (= :ambiguous-book (:type book))
+                (if (some #{text} (:books book))
+                  {:chosen id}
+                  (keep! (str "its slug now names more than one book: " (:message book))))
+
+                (library/diagnostic? book)
+                (keep! (str "its library could not list it: " (:message book)))
+
+                :else
+                (if-let [why (listing-incomplete lib g (:library id) id)]
+                  (keep! why)
+                  {:dropped id})))))
+        chosen-ids (into #{} (keep :chosen) results)
+        retained (vec (keep :retained results))
+        dropped (vec (keep :dropped results))]
+    {:chosen chosen-ids
+     :retained retained
+     :dropped dropped
+     :ids (into (vec chosen-ids) (map :id) retained)
+     :diagnostics (vec (concat
+                        (for [[from to] (keep :moved results)]
+                          {:type :chosen-moved
+                           :level :info
+                           :message (str "chosen book " (book-ref/format-book-id from) " is now at "
+                                         (book-ref/format-book-id to) "; " chosen/chosen-rel " names it so now")})
+                        (for [id dropped]
+                          {:type :chosen-dropped
+                           :level :info
+                           :message (str "chosen book " (book-ref/format-book-id id) " is no longer in its library;"
+                                         " it is dropped from " chosen/chosen-rel " and its page removed")})
+                        (for [{:keys [id reason]} retained]
+                          {:type :chosen-kept
+                           :level :warning
+                           :message (str "chosen book " (book-ref/format-book-id id) " was not found, and stays"
+                                         " chosen with its page kept: " reason)})))}))
+
+(defn- partial-site-items
+  "The `--check` items a partial site reports (TASK-330), from the scan's
+  report `report` of the graph `g`: those of its chosen books (`chosen`,
+  BookIds) and, of every library, the problems of the library itself that
+  name no book -- a library unavailable, a folder it could not list, which
+  bear on how the chosen books' references resolve, so a full build's
+  are reported whatever the chosen books (review) -- or that name a
+  chosen one (a chosen id two books share). Answers `[items
+  library-diagnostics]`, the second as `write-site!`'s
+  `:library-diagnostics` takes them, any book they name outside `chosen`
+  left out."
+  [report g chosen base-dir]
+  (let [texts (into #{} (map book-ref/format-book-id) chosen)
+        lib-diagnostics (for [[lib-name record] (when (satisfies? graph/LibraryIndex g) (graph/indexed-libraries g))
+                              d (:diagnostics record)
+                              :when (or (not (sequential? (:books d))) (some texts (:books d)))]
+                          [lib-name record (cond-> d (sequential? (:books d)) (update :books #(filterv texts %)))])]
+    [(check/sort-items
+      (concat (filter #(contains? texts (:book %)) (:diagnostics report))
+              (for [[lib-name record d] lib-diagnostics]
+                (check/book-item d {:book nil :lib-name lib-name :file (:root record) :base-dir base-dir}))))
+     (mapv peek lib-diagnostics)]))
+
 (defn- site-env
   "What a site build's record of an unchanged site
   (`haselnuss.site.unchanged`) depends on besides the files it stamps:
@@ -4102,7 +4248,8 @@
   (`haselnuss.version/build-identity`: every development build shares
   one version, and a rebuilt binary may report or emit otherwise; nil,
   unknown, is never a hit). `::build-identity` (a test seam) stands for
-  it."
+  it. (A partial site's chosen list, TASK-330, is added as `:chosen` by
+  the callers, which read it under the lock.)"
   [opts inputs base-dir]
   {:inputs inputs
    :home (if (contains? opts :library-home) (:library-home opts) (System/getProperty "user.home"))
@@ -4146,6 +4293,17 @@
   `:hook`, and is called with `:save` just before the state is saved: a
   hook that throws stands for a build killed there.
 
+  A partial site (TASK-330; doc-13, section 5), one with a
+  `.haselnuss/chosen` (`haselnuss.site.chosen`, read under the lock): its
+  chosen ids are resolved (`resolve-chosen`), and only the books they name
+  are planned, built, kept, cataloged and given data files counting
+  chosen books' references (`write-site!`'s `:chosen`), while every book
+  is still scanned; a chosen book not found keeps its page
+  (`:retained`); the items are the chosen books' (`partial-site-items`);
+  after the state is saved, the list is written again with this build's
+  header and the resolved ids. `--all-books` builds every book instead
+  and removes the list then.
+
   `::delta` (TASK-297), `haselnuss.site.unchanged/delta-scope` of what
   the record of the last build tells (`site-unchanged`): every library
   outside its `:libraries` is as that build left it, and none of them
@@ -4172,6 +4330,8 @@
         lock (volatile! nil)
         ;; TASK-297 review: why `:prepare` found the site not as examined
         slipped-in (volatile! nil)
+        ;; TASK-330: the chosen list of a partial site, read under the lock
+        chosen-list (volatile! nil)
         {scope :libraries :keys [carried global-folders] :as delta} (::delta opts)]
     (try
       (site/preflight! site-dir)
@@ -4203,6 +4363,15 @@
                               :fs-opts {:listing-cache (or (get-in @start [:loaded :listing]) {})}
                               :prepare (fn [_]
                                          (vreset! lock (site/acquire-lock! site-dir))
+                                         ;; TASK-330: a partial site's chosen books, as
+                                         ;; no other build can change them now
+                                         (let [c (chosen/read-chosen (:dir @lock))]
+                                           (when (and (:unreadable c) (not (:all-books opts)))
+                                             (throw (ex-info (str "--build-site " site-dir ": " (:unreadable c)
+                                                                  "; the site is partial, so its chosen books"
+                                                                  " cannot be told (--all-books builds every book)")
+                                                             {:type ::site-failed ::diagnostics flag-diagnostics})))
+                                           (vreset! chosen-list c))
                                          ;; TASK-297 review: the record was examined
                                          ;; under a lock since released. Any build that
                                          ;; took it meanwhile and was not a hit cleared
@@ -4253,31 +4422,65 @@
             real-dir (:dir @lock)
             base-dir (or (::check-base-dir opts) (System/getProperty "user.dir"))
             hook (::site-hook opts)
+            ;; TASK-330: a partial site (doc-13, section 5) builds its chosen
+            ;; books, as each resolves now; --all-books builds every book and
+            ;; makes the site full. A build of only some libraries (TASK-297)
+            ;; resolves the chosen books of those, and keeps the others' as
+            ;; they are.
+            partial-site? (some? @chosen-list)
+            {chosen-set :chosen :as resolved}
+            (when (and partial-site? (not (:all-books opts)))
+              (resolve-chosen dir g (cond->> (:ids @chosen-list)
+                                      delta (filter #(contains? scope (:library %))))))
             pending (when loaded (incremental/read-pending real-dir))
             plan (fn [entries]
                    (let [p (if loaded
                              (incremental/plan entries
-                                               {:dir real-dir
-                                                :old-graph (:graph loaded)
-                                                :refresh scanned
-                                                :narrowed (rebuild/narrowed (:graph loaded) scanned)
-                                                :saved (:books loaded)
-                                                :pending pending})
-                             (site/full-plan entries (:full @start)))]
+                                               (cond-> {:dir real-dir
+                                                        :old-graph (:graph loaded)
+                                                        :refresh scanned
+                                                        :narrowed (rebuild/narrowed (:graph loaded) scanned)
+                                                        :saved (:books loaded)
+                                                        :pending pending}
+                                                 chosen-set (assoc :chosen chosen-set)
+                                                 partial-site? (assoc :partial? true)))
+                             (site/full-plan (cond->> entries
+                                               chosen-set (filter #(contains? chosen-set (:id %))))
+                                             (:full @start)))]
                      ;; before any page is written: a build that stops
                      ;; before its state is saved rebuilds them next time
                      (incremental/write-pending! real-dir p)
                      p))
             lib-names (cond->> (scan/directory-library-names dir)
                         delta (filterv #(contains? scope %)))
+            report (check/check-report g {:base-dir base-dir})
+            library-diagnostics (mapcat :diagnostics (vals (graph/indexed-libraries g)))
+            [report library-diagnostics] (if chosen-set
+                                           (let [[items lib-ds] (partial-site-items report g chosen-set base-dir)]
+                                             [{:diagnostics items} lib-ds])
+                                           [report library-diagnostics])
+            ;; a chosen book not found keeps its page, data files and copies
+            retained (vec (for [{:keys [id]} (:retained resolved)
+                                :let [saved (get (:books loaded) id)
+                                      page (or (:path saved) (site/page-path id))]
+                                :when page]
+                            {:id id :page page
+                             :images (or (:images saved)
+                                         ;; no saved state: the copies the manifest
+                                         ;; names in the page's own folder
+                                         (let [d (site/page-dir-of page)]
+                                           (into {} (comp (filter #(and (str/starts-with? % d)
+                                                                        (not (str/includes? (subs % (count d)) "/"))))
+                                                          (map (fn [p] [p {:path (subs p (count d))}])))
+                                                 (site/read-image-manifest real-dir))))
+                             :saved saved}))
             result (site/write-site! real-dir
                                      (cond-> {:directory dir
                                               :library-names lib-names
                                               :emit (site-emitter opts dir)
                                               :threads (::site-threads opts)
-                                              :report (check/check-report g {:base-dir base-dir})
-                                              :library-diagnostics (mapcat :diagnostics
-                                                                           (vals (graph/indexed-libraries g)))
+                                              :report report
+                                              :library-diagnostics library-diagnostics
                                               :base-dir base-dir
                                               :graph g
                                               :previews (site-previewer opts dir)
@@ -4286,17 +4489,20 @@
                                               :replace-files? (boolean (:replace-files? @start))}
                                        ;; TASK-297: the other libraries as their
                                        ;; last build left them
-                                       delta (assoc :frozen (update-vals carried (comp :settled :piece)))))
+                                       delta (assoc :frozen (update-vals carried (comp :settled :piece)))
+                                       chosen-set (assoc :chosen chosen-set :retained retained)))
             records (graph/indexed-books g)
             files (incremental/graph-files g)
             pre-read (select-keys (:stamps checked) files)
             stamps (merge (incremental/verified-stamps g (remove #(contains? pre-read %) files)) pre-read)
-            books (into {}
-                        (map (fn [[id entry]]
-                               [id (cond-> entry
-                                     (get-in records [id :hash])
-                                     (assoc :hash (get-in records [id :hash])))]))
-                        (:books result))
+            books (-> (into {}
+                            (map (fn [[id entry]]
+                                   [id (cond-> entry
+                                         (get-in records [id :hash])
+                                         (assoc :hash (get-in records [id :hash])))]))
+                            (:books result))
+                      ;; TASK-330: a retained page is remembered as it was
+                      (into (keep (fn [{:keys [id saved]}] (when saved [id saved]))) retained))
             listing (cond-> (scan/listing-caches ctx)
                       delta (select-keys lib-names))
             {:keys [rescanned rewritten vanished]} (when loaded (:changes scanned))]
@@ -4327,42 +4533,77 @@
                                             ;; the whole build puts it
                                             :other-claimants (unchanged/carried-claimants carried files)))))
         (incremental/clear-pending! real-dir)
-        ;; TASK-296: last, what the next run checks to tell that nothing
-        ;; changed since -- when this run left the site settled and
-        ;; everything it read is stamped well enough to trust (else the
-        ;; record cleared at the start stays away)
-        ;; (an optimisation: whatever fails here leaves no record, and the
-        ;; build, done and saved, does not fail for it)
-        (try
-          (let [r (unchanged/record (assoc (site-env opts inputs base-dir)
-                                           :generation (state/saved-generation real-dir)
-                                           :output (when (nil? (:library-directory opts)) (:settled result))
-                                           :libraries (:libraries result)
-                                           :catalog (:catalog result)
-                                           :lib-names lib-names
-                                           :books books
-                                           ;; TASK-299: a timeout is retried, not skipped
-                                           :transient? (incremental/transient-left? g books)
-                                           :files-by-lib (unchanged/graph-files-by-library g)
-                                           :stamps stamps
-                                           :listing listing
-                                           :walks (scan/listing-walks ctx)
-                                           :links (unchanged/graph-links g)
-                                           :carried carried
-                                           ;; stamped after the sweep: a file another
-                                           ;; process wrote into books/ while this build
-                                           ;; held the lock is taken for the build's own
-                                           :books-dir (io/file real-dir "books")
-                                           :site-entries (unchanged/site-folder-entries
-                                                          (io/file real-dir "books")
-                                                          (distinct (concat (:folders result) global-folders)))
-                                           :manifest (unchanged/manifest-digest real-dir)))]
-            (when (:head r)
-              (unchanged/write-record! real-dir r)))
-          (catch Exception _ (unchanged/clear! real-dir)))
+        ;; TASK-330: after the state, the chosen list: rewritten with this
+        ;; build's header, canonical ids and drops (the ids of libraries a
+        ;; build of only some left alone kept as they are) -- or, with
+        ;; --all-books, removed: the site is full from now on
+        (let [chosen-digest (cond
+                              (not partial-site?) nil
+                              (:all-books opts) (do (chosen/remove-chosen! real-dir) nil)
+                              :else (chosen/sync-chosen!
+                                     real-dir inputs
+                                     (concat (:ids resolved)
+                                             (when delta
+                                               (remove #(contains? scope (:library %)) (:ids @chosen-list))))))]
+          ;; TASK-296: last, what the next run checks to tell that nothing
+          ;; changed since -- when this run left the site settled and
+          ;; everything it read is stamped well enough to trust (else the
+          ;; record cleared at the start stays away)
+          ;; (an optimisation: whatever fails here leaves no record, and the
+          ;; build, done and saved, does not fail for it). TASK-330: none
+          ;; while a chosen book is kept unfound, whose warning every run
+          ;; prints again
+          (when (empty? retained)
+            (try
+              (let [r (unchanged/record (assoc (site-env opts inputs base-dir)
+                                               :chosen chosen-digest
+                                               :generation (state/saved-generation real-dir)
+                                               :output (when (nil? (:library-directory opts)) (:settled result))
+                                               :libraries (:libraries result)
+                                               :catalog (:catalog result)
+                                               :lib-names lib-names
+                                               :books books
+                                               ;; TASK-299: a timeout is retried, not skipped
+                                               :transient? (incremental/transient-left? g books)
+                                               :files-by-lib (unchanged/graph-files-by-library g)
+                                               :stamps stamps
+                                               :listing listing
+                                               :walks (scan/listing-walks ctx)
+                                               :links (unchanged/graph-links g)
+                                               :carried carried
+                                               ;; stamped after the sweep: a file another
+                                               ;; process wrote into books/ while this build
+                                               ;; held the lock is taken for the build's own
+                                               :books-dir (io/file real-dir "books")
+                                               :site-entries (unchanged/site-folder-entries
+                                                              (io/file real-dir "books")
+                                                              (distinct (concat (:folders result) global-folders)))
+                                               :manifest (unchanged/manifest-digest real-dir)))]
+                (when (:head r)
+                  (unchanged/write-record! real-dir r)))
+              (catch Exception _ (unchanged/clear! real-dir)))))
         (-> result
             (dissoc :settled :catalog :folders :libraries)
-            (assoc :diagnostics flag-diagnostics)))
+            ;; review: a chosen book kept though not found is a warning like
+            ;; any other a site build counts (exit 1), in a book of its own
+            ;; (it has no page entry the summary counts otherwise); no record
+            ;; of an unchanged site is saved while there is one
+            (update :summary #(-> %
+                                  (update :warnings + (count (:retained resolved)))
+                                  (update :books + (count (:retained resolved)))))
+            (assoc :diagnostics
+                   (cond-> (into flag-diagnostics (:diagnostics resolved))
+                     (seq (:bad @chosen-list))
+                     (into (for [line (:bad @chosen-list)]
+                             {:type :chosen-bad-line
+                              :level :warning
+                              :message (str chosen/chosen-rel " holds " (pr-str line)
+                                            ", which is not a canonical book ID; it is left out")}))
+                     (and partial-site? (:all-books opts))
+                     (conj {:type :chosen-removed
+                            :level :info
+                            :message (str "--all-books built every book and removed " chosen/chosen-rel
+                                          "; the site is a full site from now on")})))))
       (catch clojure.lang.ExceptionInfo e
         (if (contains? #{::site-failed ::delta-fallback} (:type (ex-data e))) (throw e) (fail e)))
       (catch Exception e (fail e))
@@ -4391,7 +4632,11 @@
       (when-let [lock (try (site/acquire-lock! site-dir) (catch Exception _ nil))]
         (try
           (let [dir (:dir lock)
-                env (site-env opts (site-inputs opts) (or (::check-base-dir opts) (System/getProperty "user.dir")))
+                env (assoc (site-env opts (site-inputs opts) (or (::check-base-dir opts) (System/getProperty "user.dir")))
+                           ;; TASK-330: a partial site's chosen list as it is now; a
+                           ;; full site, and --all-books, have none
+                           :chosen (when (and (not (:all-books opts)) (chosen/partial-site? dir))
+                                     (or (chosen/chosen-digest dir) "unreadable")))
                 {:keys [hit delta]} (try (unchanged/examine dir env) (catch Exception _ nil))]
             (cond
               hit
@@ -4666,6 +4911,20 @@
      :items items
      :summary (build-doc-counts (count books) (count done) rows items)}))
 
+(defn- unbuilt-site?
+  "True when the folder `d` is a site (`site/site?`) in which nothing was
+  built yet: no saved state header, no chosen list, no `books/` and no
+  `catalog/` -- what a `--build-doc` that made the folder (taking its lock
+  makes `.haselnuss/state/`) and stopped before writing its chosen list
+  leaves (TASK-330 review). `--build-doc` makes it a partial site, as it
+  does an empty folder."
+  [d]
+  (and (site/site? d)
+       (= :missing (:reason (state/header-check d)))
+       (not (chosen/partial-site? d))
+       (not (.exists (io/file d "books")))
+       (not (.exists (io/file d "catalog")))))
+
 (defn build-doc
   "`--build-doc ID... [--site DIR]` (doc-13, section 4; TASK-328): rebuild
   the named books' pages in the full site `DIR` (`--site`, else
@@ -4674,11 +4933,22 @@
   without loading or saving the saved state -- the cost a one-book edit
   should not pay.
 
+  TASK-330 (doc-13, section 5): an empty or absent `DIR` becomes a
+  partial site -- under the lock, `.haselnuss/chosen` (`haselnuss.site.
+  chosen`) holding the named books, the reader app's files and an empty
+  catalog, before any book is built -- and on a partial site the named
+  books join its chosen list, built or not, the app files and an empty
+  catalog index are made again where they are missing, and only chosen
+  books are listed as `stale`. A site an earlier run made and left with
+  nothing in it (`unbuilt-site?`) counts as empty.
+
   Before anything is written, and then nothing is (`::site-failed`, exit
-  2): `DIR` is not a site (an empty or absent folder included, for now),
-  the saved state's header (`state/header-check`, the graph is not read)
-  is missing or unreadable, or was saved by another Haselnuss version or
-  with other inputs than `site-inputs` (`build-doc-refusal`), an
+  2): `DIR` is neither empty nor a site, the saved state's header
+  (`state/header-check`, the graph is not read) -- or, on a partial site
+  that has none yet, its chosen list's (`chosen/header-check`) -- is
+  missing or unreadable, or was saved by another Haselnuss version or
+  with other inputs than `site-inputs` (`build-doc-refusal`), a partial
+  site's chosen list cannot be read, an
   `--extensions`/`--transform` file cannot be loaded, an ID names no
   usable library or no one book, another build holds the lock.
 
@@ -4720,20 +4990,30 @@
       (throw (ex-info (str "--build-doc needs a site: pass --site DIR or set $" site-env-var)
                       {:type ::usage-error ::diagnostics flag-diagnostics})))
     (try
-      ;; doc-13: an empty or absent folder becomes a partial site (TASK-330);
-      ;; until then only an existing (full) site is built into
-      (when-not (site/site? site-dir)
-        (failed! flag-diagnostics
-                 (str shown ": not a Haselnuss site (a site holds .haselnuss/state/);"
-                      " build it with --build-site first")))
+      ;; a non-empty folder that is not a site is refused here
       (site/preflight! site-dir "--build-doc")
       (let [inputs (site-inputs opts)
+            ;; TASK-330 (doc-13, section 5): an empty or absent folder becomes
+            ;; a partial site holding the named books -- and so does one a
+            ;; run that made it stopped before it wrote anything (review)
+            fresh? (or (not (site/site? site-dir)) (unbuilt-site? site-dir))
+            ;; what the site was built with: its saved state's header, else a
+            ;; partial site's chosen list's (TASK-330), else nothing to compare
             refuse! (fn [d]
-                      (when-let [why (build-doc-refusal (state/header-check d) inputs)]
-                        (failed! flag-diagnostics
-                                 (str shown ": " why "; a page built now would not match the rest of"
-                                      " the site, so run --build-site"))))
-            _ (refuse! site-dir)
+                      (let [c (when (chosen/partial-site? d) (chosen/read-chosen d))
+                            _ (when (:unreadable c)
+                                (failed! flag-diagnostics
+                                         (str shown ": " (:unreadable c) "; the site is partial, and its chosen"
+                                              " books cannot be told")))
+                            checked (state/header-check d)
+                            checked (if (and c (= :missing (:reason checked)))
+                                      (chosen/header-check c)
+                                      checked)]
+                        (when-let [why (build-doc-refusal checked inputs)]
+                          (failed! flag-diagnostics
+                                   (str shown ": " why "; a page built now would not match the rest of"
+                                        " the site, so run --build-site")))))
+            _ (when-not fresh? (refuse! site-dir))
             _ (load-site-sidecars! opts)
             kinds (parse-kinds (registry/numbering-lexicon (build-registry) resolver/default-lexicon) :html false)
             dir (load-directory! opts kinds "--build-doc")
@@ -4742,7 +5022,34 @@
             diagnostics (into diagnostics infos)
             _ (vreset! lock (site/acquire-lock! site-dir "--build-doc"))
             real-dir (:dir @lock)
-            _ (refuse! real-dir)
+            ;; still nothing there under the lock: this run makes the site
+            ;; (another build may have made one since it was looked at)
+            create? (and fresh? (unbuilt-site? real-dir))
+            _ (when-not create? (refuse! real-dir))
+            partial-site? (or create? (chosen/partial-site? real-dir))
+            chosen-before (when (and partial-site? (not create?)) (chosen/read-chosen real-dir))
+            ;; TASK-330: before any book is built, so a run stopped at any
+            ;; point leaves a partial site the next --build-doc takes (review):
+            ;; the chosen list gains the named books, built or not (on a new
+            ;; site first: it is what marks the site partial); the reader
+            ;; app's files and an empty catalog are made where they are
+            ;; missing, which also mends a site an earlier run left without
+            chosen-ids (when partial-site?
+                         (let [ids (concat (:ids chosen-before) (map :id books))]
+                           (chosen/sync-chosen! real-dir inputs ids)
+                           (site/copy-app-files! real-dir)
+                           (when-not (site/site-file? real-dir "catalog/index.json")
+                             (doseq [[rel content] (:files (site/catalog [] [] {}))]
+                               (site/write-if-changed! real-dir rel content false)))
+                           (into #{} (map book-ref/format-book-id) ids)))
+            ;; review: a line of the list that is no book id is left out, and
+            ;; said so, as --build-site says it
+            diagnostics (into diagnostics
+                              (for [line (:bad chosen-before)]
+                                {:type :chosen-bad-line
+                                 :level :warning
+                                 :message (str chosen/chosen-rel " holds " (pr-str line)
+                                               ", which is not a canonical book ID; it is left out")}))
             base-dir (or (::check-base-dir opts) (System/getProperty "user.dir"))
             emit (site-emitter opts dir)
             ;; the page folders of every book of a library, which no image of
@@ -4762,7 +5069,9 @@
             previews (site-previewer opts dir)
             ;; from here on pages may be written: a failure is reported with
             ;; them (exit 1), never as a run that wrote nothing (exit 2)
-            written (mapv #(build-doc-write! real-dir previews %) ok)
+            written (cond->> (mapv #(build-doc-write! real-dir previews %) ok)
+                      ;; TASK-330: a partial site lists its chosen books only
+                      chosen-ids (mapv #(cond-> % (:stale %) (update :stale (fn [s] (filterv chosen-ids s))))))
             manifest-failed (when (seq ok)
                               (try (site/record-image-copies! real-dir (mapcat (comp keys :copied) written))
                                    nil
